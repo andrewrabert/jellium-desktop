@@ -69,6 +69,12 @@ pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>
         "audioPassthrough" => jfn_config::set_audio_passthrough(value),
         "audioExclusive" => jfn_config::set_audio_exclusive(value == "true"),
         "audioChannels" => jfn_config::set_audio_channels(value),
+        // Persist, then apply live so a change takes effect on the current
+        // video immediately (mpv re-renders) as well as future playback.
+        "subtitleScale" => {
+            jfn_config::set_subtitle_scale(value);
+            jfn_mpv::api::jfn_mpv_set_subtitle_scale(jfn_config::subtitle_scale_value());
+        }
         "hideScrollbar" => jfn_config::set_hide_scrollbar(value == "true"),
         "logLevel" => jfn_config::set_log_level(value),
         "forceTranscoding" => jfn_config::set_force_transcoding(value == "true"),
