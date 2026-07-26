@@ -11,5 +11,8 @@ crate-type = ["rlib"]
 [dependencies]
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [lints]
 workspace = true

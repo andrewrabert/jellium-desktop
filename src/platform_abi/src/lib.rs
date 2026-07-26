@@ -19,6 +19,7 @@ pub mod cef_host;
 pub mod context_menu;
 pub mod dropdown;
 pub mod geometry;
+pub mod instance;
 pub mod media_sink;
 pub mod mpv_host;
 #[cfg_attr(unix, path = "process_unix.rs")]
@@ -42,6 +43,7 @@ pub use geometry::{
     BootGeometry, LogicalSize, PhysicalSize, Scale, SurfaceSize, WindowExtent, WindowGeometry,
     WindowPos,
 };
+pub use instance::{Instance, InstanceId};
 pub use media_sink::MediaSink;
 pub use mpv_host::{DefaultMpvHost, MpvHost};
 pub use window_source::{
@@ -356,10 +358,6 @@ pub enum IdleInhibitLevel {
 /// in-crate; callers only ever hold the raw pointer.
 pub type SurfaceHandle = *mut c_void;
 
-/// Single-instance listener callback; the `&str` is the activation token
-/// (empty on Windows / when none).
-pub type Callback = Box<dyn Fn(&str) + Send>;
-
 /// Process-wide platform handle. Optional methods have no-op defaults so
 /// backends only override what they care about.
 ///
@@ -608,20 +606,6 @@ pub trait Platform: Send + Sync {
     /// `on_shutdown` must be async-signal-safe.
     fn install_shutdown_handler(&self, on_shutdown: fn()) {
         process::install_shutdown(on_shutdown);
-    }
-
-    /// Returns `true` if an existing instance was reached (caller should exit).
-    fn single_instance_try_signal(&self, instance_id: &str) -> bool {
-        process::try_signal_existing(instance_id)
-    }
-
-    /// `cb` runs on the listener thread with the activation token.
-    fn single_instance_start_listener(&self, instance_id: &str, cb: Callback) -> bool {
-        process::start_listener(instance_id, cb)
-    }
-
-    fn single_instance_stop(&self, instance_id: &str) {
-        process::stop_listener(instance_id);
     }
 }
 

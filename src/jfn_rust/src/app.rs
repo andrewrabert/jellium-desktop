@@ -3,11 +3,12 @@
 
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::ptr;
-use std::sync::OnceLock;
 
 use clap::Parser;
 use jfn_cef::{APP_VERSION_FULL, cef_version};
-use jfn_platform_abi::{IdleInhibitLevel, LogicalSize, Platform, WindowGeometry};
+use jfn_instance_ipc::jfn::{Request, Response};
+use jfn_instance_ipc::{Listener, Start, Stream};
+use jfn_platform_abi::{IdleInhibitLevel, Instance, LogicalSize, Platform, WindowGeometry};
 
 use crate::cli;
 
@@ -81,25 +82,6 @@ fn init_logging(log_file: Option<String>, log_level: &str) {
     if !log_path.is_empty() {
         tracing::info!(target: "Main", "Log file: {log_path}");
     }
-}
-
-fn init_single_instance() -> bool {
-    let id = crate::instance_id::instance_id();
-    if plat().single_instance_try_signal(&id) {
-        tracing::info!(target: "Main", "Signaled existing instance, exiting");
-        return false;
-    }
-    let ok = plat().single_instance_start_listener(
-        &id,
-        Box::new(|_token: &str| {
-            // TODO: raise window via xdg-activation
-        }),
-    );
-    if !ok {
-        tracing::warn!(target: "Main", "Single-instance listener failed to start");
-    }
-    install_listener_guard();
-    true
 }
 
 fn log_mpv_versions() {
@@ -364,7 +346,7 @@ fn initialize_cef(ba: &BootArgs, use_shared_textures: bool) -> bool {
     true
 }
 
-fn start_playback_coordination() -> bool {
+fn start_playback_coordination(instance: &Instance) -> bool {
     jfn_playback::ffi::jfn_playback_init();
     COORD_INITED.store(true, std::sync::atomic::Ordering::Release);
 
@@ -377,7 +359,7 @@ fn start_playback_coordination() -> bool {
         h_browsers_set_refresh_rate,
     ));
 
-    plat().media_session().start();
+    plat().media_session().start(instance);
 
     jfn_playback::ingest_driver::jfn_playback_set_scale_provider(|| {
         let s = plat().get_scale();
@@ -561,7 +543,7 @@ pub fn jfn_app_main() -> c_int {
 
     let opts = resolve_startup_options(&cli);
 
-    init_logging(opts.log_file, &opts.log_level);
+    init_logging(opts.log_file.clone(), &opts.log_level);
 
     crate::platform_install::install_from_cli(&cli);
 
@@ -569,10 +551,51 @@ pub fn jfn_app_main() -> c_int {
 
     plat().install_shutdown_handler(jfn_playback::jfn_shutdown_initiate);
 
-    if !init_single_instance() {
-        return 0;
+    let instance = match Instance::for_config_dir(&jfn_paths::config_dir()) {
+        Ok(instance) => instance,
+        Err(e) => {
+            tracing::error!(target: "Main", "establishing instance identity: {e}");
+            return 1;
+        }
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!(target: "Main", "tokio runtime: {e}");
+            return 1;
+        }
+    };
+    // The accept loop lives on `runtime`'s workers while `run_app` blocks the
+    // main thread on the native loop, so `runtime` must outlive `run_app`.
+    match runtime.block_on(Listener::try_start(
+        &instance,
+        jfn_instance_ipc::jfn::handle,
+    )) {
+        Start::Started(_listener) => run_app(&instance, opts),
+        Start::AlreadyRunning => runtime.block_on(notify_running(&instance)),
+        Start::Failed(e) => {
+            tracing::error!(target: "Main", "could not start instance IPC: {e}");
+            1
+        }
     }
+}
 
+async fn notify_running(instance: &Instance) -> c_int {
+    let acked = async {
+        let mut stream = Stream::connect(instance).await?;
+        stream.send(&Request::Ping).await?;
+        stream.recv::<Response>().await
+    }
+    .await;
+    match acked {
+        Ok(Some(_)) => tracing::info!(target: "Main", "Signaled existing instance, exiting"),
+        Ok(None) => tracing::warn!(target: "Main", "existing instance closed without ack"),
+        Err(e) => tracing::warn!(target: "Main", "could not signal existing instance: {e}"),
+    }
+    0
+}
+
+fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
     setup_mpv_environment();
 
     let boot = crate::window_geometry::controller().boot();
@@ -632,7 +655,7 @@ pub fn jfn_app_main() -> c_int {
         disable_gpu_compositing: opts.disable_gpu_compositing,
         remote_debugging_port: opts.remote_debugging_port,
     };
-    let rc = unsafe { run_with_cef(&boot_args) };
+    let rc = unsafe { run_with_cef(&boot_args, instance) };
     if rc != 0 {
         return rc;
     }
@@ -644,25 +667,6 @@ pub fn jfn_app_main() -> c_int {
     plat().post_window_cleanup();
 
     0
-}
-
-// =====================================================================
-// Single-instance listener guard
-// =====================================================================
-
-static LISTENER_GUARD: OnceLock<ListenerGuardSlot> = OnceLock::new();
-
-struct ListenerGuardSlot;
-impl Drop for ListenerGuardSlot {
-    fn drop(&mut self) {
-        plat().single_instance_stop(&crate::instance_id::instance_id());
-    }
-}
-unsafe impl Send for ListenerGuardSlot {}
-unsafe impl Sync for ListenerGuardSlot {}
-
-fn install_listener_guard() {
-    let _ = LISTENER_GUARD.set(ListenerGuardSlot);
 }
 
 // =====================================================================
@@ -788,7 +792,7 @@ fn h_shutdown_wake_manager() {
 }
 
 /// Owns the run_with_cef body — invoked once by `jfn_app_main`.
-unsafe fn run_with_cef(ba: &BootArgs) -> c_int {
+unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
     // 2. Platform init (PlatformScope). Cleanup happens in shutdown_runtime.
     let mpv_raw = jfn_mpv::boot::jfn_mpv_handle_get();
     let platform_ok = plat().init(mpv_raw as *mut std::ffi::c_void);
@@ -819,7 +823,7 @@ unsafe fn run_with_cef(ba: &BootArgs) -> c_int {
 
     let (manager_thread, main_layer) = init_main_browser(hz, use_shared_textures);
 
-    if !start_playback_coordination() {
+    if !start_playback_coordination(instance) {
         return 1;
     }
 
@@ -851,7 +855,3 @@ unsafe fn run_with_cef(ba: &BootArgs) -> c_int {
 static PLATFORM_INITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CEF_INITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static COORD_INITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-// Single-instance listener is dropped via its OnceLock at process exit;
-// signal-disposition restore lives in `shutdown_signal`. Wayland host
-// teardown lives in the backend's `post_window_cleanup`.

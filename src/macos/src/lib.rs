@@ -614,7 +614,7 @@ use jfn_platform_abi::{IdleInhibitLevel, SurfaceHandle, SurfaceSize, WindowGeome
 struct NowPlayingSink;
 
 impl jfn_platform_abi::MediaSink for NowPlayingSink {
-    fn start(&self) {
+    fn start(&self, _instance: &jfn_platform_abi::Instance) {
         jfn_macos_sink::jfn_macos_sink_start();
     }
 

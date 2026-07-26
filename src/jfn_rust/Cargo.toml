@@ -20,7 +20,6 @@ kde-palette = ["jfn-wayland/kde-palette"]
 tracing.workspace = true
 parking_lot.workspace = true
 serde_json.workspace = true
-uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "error-context", "help", "usage", "suggestions", "env"] }
 jfn-platform-abi = { path = "../platform_abi" }
 jfn-cef = { path = "../jfn_cef", default-features = false }
@@ -31,7 +30,9 @@ jfn-logging = { path = "../logging" }
 jfn-mpv = { path = "../mpv" }
 jfn-paths = { path = "../paths" }
 jfn-playback = { path = "../playback" }
+jfn-instance-ipc = { path = "../instance_ipc" }
 jfn-wake-event = { path = "../wake_event" }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 
 [target.'cfg(target_os = "macos")'.dependencies]

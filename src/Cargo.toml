@@ -19,6 +19,7 @@ members = [
     "paths",
     "platform_abi",
     "playback",
+    "instance_ipc",
     "wake_event",
     "wayland",
     "windows",
@@ -36,6 +37,7 @@ publish = false
 cef = { version = "=150.0.0", default-features = false }
 gethostname = "1"
 gix = { version = "0.85", default-features = false, features = ["status", "sha1"] }
+interprocess = { version = "2", features = ["tokio"] }
 libc = "0.2"
 nix = { version = "0.30", features = ["event", "fs", "poll", "signal", "socket", "time", "user"] }
 objc2 = "0.6"
@@ -44,6 +46,7 @@ objc2-foundation = "0.3"
 serde_json = "1"
 slotmap = "1"
 tempfile = "3"
+tokio = { version = "1" }
 tracing = "0.1"
 windows = "0.62"
 windows-core = "0.62"

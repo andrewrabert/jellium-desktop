@@ -110,6 +110,53 @@ pub fn mpv_home() -> PathBuf {
     ensure(config_dir().join("mpv"))
 }
 
+#[cfg(unix)]
+pub fn runtime_dir() -> io::Result<PathBuf> {
+    if let Ok(dir) = env::var("XDG_RUNTIME_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(ensure(PathBuf::from(dir)));
+    }
+    private_dir(PathBuf::from(format!(
+        "/tmp/{APP_DIR_NAME}-{}",
+        nix::unistd::getuid()
+    )))
+}
+
+/// `/tmp` is world-writable and the name is predictable, so a squatter can
+/// pre-create the directory and then own every socket placed inside it.
+/// Accept the path only if we just created it 0700, or it is still a real
+/// directory owned by us that nobody else can reach into.
+#[cfg(unix)]
+fn private_dir(path: PathBuf) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    match fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => return Ok(path),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = fs::symlink_metadata(&path)?;
+    if !meta.is_dir() || meta.uid() != nix::unistd::getuid().as_raw() || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a private directory we own", path.display()),
+        ));
+    }
+    Ok(path)
+}
+
+pub fn instance_listener_path(id: impl std::fmt::Display) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        Ok(runtime_dir()?.join(format!("{APP_DIR_NAME}-{id}")))
+    }
+    #[cfg(windows)]
+    {
+        Ok(PathBuf::from(format!(r"\\.\pipe\{APP_DIR_NAME}-{id}")))
+    }
+}
+
 pub fn log_path() -> PathBuf {
     log_dir().join(LOG_FILE_NAME)
 }
