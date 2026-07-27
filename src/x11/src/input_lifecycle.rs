@@ -11,9 +11,7 @@ use parking_lot::Mutex;
 static G: Mutex<Option<Handle>> = Mutex::new(None);
 
 pub fn start(parent: u32) {
-    let m = crate::x11_state::MUT.lock();
-    let screen_num = m.as_ref().map(|s| s.screen_num).unwrap_or(0);
-    drop(m);
+    let screen_num = crate::x11_state::host().map(|h| h.screen_num).unwrap_or(0);
     if let Some(handle) = start_thread(screen_num, parent) {
         *G.lock() = Some(handle);
     }

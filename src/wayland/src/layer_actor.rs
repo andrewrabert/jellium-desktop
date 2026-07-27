@@ -8,7 +8,7 @@ use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
-use jfn_gpu_paint::{DirtyRect, GpuContext, GpuPainter, PixelFrame};
+use jfn_gpu_paint::{DirtyRect, GpuContext, GpuPainter, PixelFrame, PresentOutcome};
 use jfn_platform_abi::JfnRect;
 
 use crate::layer::{FrameCommit, LayerSurface, Present, PresentError, ViewportState};
@@ -802,10 +802,14 @@ impl Runner {
         // buffer. Clamped to min(buffer, physical) to stay within bounds.
         let src_w = (p.width as i32).min(vps.pw);
         let src_h = (p.height as i32).min(vps.ph);
-        painter.push_pixels(pixel_frame, || {
+        // Map the painter's own present/skip to this layer's — a GPU skip must
+        // not be reported as committed, or the frame is lost from the mailbox.
+        match painter.push_pixels(pixel_frame, || {
             layer.set_viewport(src_w, src_h, vps.lw, vps.lh)
-        })?;
-        Ok(Present::Committed)
+        })? {
+            PresentOutcome::Presented => Ok(Present::Committed),
+            PresentOutcome::Skipped => Ok(Present::Skipped),
+        }
     }
 
     fn present_shm(

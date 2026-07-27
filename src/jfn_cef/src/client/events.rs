@@ -75,8 +75,8 @@ impl Inner {
     }
 
     pub(crate) fn set_visible(&self, visible: bool) {
-        let surface = self.surface_ptr();
-        if surface.is_null() {
+        let surface = self.surface_handle();
+        if surface.is_none() {
             return;
         }
         if let Some(p) = platform_ops::ops() {

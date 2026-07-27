@@ -51,6 +51,9 @@ pub struct JfnMpvBoot {
     pub audio_channels: *const c_char,
     /// Optional `<W>x<H>[+x+y]` geometry string from saved settings.
     pub geometry: *const c_char,
+    /// Native window ID mpv embeds into (`wid` option); 0 = mpv owns its
+    /// own window.
+    pub wid: i64,
     pub force_window_position: bool,
     pub window_maximized_at_boot: bool,
     /// libmpv log-message subscription level (`"no"`, `"error"`,
@@ -182,6 +185,9 @@ fn apply_boot_options(handle: &Handle, boot: &JfnMpvBoot) -> crate::error::Resul
     }
     if let Some(geom) = unsafe { cstr_opt(boot.geometry) } {
         set("geometry", &geom)?;
+    }
+    if boot.wid != 0 {
+        set("wid", &boot.wid.to_string())?;
     }
     if boot.force_window_position {
         set("force-window-position", "yes")?;

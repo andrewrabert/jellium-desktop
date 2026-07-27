@@ -32,8 +32,8 @@ impl Inner {
             Self::reset_popup_state(&mut p);
         }
         if !show {
-            let surface = self.surface_ptr();
-            if !surface.is_null() {
+            let surface = self.surface_handle();
+            if !surface.is_none() {
                 self.dropdown.hide(surface);
             }
             return;
@@ -91,8 +91,8 @@ impl Inner {
             )
         };
 
-        let surface = self.surface_ptr();
-        if surface.is_null() {
+        let surface = self.surface_handle();
+        if surface.is_none() {
             return;
         }
         let inner = Arc::clone(self);
@@ -124,8 +124,8 @@ impl Inner {
         if !was_visible {
             return;
         }
-        let surface = self.surface_ptr();
-        if surface.is_null() {
+        let surface = self.surface_handle();
+        if surface.is_none() {
             return;
         }
         self.dropdown.hide(surface);

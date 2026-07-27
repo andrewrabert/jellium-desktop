@@ -4,7 +4,6 @@
 
 pub(crate) mod context_menu;
 pub mod geometry;
-pub(crate) mod gpu_paint_worker;
 pub(crate) mod input;
 pub(crate) mod input_lifecycle;
 pub mod lifecycle;
@@ -12,12 +11,16 @@ pub mod make_platform;
 pub(crate) mod menu;
 pub(crate) mod mpv_host;
 pub(crate) mod mpv_proxy;
+pub(crate) mod overlay_actor;
 pub mod overlay_fsm;
+pub(crate) mod paint;
 pub mod paint_override;
+pub(crate) mod registry;
+pub(crate) mod resize_sync;
 pub(crate) mod scale;
 pub mod shm;
-pub(crate) mod shm_paint_worker;
 pub mod surface;
+pub(crate) mod window_source;
 pub(crate) mod x11_state;
 
 pub use paint_override::{X11PaintOverride, paint_override, set_paint_override};

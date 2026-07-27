@@ -24,7 +24,6 @@ use jfn_input::{
     jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll,
 };
 use jfn_linux_util::input::jfn_input_dispatch_key_raw;
-use jfn_playback::ingest_driver::jfn_playback_display_scale;
 use jfn_playback::shutdown::jfn_shutdown_register_waker;
 use jfn_wake_event::WakeEvent;
 
@@ -354,8 +353,8 @@ fn cef_modifiers(st: &State) -> u32 {
 }
 
 fn to_logical(physical: i32) -> i32 {
-    let scale = jfn_playback_display_scale();
-    let s = if scale > 0.0 { scale } else { 1.0 };
+    let scale = crate::x11_state::parent_snapshot().scale;
+    let s = if scale > 0.0 { f64::from(scale) } else { 1.0 };
     (physical as f64 / s) as i32
 }
 
@@ -556,15 +555,7 @@ struct CursorState {
 unsafe impl Send for CursorState {}
 
 fn live_overlay_windows() -> Vec<u32> {
-    let g = crate::x11_state::MUT.lock();
-    g.as_ref()
-        .map(|m| {
-            crate::lifecycle::snapshot_live_overlays_locked(m)
-                .into_iter()
-                .map(|s| s.window)
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::x11_state::overlay_windows().as_ref().clone()
 }
 
 fn apply_cursor(st: &mut CursorState, shape: CursorShape) {
@@ -853,10 +844,8 @@ pub fn start(screen_num: i32, parent: u32) -> Option<Handle> {
     };
     let mailbox = Arc::new(CursorMailbox::new());
     let input_mailbox = Arc::new(InputMailbox::new());
-    let (root, net_active_window) = crate::x11_state::MUT
-        .lock()
-        .as_ref()
-        .map(|m| (m.root, m.atoms.net_active_window))
+    let (root, net_active_window) = crate::x11_state::host()
+        .map(|h| (h.root, h.atoms.net_active_window))
         .unwrap_or((0, 0));
     let st = State {
         conn: conn.clone(),

@@ -34,7 +34,22 @@ pub struct GpuContext {
     pub(crate) adapter: wgpu::Adapter,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
+    // wgpu-core's surface.configure drains the whole device queue and errors if
+    // another thread submits mid-drain, leaving the surface unconfigured → next
+    // acquire fatally panics. Configure takes the write side, submit the read.
+    pub(crate) submit_gate: parking_lot::RwLock<()>,
     caps: Capabilities,
+}
+
+impl GpuContext {
+    pub(crate) fn configure_surface(
+        &self,
+        surface: &wgpu::Surface<'static>,
+        config: &wgpu::SurfaceConfiguration,
+    ) {
+        let _guard = self.submit_gate.write();
+        surface.configure(&self.device, config);
+    }
 }
 
 impl GpuContext {
@@ -145,6 +160,7 @@ impl GpuContext {
             adapter,
             device,
             queue,
+            submit_gate: parking_lot::RwLock::new(()),
             caps: Capabilities {
                 gpu_available: true,
                 dmabuf_import,

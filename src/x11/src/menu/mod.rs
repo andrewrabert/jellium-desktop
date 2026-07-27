@@ -13,7 +13,7 @@ use x11rb::protocol::xproto::{
 use x11rb::rust_connection::RustConnection;
 
 use crate::shm::{shm_alloc, shm_free};
-use crate::x11_state::{MUT, ShmBuffer};
+use crate::x11_state::ShmBuffer;
 use jfn_menu::interaction_fsm::{self, MenuEffect, MenuEvent, MenuState};
 use jfn_menu::render::{self, Fonts, Layout};
 use lifecycle_fsm::{Life, LifeEffect, LifeEvent};
@@ -99,23 +99,24 @@ struct Snap {
 }
 
 fn snapshot(conn: &RustConnection) -> Option<Snap> {
-    let g = MUT.lock();
-    let m = g.as_ref()?;
+    let host = crate::x11_state::host()?;
+    let paint = crate::x11_state::paint()?;
+    let parent = crate::x11_state::parent_snapshot();
     let screen = conn
         .setup()
         .roots
         .iter()
-        .find(|s| s.root == m.root)
+        .find(|s| s.root == host.root)
         .or_else(|| conn.setup().roots.first())?;
     Some(Snap {
-        visual: m.argb_visual,
-        depth: m.argb_depth,
-        colormap: m.colormap,
-        root: m.root,
-        parent_x: m.parent_x,
-        parent_y: m.parent_y,
-        scale: if m.cached_scale > 0.0 {
-            m.cached_scale
+        visual: paint.argb_visual,
+        depth: paint.argb_depth,
+        colormap: paint.colormap,
+        root: host.root,
+        parent_x: parent.origin_x,
+        parent_y: parent.origin_y,
+        scale: if parent.scale > 0.0 {
+            parent.scale
         } else {
             1.0
         },

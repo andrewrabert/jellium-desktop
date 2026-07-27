@@ -35,8 +35,8 @@ impl Inner {
 
         // Wayland viewport must update on every configure (not debounced) or
         // src/dst go stale.
-        let surface = self.surface_ptr();
-        if !surface.is_null()
+        let surface = self.surface_handle();
+        if !surface.is_none()
             && let Some(p) = platform_ops::ops()
         {
             p.surface_resize(

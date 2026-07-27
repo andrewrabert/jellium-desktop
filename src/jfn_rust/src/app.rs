@@ -199,6 +199,7 @@ struct MpvInitOptions<'a> {
     boot_geometry: Option<&'a str>,
     boot_force_position: bool,
     boot_window_max: bool,
+    embed_wid: Option<i64>,
     hwdec: &'a str,
     audio_passthrough: &'a str,
     audio_exclusive: bool,
@@ -229,6 +230,7 @@ fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
             channels_c.as_ptr()
         },
         geometry: geometry_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+        wid: opts.embed_wid.unwrap_or(0),
         force_window_position: opts.boot_force_position,
         window_maximized_at_boot: opts.boot_window_max,
         mpv_log_level: mpv_log_level_c.as_ptr(),
@@ -596,22 +598,32 @@ async fn notify_running(instance: &Instance) -> c_int {
 }
 
 fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
-    setup_mpv_environment();
-
+    // Boot geometry resolves before the host prepare so its display probes
+    // hit the real server, not the mpv proxy the prepare may install.
     let boot = crate::window_geometry::controller().boot();
     plat().apply_boot_geometry(&boot);
+
+    setup_mpv_environment();
+
+    // Hosts that own their toplevel create it here, before mpv init, so its
+    // window ID can be handed to mpv as `wid`.
+    plat().mpv_host().ensure_host_window();
 
     let mpv_log_level = mpv_log_level_from_filter();
 
     // mpv's --geometry takes physical pixels (see m_geometry_apply in
-    // third_party/mpv/options/m_option.c).
+    // third_party/mpv/options/m_option.c). Window boot options only apply
+    // when mpv owns the window; toplevel-owning backends size and
+    // position/maximize the host window themselves.
     let backend_byte: u8 = plat().display() as u8;
     let boot_mpv_geometry = plat().boot_mpv_geometry(&boot);
+    let mpv_owns_window = boot_mpv_geometry.is_some();
     let raw = init_mpv_handle(MpvInitOptions {
         backend_byte,
         boot_geometry: boot_mpv_geometry.as_deref(),
-        boot_force_position: boot.force_position(),
-        boot_window_max: boot.maximized(),
+        boot_force_position: mpv_owns_window && boot.force_position(),
+        boot_window_max: mpv_owns_window && boot.maximized(),
+        embed_wid: plat().mpv_host().embed_wid(),
         hwdec: &opts.hwdec,
         audio_passthrough: &opts.audio_passthrough,
         audio_exclusive: opts.audio_exclusive,
@@ -644,8 +656,6 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
     // input-default-bindings=no drops the builtin CLOSE_WIN -> quit binding;
     // the WM close button needs it back.
     install_mpv_close_binding(raw);
-
-    plat().mpv_host().ensure_host_window();
 
     if !wait_for_vo_window() {
         return 0;

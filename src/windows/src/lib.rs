@@ -349,15 +349,15 @@ impl Platform for WindowsPlatform {
     }
 
     fn alloc_surface(&self) -> SurfaceHandle {
-        win_alloc_surface()
+        SurfaceHandle::from_ptr(win_alloc_surface())
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
-        win_free_surface(s);
+        win_free_surface(s.as_ptr());
     }
 
     fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
-        win_surface_present(s, info)
+        win_surface_present(s.as_ptr(), info)
     }
 
     fn surface_present_software(
@@ -368,12 +368,12 @@ impl Platform for WindowsPlatform {
         w: c_int,
         h: c_int,
     ) -> bool {
-        win_surface_present_software(s, dirty.as_ptr(), dirty.len(), buffer, w, h)
+        win_surface_present_software(s.as_ptr(), dirty.as_ptr(), dirty.len(), buffer, w, h)
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
         win_surface_resize(
-            s,
+            s.as_ptr(),
             size.logical_w,
             size.logical_h,
             size.physical_w,
@@ -382,11 +382,13 @@ impl Platform for WindowsPlatform {
     }
 
     fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        win_surface_set_visible(s, visible);
+        win_surface_set_visible(s.as_ptr(), visible);
     }
 
     fn restack(&self, ordered: &[SurfaceHandle]) {
-        win_restack(ordered.as_ptr(), ordered.len());
+        // `SurfaceHandle` is `#[repr(transparent)]` over `*mut c_void`, so the
+        // slice pointer reinterprets directly.
+        win_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
     fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {

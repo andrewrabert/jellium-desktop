@@ -77,7 +77,7 @@ pub(crate) struct Inner {
     injection_kind: Mutex<String>,
     // Opaque per-layer surface handle (PlatformSurface*); passed back to the
     // C++ platform vtable for surface_resize / present / popup.
-    surface: Mutex<*mut c_void>,
+    surface: Mutex<platform_ops::SurfaceHandle>,
 
     // logical/physical dims (slice 3)
     width: AtomicI32,
@@ -177,7 +177,7 @@ impl Inner {
             pending_menu_callback: Mutex::new(None),
             pending_menu_on_selected: Mutex::new(None),
             injection_kind: Mutex::new(String::new()),
-            surface: Mutex::new(std::ptr::null_mut()),
+            surface: Mutex::new(platform_ops::SurfaceHandle::NONE),
             width: AtomicI32::new(0),
             height: AtomicI32::new(0),
             physical_w: AtomicI32::new(0),
@@ -231,7 +231,7 @@ impl Inner {
         self.cursor_handle.get().copied()
     }
 
-    fn surface_ptr(&self) -> *mut c_void {
+    fn surface_handle(&self) -> platform_ops::SurfaceHandle {
         *self.surface.lock()
     }
 }

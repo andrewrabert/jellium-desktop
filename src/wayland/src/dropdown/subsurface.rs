@@ -14,7 +14,7 @@ pub(super) struct SubsurfaceDropdown;
 impl DropdownBackend for SubsurfaceDropdown {
     fn show(&self, s: SurfaceHandle, req: JfnPopupRequest) {
         wl_ops::popup_show(
-            s as *mut crate::wl_state::PlatformSurface,
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
             req.x,
             req.y,
             req.lw,
@@ -23,14 +23,19 @@ impl DropdownBackend for SubsurfaceDropdown {
     }
 
     fn hide(&self, s: SurfaceHandle) {
-        wl_ops::popup_hide(s as *mut crate::wl_state::PlatformSurface);
+        wl_ops::popup_hide(s.as_ptr() as *mut crate::wl_state::PlatformSurface);
     }
 
     fn present(&self, s: SurfaceHandle, info: *const c_void, lw: c_int, lh: c_int) {
         let Some(frame) = (unsafe { to_dmabuf_frame(info) }) else {
             return;
         };
-        wl_ops::popup_present(s as *mut crate::wl_state::PlatformSurface, &frame, lw, lh);
+        wl_ops::popup_present(
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+            &frame,
+            lw,
+            lh,
+        );
     }
 
     fn present_software(
@@ -51,7 +56,7 @@ impl DropdownBackend for SubsurfaceDropdown {
         let Some(len) = len else { return };
         let pixels = unsafe { std::slice::from_raw_parts(buffer as *const u8, len) };
         wl_ops::popup_present_software(
-            s as *mut crate::wl_state::PlatformSurface,
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
             pixels,
             pw,
             ph,

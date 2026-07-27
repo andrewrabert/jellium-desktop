@@ -14,8 +14,10 @@ parking_lot.workspace = true
 # The whole crate is `#![cfg(target_os = "linux")]`, so it's an empty rlib
 # elsewhere and the workspace builds uniformly on every platform.
 [target.'cfg(target_os = "linux")'.dependencies]
+arc-swap.workspace = true
 cef.workspace = true
 cursor-icon = "1"
+slotmap.workspace = true
 jfn-compositor-core = { path = "../compositor_core" }
 jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-input = { path = "../input" }
@@ -33,7 +35,7 @@ nix.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 xcb = { version = "1.7", features = ["xkb", "as-raw-xcb-connection"] }
-x11rb = { version = "0.14", features = ["cursor", "request-parsing", "resource_manager", "shape", "shm", "xfixes"] }
+x11rb = { version = "0.14", features = ["cursor", "request-parsing", "resource_manager", "shape", "shm", "sync", "xfixes"] }
 xkbcommon = { version = "0.9", default-features = false, features = ["x11"] }
 
 [lints]

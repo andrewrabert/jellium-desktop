@@ -15,5 +15,5 @@ mod types;
 
 pub use context::{Capabilities, GpuContext, GpuTarget};
 pub use error::GpuPaintError;
-pub use painter::GpuPainter;
+pub use painter::{GpuPainter, PresentOutcome, SizePolicy};
 pub use types::{DirtyRect, DmabufFormat, DmabufFrame, DmabufPlane, PixelFrame, WindowTarget};

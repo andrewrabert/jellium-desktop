@@ -1,19 +1,28 @@
-//! Shared X11 state: connection, atoms, ARGB visual, per-surface table.
+//! Shared X11 state, split by ownership so every mutable resource has exactly
+//! one writer:
 //!
-//! Connection lives behind an `Arc` so the input thread can hold a
-//! reference independent of the global mutex. The mutex protects every
-//! mutable field including the `live` surface list.
+//! - [`HostServices`] / [`PaintServices`] — immutable, process-lifetime facts
+//!   set once (host-window creation, then platform init) and read lock-free
+//!   thereafter.
+//! - [`ParentSnapshot`] — the app top-level's live geometry, published by the
+//!   geometry thread through an [`ArcSwap`] so all other readers are lock-free.
+//! - [`crate::registry`] — the owned surface arena and the geometry-command
+//!   queue; the geometry thread is the sole structure writer.
+//! - [`GATE`] — the resize transition gate (its own small lock).
+//!
+//! The xcb/x11rb connections still live behind `Arc`s so the input and content
+//! threads can hold references independent of any lock.
 
 use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 
+use arc_swap::ArcSwap;
+use jfn_compositor_core::transition::TransitionGate;
 use jfn_gpu_paint::{Capabilities, GpuContext};
-
-use crate::gpu_paint_worker::X11GpuPaintWorker;
-use crate::shm_paint_worker::X11ShmPaintWorker;
-use x11rb::{protocol::shm, rust_connection::RustConnection};
+use x11rb::protocol::shm;
+use x11rb::rust_connection::RustConnection;
 
 /// Owns one SHM segment + the mapped memory. Two per surface so the
 /// renderer can double-buffer.
@@ -47,45 +56,6 @@ impl Default for ShmBuffer {
     }
 }
 
-/// Per-CefLayer surface. Each is a top-level ARGB window positioned over
-/// the app top-level.
-pub struct PlatformSurface {
-    pub window: u32,
-    pub gc: u32,
-    pub(crate) shm_paint_worker: Option<X11ShmPaintWorker>,
-    pub visible: bool,
-    pub pw: i32,
-    pub ph: i32,
-    /// GPU presenter worker, lazily created on the first software present
-    /// when a [`GpuContext`] is available. Falls back to SHM if init or
-    /// present fails.
-    pub(crate) gpu_paint_worker: Option<X11GpuPaintWorker>,
-    pub(crate) fsm_state: Option<crate::overlay_fsm::OverlayState>,
-}
-
-unsafe impl Send for PlatformSurface {}
-
-impl Default for PlatformSurface {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PlatformSurface {
-    pub fn new() -> Self {
-        Self {
-            window: 0,
-            gc: 0,
-            shm_paint_worker: None,
-            visible: true,
-            pw: 0,
-            ph: 0,
-            gpu_paint_worker: None,
-            fsm_state: None,
-        }
-    }
-}
-
 #[derive(Copy, Clone)]
 pub struct Atoms {
     pub net_wm_window_type: u32,
@@ -94,50 +64,121 @@ pub struct Atoms {
     pub net_wm_state_skip_taskbar: u32,
     pub net_wm_state_skip_pager: u32,
     pub net_wm_state_fullscreen: u32,
+    pub net_wm_state_maximized_vert: u32,
+    pub net_wm_state_maximized_horz: u32,
     pub wm_protocols: u32,
     pub wm_delete_window: u32,
+    // Consumed by the Phase 3 `_NET_WM_SYNC_REQUEST` handshake.
+    pub net_wm_sync_request: u32,
+    pub net_wm_sync_request_counter: u32,
+    pub cardinal: u32,
     pub motif_wm_hints: u32,
     pub net_active_window: u32,
 }
 
-pub struct Mutable {
+/// Immutable host-window facts, set once by [`crate::lifecycle::ensure_host_window`].
+pub struct HostServices {
     pub screen_num: i32,
     pub root: u32,
+    /// App-owned WM-managed top-level; carries the identity/title and owns
+    /// fullscreen.
+    pub toplevel: u32,
+    /// App-owned child of [`Self::toplevel`] filling its client area at the
+    /// bottom of the stack; mpv embeds into it via `--wid`.
+    pub video_host: u32,
+    pub atoms: Atoms,
+    /// XSync counter advertised via `_NET_WM_SYNC_REQUEST_COUNTER`, or 0 when the
+    /// full handshake could not be established (then the protocol is NOT
+    /// advertised and resizes degrade to same-pass chase).
+    pub sync_counter: u32,
+}
+
+/// Immutable paint/visual facts, set once by [`crate::lifecycle::init`] after
+/// the ARGB visual and GPU tier are resolved.
+pub struct PaintServices {
     pub argb_visual: u32,
     pub argb_depth: u8,
     pub colormap: u32,
-    /// App-owned WM-managed top-level window; carries the identity/title and
-    /// owns fullscreen.
-    pub toplevel: u32,
-    /// mpv's video window, reparented as a child of [`Self::toplevel`] — not
-    /// the overlays' X11 parent despite the name.
-    pub parent: u32,
-    /// [`Self::toplevel`]'s absolute origin and client size, not
-    /// [`Self::parent`]'s.
-    pub parent_x: i32,
-    pub parent_y: i32,
-    pub pw: i32,
-    pub ph: i32,
-    pub parent_fullscreen: bool,
-    pub cached_scale: f32,
-    pub atoms: Atoms,
-    pub live: Vec<*mut PlatformSurface>,
-    /// Shared GPU compositor. `None` when no Vulkan adapter was found
-    /// at init; in that case surface presents fall back to SHM.
+    /// Shared GPU compositor. `None` when no Vulkan adapter was found at init;
+    /// presents then fall back to SHM.
     pub gpu_ctx: Option<Arc<GpuContext>>,
     pub gpu_caps: Capabilities,
-    /// When set, the dmabuf-import tier is active: presents arrive via
-    /// `surface_present` rather than `surface_present_software`.
+    /// When set, the dmabuf-import tier is active.
     pub use_dmabuf: bool,
-    /// Drops stale-size frames during a resize so the last good frame holds.
-    pub gate: jfn_compositor_core::transition::TransitionGate,
 }
 
-unsafe impl Send for Mutable {}
+/// The app top-level's live geometry, published by the geometry thread. An
+/// immutable snapshot swapped wholesale so every other reader is lock-free and
+/// never tears placement mid-update.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ParentSnapshot {
+    pub origin_x: i32,
+    pub origin_y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub fullscreen: bool,
+    pub maximized: bool,
+    pub scale: f32,
+}
+
+static HOST: OnceLock<HostServices> = OnceLock::new();
+static PAINT: OnceLock<PaintServices> = OnceLock::new();
+static PARENT: OnceLock<ArcSwap<ParentSnapshot>> = OnceLock::new();
+/// Bottom-to-top live overlay window ids, republished by the geometry thread on
+/// every create/destroy so the cursor thread can target them lock-free.
+static OVERLAY_WINDOWS: OnceLock<ArcSwap<Vec<u32>>> = OnceLock::new();
+
+/// Resize transition gate. Drops stale-size frames during a resize so the last
+/// good frame holds. Small dedicated lock (the [`TransitionGate`] is a pure
+/// value type).
+pub static GATE: Mutex<TransitionGate> = Mutex::new(TransitionGate::new());
 
 static CONN: OnceLock<Arc<xcb::Connection>> = OnceLock::new();
 pub static X11RB_CONN: OnceLock<Arc<RustConnection>> = OnceLock::new();
-pub static MUT: Mutex<Option<Mutable>> = Mutex::new(None);
+
+pub(crate) fn set_host_services(h: HostServices) -> bool {
+    HOST.set(h).is_ok()
+}
+
+pub(crate) fn host() -> Option<&'static HostServices> {
+    HOST.get()
+}
+
+pub(crate) fn set_paint_services(p: PaintServices) -> bool {
+    PAINT.set(p).is_ok()
+}
+
+pub(crate) fn paint() -> Option<&'static PaintServices> {
+    PAINT.get()
+}
+
+fn parent_cell() -> &'static ArcSwap<ParentSnapshot> {
+    PARENT.get_or_init(|| ArcSwap::from_pointee(ParentSnapshot::default()))
+}
+
+/// Publish a fresh parent snapshot. Called only by the geometry thread.
+pub(crate) fn publish_parent(snap: ParentSnapshot) {
+    parent_cell().store(Arc::new(snap));
+}
+
+/// Lock-free read of the latest published parent geometry.
+pub fn parent_snapshot() -> Arc<ParentSnapshot> {
+    parent_cell().load_full()
+}
+
+fn overlay_windows_cell() -> &'static ArcSwap<Vec<u32>> {
+    OVERLAY_WINDOWS.get_or_init(|| ArcSwap::from_pointee(Vec::new()))
+}
+
+/// Publish the live overlay window ids. Called only by the geometry thread.
+pub(crate) fn publish_overlay_windows(windows: Vec<u32>) {
+    overlay_windows_cell().store(Arc::new(windows));
+}
+
+/// Lock-free read of the live overlay window ids.
+pub fn overlay_windows() -> Arc<Vec<u32>> {
+    overlay_windows_cell().load_full()
+}
 
 pub(crate) fn open_xcb_connection() -> Result<Arc<xcb::Connection>, String> {
     let conn = xcb::Connection::connect(None)
@@ -159,12 +200,4 @@ pub fn x11rb_conn() -> Option<Arc<RustConnection>> {
 pub(crate) fn raw_xcb_connection() -> Option<NonNull<c_void>> {
     let conn = CONN.get()?;
     NonNull::new(conn.get_raw_conn() as *mut c_void)
-}
-
-pub fn is_none_window(w: u32) -> bool {
-    w == 0
-}
-
-pub fn is_none_gc(g: u32) -> bool {
-    g == 0
 }

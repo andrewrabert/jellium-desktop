@@ -31,6 +31,13 @@ pub trait MpvHost: Send + Sync {
 
     fn ensure_host_window(&self) {}
 
+    /// Native window ID mpv should embed into (its `wid` option), or `None`
+    /// when mpv creates its own window. Hosts that return `Some` must have
+    /// created the window in [`Self::ensure_host_window`], which runs first.
+    fn embed_wid(&self) -> Option<i64> {
+        None
+    }
+
     /// Own the VO wait loop. `pump(may_block)` drains queued mpv events
     /// (and, when `may_block`, may additionally wait for the next one);
     /// it returns `false` once waiting is over. Platforms that must keep
@@ -52,7 +59,7 @@ pub trait MpvHost: Send + Sync {
 }
 
 /// All-default host for backends where mpv needs nothing from the
-/// platform (X11: mpv owns its window outright).
+/// platform (macOS / Windows: mpv owns its window outright).
 pub struct DefaultMpvHost;
 
 impl MpvHost for DefaultMpvHost {}

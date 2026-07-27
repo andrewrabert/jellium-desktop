@@ -10,10 +10,8 @@ use std::os::fd::BorrowedFd;
 
 use jfn_gpu_paint::{DmabufFormat, DmabufFrame, DmabufPlane};
 
-use crate::surface::{
-    jfn_x11_alloc_surface, jfn_x11_free_surface, jfn_x11_restack, jfn_x11_surface_present_dmabuf,
-    jfn_x11_surface_present_software, jfn_x11_surface_resize, jfn_x11_surface_set_visible,
-};
+use crate::registry::SurfaceId;
+use crate::surface;
 
 /// CEF reclaims the original fd when the paint callback returns, so each plane
 /// fd is dup'd into an `OwnedFd` the presenter worker can outlive.
@@ -70,10 +68,6 @@ pub use jfn_platform_abi::{
     SurfaceHandle, SurfaceSize, WindowDecorations, WindowGeometry, WindowPos,
 };
 
-use jfn_mpv::api::{jfn_mpv_set_fullscreen, jfn_mpv_toggle_fullscreen};
-use jfn_mpv::boot::jfn_mpv_handle_get;
-use jfn_playback::ingest_driver::{jfn_playback_display_scale, jfn_playback_fullscreen};
-
 pub struct X11Platform;
 
 impl Platform for X11Platform {
@@ -103,21 +97,25 @@ impl Platform for X11Platform {
         crate::lifecycle::cleanup();
     }
 
+    // Runs after mpv_terminate_destroy: mpv's embedded window is gone, so the
+    // top-level's connection can finally close.
+    fn post_window_cleanup(&self) {
+        crate::geometry::drop_toplevel_connection();
+    }
+
     fn alloc_surface(&self) -> SurfaceHandle {
-        jfn_x11_alloc_surface() as *mut c_void
+        surface::alloc_surface().to_handle()
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
-        unsafe { jfn_x11_free_surface(s as *mut crate::x11_state::PlatformSurface) };
+        surface::free_surface(SurfaceId::from_handle(s));
     }
 
     fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
         let Some(frame) = (unsafe { to_dmabuf_frame(info) }) else {
             return false;
         };
-        unsafe {
-            jfn_x11_surface_present_dmabuf(s as *mut crate::x11_state::PlatformSurface, frame)
-        }
+        surface::surface_present_dmabuf(SurfaceId::from_handle(s), frame)
     }
 
     fn surface_present_software(
@@ -129,8 +127,8 @@ impl Platform for X11Platform {
         h: c_int,
     ) -> bool {
         unsafe {
-            jfn_x11_surface_present_software(
-                s as *mut crate::x11_state::PlatformSurface,
+            surface::surface_present_software(
+                SurfaceId::from_handle(s),
                 dirty.as_ptr(),
                 dirty.len(),
                 buffer,
@@ -141,30 +139,16 @@ impl Platform for X11Platform {
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
-        unsafe {
-            jfn_x11_surface_resize(
-                s as *mut crate::x11_state::PlatformSurface,
-                size.logical_w,
-                size.logical_h,
-                size.physical_w,
-                size.physical_h,
-            )
-        };
+        surface::surface_resize(SurfaceId::from_handle(s), size.physical_w, size.physical_h);
     }
 
     fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        unsafe {
-            jfn_x11_surface_set_visible(s as *mut crate::x11_state::PlatformSurface, visible)
-        };
+        surface::surface_set_visible(SurfaceId::from_handle(s), visible);
     }
 
     fn restack(&self, handles: &[SurfaceHandle]) {
-        unsafe {
-            jfn_x11_restack(
-                handles.as_ptr() as *const *mut crate::x11_state::PlatformSurface,
-                handles.len(),
-            )
-        };
+        let ids: Vec<SurfaceId> = handles.iter().map(|&h| SurfaceId::from_handle(h)).collect();
+        surface::restack(&ids);
     }
 
     fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {
@@ -196,83 +180,83 @@ impl Platform for X11Platform {
     }
 
     fn begin_transition(&self) {
-        if let Some(m) = crate::x11_state::MUT.lock().as_mut() {
-            m.gate.begin_capturing((m.pw, m.ph));
-        }
+        let snap = crate::x11_state::parent_snapshot();
+        crate::x11_state::GATE
+            .lock()
+            .begin_capturing((snap.width, snap.height));
     }
 
     fn end_transition(&self) {
         // Only end the gate; the geometry thread is the sole owner of overlay
-        // position, so do not re-apply it here.
-        if let Some(m) = crate::x11_state::MUT.lock().as_mut() {
-            m.gate.end();
-        }
+        // structure, so do not re-apply it here.
+        crate::x11_state::GATE.lock().end();
     }
 
     fn in_transition(&self) -> bool {
-        crate::x11_state::MUT
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.gate.in_transition())
+        crate::x11_state::GATE.lock().in_transition()
     }
 
     fn set_expected_size(&self, w: c_int, h: c_int) {
-        if let Some(m) = crate::x11_state::MUT.lock().as_mut() {
-            m.gate.set_expected((w, h));
-        }
+        crate::x11_state::GATE.lock().set_expected((w, h));
     }
 
     fn set_fullscreen(&self, fullscreen: bool) {
-        // Runs before the guard below: as the observation handler this must
-        // mirror every fullscreen change to the overlays, not just app-initiated
-        // ones.
+        // The app owns fullscreen: drive the toplevel's `_NET_WM_STATE` and
+        // reconcile; WM-initiated flips flow back via the geometry thread.
         crate::geometry::set_parent_fullscreen(fullscreen);
-        if jfn_mpv_handle_get().is_null() {
-            return;
-        }
-        if jfn_playback_fullscreen() == fullscreen {
-            return;
-        }
-        jfn_mpv_set_fullscreen(fullscreen);
     }
 
     fn toggle_fullscreen(&self) {
-        if !jfn_mpv_handle_get().is_null() {
-            jfn_mpv_toggle_fullscreen();
-        }
+        let fullscreen = crate::x11_state::parent_snapshot().fullscreen;
+        crate::geometry::set_parent_fullscreen(!fullscreen);
     }
 
     fn get_scale(&self) -> f32 {
-        let s = jfn_playback_display_scale();
-        if s > 0.0 {
-            let f = s as f32;
-            if let Some(m) = crate::x11_state::MUT.lock().as_mut() {
-                m.cached_scale = f;
-            }
-            return f;
-        }
-        if let Some(m) = crate::x11_state::MUT.lock().as_ref()
-            && m.cached_scale > 0.0
-        {
-            return m.cached_scale;
-        }
-        1.0
+        // App-owned scale (Xft.dpi probe), seeded at host-window creation and
+        // refreshed by the geometry thread on RESOURCE_MANAGER changes.
+        let scale = crate::x11_state::parent_snapshot().scale;
+        if scale > 0.0 { scale } else { 1.0 }
+    }
+
+    // The app owns the toplevel and the display scale; mpv's
+    // `display-hidpi-scale` is not authoritative here.
+    fn effective_scale(&self, _mpv_display_hidpi_scale: f64) -> f32 {
+        self.get_scale()
     }
 
     fn get_display_scale(&self, _x: c_int, _y: c_int) -> f32 {
         crate::scale::query_display_scale().unwrap_or(1.0)
     }
 
+    fn apply_boot_geometry(&self, g: &jfn_platform_abi::BootGeometry) {
+        crate::lifecycle::set_boot_geometry(*g);
+    }
+
+    // The app owns its toplevel and sizes it in ensure_host_window, so mpv
+    // neither sizes at boot nor reconciles on scale change.
+    fn boot_mpv_geometry(&self, _g: &jfn_platform_abi::BootGeometry) -> Option<String> {
+        None
+    }
+
+    fn reconcile_mpv_size(
+        &self,
+        _display_hidpi_scale: f64,
+        _saved_scale: f32,
+        _saved_logical: jfn_platform_abi::LogicalSize,
+        _locked: bool,
+    ) -> Option<jfn_platform_abi::PhysicalSize> {
+        None
+    }
+
     fn window_source(&self) -> &'static dyn jfn_platform_abi::WindowSource {
-        &jfn_playback::window_source::MPV_WINDOW_SOURCE
+        &crate::window_source::X11_WINDOW_SOURCE
     }
 
     fn query_window_position(&self) -> Option<WindowPos> {
         let conn = crate::x11_state::x11rb_conn()?;
-        let g = crate::x11_state::MUT.lock();
-        let m = g.as_ref()?;
+        let host = crate::x11_state::host()?;
         let (x, y, _, _) =
-            crate::lifecycle::query_parent_geometry_x11rb(&conn, m.toplevel, m.root)?;
+            crate::lifecycle::query_parent_geometry_x11rb(&conn, host.toplevel, host.root)?;
         Some(WindowPos { x, y })
     }
 
@@ -296,10 +280,7 @@ impl Platform for X11Platform {
     }
 
     fn shared_texture_supported(&self) -> bool {
-        crate::x11_state::MUT
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.use_dmabuf)
+        crate::x11_state::paint().is_some_and(|p| p.use_dmabuf)
     }
 
     fn clipboard_text_supported(&self) -> bool {

@@ -1,23 +1,35 @@
-//! X11 init/cleanup/clamp and helpers for atom interning, ARGB visual
-//! discovery, parent geometry queries, and overlay repositioning.
+//! X11 host-window creation, init/cleanup/clamp, and helpers for atom
+//! interning, ARGB visual discovery, parent geometry queries, and overlay
+//! repositioning.
 
+use parking_lot::Mutex;
 use x11rb::connection::Connection as X11rbConnection;
+use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
 use x11rb::protocol::shm::ConnectionExt as X11rbShmConnection;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConfigureWindowAux, ConnectionExt as X11rbXprotoConnection, CreateWindowAux,
-    EventMask, PropMode, Screen, VisualClass, WindowClass,
+    AtomEnum, ConnectionExt as X11rbXprotoConnection, CreateWindowAux, EventMask, PropMode, Screen,
+    VisualClass, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as X11rbWrapperConnection;
 
-use crate::x11_state::{Atoms, MUT, Mutable, X11RB_CONN, is_none_gc, is_none_window};
+use jfn_platform_abi::BootGeometry;
+
+use crate::x11_state::{
+    Atoms, HostServices, PaintServices, ParentSnapshot, X11RB_CONN, host, set_host_services,
+    set_paint_services,
+};
 
 /// Must match `StartupWMClass` in `net.nullsum.JelliumDesktop.desktop` so the
 /// DE resolves the window to that desktop file for the taskbar icon.
 const WM_CLASS_VALUE: &[u8] = b"net.nullsum.JelliumDesktop\0net.nullsum.JelliumDesktop\0";
 const APP_TITLE: &[u8] = b"Jellium Desktop";
 
-fn set_toplevel_identity(conn: &RustConnection, win: u32, atoms: &Atoms) {
+/// Advertise the app top-level's identity and, when the full XSync handshake can
+/// be established, the `_NET_WM_SYNC_REQUEST` protocol. Returns the created sync
+/// counter id, or 0 if sync could not be set up (then the protocol is NOT
+/// advertised — a WM must never wait on a counter we would never set).
+fn set_toplevel_identity(conn: &RustConnection, win: u32, atoms: &Atoms) -> u32 {
     let _ = conn.change_property8(
         PropMode::REPLACE,
         win,
@@ -37,12 +49,21 @@ fn set_toplevel_identity(conn: &RustConnection, win: u32, atoms: &Atoms) {
     if utf8 != 0 && net_wm_name != 0 {
         let _ = conn.change_property8(PropMode::REPLACE, win, net_wm_name, utf8, APP_TITLE);
     }
+
+    let sync_counter = setup_sync_counter(conn, win, atoms);
+
+    // Keep WM_DELETE_WINDOW; add _NET_WM_SYNC_REQUEST only when the counter is
+    // real (all-or-nothing).
+    let mut protocols = vec![atoms.wm_delete_window];
+    if sync_counter != 0 && atoms.net_wm_sync_request != 0 {
+        protocols.push(atoms.net_wm_sync_request);
+    }
     let _ = conn.change_property32(
         PropMode::REPLACE,
         win,
         atoms.wm_protocols,
         u32::from(AtomEnum::ATOM),
-        &[atoms.wm_delete_window],
+        &protocols,
     );
     let _ = conn.change_property32(
         PropMode::REPLACE,
@@ -52,30 +73,53 @@ fn set_toplevel_identity(conn: &RustConnection, win: u32, atoms: &Atoms) {
         &[atoms.net_wm_window_type_normal],
     );
     let _ = conn.flush();
+    sync_counter
 }
 
-use jfn_mpv::api::jfn_mpv_get_property_int;
+/// Create the resize-sync XSync counter and set `_NET_WM_SYNC_REQUEST_COUNTER`
+/// on the top-level. Returns 0 on any failure so the caller withholds the
+/// protocol advertisement.
+fn setup_sync_counter(conn: &RustConnection, win: u32, atoms: &Atoms) -> u32 {
+    use x11rb::protocol::sync::{ConnectionExt as _, Int64};
 
-fn paint_name(mode: crate::paint_override::X11PaintOverride) -> &'static str {
-    use crate::paint_override::X11PaintOverride as M;
-    match mode {
-        M::Dmabuf => "dmabuf",
-        M::Gpu => "gpu",
-        M::Shm => "shm",
+    if atoms.net_wm_sync_request_counter == 0 {
+        return 0;
     }
-}
-
-fn cef_dmabuf_producer_ok() -> bool {
-    unsafe {
-        jfn_linux_util::dmabuf_probe::jfn_wl_dmabuf_probe(c"x11".as_ptr(), std::ptr::null_mut())
+    let sync_ok = conn
+        .sync_initialize(3, 0)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .is_some();
+    if !sync_ok {
+        return 0;
     }
-}
-
-fn cef_producer_target() -> jfn_gpu_paint::GpuTarget {
-    let drm_render = unsafe {
-        jfn_linux_util::dmabuf_probe::cef_render_node(c"x11".as_ptr(), std::ptr::null_mut())
+    let Ok(counter) = conn.generate_id() else {
+        return 0;
     };
-    jfn_gpu_paint::GpuTarget { drm_render }
+    let created = conn
+        .sync_create_counter(counter, Int64 { hi: 0, lo: 0 })
+        .ok()
+        .and_then(|c| c.check().ok())
+        .is_some();
+    if !created {
+        return 0;
+    }
+    let advertised = conn
+        .change_property32(
+            PropMode::REPLACE,
+            win,
+            atoms.net_wm_sync_request_counter,
+            atoms.cardinal,
+            &[counter],
+        )
+        .ok()
+        .and_then(|c| c.check().ok())
+        .is_some();
+    if !advertised {
+        let _ = conn.sync_destroy_counter(counter);
+        return 0;
+    }
+    counter
 }
 
 /// Find a 32-bit TrueColor visual.
@@ -95,6 +139,196 @@ fn intern_atom(conn: &RustConnection, name: &[u8]) -> u32 {
         .and_then(|cookie| cookie.reply().ok())
         .map(|r| r.atom)
         .unwrap_or(0)
+}
+
+static BOOT_GEOMETRY: Mutex<Option<BootGeometry>> = Mutex::new(None);
+
+pub(crate) fn set_boot_geometry(g: BootGeometry) {
+    *BOOT_GEOMETRY.lock() = Some(g);
+}
+
+fn intern_atoms(conn: &RustConnection) -> Atoms {
+    Atoms {
+        net_wm_window_type: intern_atom(conn, b"_NET_WM_WINDOW_TYPE"),
+        net_wm_window_type_normal: intern_atom(conn, b"_NET_WM_WINDOW_TYPE_NORMAL"),
+        net_wm_state: intern_atom(conn, b"_NET_WM_STATE"),
+        net_wm_state_skip_taskbar: intern_atom(conn, b"_NET_WM_STATE_SKIP_TASKBAR"),
+        net_wm_state_skip_pager: intern_atom(conn, b"_NET_WM_STATE_SKIP_PAGER"),
+        net_wm_state_fullscreen: intern_atom(conn, b"_NET_WM_STATE_FULLSCREEN"),
+        net_wm_state_maximized_vert: intern_atom(conn, b"_NET_WM_STATE_MAXIMIZED_VERT"),
+        net_wm_state_maximized_horz: intern_atom(conn, b"_NET_WM_STATE_MAXIMIZED_HORZ"),
+        wm_protocols: intern_atom(conn, b"WM_PROTOCOLS"),
+        wm_delete_window: intern_atom(conn, b"WM_DELETE_WINDOW"),
+        net_wm_sync_request: intern_atom(conn, b"_NET_WM_SYNC_REQUEST"),
+        net_wm_sync_request_counter: intern_atom(conn, b"_NET_WM_SYNC_REQUEST_COUNTER"),
+        cardinal: u32::from(AtomEnum::CARDINAL),
+        motif_wm_hints: intern_atom(conn, b"_MOTIF_WM_HINTS"),
+        net_active_window: intern_atom(conn, b"_NET_ACTIVE_WINDOW"),
+    }
+}
+
+/// Create the app-owned WM toplevel and the video-host child mpv embeds into
+/// (`--wid`), at the boot geometry, and start the geometry thread. Runs
+/// before mpv init — while the proxy has `DISPLAY` repointed — so every
+/// connection here targets the real display explicitly. Idempotent.
+pub(crate) fn ensure_host_window() -> bool {
+    if host().is_some() {
+        return true;
+    }
+    let boot = *BOOT_GEOMETRY.lock();
+
+    // The top-level is created on the connection the geometry thread owns and
+    // polls: the WM delivers `WM_DELETE` (empty-mask SendEvent) only to the
+    // creating client, so that client must be the one watching for the close.
+    let display = crate::mpv_proxy::real_display();
+    let (geo_conn, screen_num) = match RustConnection::connect(display.as_deref()) {
+        Ok((conn, screen_num)) => (std::sync::Arc::new(conn), screen_num as i32),
+        Err(e) => {
+            eprintln!("[x11] failed to connect top-level/geometry connection: {e:?}");
+            return false;
+        }
+    };
+    let Some(screen) = geo_conn.setup().roots.get(screen_num as usize) else {
+        eprintln!("[x11] no screen at index {screen_num}");
+        return false;
+    };
+    let root = screen.root;
+    let black_pixel = screen.black_pixel;
+    let atoms = intern_atoms(&geo_conn);
+    let net_wm_state = atoms.net_wm_state;
+    let scale = crate::scale::query_display_scale().unwrap_or(1.0);
+
+    let (boot_w, boot_h) = boot.map_or_else(
+        || {
+            let s = f64::from(scale);
+            ((1600.0 * s) as i32, (900.0 * s) as i32)
+        },
+        |b| (b.physical().w.max(1), b.physical().h.max(1)),
+    );
+    let position = boot.and_then(|b| b.position());
+    let maximized = boot.is_some_and(|b| b.maximized());
+    let (boot_x, boot_y) = position.map_or((0, 0), |p| (p.x, p.y));
+
+    let Ok(toplevel) = geo_conn.generate_id() else {
+        eprintln!("[x11] failed to allocate top-level window id");
+        return false;
+    };
+    let win_aux = CreateWindowAux::new()
+        .background_pixel(black_pixel)
+        .event_mask(EventMask::EXPOSURE);
+    if geo_conn
+        .create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            toplevel,
+            root,
+            boot_x as i16,
+            boot_y as i16,
+            boot_w as u16,
+            boot_h as u16,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &win_aux,
+        )
+        .is_err()
+    {
+        eprintln!("[x11] failed to create top-level window");
+        return false;
+    }
+    let sync_counter = set_toplevel_identity(&geo_conn, toplevel, &atoms);
+    if position.is_some() {
+        // User-specified hints make the WM honor the restored position
+        // instead of applying its own placement policy.
+        let mut hints = WmSizeHints::new();
+        hints.position = Some((WmSizeHintsSpecification::UserSpecified, boot_x, boot_y));
+        hints.size = Some((WmSizeHintsSpecification::UserSpecified, boot_w, boot_h));
+        let _ = hints.set_normal_hints(geo_conn.as_ref(), toplevel);
+    }
+
+    let Ok(video_host) = geo_conn.generate_id() else {
+        eprintln!("[x11] failed to allocate video-host window id");
+        return false;
+    };
+    let host_aux = CreateWindowAux::new().background_pixel(black_pixel);
+    if geo_conn
+        .create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            video_host,
+            toplevel,
+            0,
+            0,
+            boot_w as u16,
+            boot_h as u16,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &host_aux,
+        )
+        .is_err()
+    {
+        eprintln!("[x11] failed to create video-host window");
+        return false;
+    }
+
+    if maximized {
+        // Pre-map EWMH: the WM reads the initial `_NET_WM_STATE` when it maps
+        // the window; client messages only apply to already-mapped windows.
+        let _ = geo_conn.change_property32(
+            PropMode::REPLACE,
+            toplevel,
+            atoms.net_wm_state,
+            u32::from(AtomEnum::ATOM),
+            &[
+                atoms.net_wm_state_maximized_vert,
+                atoms.net_wm_state_maximized_horz,
+            ],
+        );
+    }
+    let _ = geo_conn.map_window(video_host);
+    let _ = geo_conn.map_window(toplevel);
+    let _ = geo_conn.flush();
+
+    let (parent_x, parent_y, pw, ph) = query_parent_geometry_x11rb(&geo_conn, toplevel, root)
+        .unwrap_or((boot_x, boot_y, boot_w, boot_h));
+
+    if !set_host_services(HostServices {
+        screen_num,
+        root,
+        toplevel,
+        video_host,
+        atoms,
+        sync_counter,
+    }) {
+        eprintln!("[x11] host services already initialized");
+        return false;
+    }
+    crate::x11_state::publish_parent(ParentSnapshot {
+        origin_x: parent_x,
+        origin_y: parent_y,
+        width: pw,
+        height: ph,
+        fullscreen: false,
+        maximized: false,
+        scale,
+    });
+
+    let xfixes_opcode = geo_conn
+        .query_extension(x11rb::protocol::xfixes::X11_EXTENSION_NAME.as_bytes())
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .filter(|r| r.present)
+        .map(|r| r.major_opcode);
+    crate::mpv_proxy::set_embed_context(
+        video_host,
+        net_wm_state,
+        xfixes_opcode,
+        pw.max(1) as u16,
+        ph.max(1) as u16,
+    );
+
+    crate::geometry::start(geo_conn, toplevel, video_host, root);
+    eprintln!("[x11] host window created (toplevel=0x{toplevel:x} video_host=0x{video_host:x})");
+    true
 }
 
 pub(crate) const COMPOSITOR_NOT_DETECTED_MSG: &str =
@@ -132,86 +366,18 @@ pub(crate) fn query_parent_geometry_x11rb(
     ))
 }
 
-#[derive(Copy, Clone)]
-pub(crate) struct OverlaySnap {
-    pub window: u32,
-    pub visible: bool,
-    /// False on the dmabuf tier once a worker exists: the GPU worker sizes the
-    /// window in lockstep, so the geometry thread must not drive size too.
-    pub send_size: bool,
-    pub state: crate::overlay_fsm::OverlayState,
-}
-
-pub(crate) fn snapshot_live_overlays_locked(m: &Mutable) -> Vec<OverlaySnap> {
-    m.live
-        .iter()
-        .filter(|&&s_ptr| !s_ptr.is_null())
-        .map(|&s_ptr| unsafe { &*s_ptr })
-        .filter(|s| !is_none_window(s.window))
-        .map(|s| OverlaySnap {
-            window: s.window,
-            visible: s.visible,
-            send_size: !(m.use_dmabuf && s.gpu_paint_worker.is_some()),
-            state: s.fsm_state.unwrap_or_else(|| {
-                crate::overlay_fsm::OverlayState::new_mapped(m.parent_fullscreen)
-            }),
-        })
-        .collect()
-}
-
-pub(crate) fn store_overlay_state_locked(
-    m: &Mutable,
-    window: u32,
-    state: crate::overlay_fsm::OverlayState,
-) {
-    for &s_ptr in &m.live {
-        if s_ptr.is_null() {
-            continue;
-        }
-        let s = unsafe { &mut *s_ptr };
-        if s.window == window {
-            s.fsm_state = Some(state);
-            return;
-        }
-    }
-}
-
-pub(crate) fn set_parent_geometry_locked(m: &mut Mutable, px: i32, py: i32, pw: i32, ph: i32) {
-    m.parent_x = px;
-    m.parent_y = py;
-    m.pw = pw;
-    m.ph = ph;
-}
-
-pub fn hide_all_live_locked(m: &Mutable) {
-    let Some(conn) = crate::x11_state::x11rb_conn() else {
-        return;
-    };
-    for &s_ptr in &m.live {
-        if s_ptr.is_null() {
-            continue;
-        }
-        let s = unsafe { &*s_ptr };
-        if !is_none_window(s.window) {
-            let _ = conn.unmap_window(s.window);
-        }
-    }
-    let _ = conn.flush();
-}
-
-/// Platform init. Opens X11 connections, finds the ARGB visual,
-/// interns atoms, queries parent geometry, and starts the input thread.
+/// Platform init. Opens the control/interop connections, finds the ARGB
+/// visual, drains the paint tier resolved in [`crate::mpv_host`]'s `prepare`
+/// into the state seeded by [`ensure_host_window`], and starts the input
+/// thread. mpv is already up and embedded in the video host by the time this
+/// runs.
 pub fn init() -> bool {
     crate::mpv_proxy::restore_real_display();
 
-    let mut wid: i64 = 0;
-    let name = c"window-id";
-    let rc = unsafe { jfn_mpv_get_property_int(name.as_ptr(), &mut wid) };
-    if rc < 0 || wid <= 0 {
-        eprintln!("[x11] failed to get window-id from mpv");
+    let Some(toplevel) = host().map(|h| h.toplevel) else {
+        eprintln!("[x11] host window missing at init");
         return false;
-    }
-    let parent = wid as u32;
+    };
 
     let (x11rb_conn, screen_num) = match RustConnection::connect(None) {
         Ok((conn, screen_num)) => (std::sync::Arc::new(conn), screen_num as i32),
@@ -260,19 +426,6 @@ pub fn init() -> bool {
         return false;
     }
 
-    let atoms = Atoms {
-        net_wm_window_type: intern_atom(&x11rb_conn, b"_NET_WM_WINDOW_TYPE"),
-        net_wm_window_type_normal: intern_atom(&x11rb_conn, b"_NET_WM_WINDOW_TYPE_NORMAL"),
-        net_wm_state: intern_atom(&x11rb_conn, b"_NET_WM_STATE"),
-        net_wm_state_skip_taskbar: intern_atom(&x11rb_conn, b"_NET_WM_STATE_SKIP_TASKBAR"),
-        net_wm_state_skip_pager: intern_atom(&x11rb_conn, b"_NET_WM_STATE_SKIP_PAGER"),
-        net_wm_state_fullscreen: intern_atom(&x11rb_conn, b"_NET_WM_STATE_FULLSCREEN"),
-        wm_protocols: intern_atom(&x11rb_conn, b"WM_PROTOCOLS"),
-        wm_delete_window: intern_atom(&x11rb_conn, b"WM_DELETE_WINDOW"),
-        motif_wm_hints: intern_atom(&x11rb_conn, b"_MOTIF_WM_HINTS"),
-        net_active_window: intern_atom(&x11rb_conn, b"_NET_ACTIVE_WINDOW"),
-    };
-
     // Verify the MIT-SHM extension is present.
     let shm_ok = x11rb_conn
         .shm_query_version()
@@ -284,142 +437,19 @@ pub fn init() -> bool {
         return false;
     }
 
-    let (mpv_x, mpv_y, mpv_w, mpv_h) =
-        query_parent_geometry_x11rb(&x11rb_conn, parent, root).unwrap_or((0, 0, 1, 1));
-    let init_w = mpv_w.max(1) as u16;
-    let init_h = mpv_h.max(1) as u16;
-
-    // The top-level is created on the connection the geometry thread owns and
-    // polls: the WM delivers `WM_DELETE` (empty-mask SendEvent) only to the
-    // creating client, so that client must be the one watching for the close.
-    let geo_conn = match RustConnection::connect(None) {
-        Ok((conn, _)) => std::sync::Arc::new(conn),
-        Err(e) => {
-            eprintln!("[x11] failed to connect top-level/geometry connection: {e:?}");
-            return false;
-        }
-    };
-    let Ok(toplevel) = geo_conn.generate_id() else {
-        eprintln!("[x11] failed to allocate top-level window id");
+    // Drain the paint tier resolved before the proxy repointed DISPLAY (see
+    // `crate::paint`) into the process-lifetime paint services.
+    let tier = crate::paint::resolved();
+    if !set_paint_services(PaintServices {
+        argb_visual,
+        argb_depth,
+        colormap,
+        gpu_ctx: tier.gpu_ctx,
+        gpu_caps: tier.gpu_caps,
+        use_dmabuf: tier.use_dmabuf,
+    }) {
+        eprintln!("[x11] paint services already initialized");
         return false;
-    };
-    let win_aux = CreateWindowAux::new()
-        .background_pixel(screen.black_pixel)
-        .event_mask(EventMask::EXPOSURE);
-    if geo_conn
-        .create_window(
-            x11rb::COPY_DEPTH_FROM_PARENT,
-            toplevel,
-            root,
-            mpv_x as i16,
-            mpv_y as i16,
-            init_w,
-            init_h,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            x11rb::COPY_FROM_PARENT,
-            &win_aux,
-        )
-        .is_err()
-    {
-        eprintln!("[x11] failed to create top-level window");
-        return false;
-    }
-    set_toplevel_identity(&geo_conn, toplevel, &atoms);
-
-    let _ = geo_conn.reparent_window(parent, toplevel, 0, 0);
-    let _ = geo_conn.configure_window(
-        parent,
-        &ConfigureWindowAux::new()
-            .x(0)
-            .y(0)
-            .width(u32::from(init_w))
-            .height(u32::from(init_h)),
-    );
-    let _ = geo_conn.map_window(parent);
-    let _ = geo_conn.map_window(toplevel);
-    let _ = geo_conn.flush();
-
-    let (parent_x, parent_y, pw, ph) = query_parent_geometry_x11rb(&geo_conn, toplevel, root)
-        .unwrap_or((mpv_x, mpv_y, mpv_w, mpv_h));
-
-    // Resolve the paint preference down the dmabuf → gpu → shm chain, where
-    // `--platform-paint` only picks the entry tier and an unusable tier degrades
-    // to the next.
-    use crate::paint_override::X11PaintOverride as Req;
-    let requested = crate::paint_override::paint_override();
-    let explicit = requested.is_some();
-    let want_gpu = !matches!(requested, Some(Req::Shm));
-    let want_dmabuf = matches!(requested, None | Some(Req::Dmabuf));
-    let (gpu_ctx, gpu_caps, use_dmabuf, resolved) = if want_gpu {
-        let target = cef_producer_target();
-        let caps = jfn_gpu_paint::GpuContext::probe(target);
-        if caps.gpu_available {
-            match jfn_gpu_paint::GpuContext::new(target) {
-                Ok(c) => {
-                    let caps = c.capabilities();
-                    // caps.dmabuf_import only proves our Vulkan side can consume;
-                    // also probe CEF's producer, broken on NVIDIA proprietary X11.
-                    if want_dmabuf
-                        && caps.dmabuf_import
-                        && caps.dmabuf_device_matched
-                        && cef_dmabuf_producer_ok()
-                    {
-                        tracing::info!("paint: dmabuf import");
-                        (Some(c), caps, true, Req::Dmabuf)
-                    } else {
-                        tracing::info!("paint: Vulkan pixel-upload");
-                        (Some(c), caps, false, Req::Gpu)
-                    }
-                }
-                Err(e) => {
-                    tracing::info!("paint: Vulkan init failed: {e}; using SHM");
-                    (None, jfn_gpu_paint::Capabilities::NONE, false, Req::Shm)
-                }
-            }
-        } else {
-            tracing::info!("paint: no Vulkan adapter; using SHM");
-            (None, jfn_gpu_paint::Capabilities::NONE, false, Req::Shm)
-        }
-    } else {
-        tracing::info!("paint: using SHM");
-        (None, jfn_gpu_paint::Capabilities::NONE, false, Req::Shm)
-    };
-    if explicit
-        && let Some(req) = requested
-        && req != resolved
-    {
-        tracing::warn!(
-            "--platform-paint={} unavailable; using {}",
-            paint_name(req),
-            paint_name(resolved)
-        );
-    }
-
-    // Populate the global mutable state.
-    {
-        let mut g = MUT.lock();
-        *g = Some(Mutable {
-            screen_num,
-            root,
-            argb_visual,
-            argb_depth,
-            colormap,
-            toplevel,
-            parent,
-            parent_x,
-            parent_y,
-            pw,
-            ph,
-            parent_fullscreen: false,
-            cached_scale: 1.0,
-            atoms,
-            live: Vec::new(),
-            gpu_ctx,
-            gpu_caps,
-            use_dmabuf,
-            gate: jfn_compositor_core::transition::TransitionGate::new(),
-        });
     }
 
     if X11RB_CONN.set(x11rb_conn).is_err() {
@@ -428,18 +458,23 @@ pub fn init() -> bool {
     }
 
     crate::input_lifecycle::start(toplevel);
-    crate::geometry::start(geo_conn, toplevel, parent, root);
 
-    eprintln!("[x11] platform initialized (toplevel=0x{toplevel:x} mpv=0x{parent:x})");
+    eprintln!("[x11] platform initialized (toplevel=0x{toplevel:x})");
     true
 }
 
 pub fn cleanup() {
-    // Defensively unmap any straggler surface windows.
+    // Stop every surviving content actor (frees content GCs + SHM + GPU
+    // resources on the content connection). Structure teardown (unmap/destroy)
+    // rides on the geometry thread's shutdown + the top-level connection close.
     {
-        let g = MUT.lock();
-        if let Some(m) = g.as_ref() {
-            hide_all_live_locked(m);
+        let records: Vec<_> = crate::registry::registry()
+            .lock()
+            .drain()
+            .map(|(_, record)| record)
+            .collect();
+        for record in records {
+            record.actor.shutdown();
         }
     }
 
@@ -447,33 +482,11 @@ pub fn cleanup() {
     crate::geometry::cleanup();
     crate::input_lifecycle::cleanup();
 
-    // Free any surface that outlived Browsers (defensive).
     if let Some(conn) = crate::x11_state::x11rb_conn() {
-        let mut g = MUT.lock();
-        if let Some(m) = g.as_mut() {
-            for &s_ptr in &m.live {
-                if s_ptr.is_null() {
-                    continue;
-                }
-                let s = unsafe { &mut *s_ptr };
-                if let Some(worker) = s.gpu_paint_worker.take() {
-                    worker.shutdown();
-                }
-                if let Some(worker) = s.shm_paint_worker.take() {
-                    worker.shutdown();
-                }
-                if !is_none_gc(s.gc) {
-                    let _ = conn.free_gc(s.gc);
-                }
-                if !is_none_window(s.window) {
-                    let _ = conn.destroy_window(s.window);
-                }
-                drop(unsafe { Box::from_raw(s_ptr) });
-            }
-            m.live.clear();
-            if m.colormap != 0 {
-                let _ = conn.free_colormap(m.colormap);
-            }
+        if let Some(colormap) = crate::x11_state::paint().map(|p| p.colormap)
+            && colormap != 0
+        {
+            let _ = conn.free_colormap(colormap);
         }
         let _ = conn.flush();
     }
@@ -482,9 +495,11 @@ pub fn cleanup() {
 }
 
 /// Clamp saved window geometry to the primary screen extent. Runs before
-/// `init()` so it opens its own short-lived connection.
+/// `init()` so it opens its own short-lived connection (to the real display,
+/// in case the mpv proxy has `DISPLAY` repointed).
 pub fn clamp_window_geometry(w: &mut i32, h: &mut i32) {
-    let Ok((conn, screen_num)) = RustConnection::connect(None) else {
+    let display = crate::mpv_proxy::real_display();
+    let Ok((conn, screen_num)) = RustConnection::connect(display.as_deref()) else {
         return;
     };
     let Some(root) = conn.setup().roots.get(screen_num) else {

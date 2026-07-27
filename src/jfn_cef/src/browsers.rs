@@ -13,7 +13,6 @@
 
 use parking_lot::Mutex;
 use std::ffi::c_char;
-use std::os::raw::c_void;
 use std::sync::Arc;
 
 use jfn_platform_abi::cursor::CursorShape;
@@ -93,8 +92,9 @@ pub fn jfn_browsers_shutdown() {
         return;
     };
     for layer in &b.layers {
-        let s = unsafe { jfn_cef_layer_get_surface(*layer) };
-        if !s.is_null() {
+        let s =
+            jfn_platform_abi::SurfaceHandle::from_ptr(unsafe { jfn_cef_layer_get_surface(*layer) });
+        if !s.is_none() {
             jfn_platform_abi::get().free_surface(s);
         }
         unsafe { jfn_cef_layer_free(*layer) };
@@ -113,13 +113,13 @@ pub unsafe fn jfn_browsers_create(kind: *const c_char) -> *mut JfnCefLayer {
     let surface = jfn_platform_abi::get().alloc_surface();
     let layer = jfn_cef_layer_new();
     if layer.is_null() {
-        if !surface.is_null() {
+        if !surface.is_none() {
             jfn_platform_abi::get().free_surface(surface);
         }
         return std::ptr::null_mut();
     }
     unsafe {
-        jfn_cef_layer_set_surface(layer, surface);
+        jfn_cef_layer_set_surface(layer, surface.as_ptr());
         jfn_cef_layer_resize(layer, b.lw, b.lh, b.pw, b.ph);
         jfn_cef_layer_set_refresh_rate(layer, b.frame_rate as f64);
         if !kind.is_null() {
@@ -165,9 +165,10 @@ pub fn jfn_browsers_remove(layer: *mut JfnCefLayer) {
     unsafe { jfn_cef_layer_on_deactivated(layer) };
     let pos = b.layers.iter().position(|l| *l == layer);
     let Some(idx) = pos else { return };
-    let surface = unsafe { jfn_cef_layer_get_surface(layer) };
+    let surface =
+        jfn_platform_abi::SurfaceHandle::from_ptr(unsafe { jfn_cef_layer_get_surface(layer) });
     b.layers.remove(idx);
-    if !surface.is_null() {
+    if !surface.is_none() {
         jfn_platform_abi::get().free_surface(surface);
     }
     unsafe { jfn_cef_layer_free(layer) };
@@ -399,10 +400,10 @@ pub fn jfn_browsers_close_all_blocking() {
 }
 
 fn restack(layers: &[*mut JfnCefLayer]) {
-    let mut ordered: Vec<*mut c_void> = Vec::with_capacity(layers.len());
+    let mut ordered: Vec<jfn_platform_abi::SurfaceHandle> = Vec::with_capacity(layers.len());
     for l in layers {
-        let s = unsafe { jfn_cef_layer_get_surface(*l) };
-        if !s.is_null() {
+        let s = jfn_platform_abi::SurfaceHandle::from_ptr(unsafe { jfn_cef_layer_get_surface(*l) });
+        if !s.is_none() {
             ordered.push(s);
         }
     }

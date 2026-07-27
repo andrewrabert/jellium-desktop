@@ -129,11 +129,11 @@ impl Platform for WaylandPlatform {
     }
 
     fn alloc_surface(&self) -> SurfaceHandle {
-        wl_ops::alloc_surface() as *mut c_void
+        SurfaceHandle::from_ptr(wl_ops::alloc_surface() as *mut c_void)
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
-        wl_ops::free_surface(s as *mut crate::wl_state::PlatformSurface);
+        wl_ops::free_surface(s.as_ptr() as *mut crate::wl_state::PlatformSurface);
     }
 
     fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
@@ -141,7 +141,7 @@ impl Platform for WaylandPlatform {
             return false;
         };
         present_ok(wl_ops::surface_present(
-            s as *mut crate::wl_state::PlatformSurface,
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
             frame,
         ))
     }
@@ -163,7 +163,7 @@ impl Platform for WaylandPlatform {
         let Some(len) = len else { return false };
         let pixels = unsafe { std::slice::from_raw_parts(buffer as *const u8, len) };
         present_ok(wl_ops::surface_present_software(
-            s as *mut crate::wl_state::PlatformSurface,
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
             dirty,
             pixels,
             w,
@@ -173,7 +173,7 @@ impl Platform for WaylandPlatform {
 
     fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
         wl_ops::surface_set_visible(
-            s as *mut crate::wl_state::PlatformSurface,
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
             visible,
             BG_R,
             BG_G,

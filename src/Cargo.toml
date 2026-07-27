@@ -34,6 +34,7 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+arc-swap = "1"
 cef = { version = "=150.0.0", default-features = false }
 gethostname = "1"
 gix = { version = "0.85", default-features = false, features = ["status", "sha1"] }

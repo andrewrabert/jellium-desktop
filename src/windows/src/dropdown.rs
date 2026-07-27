@@ -10,15 +10,15 @@ pub(crate) struct CompositorDropdown;
 
 impl DropdownBackend for CompositorDropdown {
     fn show(&self, s: SurfaceHandle, req: JfnPopupRequest) {
-        win_popup_show(s, req.x, req.y);
+        win_popup_show(s.as_ptr(), req.x, req.y);
     }
 
     fn hide(&self, s: SurfaceHandle) {
-        win_popup_hide(s);
+        win_popup_hide(s.as_ptr());
     }
 
     fn present(&self, s: SurfaceHandle, info: *const c_void, lw: c_int, lh: c_int) {
-        win_popup_present(s, info, lw, lh);
+        win_popup_present(s.as_ptr(), info, lw, lh);
     }
 
     fn present_software(
@@ -30,6 +30,6 @@ impl DropdownBackend for CompositorDropdown {
         lw: c_int,
         lh: c_int,
     ) {
-        win_popup_present_software(s, buffer, pw, ph, lw, lh);
+        win_popup_present_software(s.as_ptr(), buffer, pw, ph, lw, lh);
     }
 }

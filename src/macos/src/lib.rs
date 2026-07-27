@@ -647,15 +647,15 @@ impl Platform for MacosPlatform {
     }
 
     fn alloc_surface(&self) -> SurfaceHandle {
-        macos_alloc_surface()
+        SurfaceHandle::from_ptr(macos_alloc_surface())
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
-        macos_free_surface(s);
+        macos_free_surface(s.as_ptr());
     }
 
     fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
-        macos_surface_present(s, info)
+        macos_surface_present(s.as_ptr(), info)
     }
 
     fn surface_present_software(
@@ -666,12 +666,12 @@ impl Platform for MacosPlatform {
         w: c_int,
         h: c_int,
     ) -> bool {
-        macos_surface_present_software(s, dirty.as_ptr(), dirty.len(), buffer, w, h)
+        macos_surface_present_software(s.as_ptr(), dirty.as_ptr(), dirty.len(), buffer, w, h)
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
         macos_surface_resize(
-            s,
+            s.as_ptr(),
             size.logical_w,
             size.logical_h,
             size.physical_w,
@@ -680,11 +680,13 @@ impl Platform for MacosPlatform {
     }
 
     fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        macos_surface_set_visible(s, visible);
+        macos_surface_set_visible(s.as_ptr(), visible);
     }
 
     fn restack(&self, ordered: &[SurfaceHandle]) {
-        macos_restack(ordered.as_ptr(), ordered.len());
+        // `SurfaceHandle` is `#[repr(transparent)]` over `*mut c_void`, so the
+        // slice pointer reinterprets directly.
+        macos_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
     fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {

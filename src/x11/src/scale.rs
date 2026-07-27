@@ -1,11 +1,11 @@
-//! X11 display scale probe used before mpv creates its window.
+//! X11 display scale probe: the app's scale authority.
 //!
-//! mpv's `--geometry` is specified in physical X11 pixels, while Jellyfin
-//! stores/restores window size in logical pixels. At startup this backend must
-//! therefore predict the same X11 HiDPI scale mpv will later expose through
-//! `display-hidpi-scale`, so this mirrors mpv's logic in
-//! `third_party/mpv/video/out/x11_common.c` — including the half-step
-//! quantization the tests pin.
+//! The app owns geometry and scale on X11 (mpv is embedded and passive), so
+//! this probe defines the logical ↔ physical conversion everywhere: boot
+//! restore, persist, CEF device scale, and input mapping. The Xft.dpi
+//! half-step quantization matches mpv's historical behavior
+//! (`third_party/mpv/video/out/x11_common.c`) so saved logical sizes
+//! round-trip across the ownership change; the tests pin it.
 
 use x11rb::connection::Connection;
 use x11rb::resource_manager::new_from_resource_manager;
@@ -14,7 +14,10 @@ use x11rb::rust_connection::RustConnection;
 const BASE_DPI: f64 = 96.0;
 
 pub(crate) fn query_display_scale() -> Option<f32> {
-    let (conn, screen_num) = RustConnection::connect(None).ok()?;
+    // Explicitly target the real server: while the mpv proxy has DISPLAY
+    // repointed, env-based connect would route through it.
+    let display = crate::mpv_proxy::real_display();
+    let (conn, screen_num) = RustConnection::connect(display.as_deref()).ok()?;
     if let Some(scale) = query_xft_dpi_scale(&conn) {
         tracing::debug!(target: "x11::scale", "Using Xft.dpi scale: {scale}");
         return Some(scale);

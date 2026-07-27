@@ -354,9 +354,58 @@ pub enum IdleInhibitLevel {
     Display,
 }
 
-/// Backend-allocated per-surface handle. Backends define the layout
-/// in-crate; callers only ever hold the raw pointer.
-pub type SurfaceHandle = *mut c_void;
+/// Backend-allocated per-surface handle: an opaque, backend-defined id.
+///
+/// Callers hold it as a value and pass it back verbatim; no caller may
+/// dereference it. Its representation is one machine word so it round-trips
+/// losslessly through the CEF C++ layer's `void*` slot. Pointer-backed
+/// backends (Wayland/Windows/macOS) bridge through [`SurfaceHandle::from_ptr`]
+/// / [`SurfaceHandle::as_ptr`]; the X11 backend stores a generational id via
+/// [`SurfaceHandle::from_id`] / [`SurfaceHandle::id`] and never treats it as a
+/// pointer.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[repr(transparent)]
+pub struct SurfaceHandle(*mut c_void);
+
+// A word-sized opaque id; the wrapped pointer is never dereferenced by the ABI
+// itself. Backends carry their own `unsafe impl Send` on the state they map it to.
+unsafe impl Send for SurfaceHandle {}
+unsafe impl Sync for SurfaceHandle {}
+
+impl SurfaceHandle {
+    /// The absent handle (allocation failed / no surface).
+    pub const NONE: Self = Self(std::ptr::null_mut());
+
+    #[must_use]
+    pub fn is_none(self) -> bool {
+        self.0.is_null()
+    }
+
+    /// Bridge for pointer-backed backends: wrap a backend surface pointer.
+    #[must_use]
+    pub fn from_ptr(p: *mut c_void) -> Self {
+        Self(p)
+    }
+
+    /// Bridge for pointer-backed backends: recover the backend surface pointer.
+    #[must_use]
+    pub fn as_ptr(self) -> *mut c_void {
+        self.0
+    }
+
+    /// Bridge for id-backed backends (X11): pack a generational id. The value
+    /// is never dereferenced.
+    #[must_use]
+    pub fn from_id(id: u64) -> Self {
+        Self(id as *mut c_void)
+    }
+
+    /// Bridge for id-backed backends (X11): recover the generational id.
+    #[must_use]
+    pub fn id(self) -> u64 {
+        self.0 as u64
+    }
+}
 
 /// Process-wide platform handle. Optional methods have no-op defaults so
 /// backends only override what they care about.
@@ -398,7 +447,7 @@ pub trait Platform: Send + Sync {
 
     // Per-surface
     fn alloc_surface(&self) -> SurfaceHandle {
-        std::ptr::null_mut()
+        SurfaceHandle::NONE
     }
     fn free_surface(&self, _s: SurfaceHandle) {}
     /// `_info` is CEF's `OnAcceleratedPaint` accel-paint info — a raw C

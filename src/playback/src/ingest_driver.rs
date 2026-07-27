@@ -150,14 +150,16 @@ pub fn jfn_playback_set_display_hz(hz: f64) {
 /// Display-backend discriminant.
 ///   0 = Wayland, 1 = X11, 2 = Other (macOS/Windows)
 pub const BACKEND_WAYLAND: u8 = 0;
+pub const BACKEND_X11: u8 = 1;
 
 /// Register the property observations whose IDs are dispatched by the
 /// ingest layer. Backend selection skips `osd-dimensions`, `fullscreen`,
-/// and `window-maximized` on Wayland — the compositor owns the toplevel
-/// there, so the window's `xdg_toplevel.configure` feeds dims and mode via
-/// [`jfn_playback_post_osd_pixels`] / [`jfn_playback_post_window_state`]
-/// instead, and mpv's own properties either never change (mode) or would
-/// double-post identical values (dims).
+/// and `window-maximized` on Wayland and X11 — the app owns the toplevel
+/// there, so the host window feeds dims and mode through the native
+/// [`jfn_platform_abi::WindowSource`] (via `notify_window_changed` →
+/// `jfn_playback_reconcile_window_mode`) instead, and mpv's own properties
+/// either never change (mode) or describe an embedded child, not the
+/// window.
 ///
 /// Requires `jfn_mpv_handle_init` to have succeeded; returns false if
 /// the handle is missing.
@@ -206,7 +208,9 @@ pub fn jfn_playback_observe_mpv_properties(backend: u8) -> bool {
     ];
 
     for &(id, name, fmt) in pairs {
-        if backend == BACKEND_WAYLAND && matches!(id, OSD_DIMS | FULLSCREEN | WINDOW_MAX) {
+        if matches!(backend, BACKEND_WAYLAND | BACKEND_X11)
+            && matches!(id, OSD_DIMS | FULLSCREEN | WINDOW_MAX)
+        {
             continue;
         }
         unsafe { jfn_mpv::sys::mpv_observe_property(raw, id, name.as_ptr(), fmt) };

@@ -2566,6 +2566,7 @@ dependencies = [
 name = "jfn-x11"
 version = "0.1.0-dev"
 dependencies = [
+ "arc-swap",
  "cef",
  "cursor-icon",
  "gethostname",
@@ -2583,6 +2584,7 @@ dependencies = [
  "libc",
  "nix",
  "parking_lot",
+ "slotmap",
  "tempfile",
  "tracing",
  "x11rb",

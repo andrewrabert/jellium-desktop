@@ -32,8 +32,8 @@ impl Inner {
         w: i32,
         h: i32,
     ) {
-        let surface = self.surface_ptr();
-        if surface.is_null() {
+        let surface = self.surface_handle();
+        if surface.is_none() {
             return;
         }
         if is_popup {
@@ -55,8 +55,8 @@ impl Inner {
     }
 
     pub(crate) fn on_accelerated_paint(&self, is_popup: bool, info: *const c_void) {
-        let surface = self.surface_ptr();
-        if surface.is_null() || info.is_null() {
+        let surface = self.surface_handle();
+        if surface.is_none() || info.is_null() {
             return;
         }
         if is_popup {
