@@ -7,21 +7,20 @@
 //! before handing it to `jfn_platform_abi::install`.
 
 #![allow(non_snake_case)]
-// Platform trait carries raw-pointer args (dmabuf info, accel-paint info)
-// from CEF; trait impls forward them unchanged to unsafe FFI fns.
+// The Platform trait carries raw pointers for non-paint entry points;
+// trait impls forward them unchanged to unsafe FFI fns.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_int, c_void};
-use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::layer::{Present, PresentError};
-use crate::wl_ops::{self, JfnDmabufFrame};
+use crate::wl_ops;
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
     BootGeometry, DisplayBackend, IdleInhibitLevel, JfnContextMenuRequest, JfnPopupRequest,
-    JfnRect, Platform, SurfaceHandle, SurfaceSize, WindowDecorations,
+    JfnRect, PaintFrame, Platform, SurfaceHandle, SurfaceSize, WindowDecorations,
 };
 
 // =====================================================================
@@ -43,29 +42,6 @@ fn present_ok(result: Result<Present, PresentError>) -> bool {
             false
         }
     }
-}
-
-pub(crate) unsafe fn to_dmabuf_frame(info: *const c_void) -> Option<JfnDmabufFrame> {
-    let info = info as *const cef::sys::_cef_accelerated_paint_info_t;
-    if info.is_null() {
-        return None;
-    }
-    let info = unsafe { &*info };
-    let plane0 = &info.planes[0];
-    let fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(plane0.fd) }).ok()?;
-    let id = nix::sys::stat::fstat(&fd)
-        .ok()
-        .map(|st| (st.st_dev, st.st_ino));
-    Some(JfnDmabufFrame {
-        fd,
-        id,
-        stride: plane0.stride,
-        modifier: info.modifier,
-        coded_w: info.extra.coded_size.width,
-        coded_h: info.extra.coded_size.height,
-        visible_w: info.extra.visible_rect.width,
-        visible_h: info.extra.visible_rect.height,
-    })
 }
 
 // =====================================================================
@@ -136,39 +112,16 @@ impl Platform for WaylandPlatform {
         wl_ops::free_surface(s.as_ptr() as *mut crate::wl_state::PlatformSurface);
     }
 
-    fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
-        let Some(frame) = (unsafe { to_dmabuf_frame(info) }) else {
-            return false;
-        };
-        present_ok(wl_ops::surface_present(
-            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
-            frame,
-        ))
-    }
-
-    fn surface_present_software(
-        &self,
-        s: SurfaceHandle,
-        dirty: &[JfnRect],
-        buffer: *const c_void,
-        w: c_int,
-        h: c_int,
-    ) -> bool {
-        if buffer.is_null() || w <= 0 || h <= 0 {
-            return false;
-        }
-        let len = (w as usize)
-            .checked_mul(h as usize)
-            .and_then(|n| n.checked_mul(4));
-        let Some(len) = len else { return false };
-        let pixels = unsafe { std::slice::from_raw_parts(buffer as *const u8, len) };
-        present_ok(wl_ops::surface_present_software(
-            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
-            dirty,
-            pixels,
-            w,
-            h,
-        ))
+    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
+        let ptr = s.as_ptr() as *mut crate::wl_state::PlatformSurface;
+        present_ok(match frame {
+            PaintFrame::Accelerated(tex) => wl_ops::surface_present(ptr, tex),
+            PaintFrame::Software {
+                size,
+                pixels,
+                dirty,
+            } => wl_ops::surface_present_software(ptr, dirty, pixels, size.w, size.h),
+        })
     }
 
     fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {

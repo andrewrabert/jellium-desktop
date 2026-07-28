@@ -2,8 +2,11 @@
 
 pub use jfn_platform_abi::{
     Delivery, DeliveryKind, DisplayBackend, JfnContextMenuRequest, JfnMenuItem, JfnPopupRequest,
-    JfnRect, JsMenuChannel, Platform, SurfaceHandle, SurfaceSize,
+    JfnRect, JsMenuChannel, PaintFrame, PhysicalSize, Platform, SharedTexture, SurfaceHandle,
+    SurfaceSize,
 };
+#[cfg(target_os = "linux")]
+pub use jfn_platform_abi::{DmabufFormat, DmabufPlane};
 
 /// Returns the installed platform backend, or `None` if no backend has
 /// been installed yet (e.g. early CEF helper-process boot before

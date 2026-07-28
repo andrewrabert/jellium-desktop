@@ -12,9 +12,8 @@
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
-use jfn_gpu_paint::{
-    DirtyRect, DmabufFrame, GpuPainter, PixelFrame, PresentOutcome, SizePolicy, WindowTarget,
-};
+use jfn_gpu_paint::{Frame, Pixels, Presented, WindowTarget};
+use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
 use x11rb::connection::Connection;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xproto;
@@ -27,12 +26,12 @@ use crate::x11_state::ShmBuffer;
 enum PendingFrame {
     Pixels {
         pixels: Vec<u8>,
-        dirty: Vec<DirtyRect>,
+        dirty: Vec<JfnRect>,
         width: i32,
         height: i32,
         stride: usize,
     },
-    Dmabuf(Box<DmabufFrame>),
+    Shared(Box<SharedTexture>),
 }
 
 struct Mailbox {
@@ -104,7 +103,7 @@ impl OverlayActor {
 
     pub(crate) fn present_software(
         &self,
-        dirty: &[DirtyRect],
+        dirty: &[JfnRect],
         pixels: &[u8],
         width: i32,
         height: i32,
@@ -134,10 +133,10 @@ impl OverlayActor {
         true
     }
 
-    pub(crate) fn present_dmabuf(&self, frame: DmabufFrame) -> bool {
+    pub(crate) fn present_shared(&self, frame: SharedTexture) -> bool {
         self.with_state(|s| {
             if s.visible {
-                s.pending = Some(PendingFrame::Dmabuf(Box::new(frame)));
+                s.pending = Some(PendingFrame::Shared(Box::new(frame)));
             }
         });
         true
@@ -181,13 +180,12 @@ struct ShmState {
 }
 
 enum Backend {
-    Gpu(Option<Box<GpuPainter>>),
+    Gpu(Option<Box<jfn_gpu_paint::Surface<'static>>>),
     Shm(ShmState),
 }
 
 fn initial_backend() -> Backend {
-    let gpu_available = crate::x11_state::paint().is_some_and(|p| p.gpu_caps.gpu_available);
-    if gpu_available {
+    if crate::paint::gpu().is_some() {
         Backend::Gpu(None)
     } else {
         Backend::Shm(ShmState::default())
@@ -259,13 +257,13 @@ fn present_frame(
             if present_gpu(painter, window, target_size, frame) {
                 return;
             }
-            // GPU failed on a pixel frame: degrade to SHM. (A dmabuf frame that
-            // fails is dropped by present_gpu without signalling degrade, since
-            // dmabuf has no CPU fallback — so we only reach here for pixels.)
+            // A fatal GPU failure: degrade to SHM. Take the painter out and
+            // shut it down BEFORE switching — wgpu's swapchain and hand-rolled
+            // SHM must never both be writing this window.
             if let Backend::Gpu(p) = backend
                 && let Some(p) = p.take()
             {
-                p.shutdown();
+                drop(p);
             }
             *backend = Backend::Shm(ShmState::default());
         }
@@ -277,26 +275,23 @@ fn present_frame(
     }
 }
 
-/// Present through the GPU painter. Returns `false` only when a PIXEL frame
-/// failed and the caller should degrade to SHM; a failed dmabuf frame returns
-/// `true` (logged, dropped) because dmabuf has no CPU fallback.
+/// Present through the GPU surface. Returns `false` only when the failure was
+/// fatal and the caller should degrade to SHM. A failed shared frame is never
+/// fatal — dmabuf has no CPU fallback, so degrading would strand the surface
+/// with no output at all; the frame is logged and dropped instead.
 fn present_gpu(
-    painter: &mut Option<Box<GpuPainter>>,
+    painter: &mut Option<Box<jfn_gpu_paint::Surface<'static>>>,
     window: u32,
     target_size: (u32, u32),
     frame: PendingFrame,
 ) -> bool {
-    let is_dmabuf = matches!(frame, PendingFrame::Dmabuf(_));
-
     if painter.is_none() {
-        let (Some(conn_ptr), Some(paint)) = (
+        let (Some(conn_ptr), Some(paint), Some(gpu)) = (
             crate::x11_state::raw_xcb_connection(),
             crate::x11_state::paint(),
+            crate::paint::gpu(),
         ) else {
-            return is_dmabuf;
-        };
-        let Some(ctx) = paint.gpu_ctx.clone() else {
-            return is_dmabuf;
+            return true;
         };
         let target = WindowTarget::Xcb {
             connection: conn_ptr,
@@ -304,57 +299,69 @@ fn present_gpu(
             screen: crate::x11_state::host().map_or(0, |h| h.screen_num),
             visual: paint.argb_visual,
         };
-        // FollowTarget: the geometry thread sizes the overlay window; the
-        // painter drives its swapchain from that parent-derived extent
-        // (fed via resize), never from the CEF frame size or the window. Seed
-        // with the target extent so the first configure already matches.
-        let init = (target_size.0.max(1), target_size.1.max(1));
-        match GpuPainter::with_policy(ctx, target, init, SizePolicy::FollowTarget) {
+        // Seed with the parent-derived target extent so the first configure
+        // already matches the window the geometry thread sized.
+        let init = PhysicalSize {
+            w: target_size.0.max(1) as i32,
+            h: target_size.1.max(1) as i32,
+        };
+        match gpu.new_surface(target, init) {
             Ok(p) => *painter = Some(Box::new(p)),
             Err(e) => {
+                // Degrading a shared frame strands the surface: SHM cannot
+                // present it, so it would be dropped here and so would every
+                // frame after it. Stay on GPU and retry creation next frame.
+                if matches!(frame, PendingFrame::Shared(_)) {
+                    tracing::warn!("[x11] overlay actor gpu init failed: {e}; dropping frame");
+                    return true;
+                }
                 eprintln!("[x11] overlay actor gpu init failed: {e}; using SHM");
-                return is_dmabuf;
+                return false;
             }
         }
     }
     let Some(painter) = painter.as_mut() else {
-        return is_dmabuf;
+        return true;
     };
     painter.set_visible(true);
-    painter.resize(target_size);
+    painter.resize(PhysicalSize {
+        w: target_size.0 as i32,
+        h: target_size.1 as i32,
+    });
 
-    match frame {
+    let outcome = match &frame {
         PendingFrame::Pixels {
             pixels,
             dirty,
             width,
             height,
             stride,
-        } => {
-            let pf = PixelFrame {
-                width: width as u32,
-                height: height as u32,
-                stride: stride as u32,
-                bgra: &pixels,
-                dirty: &dirty,
-            };
-            match painter.push_pixels(pf, || {}) {
-                Ok(PresentOutcome::Presented) => true,
-                Ok(PresentOutcome::Skipped) => {
-                    tracing::debug!("[x11] overlay actor gpu frame skipped (surface unavailable)");
-                    true
-                }
-                Err(e) => {
-                    eprintln!("[x11] overlay actor push_pixels failed: {e}; using SHM");
-                    false
-                }
-            }
-        }
-        PendingFrame::Dmabuf(frame) => {
-            if let Err(e) = painter.push_dmabuf(*frame) {
-                tracing::warn!("[x11] overlay actor push_dmabuf failed: {e}");
-            }
+        } => painter.present(
+            Frame::Copied(Pixels {
+                size: PhysicalSize {
+                    w: *width,
+                    h: *height,
+                },
+                stride: *stride as u32,
+                bgra: pixels,
+                dirty,
+            }),
+            || {},
+        ),
+        PendingFrame::Shared(tex) => painter.present(Frame::Shared(tex), || {}),
+    };
+
+    match outcome {
+        Ok(Presented::Yes) => true,
+        Ok(Presented::Skipped) => {
+            tracing::debug!("[x11] overlay actor frame skipped (surface unavailable)");
             true
+        }
+        // An `Err` is the surface saying it is done; anything recoverable came
+        // back as `Skipped`.
+        Err(e) => {
+            eprintln!("[x11] overlay actor present failed: {e}; using SHM");
+            false
         }
     }
 }
@@ -374,7 +381,8 @@ fn present_shm(
         stride,
     } = frame
     else {
-        // dmabuf frames never reach the SHM backend.
+        // Shared frames never reach the SHM backend: a shared failure is not
+        // fatal, so it never degrades.
         return;
     };
     let depth = crate::x11_state::paint().map_or(32, |p| p.argb_depth);
@@ -424,7 +432,7 @@ fn present_shm(
     let _ = conn.flush();
 }
 
-fn clip_rect(rect: &DirtyRect, width: i32, height: i32) -> Option<(i32, i32, i32, i32)> {
+fn clip_rect(rect: &JfnRect, width: i32, height: i32) -> Option<(i32, i32, i32, i32)> {
     let mut rx = rect.x;
     let mut ry = rect.y;
     let mut rw = rect.w;
@@ -455,7 +463,7 @@ fn teardown(
     shared: &Arc<(Mutex<Mailbox>, Condvar)>,
 ) {
     match backend {
-        Backend::Gpu(Some(painter)) => painter.shutdown(),
+        Backend::Gpu(Some(painter)) => drop(painter),
         Backend::Gpu(None) => {}
         Backend::Shm(mut state) => {
             for buf in &mut state.bufs {
@@ -478,8 +486,8 @@ fn teardown(
 mod tests {
     use super::*;
 
-    fn rect(x: i32, y: i32, w: i32, h: i32) -> DirtyRect {
-        DirtyRect { x, y, w, h }
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> JfnRect {
+        JfnRect { x, y, w, h }
     }
 
     #[test]

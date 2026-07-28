@@ -20,7 +20,6 @@ use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 use jfn_compositor_core::transition::TransitionGate;
-use jfn_gpu_paint::{Capabilities, GpuContext};
 use x11rb::protocol::shm;
 use x11rb::rust_connection::RustConnection;
 
@@ -93,18 +92,12 @@ pub struct HostServices {
     pub sync_counter: u32,
 }
 
-/// Immutable paint/visual facts, set once by [`crate::lifecycle::init`] after
-/// the ARGB visual and GPU tier are resolved.
+/// Immutable visual facts, set once by [`crate::lifecycle::init`] once the ARGB
+/// visual is found. The composite tier is not here — [`crate::paint`] owns it.
 pub struct PaintServices {
     pub argb_visual: u32,
     pub argb_depth: u8,
     pub colormap: u32,
-    /// Shared GPU compositor. `None` when no Vulkan adapter was found at init;
-    /// presents then fall back to SHM.
-    pub gpu_ctx: Option<Arc<GpuContext>>,
-    pub gpu_caps: Capabilities,
-    /// When set, the dmabuf-import tier is active.
-    pub use_dmabuf: bool,
 }
 
 /// The app top-level's live geometry, published by the geometry thread. An

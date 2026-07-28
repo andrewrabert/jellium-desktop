@@ -21,6 +21,7 @@ use objc2::runtime::AnyObject;
 
 use jfn_compositor_core::stack::SurfaceStack;
 use jfn_compositor_core::transition::TransitionGate;
+use jfn_platform_abi::SharedTexture;
 
 use crate::init::{jfn_macos_get_input_view, jfn_macos_get_window};
 
@@ -549,7 +550,7 @@ unsafe fn wrap_input_surface(s: &mut Surface, surface: IOSurfaceRef, w: u64, h: 
 // next drawable with premultiplied alpha. Off-main-thread safe.
 // =====================================================================
 
-unsafe fn present_iosurface(s: &mut Surface, info: &cef::sys::_cef_accelerated_paint_info_t) {
+unsafe fn present_iosurface(s: &mut Surface, tex: &SharedTexture) {
     if s.layer.is_null() {
         tracing::warn!("[METAL] present skipped: layer null");
         return;
@@ -562,7 +563,7 @@ unsafe fn present_iosurface(s: &mut Surface, info: &cef::sys::_cef_accelerated_p
         }
     };
 
-    let surface = info.shared_texture_io_surface as IOSurfaceRef;
+    let surface = tex.io_surface() as IOSurfaceRef;
     if surface.is_null() {
         tracing::warn!("[METAL] present skipped: null IOSurface");
         return;
@@ -707,12 +708,11 @@ pub fn macos_free_surface(s: *mut c_void) {
     unsafe { drop(Box::from_raw(s_ptr)) };
 }
 
-pub fn macos_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
-    if s.is_null() || raw_info.is_null() {
+pub fn macos_surface_present(s: *mut c_void, tex: &SharedTexture) -> bool {
+    if s.is_null() {
         return false;
     }
     let s_ptr = s as *mut Surface;
-    let info = unsafe { &*(raw_info as *const cef::sys::_cef_accelerated_paint_info_t) };
 
     // is-cef-main = bottom-of-stack check.
     let is_main = G_SURFACE_STACK.lock().is_main(SurfacePtr(s_ptr));
@@ -721,10 +721,10 @@ pub fn macos_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
         if G_GATE.lock().in_transition() {
             return false;
         }
-        unsafe { present_iosurface(&mut *s_ptr, info) };
+        unsafe { present_iosurface(&mut *s_ptr, tex) };
         // Clear the gate when the incoming frame matches the expected
         // post-transition size.
-        let surface = info.shared_texture_io_surface as IOSurfaceRef;
+        let surface = tex.io_surface() as IOSurfaceRef;
         if !surface.is_null() {
             let w = unsafe { IOSurfaceGetWidth(surface) } as c_int;
             let h = unsafe { IOSurfaceGetHeight(surface) } as c_int;
@@ -732,7 +732,7 @@ pub fn macos_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
         }
         return true;
     }
-    unsafe { present_iosurface(&mut *s_ptr, info) };
+    unsafe { present_iosurface(&mut *s_ptr, tex) };
     true
 }
 

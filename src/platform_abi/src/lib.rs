@@ -25,6 +25,7 @@ pub mod mpv_host;
 #[cfg_attr(unix, path = "process_unix.rs")]
 #[cfg_attr(not(unix), path = "process_other.rs")]
 mod process;
+pub mod shared_texture;
 #[cfg_attr(unix, path = "signal_unix.rs")]
 #[cfg_attr(not(unix), path = "signal_other.rs")]
 mod signal;
@@ -46,6 +47,9 @@ pub use geometry::{
 pub use instance::{Instance, InstanceId};
 pub use media_sink::MediaSink;
 pub use mpv_host::{DefaultMpvHost, MpvHost};
+pub use shared_texture::SharedTexture;
+#[cfg(target_os = "linux")]
+pub use shared_texture::{DmabufFormat, DmabufPlane};
 pub use window_source::{
     WindowSnapshot, WindowSource, notify_window_changed, subscribe_window_changed,
 };
@@ -339,11 +343,28 @@ impl DecorationOptions {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct JfnRect {
     pub x: c_int,
     pub y: c_int,
     pub w: c_int,
     pub h: c_int,
+}
+
+/// One CEF paint callback's payload, decoded.
+///
+/// CEF has exactly two output paths — `OnAcceleratedPaint` and `OnPaint` —
+/// selected once per browser by `shared_texture_enabled`.
+pub enum PaintFrame<'a> {
+    /// A texture the app owns. By value, because a backend that presents off
+    /// the callback thread (X11 and Wayland both do) has to keep it.
+    Accelerated(SharedTexture),
+    /// CPU pixels in BGRA, tightly packed, with the regions that changed.
+    Software {
+        size: PhysicalSize,
+        pixels: &'a [u8],
+        dirty: &'a [JfnRect],
+    },
 }
 
 /// Idle-inhibit level.
@@ -450,21 +471,7 @@ pub trait Platform: Send + Sync {
         SurfaceHandle::NONE
     }
     fn free_surface(&self, _s: SurfaceHandle) {}
-    /// `_info` is CEF's `OnAcceleratedPaint` accel-paint info — a raw C
-    /// pointer that crosses the CEF ABI, so it stays raw.
-    fn surface_present(&self, _s: SurfaceHandle, _info: *const c_void) -> bool {
-        false
-    }
-    /// `_buffer` is CEF's `OnPaint` software paint buffer — a raw C pointer
-    /// that crosses the CEF ABI, so it stays raw.
-    fn surface_present_software(
-        &self,
-        _s: SurfaceHandle,
-        _dirty: &[JfnRect],
-        _buffer: *const c_void,
-        _w: c_int,
-        _h: c_int,
-    ) -> bool {
+    fn surface_present(&self, _s: SurfaceHandle, _frame: PaintFrame<'_>) -> bool {
         false
     }
     fn surface_resize(&self, _s: SurfaceHandle, _size: SurfaceSize) {}

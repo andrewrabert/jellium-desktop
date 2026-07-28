@@ -1,35 +1,16 @@
-//! Vulkan-only wgpu device. Singleton, shared across surfaces.
-
-use std::sync::Arc;
+//! The process's one wgpu device, shared across surfaces.
 
 use wgpu_hal::vulkan;
 
-use crate::dmabuf_import;
-use crate::error::GpuPaintError;
+use crate::error::{Kind, SurfaceLost};
+use crate::painter::Surface;
+use crate::shared_import;
+use crate::types::WindowTarget;
+use jfn_platform_abi::PhysicalSize;
 
-#[derive(Copy, Clone, Debug)]
-pub struct Capabilities {
-    pub gpu_available: bool,
-    /// Reserved for v1 (wgpu-hal Vulkan backdoor + dmabuf import).
-    /// v0 always reports false.
-    pub dmabuf_import: bool,
-    pub dmabuf_device_matched: bool,
-}
-
-impl Capabilities {
-    pub const NONE: Self = Self {
-        gpu_available: false,
-        dmabuf_import: false,
-        dmabuf_device_matched: false,
-    };
-}
-
-#[derive(Copy, Clone, Debug, Default)]
-pub struct GpuTarget {
-    pub drm_render: Option<(i64, i64)>,
-}
-
-pub struct GpuContext {
+/// The only handle to wgpu in the process. Held once; [`crate::Surface`]s
+/// borrow it.
+pub struct Surfaces {
     pub(crate) instance: wgpu::Instance,
     pub(crate) adapter: wgpu::Adapter,
     pub(crate) device: wgpu::Device,
@@ -38,10 +19,10 @@ pub struct GpuContext {
     // another thread submits mid-drain, leaving the surface unconfigured → next
     // acquire fatally panics. Configure takes the write side, submit the read.
     pub(crate) submit_gate: parking_lot::RwLock<()>,
-    caps: Capabilities,
+    can_import_shared: bool,
 }
 
-impl GpuContext {
+impl Surfaces {
     pub(crate) fn configure_surface(
         &self,
         surface: &wgpu::Surface<'static>,
@@ -50,53 +31,58 @@ impl GpuContext {
         let _guard = self.submit_gate.write();
         surface.configure(&self.device, config);
     }
-}
 
-impl GpuContext {
-    /// Cheap probe: enumerate Vulkan adapters and pick one. Does not
-    /// create a `Device` and does not need a surface.
-    pub fn probe(target: GpuTarget) -> Capabilities {
+    /// Open the device, selecting the adapter CEF produces its shared buffers
+    /// on where that is knowable. `None` when this system has no usable GPU
+    /// path at all.
+    ///
+    /// Creates the process's GPU instance, which on X11 must happen before the
+    /// mpv proxy repoints `DISPLAY` and before mpv init: NVIDIA's Vulkan ICD
+    /// does a lazy, one-time global init on first `vkCreateInstance` that
+    /// includes an internal `XOpenDisplay`. Running it here keeps the ICD's
+    /// connection on the real server and completes before mpv's VO thread is
+    /// spawned, winning the loader-scan race that otherwise crashes NVIDIA
+    /// proprietary (two threads reading a half-populated ICD dispatch table).
+    pub fn init() -> Option<Self> {
+        // Cheap pre-check: enumerating adapters needs no device and no surface,
+        // so a machine with no GPU never pays for device creation.
+        let producer = cef_render_node();
         let instance = build_instance();
-        match pick_adapter(&instance, target) {
-            Some((adapter, dmabuf_device_matched)) => {
-                let info = adapter.get_info();
-                let dmabuf_import = probe_dmabuf_import(&adapter);
-                tracing::info!(
-                    name = %info.name,
-                    backend = ?info.backend,
-                    device_type = ?info.device_type,
-                    dmabuf_import,
-                    dmabuf_device_matched,
-                    "gpu_paint: probe found Vulkan adapter"
-                );
-                Capabilities {
-                    gpu_available: true,
-                    dmabuf_import,
-                    dmabuf_device_matched,
-                }
-            }
-            None => {
-                tracing::info!("gpu_paint: probe found no Vulkan adapter");
-                Capabilities::NONE
+        pick_adapter(&instance, producer)?;
+        drop(instance);
+
+        match Self::open(producer) {
+            Ok(surfaces) => Some(surfaces),
+            Err(e) => {
+                tracing::info!("gpu_paint: device init failed: {e}");
+                None
             }
         }
     }
 
-    pub fn new(target: GpuTarget) -> Result<Arc<Self>, GpuPaintError> {
+    /// Whether *this device* can import CEF's shared buffers.
+    ///
+    /// The consumer half only. Whether CEF can *produce* them is a separate
+    /// question, answered by `jfn_linux_util::dmabuf_probe`; callers AND the
+    /// two to get the app-level answer CEF needs before any browser exists.
+    pub fn can_import_shared(&self) -> bool {
+        self.can_import_shared
+    }
+
+    fn open(producer: Option<(i64, i64)>) -> Result<Self, SurfaceLost> {
         let instance = build_instance();
-        let (adapter, dmabuf_device_matched) =
-            pick_adapter(&instance, target).ok_or(GpuPaintError::NoAdapter)?;
+        let (adapter, device_matched) = pick_adapter(&instance, producer).ok_or(Kind::NoAdapter)?;
         let info = adapter.get_info();
         let limits = adapter.limits();
 
-        let (want_dmabuf, extra_exts) = unsafe {
+        let (want_import, extra_exts) = unsafe {
             match adapter.as_hal::<vulkan::Api>() {
                 Some(hal) => {
                     let ash_instance = hal.shared_instance().raw_instance();
                     let phys = hal.raw_physical_device();
                     (
-                        dmabuf_import::import_supported(ash_instance, phys),
-                        dmabuf_import::extra_device_extensions(ash_instance, phys),
+                        shared_import::import_supported(ash_instance, phys),
+                        shared_import::extra_device_extensions(ash_instance, phys),
                     )
                 }
                 None => (false, Vec::new()),
@@ -104,9 +90,7 @@ impl GpuContext {
         };
 
         let open_device = unsafe {
-            let hal = adapter
-                .as_hal::<vulkan::Api>()
-                .ok_or(GpuPaintError::NoAdapter)?;
+            let hal = adapter.as_hal::<vulkan::Api>().ok_or(Kind::NoAdapter)?;
             hal.open_with_callback(
                 wgpu::Features::empty(),
                 &limits,
@@ -119,7 +103,7 @@ impl GpuContext {
                     }
                 })),
             )
-            .map_err(|_| GpuPaintError::NoAdapter)?
+            .map_err(|_| Kind::NoAdapter)?
         };
 
         let (device, queue) = unsafe {
@@ -145,74 +129,88 @@ impl GpuContext {
             tracing::error!("gpu_paint: wgpu error: {e}");
         }));
 
-        let dmabuf_import = want_dmabuf && dmabuf_import::required_extensions_enabled(&device);
+        // Importing needs both halves: this device's extensions must be live,
+        // and it must be the same device CEF allocates on — an import from a
+        // different GPU fails at bind time.
+        let can_import_shared =
+            want_import && shared_import::required_extensions_enabled(&device) && device_matched;
 
         tracing::info!(
             adapter = %info.name,
             backend = ?info.backend,
-            dmabuf_import,
-            dmabuf_device_matched,
+            can_import_shared,
             "gpu_paint: device created"
         );
 
-        Ok(Arc::new(Self {
+        Ok(Self {
             instance,
             adapter,
             device,
             queue,
             submit_gate: parking_lot::RwLock::new(()),
-            caps: Capabilities {
-                gpu_available: true,
-                dmabuf_import,
-                dmabuf_device_matched,
-            },
-        }))
+            can_import_shared,
+        })
     }
 
-    pub fn capabilities(&self) -> Capabilities {
-        self.caps
+    /// Bind a swapchain to one window. `size` seeds the swapchain extent; the
+    /// surface takes its frame kind from the first frame presented to it.
+    pub fn new_surface(
+        &self,
+        target: WindowTarget,
+        size: PhysicalSize,
+    ) -> Result<Surface<'_>, SurfaceLost> {
+        Surface::new(self, target, size)
     }
+}
+
+/// The DRM render node CEF produces its shared buffers on, as `(major, minor)`.
+///
+/// The probe needs the ozone platform name, so ask the installed backend which
+/// one we are on rather than guessing. On Wayland it gets a null EGL display
+/// and yields `None`, which is what the caller passed explicitly before.
+fn cef_render_node() -> Option<(i64, i64)> {
+    let ozone = match jfn_platform_abi::try_get().map(|p| p.display()) {
+        Some(jfn_platform_abi::DisplayBackend::Wayland) => c"wayland",
+        _ => c"x11",
+    };
+    unsafe { jfn_linux_util::dmabuf_probe::cef_render_node(ozone.as_ptr(), std::ptr::null_mut()) }
 }
 
 fn build_instance() -> wgpu::Instance {
     wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
+        backends: native_backends(),
         flags: wgpu::InstanceFlags::empty(),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     })
 }
 
-fn probe_dmabuf_import(adapter: &wgpu::Adapter) -> bool {
-    unsafe {
-        adapter
-            .as_hal::<vulkan::Api>()
-            .map(|hal| {
-                dmabuf_import::import_supported(
-                    hal.shared_instance().raw_instance(),
-                    hal.raw_physical_device(),
-                )
-            })
-            .unwrap_or(false)
-    }
+/// The one backend that can present on this platform. Kept to a single choice
+/// so the adapter we probe is always the adapter we open.
+const fn native_backends() -> wgpu::Backends {
+    wgpu::Backends::VULKAN
 }
 
-fn pick_adapter(instance: &wgpu::Instance, target: GpuTarget) -> Option<(wgpu::Adapter, bool)> {
-    let mut adapters: Vec<_> =
-        pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
-            .into_iter()
-            .filter(|a| {
-                !matches!(
-                    a.get_info().device_type,
-                    wgpu::DeviceType::Cpu | wgpu::DeviceType::Other
-                )
-            })
-            .collect();
+/// Pick an adapter, and report whether it is the one CEF produces on. A
+/// mismatch is not fatal — it only means shared import is unavailable.
+fn pick_adapter(
+    instance: &wgpu::Instance,
+    producer: Option<(i64, i64)>,
+) -> Option<(wgpu::Adapter, bool)> {
+    let mut adapters: Vec<_> = pollster::block_on(instance.enumerate_adapters(native_backends()))
+        .into_iter()
+        .filter(|a| {
+            !matches!(
+                a.get_info().device_type,
+                wgpu::DeviceType::Cpu | wgpu::DeviceType::Other
+            )
+        })
+        .collect();
 
     if adapters.is_empty() {
         return None;
     }
 
-    if let Some(want) = target.drm_render
+    if let Some(want) = producer
         && let Some(pos) = adapters
             .iter()
             .position(|a| adapter_render_node(a) == Some(want))
@@ -228,12 +226,14 @@ fn pick_adapter(instance: &wgpu::Instance, target: GpuTarget) -> Option<(wgpu::A
             wgpu::DeviceType::VirtualGpu => 1,
             _ => 0,
         })?;
-    Some((chosen, target.drm_render.is_none()))
+    // With no device to match against, the best adapter is as good as it gets
+    // and counts as matched; a device we asked for and missed does not.
+    Some((chosen, producer.is_none()))
 }
 
 fn adapter_render_node(adapter: &wgpu::Adapter) -> Option<(i64, i64)> {
     unsafe { adapter.as_hal::<vulkan::Api>() }.and_then(|hal| {
-        dmabuf_import::drm_render_node(
+        shared_import::drm_render_node(
             hal.shared_instance().raw_instance(),
             hal.raw_physical_device(),
         )

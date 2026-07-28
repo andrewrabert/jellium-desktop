@@ -102,12 +102,16 @@ pub(crate) fn init() -> bool {
     }
 
     if want_gpu_paint {
-        match jfn_gpu_paint::GpuContext::new(jfn_gpu_paint::GpuTarget::default()) {
-            Ok(ctx) => {
-                crate::wl_state::install_gpu_paint(ctx);
+        // Held for the process: each layer's surface borrows it, and it is
+        // never replaced.
+        static GPU: std::sync::OnceLock<jfn_gpu_paint::Surfaces> = std::sync::OnceLock::new();
+        match jfn_gpu_paint::Surfaces::init() {
+            Some(gpu) => {
+                let gpu = GPU.get_or_init(|| gpu);
+                crate::wl_state::install_gpu_paint(gpu);
             }
-            Err(e) => {
-                tracing::info!("paint: Vulkan init failed: {e}; using wl_shm");
+            None => {
+                tracing::info!("paint: no usable GPU device; using wl_shm");
                 resolved = Req::Shm;
             }
         }

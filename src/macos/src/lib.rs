@@ -7,7 +7,9 @@ use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::Ordering;
 
 use jfn_platform_abi::geometry::{Bounds, clamp_to_bounds};
-pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform, WindowDecorations};
+pub use jfn_platform_abi::{
+    DisplayBackend, JfnPopupRequest, JfnRect, PaintFrame, Platform, WindowDecorations,
+};
 
 // =====================================================================
 // Backend no-op entry points.
@@ -277,19 +279,6 @@ pub fn macos_clamp_window_geometry(w: &mut c_int, h: &mut c_int, x: &mut c_int, 
         *x = nx;
         *y = ny;
     }
-}
-
-pub fn macos_surface_present_software(
-    _s: *mut c_void,
-    _dirty: *const JfnRect,
-    _dirty_len: usize,
-    _buffer: *const c_void,
-    _w: c_int,
-    _h: c_int,
-) -> bool {
-    // CEF on macOS runs hardware-accelerated (shared_texture_supported=
-    // true); the software path is not exercised. Kept for API completeness.
-    false
 }
 
 // macos_early_init / macos_init / macos_cleanup + jfn_macos_get_input_view
@@ -654,19 +643,14 @@ impl Platform for MacosPlatform {
         macos_free_surface(s.as_ptr());
     }
 
-    fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
-        macos_surface_present(s.as_ptr(), info)
-    }
-
-    fn surface_present_software(
-        &self,
-        s: SurfaceHandle,
-        dirty: &[JfnRect],
-        buffer: *const c_void,
-        w: c_int,
-        h: c_int,
-    ) -> bool {
-        macos_surface_present_software(s.as_ptr(), dirty.as_ptr(), dirty.len(), buffer, w, h)
+    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
+        match frame {
+            PaintFrame::Accelerated(tex) => macos_surface_present(s.as_ptr(), &tex),
+            // CEF on macOS runs hardware-accelerated
+            // (shared_texture_supported = true); the software path is never
+            // exercised.
+            PaintFrame::Software { .. } => false,
+        }
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {

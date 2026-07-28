@@ -1,6 +1,6 @@
-use std::ffi::{c_int, c_void};
+use std::ffi::c_int;
 
-use crate::{DisplayBackend, SurfaceHandle};
+use crate::{DisplayBackend, PaintFrame, SurfaceHandle};
 
 /// The mechanism a backend uses to present a `<select>` dropdown. Each platform
 /// maps its chosen style to a concrete [`DropdownBackend`]; this is the single
@@ -58,15 +58,7 @@ pub trait DropdownBackend: Send + Sync {
     }
     fn show(&self, _s: SurfaceHandle, _req: JfnPopupRequest) {}
     fn hide(&self, _s: SurfaceHandle) {}
-    fn present(&self, _s: SurfaceHandle, _info: *const c_void, _lw: c_int, _lh: c_int) {}
-    fn present_software(
-        &self,
-        _s: SurfaceHandle,
-        _buffer: *const c_void,
-        _pw: c_int,
-        _ph: c_int,
-        _lw: c_int,
-        _lh: c_int,
-    ) {
-    }
+    /// `lw`/`lh` are the parent layer's logical size; the frame carries its own
+    /// extent.
+    fn present(&self, _s: SurfaceHandle, _frame: PaintFrame<'_>, _lw: c_int, _lh: c_int) {}
 }

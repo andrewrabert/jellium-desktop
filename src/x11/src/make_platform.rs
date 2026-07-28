@@ -1,71 +1,16 @@
 //! X11 backend impl of [`jfn_platform_abi::Platform`].
 
 #![allow(non_snake_case)]
-// Platform trait carries raw-pointer args (dirty rects, accel-paint info)
-// from CEF; trait impls forward them unchanged to unsafe FFI fns.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_int, c_void};
-use std::os::fd::BorrowedFd;
-
-use jfn_gpu_paint::{DmabufFormat, DmabufFrame, DmabufPlane};
 
 use crate::registry::SurfaceId;
 use crate::surface;
 
-/// CEF reclaims the original fd when the paint callback returns, so each plane
-/// fd is dup'd into an `OwnedFd` the presenter worker can outlive.
-unsafe fn to_dmabuf_frame(info: *const c_void) -> Option<DmabufFrame> {
-    let info = info as *const cef::sys::_cef_accelerated_paint_info_t;
-    if info.is_null() {
-        return None;
-    }
-    let info = unsafe { &*info };
-    if info.plane_count < 1 {
-        return None;
-    }
-    let format = match info.format {
-        cef::sys::cef_color_type_t::CEF_COLOR_TYPE_BGRA_8888 => DmabufFormat::Bgra8,
-        cef::sys::cef_color_type_t::CEF_COLOR_TYPE_RGBA_8888 => DmabufFormat::Rgba8,
-        _ => return None,
-    };
-    let w = info.extra.coded_size.width;
-    let h = info.extra.coded_size.height;
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    let vw = info.extra.visible_rect.width.max(0);
-    let vh = info.extra.visible_rect.height.max(0);
-    // Include every memory plane the modifier uses; DCC/CCS modifiers add an
-    // auxiliary plane beyond the color plane.
-    let n = info.plane_count.clamp(0, info.planes.len() as i32) as usize;
-    if n < 1 {
-        return None;
-    }
-    let mut planes = Vec::with_capacity(n);
-    for p in &info.planes[..n] {
-        let fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(p.fd) }).ok()?;
-        planes.push(DmabufPlane {
-            fd,
-            offset: p.offset,
-            stride: p.stride,
-        });
-    }
-    Some(DmabufFrame {
-        width: w as u32,
-        height: h as u32,
-        visible_w: vw as u32,
-        visible_h: vh as u32,
-        format,
-        modifier: info.modifier,
-        planes,
-    })
-}
-
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    DisplayBackend, IdleInhibitLevel, JfnContextMenuRequest, JfnPopupRequest, JfnRect, Platform,
-    SurfaceHandle, SurfaceSize, WindowDecorations, WindowGeometry, WindowPos,
+    DisplayBackend, IdleInhibitLevel, JfnContextMenuRequest, JfnPopupRequest, JfnRect, PaintFrame,
+    Platform, SurfaceHandle, SurfaceSize, WindowDecorations, WindowGeometry, WindowPos,
 };
 
 pub struct X11Platform;
@@ -111,30 +56,15 @@ impl Platform for X11Platform {
         surface::free_surface(SurfaceId::from_handle(s));
     }
 
-    fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
-        let Some(frame) = (unsafe { to_dmabuf_frame(info) }) else {
-            return false;
-        };
-        surface::surface_present_dmabuf(SurfaceId::from_handle(s), frame)
-    }
-
-    fn surface_present_software(
-        &self,
-        s: SurfaceHandle,
-        dirty: &[JfnRect],
-        buffer: *const c_void,
-        w: c_int,
-        h: c_int,
-    ) -> bool {
-        unsafe {
-            surface::surface_present_software(
-                SurfaceId::from_handle(s),
-                dirty.as_ptr(),
-                dirty.len(),
-                buffer,
-                w,
-                h,
-            )
+    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
+        let id = SurfaceId::from_handle(s);
+        match frame {
+            PaintFrame::Accelerated(tex) => surface::surface_present_shared(id, tex),
+            PaintFrame::Software {
+                size,
+                pixels,
+                dirty,
+            } => surface::surface_present_software(id, dirty, pixels, size.w, size.h),
         }
     }
 
@@ -280,7 +210,7 @@ impl Platform for X11Platform {
     }
 
     fn shared_texture_supported(&self) -> bool {
-        crate::x11_state::paint().is_some_and(|p| p.use_dmabuf)
+        crate::paint::resolved().is_some_and(|t| t.use_dmabuf)
     }
 
     fn clipboard_text_supported(&self) -> bool {

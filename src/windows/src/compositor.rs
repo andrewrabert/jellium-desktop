@@ -34,7 +34,7 @@ use windows_core::Interface;
 
 use jfn_compositor_core::stack::SurfaceStack;
 use jfn_compositor_core::transition::{PresentDecision, TransitionGate};
-use jfn_platform_abi::JfnRect;
+use jfn_platform_abi::SharedTexture;
 
 // =====================================================================
 // Per-surface state. Stored as `Box<Surface>` and exposed across the C
@@ -482,12 +482,11 @@ pub fn win_restack(ordered: *const *mut c_void, n: usize) {
 // Per-frame presentation.
 // =====================================================================
 
-pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
-    if s.is_null() || raw_info.is_null() {
+pub fn win_surface_present(s: *mut c_void, tex: &SharedTexture) -> bool {
+    if s.is_null() {
         return false;
     }
-    let info = unsafe { &*(raw_info as *const cef::sys::_cef_accelerated_paint_info_t) };
-    let handle = info.shared_texture_handle;
+    let handle = tex.handle();
     if handle.is_null() {
         return false;
     }
@@ -562,19 +561,6 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
     };
     present_to_swap_chain(devices, &sc, &src);
     true
-}
-
-/// Software fallback: Windows is shared-textures-only in practice.
-/// No-op to match prior overlay/about behavior.
-pub fn win_surface_present_software(
-    _s: *mut c_void,
-    _dirty: *const JfnRect,
-    _dirty_len: usize,
-    _buffer: *const c_void,
-    _w: c_int,
-    _h: c_int,
-) -> bool {
-    false
 }
 
 pub fn win_surface_resize(s: *mut c_void, _lw: c_int, _lh: c_int, pw: c_int, ph: c_int) {
@@ -779,12 +765,11 @@ pub fn win_popup_hide(s: *mut c_void) {
     }
 }
 
-pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _lh: c_int) {
-    if s.is_null() || raw_info.is_null() {
+pub fn win_popup_present(s: *mut c_void, tex: &SharedTexture, _lw: c_int, _lh: c_int) {
+    if s.is_null() {
         return;
     }
-    let info = unsafe { &*(raw_info as *const cef::sys::_cef_accelerated_paint_info_t) };
-    let handle = info.shared_texture_handle;
+    let handle = tex.handle();
     if handle.is_null() {
         return;
     }
@@ -835,13 +820,13 @@ pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _l
 
 pub fn win_popup_present_software(
     s: *mut c_void,
-    buffer: *const c_void,
+    pixels: &[u8],
     pw: c_int,
     ph: c_int,
     _lw: c_int,
     _lh: c_int,
 ) {
-    if s.is_null() || buffer.is_null() || pw <= 0 || ph <= 0 {
+    if s.is_null() || pixels.is_empty() || pw <= 0 || ph <= 0 {
         return;
     }
     let st = STATE.lock();
@@ -873,7 +858,7 @@ pub fn win_popup_present_software(
         ..Default::default()
     };
     let init = D3D11_SUBRESOURCE_DATA {
-        pSysMem: buffer,
+        pSysMem: pixels.as_ptr().cast::<c_void>(),
         SysMemPitch: pw as u32 * 4,
         SysMemSlicePitch: 0,
     };

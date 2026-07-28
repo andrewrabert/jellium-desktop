@@ -7,8 +7,15 @@ use ash::vk::Handle;
 use ash::{ext, khr, vk};
 use wgpu_hal::vulkan;
 
-use crate::error::GpuPaintError;
-use crate::types::{DmabufFormat, DmabufFrame};
+/// A shared-texture import that did not work.
+///
+/// Deliberately not a [`crate::SurfaceLost`]: a shared frame has no CPU pixels,
+/// so there is nothing to fall back to. The frame is logged and dropped and the
+/// surface stays usable, which is why this never reaches a caller.
+#[derive(Debug, thiserror::Error)]
+#[error("shared-texture import failed: {0}")]
+pub(crate) struct ImportFailed(pub(crate) &'static str);
+use jfn_platform_abi::{DmabufFormat, SharedTexture};
 
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
@@ -163,33 +170,34 @@ unsafe fn format_importable(
 /// sampling.
 ///
 /// # Safety
-/// - `frame.planes[0].fd` must be a valid dmabuf fd describing a
-///   `frame.width x frame.height` image in `frame.format`/`frame.modifier`.
+/// - `frame.planes()[0].fd` must be a valid dmabuf fd describing a
+///   image of the frame's coded size in `frame.format()`/`frame.modifier()`.
 pub(crate) unsafe fn import(
     device: &wgpu::Device,
-    frame: &DmabufFrame,
-) -> Result<(wgpu::Texture, u64), GpuPaintError> {
-    if frame.planes.is_empty() {
-        return Err(GpuPaintError::DmabufImport("no planes"));
+    frame: &SharedTexture,
+) -> Result<(wgpu::Texture, u64), ImportFailed> {
+    let coded = (frame.coded().w.max(0) as u32, frame.coded().h.max(0) as u32);
+    if frame.planes().is_empty() {
+        return Err(ImportFailed("no planes"));
     }
 
     let (hal_texture, image) = {
-        let hal_device = unsafe { device.as_hal::<vulkan::Api>() }
-            .ok_or(GpuPaintError::DmabufImport("not a Vulkan device"))?;
+        let hal_device =
+            unsafe { device.as_hal::<vulkan::Api>() }.ok_or(ImportFailed("not a Vulkan device"))?;
         unsafe { import_hal_texture(&hal_device, frame) }?
     };
 
     let desc = wgpu::TextureDescriptor {
         label: Some("jfn_gpu_paint dmabuf"),
         size: wgpu::Extent3d {
-            width: frame.width,
-            height: frame.height,
+            width: coded.0,
+            height: coded.1,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu_format(frame.format),
+        format: wgpu_format(frame.format()),
         usage: wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     };
@@ -249,9 +257,10 @@ pub(crate) fn acquire_barrier(
 
 unsafe fn import_hal_texture(
     hal_device: &vulkan::Device,
-    frame: &DmabufFrame,
-) -> Result<(vulkan::Texture, vk::Image), GpuPaintError> {
-    let plane = &frame.planes[0];
+    frame: &SharedTexture,
+) -> Result<(vulkan::Texture, vk::Image), ImportFailed> {
+    let coded = (frame.coded().w.max(0) as u32, frame.coded().h.max(0) as u32);
+    let plane = &frame.planes()[0];
     let ash_device = hal_device.raw_device();
     let instance = hal_device.shared_instance().raw_instance();
 
@@ -259,9 +268,9 @@ unsafe fn import_hal_texture(
     // tiling to describe, so import with OPTIMAL tiling and let the (same)
     // driver interpret its own layout; only an explicit modifier may use
     // the DRM-modifier path.
-    let explicit = frame.modifier != DRM_FORMAT_MOD_INVALID;
+    let explicit = frame.modifier() != DRM_FORMAT_MOD_INVALID;
     let plane_layouts: Vec<vk::SubresourceLayout> = frame
-        .planes
+        .planes()
         .iter()
         .map(|p| vk::SubresourceLayout {
             offset: p.offset,
@@ -272,16 +281,16 @@ unsafe fn import_hal_texture(
         })
         .collect();
     let mut drm_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-        .drm_format_modifier(frame.modifier)
+        .drm_format_modifier(frame.modifier())
         .plane_layouts(&plane_layouts);
     let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
     let mut image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk_format(frame.format))
+        .format(vk_format(frame.format()))
         .extent(vk::Extent3D {
-            width: frame.width,
-            height: frame.height,
+            width: coded.0,
+            height: coded.1,
             depth: 1,
         })
         .mip_levels(1)
@@ -302,20 +311,20 @@ unsafe fn import_hal_texture(
     let image = unsafe { ash_device.create_image(&image_info, None) }.map_err(|e| {
         tracing::warn!(
             "dmabuf vkCreateImage failed: modifier={:#018x} planes={} layouts=[{}] format={:?} size={}x{} result={:?}",
-            frame.modifier,
-            frame.planes.len(),
+            frame.modifier(),
+            frame.planes().len(),
             frame
-                .planes
+                .planes()
                 .iter()
                 .map(|p| format!("off={} stride={}", p.offset, p.stride))
                 .collect::<Vec<_>>()
                 .join(", "),
-            frame.format,
-            frame.width,
-            frame.height,
+            frame.format(),
+            coded.0,
+            coded.1,
             e
         );
-        GpuPaintError::DmabufImport("vkCreateImage")
+        ImportFailed("vkCreateImage")
     })?;
 
     let memory = match unsafe { import_memory(ash_device, instance, image, plane.fd.as_raw_fd()) } {
@@ -331,20 +340,20 @@ unsafe fn import_hal_texture(
             ash_device.free_memory(memory, None);
             ash_device.destroy_image(image, None);
         }
-        return Err(GpuPaintError::DmabufImport("vkBindImageMemory"));
+        return Err(ImportFailed("vkBindImageMemory"));
     }
 
     let desc = wgpu_hal::TextureDescriptor {
         label: Some("jfn_gpu_paint dmabuf"),
         size: wgpu::Extent3d {
-            width: frame.width,
-            height: frame.height,
+            width: coded.0,
+            height: coded.1,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu_format(frame.format),
+        format: wgpu_format(frame.format()),
         usage: wgpu::TextureUses::RESOURCE,
         memory_flags: wgpu_hal::MemoryFlags::empty(),
         view_formats: vec![],
@@ -363,7 +372,7 @@ unsafe fn import_memory(
     instance: &ash::Instance,
     image: vk::Image,
     fd: i32,
-) -> Result<vk::DeviceMemory, GpuPaintError> {
+) -> Result<vk::DeviceMemory, ImportFailed> {
     let mut dedicated_req = vk::MemoryDedicatedRequirements::default();
     let mut req2 = vk::MemoryRequirements2::default().push_next(&mut dedicated_req);
     let req_info = vk::ImageMemoryRequirementsInfo2::default().image(image);
@@ -379,17 +388,17 @@ unsafe fn import_memory(
             &mut fd_props,
         )
     }
-    .map_err(|_| GpuPaintError::DmabufImport("vkGetMemoryFdProperties"))?;
+    .map_err(|_| ImportFailed("vkGetMemoryFdProperties"))?;
 
     let type_bits = req2.memory_requirements.memory_type_bits & fd_props.memory_type_bits;
     if type_bits == 0 {
-        return Err(GpuPaintError::DmabufImport("no compatible memory type"));
+        return Err(ImportFailed("no compatible memory type"));
     }
     let mem_type_index = type_bits.trailing_zeros();
 
     // Vulkan takes ownership of the fd on a successful allocate; hand it a dup.
     let import_fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) })
-        .map_err(|_| GpuPaintError::DmabufImport("dup fd"))?;
+        .map_err(|_| ImportFailed("dup fd"))?;
     let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
     let mut import_info = vk::ImportMemoryFdInfoKHR::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
@@ -406,6 +415,6 @@ unsafe fn import_memory(
             Ok(memory)
         }
         // fd not consumed on failure — dropping the dup closes it.
-        Err(_) => Err(GpuPaintError::DmabufImport("vkAllocateMemory")),
+        Err(_) => Err(ImportFailed("vkAllocateMemory")),
     }
 }

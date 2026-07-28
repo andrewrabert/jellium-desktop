@@ -437,16 +437,10 @@ pub fn init() -> bool {
         return false;
     }
 
-    // Drain the paint tier resolved before the proxy repointed DISPLAY (see
-    // `crate::paint`) into the process-lifetime paint services.
-    let tier = crate::paint::resolved();
     if !set_paint_services(PaintServices {
         argb_visual,
         argb_depth,
         colormap,
-        gpu_ctx: tier.gpu_ctx,
-        gpu_caps: tier.gpu_caps,
-        use_dmabuf: tier.use_dmabuf,
     }) {
         eprintln!("[x11] paint services already initialized");
         return false;

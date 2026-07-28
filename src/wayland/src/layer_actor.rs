@@ -8,11 +8,11 @@ use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
-use jfn_gpu_paint::{DirtyRect, GpuContext, GpuPainter, PixelFrame, PresentOutcome};
-use jfn_platform_abi::JfnRect;
+use jfn_gpu_paint::{Frame, Pixels, Presented, Surfaces};
+use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
 
 use crate::layer::{FrameCommit, LayerSurface, Present, PresentError, ViewportState};
-use crate::wl_ops::JfnDmabufFrame;
+use crate::wl_ops::dmabuf_pool_key;
 use crate::wl_state::{
     DispatchState, DmabufBuf, OwnedBuffer, buffer_is_idle, build_argb8888_shm_buffer,
     build_shm_buffer_from_pixels, create_dmabuf_buffer, retire_buffer,
@@ -21,7 +21,7 @@ use crate::wl_state::{
 const DMABUF_POOL_CAP: usize = 16;
 
 pub(crate) enum LayerBackend {
-    Gpu(Arc<GpuContext>),
+    Gpu(&'static Surfaces),
     Shm,
 }
 
@@ -41,7 +41,7 @@ struct ShmRect {
 
 struct GpuPayload {
     pixels: Vec<u8>,
-    dirty: Vec<DirtyRect>,
+    dirty: Vec<JfnRect>,
     width: u32,
     height: u32,
     stride: u32,
@@ -57,7 +57,7 @@ struct ShmPayload {
 enum PendingFrame {
     Gpu(GpuPayload),
     Shm(ShmPayload),
-    Dmabuf(JfnDmabufFrame),
+    Dmabuf(SharedTexture),
     Placeholder(u8, u8, u8),
 }
 
@@ -127,7 +127,7 @@ impl Mailbox {
         self.shadow = ShadowState::Stale;
     }
 
-    fn present_dmabuf(&mut self, frame: JfnDmabufFrame) {
+    fn present_dmabuf(&mut self, frame: SharedTexture) {
         self.pending = Some(PendingFrame::Dmabuf(frame));
         self.shadow = ShadowState::Stale;
     }
@@ -286,8 +286,8 @@ impl LayerActor {
         }
     }
 
-    pub(crate) fn present_dmabuf(&self, frame: JfnDmabufFrame) -> Result<Present, PresentError> {
-        validate_present_dims(frame.coded_w, frame.coded_h)?;
+    pub(crate) fn present_dmabuf(&self, frame: SharedTexture) -> Result<Present, PresentError> {
+        validate_present_dims(frame.coded().w, frame.coded().h)?;
         self.with_state(|s| s.present_dmabuf(frame));
         Ok(Present::Committed)
     }
@@ -325,15 +325,7 @@ impl LayerActor {
         stride: usize,
         dirty: &[JfnRect],
     ) -> Result<Present, PresentError> {
-        let dirty = dirty
-            .iter()
-            .map(|r| DirtyRect {
-                x: r.x,
-                y: r.y,
-                w: r.w,
-                h: r.h,
-            })
-            .collect();
+        let dirty = dirty.to_vec();
         self.with_state(|s| {
             s.enqueue_gpu(GpuPayload {
                 pixels: pixels[..len].to_vec(),
@@ -481,21 +473,29 @@ struct ShmShadow {
 }
 
 enum Backend {
-    Gpu { painter: Option<Box<GpuPainter>> },
-    Shm { shadow: ShmShadow },
+    Gpu {
+        painter: Option<Box<jfn_gpu_paint::Surface<'static>>>,
+    },
+    Shm {
+        shadow: ShmShadow,
+    },
 }
 
 fn hide_detaches(backend: &Backend) -> bool {
     matches!(backend, Backend::Shm { .. })
 }
 
-/// Only a GPU failure degrades: dmabuf has no CPU fallback, so latching it to
-/// shm would strand the surface with no output.
+/// Only a GPU failure degrades. An `Err` from the compositor means the surface
+/// is done — anything it could absorb came back as a skip, including a failed
+/// shared import, which has no CPU fallback to degrade to.
 fn is_degrading_error(err: &PresentError) -> bool {
     matches!(err, PresentError::Gpu(_))
 }
 
-fn degrade(backend: &mut Backend, gpu_failed: &AtomicBool) -> Option<Box<GpuPainter>> {
+fn degrade(
+    backend: &mut Backend,
+    gpu_failed: &AtomicBool,
+) -> Option<Box<jfn_gpu_paint::Surface<'static>>> {
     let old = match backend {
         Backend::Gpu { painter } => painter.take(),
         Backend::Shm { .. } => None,
@@ -512,7 +512,7 @@ struct Runner {
     shm: WlShm,
     dmabuf: Option<ZwpLinuxDmabufV1>,
     backend: Backend,
-    gpu_ctx: Option<Arc<GpuContext>>,
+    gpu: Option<&'static Surfaces>,
     gpu_failed: Arc<AtomicBool>,
     /// Gates present-failure logging to the first failure of a failing streak.
     present_failing: bool,
@@ -531,8 +531,8 @@ fn run(
     shared: Arc<(Mutex<Mailbox>, Condvar)>,
     gpu_failed: Arc<AtomicBool>,
 ) {
-    let (backend, gpu_ctx) = match backend {
-        LayerBackend::Gpu(ctx) => (Backend::Gpu { painter: None }, Some(ctx)),
+    let (backend, gpu) = match backend {
+        LayerBackend::Gpu(gpu) => (Backend::Gpu { painter: None }, Some(gpu)),
         LayerBackend::Shm => (
             Backend::Shm {
                 shadow: ShmShadow::default(),
@@ -545,7 +545,7 @@ fn run(
         shm,
         dmabuf,
         backend,
-        gpu_ctx,
+        gpu,
         gpu_failed,
         present_failing: false,
         dmabuf_pool: Vec::new(),
@@ -723,7 +723,7 @@ impl Runner {
         if degraded {
             let old = degrade(&mut self.backend, &self.gpu_failed);
             if let Some(painter) = old {
-                painter.shutdown();
+                drop(painter);
             }
         }
         if !self.present_failing {
@@ -775,24 +775,37 @@ impl Runner {
         vps: ViewportState,
         p: &GpuPayload,
     ) -> Result<Present, PresentError> {
-        let (Backend::Gpu { painter }, Some(ctx)) = (&mut self.backend, &self.gpu_ctx) else {
+        let (Backend::Gpu { painter }, Some(gpu)) = (&mut self.backend, self.gpu) else {
             return Ok(Present::Skipped);
         };
         if painter.is_none() {
             let Some(target) = layer.window_target() else {
                 return Ok(Present::Skipped);
             };
-            let new = GpuPainter::new(ctx.clone(), target, (p.width, p.height))?;
+            // This path only ever carries CPU pixels; Wayland's shared frames
+            // are a `wl_buffer` dmabuf attach and never reach wgpu.
+            let new = gpu.new_surface(
+                target,
+                PhysicalSize {
+                    w: p.width as i32,
+                    h: p.height as i32,
+                },
+            )?;
             *painter = Some(Box::new(new));
         }
         let Some(painter) = painter.as_mut() else {
             return Ok(Present::Skipped);
         };
         painter.set_visible(true);
-        painter.resize((vps.pw.max(1) as u32, vps.ph.max(1) as u32));
-        let pixel_frame = PixelFrame {
-            width: p.width,
-            height: p.height,
+        painter.resize(PhysicalSize {
+            w: vps.pw.max(1),
+            h: vps.ph.max(1),
+        });
+        let pixel_frame = Pixels {
+            size: PhysicalSize {
+                w: p.width as i32,
+                h: p.height as i32,
+            },
             stride: p.stride,
             bgra: &p.pixels,
             dirty: &p.dirty,
@@ -804,11 +817,11 @@ impl Runner {
         let src_h = (p.height as i32).min(vps.ph);
         // Map the painter's own present/skip to this layer's — a GPU skip must
         // not be reported as committed, or the frame is lost from the mailbox.
-        match painter.push_pixels(pixel_frame, || {
-            layer.set_viewport(src_w, src_h, vps.lw, vps.lh)
+        match painter.present(Frame::Copied(pixel_frame), || {
+            layer.set_viewport(src_w, src_h, vps.lw, vps.lh);
         })? {
-            PresentOutcome::Presented => Ok(Present::Committed),
-            PresentOutcome::Skipped => Ok(Present::Skipped),
+            Presented::Yes => Ok(Present::Committed),
+            Presented::Skipped => Ok(Present::Skipped),
         }
     }
 
@@ -850,22 +863,13 @@ impl Runner {
         &mut self,
         layer: &LayerSurface,
         vps: ViewportState,
-        frame: &JfnDmabufFrame,
+        frame: &SharedTexture,
     ) -> Result<Present, PresentError> {
-        let vw = if frame.visible_w > 0 {
-            frame.visible_w
-        } else {
-            frame.coded_w
-        };
-        let vh = if frame.visible_h > 0 {
-            frame.visible_h
-        } else {
-            frame.coded_h
-        };
+        let (vw, vh) = (frame.visible().w, frame.visible().h);
         let Some(pos) = self.lease_dmabuf(frame) else {
             return Err(PresentError::DmabufCreate);
         };
-        let (cw, ch) = (frame.coded_w, frame.coded_h);
+        let (cw, ch) = (frame.coded().w, frame.coded().h);
         match pos {
             DmabufLease::Pooled => {
                 layer.present(FrameCommit::new(
@@ -887,27 +891,28 @@ impl Runner {
         Ok(Present::Committed)
     }
 
-    fn lease_dmabuf(&mut self, frame: &JfnDmabufFrame) -> Option<DmabufLease> {
+    fn lease_dmabuf(&mut self, frame: &SharedTexture) -> Option<DmabufLease> {
         let dmabuf = self.dmabuf.as_ref()?;
-        let Some(id) = frame.id else {
+        let plane = frame.planes().first()?;
+        let Some(id) = dmabuf_pool_key(frame) else {
             let buf = create_dmabuf_buffer(
                 dmabuf,
                 &self.qh,
-                frame.fd.as_fd(),
-                frame.stride,
-                frame.modifier,
-                frame.coded_w,
-                frame.coded_h,
+                plane.fd.as_fd(),
+                plane.stride,
+                frame.modifier(),
+                frame.coded().w,
+                frame.coded().h,
             )?;
             return Some(DmabufLease::OneShot(buf));
         };
 
         let hit = self.dmabuf_pool.iter().position(|e| {
             e.id == id
-                && e.w == frame.coded_w
-                && e.h == frame.coded_h
-                && e.stride == frame.stride
-                && e.modifier == frame.modifier
+                && e.w == frame.coded().w
+                && e.h == frame.coded().h
+                && e.stride == plane.stride
+                && e.modifier == frame.modifier()
         });
         if let Some(pos) = hit {
             if buffer_is_idle(&self.dmabuf_pool[pos].buf) {
@@ -924,20 +929,20 @@ impl Runner {
         let buf = create_dmabuf_buffer(
             dmabuf,
             &self.qh,
-            frame.fd.as_fd(),
-            frame.stride,
-            frame.modifier,
-            frame.coded_w,
-            frame.coded_h,
+            plane.fd.as_fd(),
+            plane.stride,
+            frame.modifier(),
+            frame.coded().w,
+            frame.coded().h,
         )?;
         self.dmabuf_pool.insert(
             0,
             DmabufBuf {
                 id,
-                w: frame.coded_w,
-                h: frame.coded_h,
-                stride: frame.stride,
-                modifier: frame.modifier,
+                w: frame.coded().w,
+                h: frame.coded().h,
+                stride: plane.stride,
+                modifier: frame.modifier(),
                 buf,
             },
         );
@@ -958,7 +963,7 @@ impl Runner {
             painter: Some(painter),
         } = self.backend
         {
-            painter.shutdown();
+            drop(painter);
         }
     }
 }
@@ -1272,18 +1277,25 @@ mod tests {
         assert!(mb.needs_full_copy(100, 100));
     }
 
-    fn dmabuf_frame(coded_w: i32, coded_h: i32) -> JfnDmabufFrame {
-        let fd = std::fs::File::open("/dev/null").unwrap().into();
-        JfnDmabufFrame {
-            fd,
-            id: None,
-            stride: 0,
-            modifier: 0,
-            coded_w,
-            coded_h,
-            visible_w: coded_w,
-            visible_h: coded_h,
-        }
+    fn dmabuf_frame(coded_w: i32, coded_h: i32) -> SharedTexture {
+        let fd = std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into();
+        let size = PhysicalSize {
+            w: coded_w,
+            h: coded_h,
+        };
+        SharedTexture::new(
+            size,
+            size,
+            jfn_platform_abi::DmabufFormat::Bgra8,
+            0,
+            vec![jfn_platform_abi::DmabufPlane {
+                fd,
+                offset: 0,
+                stride: 0,
+            }],
+        )
     }
 
     fn valid_shadow() -> ShadowState {
@@ -1348,11 +1360,9 @@ mod tests {
 
     #[test]
     fn gpu_error_degrades_backend() {
-        assert!(is_degrading_error(&PresentError::Gpu(
-            jfn_gpu_paint::GpuPaintError::SurfaceUnsupported
-        )));
         assert!(!is_degrading_error(&PresentError::ShmAlloc));
         assert!(!is_degrading_error(&PresentError::DmabufCreate));
+        assert!(!is_degrading_error(&PresentError::BadDimensions(0, 0)));
 
         let mut backend = Backend::Gpu { painter: None };
         let flag = AtomicBool::new(false);

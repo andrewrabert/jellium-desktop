@@ -21,9 +21,9 @@ use nix::sys::memfd::MFdFlags;
 use parking_lot::{Mutex, MutexGuard};
 use std::ffi::c_void;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use jfn_gpu_paint::GpuContext;
+use jfn_gpu_paint::Surfaces;
 
 use crate::layer::SurfaceRef;
 use crate::layer_actor::LayerActor;
@@ -203,7 +203,7 @@ pub(crate) struct WlState {
 
     pub was_fullscreen: bool,
 
-    pub gpu_ctx: Option<Arc<GpuContext>>,
+    pub gpu: Option<&'static Surfaces>,
     /// When true, `surface_present_software` routes through each
     /// surface's GPU paint worker (Vulkan WSI) instead of `wl_shm`.
     /// `set_visible` and `resize` also skip their
@@ -427,7 +427,7 @@ pub(crate) unsafe fn init(display_ptr: *mut c_void) -> Result<(), String> {
         root_surface: None,
         stack: Vec::new(),
         was_fullscreen: false,
-        gpu_ctx: None,
+        gpu: None,
         use_gpu_paint: false,
         scene: crate::scene::Scene::default(),
         menu_io: crate::popup::MenuIo::default(),
@@ -521,9 +521,12 @@ impl WlState {
     }
 }
 
-pub fn install_gpu_paint(ctx: Arc<GpuContext>) {
+/// Adopt the process's GPU device for the copied-frame path. `'static` because
+/// the device is opened once at init and never replaced, which is what lets
+/// each layer's surface borrow it for its whole life.
+pub fn install_gpu_paint(gpu: &'static Surfaces) {
     let mut st = lock();
-    st.gpu_ctx = Some(ctx);
+    st.gpu = Some(gpu);
     st.use_gpu_paint = true;
 }
 

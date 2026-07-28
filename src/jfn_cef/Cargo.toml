@@ -23,6 +23,10 @@ jfn-playback = { path = "../playback" }
 serde_json.workspace = true
 slotmap.workspace = true
 
+# Dup'ing CEF's dmabuf plane fds at the accelerated-paint boundary.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
+
 
 [build-dependencies]
 gix = { workspace = true }

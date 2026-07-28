@@ -5,8 +5,8 @@
 //! before returning so commits land in compositor order matching the
 //! C++ original.
 
-use jfn_platform_abi::JfnRect;
-use std::os::fd::{AsFd, OwnedFd};
+use jfn_platform_abi::{JfnRect, SharedTexture};
+use std::os::fd::AsFd;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
@@ -248,18 +248,14 @@ fn popup_destroy_locked(s: &mut PlatformSurface) {
 // Present (dmabuf / software)
 // =====================================================================
 
-/// Frame info the caller unpacks from CefAcceleratedPaintInfo. Owns its
-/// dup'd dmabuf fd so it's closed on drop after the buffer is built —
-/// the compositor dups its own copy over the wire in `create_params.add`.
-pub struct JfnDmabufFrame {
-    pub fd: OwnedFd,
-    pub id: Option<(u64, u64)>,
-    pub stride: u32,
-    pub modifier: u64,
-    pub coded_w: i32,
-    pub coded_h: i32,
-    pub visible_w: i32,
-    pub visible_h: i32,
+/// Identity of the dmabuf behind a frame, for the buffer pool: CEF recycles a
+/// small set of buffers, so the same `(dev, ino)` means the same `wl_buffer`
+/// can be reattached instead of rebuilt. `None` disables pooling for the frame.
+pub(crate) fn dmabuf_pool_key(frame: &SharedTexture) -> Option<(u64, u64)> {
+    let plane = frame.planes().first()?;
+    nix::sys::stat::fstat(&plane.fd)
+        .ok()
+        .map(|st| (st.st_dev, st.st_ino))
 }
 
 fn build_actor(
@@ -268,7 +264,7 @@ fn build_actor(
     viewport: &Option<WpViewport>,
     visible: bool,
 ) -> LayerActor {
-    let backend = match (st.use_gpu_paint, st.gpu_ctx.clone()) {
+    let backend = match (st.use_gpu_paint, st.gpu) {
         (true, Some(ctx)) => LayerBackend::Gpu(ctx),
         _ => LayerBackend::Shm,
     };
@@ -298,13 +294,13 @@ fn extent_or(w: i32, h: i32) -> (i32, i32, i32, i32) {
 
 pub(crate) fn surface_present(
     ptr: *mut PlatformSurface,
-    frame: JfnDmabufFrame,
+    frame: SharedTexture,
 ) -> Result<Present, PresentError> {
     if ptr.is_null() {
         return Ok(Present::Skipped);
     }
-    let (w, h) = (frame.coded_w, frame.coded_h);
-    let (vw, vh) = (frame.visible_w, frame.visible_h);
+    let (w, h) = (frame.coded().w, frame.coded().h);
+    let (vw, vh) = (frame.visible_rect().w, frame.visible_rect().h);
 
     let st = lock();
     let s = unsafe { surface_mut(ptr) };
@@ -354,7 +350,7 @@ pub(crate) fn surface_present_software(
     actor.present_software(pixels, w, h, dirty)
 }
 
-pub(crate) fn popup_present(ptr: *mut PlatformSurface, frame: &JfnDmabufFrame, lw: i32, lh: i32) {
+pub(crate) fn popup_present(ptr: *mut PlatformSurface, frame: &SharedTexture, lw: i32, lh: i32) {
     if ptr.is_null() || lw <= 0 || lh <= 0 {
         return;
     }
@@ -363,17 +359,11 @@ pub(crate) fn popup_present(ptr: *mut PlatformSurface, frame: &JfnDmabufFrame, l
     if s.popup_surface.is_none() || !s.popup_visible {
         return;
     }
-    let w = frame.coded_w;
-    let h = frame.coded_h;
-    let vw = if frame.visible_w > 0 {
-        frame.visible_w
-    } else {
-        w
-    };
-    let vh = if frame.visible_h > 0 {
-        frame.visible_h
-    } else {
-        h
+    let w = frame.coded().w;
+    let h = frame.coded().h;
+    let (vw, vh) = (frame.visible().w, frame.visible().h);
+    let Some(plane) = frame.planes().first() else {
+        return;
     };
     let Some(dmabuf) = st.dmabuf.as_ref() else {
         return;
@@ -381,9 +371,9 @@ pub(crate) fn popup_present(ptr: *mut PlatformSurface, frame: &JfnDmabufFrame, l
     let Some(buf) = create_dmabuf_buffer(
         dmabuf,
         &st.qh,
-        frame.fd.as_fd(),
-        frame.stride,
-        frame.modifier,
+        plane.fd.as_fd(),
+        plane.stride,
+        frame.modifier(),
         w,
         h,
     ) else {

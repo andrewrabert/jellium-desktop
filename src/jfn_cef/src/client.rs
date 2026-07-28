@@ -24,6 +24,7 @@ use crate::sink_routing::Handle;
 
 use crate::paint_scheduler::{PaintMode, PaintScheduler};
 
+mod accel;
 mod browser_ops;
 mod callbacks;
 mod events;

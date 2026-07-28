@@ -1,12 +1,17 @@
 use std::ffi::c_void;
-use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
 
-/// Where the painter should attach its swapchain. Caller passes raw
-/// platform handles; the painter wraps them in raw-window-handle types.
+use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
+
+/// Where a [`crate::Surface`] attaches its swapchain. One variant per window
+/// system; new platforms are added here rather than by reshaping the API.
+///
+/// The variant also fixes the size policy — see [`crate::painter::SizePolicy`]
+/// — because whether the swapchain *is* the window is a property of the target,
+/// not a caller preference.
 pub enum WindowTarget {
-    /// X11 (xcb) — `connection` is an `xcb_connection_t*`, `window` is the
-    /// XID. `visual` is the ARGB visual ID. `screen` is the screen index.
+    /// X11 (xcb) — `connection` is an `xcb_connection_t*`, `window` is the XID.
+    /// `visual` is the ARGB visual ID. `screen` is the screen index.
     Xcb {
         connection: NonNull<c_void>,
         window: u32,
@@ -23,50 +28,48 @@ pub enum WindowTarget {
     },
 }
 
-// Both variants only carry pointers the caller already keeps alive for
-// the lifetime of the painter; the painter never derefs without the
-// caller's coordination.
-unsafe impl Send for WindowTarget {}
-
-#[derive(Copy, Clone, Debug)]
-pub struct DirtyRect {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
+/// Which kind of frame a surface carries. Latched from the first frame and
+/// never public: callers say what a frame *is* by picking a [`Frame`] variant,
+/// which is the same information.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum PaintMode {
+    /// Frames arrive as a platform shared-buffer handle.
+    Shared,
+    /// Frames arrive as CPU pixels, uploaded here.
+    Copied,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum DmabufFormat {
-    Bgra8,
-    Rgba8,
+/// Whether a frame reached the screen. A `Skipped` is a deliberate no-op — the
+/// surface was hidden, or the swapchain was transiently unavailable — not a
+/// failure, and never an `Err`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Presented {
+    Yes,
+    Skipped,
 }
 
-/// One plane of a dmabuf. Owns its fd, closed on drop; Vulkan consumes a
-/// dup of it at import.
-pub struct DmabufPlane {
-    pub fd: OwnedFd,
-    pub offset: u64,
-    pub stride: u32,
-}
-
-/// A CEF `OnAcceleratedPaint` frame. CEF reclaims the original fd when the
-/// paint callback returns, so the caller must dup into the `OwnedFd`.
-pub struct DmabufFrame {
-    pub width: u32,
-    pub height: u32,
-    /// CEF's visible rect; the coded `width`/`height` may be padded larger.
-    pub visible_w: u32,
-    pub visible_h: u32,
-    pub format: DmabufFormat,
-    pub modifier: u64,
-    pub planes: Vec<DmabufPlane>,
-}
-
-pub struct PixelFrame<'a> {
-    pub width: u32,
-    pub height: u32,
+/// A borrowed CPU frame plus the regions that changed since the last one.
+/// `stride` is in bytes.
+pub struct Pixels<'a> {
+    pub size: PhysicalSize,
     pub stride: u32,
     pub bgra: &'a [u8],
-    pub dirty: &'a [DirtyRect],
+    /// Reuses CEF's own rect type, which is what these always are.
+    pub dirty: &'a [JfnRect],
+}
+
+/// One frame handed to [`crate::Surface::present`]. The variant must match the
+/// [`PaintMode`] the surface was created with.
+pub enum Frame<'a> {
+    Shared(&'a SharedTexture),
+    Copied(Pixels<'a>),
+}
+
+impl Frame<'_> {
+    pub(crate) fn mode(&self) -> PaintMode {
+        match self {
+            Frame::Shared(_) => PaintMode::Shared,
+            Frame::Copied(_) => PaintMode::Copied,
+        }
+    }
 }

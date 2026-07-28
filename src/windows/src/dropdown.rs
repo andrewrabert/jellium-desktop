@@ -1,6 +1,6 @@
-use std::ffi::{c_int, c_void};
+use std::ffi::c_int;
 
-use jfn_platform_abi::{DropdownBackend, JfnPopupRequest, SurfaceHandle};
+use jfn_platform_abi::{DropdownBackend, JfnPopupRequest, PaintFrame, SurfaceHandle};
 
 use crate::compositor::{
     win_popup_hide, win_popup_present, win_popup_present_software, win_popup_show,
@@ -17,19 +17,12 @@ impl DropdownBackend for CompositorDropdown {
         win_popup_hide(s.as_ptr());
     }
 
-    fn present(&self, s: SurfaceHandle, info: *const c_void, lw: c_int, lh: c_int) {
-        win_popup_present(s.as_ptr(), info, lw, lh);
-    }
-
-    fn present_software(
-        &self,
-        s: SurfaceHandle,
-        buffer: *const c_void,
-        pw: c_int,
-        ph: c_int,
-        lw: c_int,
-        lh: c_int,
-    ) {
-        win_popup_present_software(s.as_ptr(), buffer, pw, ph, lw, lh);
+    fn present(&self, s: SurfaceHandle, frame: PaintFrame<'_>, lw: c_int, lh: c_int) {
+        match frame {
+            PaintFrame::Accelerated(tex) => win_popup_present(s.as_ptr(), &tex, lw, lh),
+            PaintFrame::Software { size, pixels, .. } => {
+                win_popup_present_software(s.as_ptr(), pixels, size.w, size.h, lw, lh);
+            }
+        }
     }
 }

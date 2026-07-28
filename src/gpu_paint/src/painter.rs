@@ -1,45 +1,54 @@
-//! Per-surface Vulkan compositor. Owns a swapchain, render pipeline,
-//! and a persistent upload texture; presents BGRA pixels uploaded via
-//! `queue.write_texture` (dirty-rect granularity).
+//! One window's swapchain, render pipeline, and persistent upload texture.
+//!
+//! Copied frames are uploaded via `queue.write_texture` at dirty-rect
+//! granularity; shared frames are imported as a texture and sampled.
 
 use std::num::NonZeroU32;
-use std::sync::Arc;
 
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, XcbDisplayHandle,
     XcbWindowHandle,
 };
 
-use crate::context::GpuContext;
-use crate::error::GpuPaintError;
-use crate::types::{DmabufFrame, PixelFrame, WindowTarget};
+use crate::context::Surfaces;
+use crate::error::{Kind, SurfaceLost};
+use crate::types::{Frame, PaintMode, Pixels, Presented, WindowTarget};
+use jfn_platform_abi::{PhysicalSize, SharedTexture};
 
 const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
+/// How a surface chooses its swapchain extent.
+///
+/// Derived from [`WindowTarget`], never chosen by a caller: whether the
+/// swapchain *is* the window is a fact about the window system.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PresentOutcome {
-    Presented,
-    Skipped,
-}
-
-/// How the painter chooses its swapchain extent.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SizePolicy {
-    /// The swapchain tracks each incoming frame's size. Used where another layer
-    /// (Wayland's `wp_viewport`) rescales the buffer to the surface's logical
-    /// size, so presenting at the producer's size keeps content 1:1.
+enum SizePolicy {
+    /// Track each incoming frame's size. Used where another layer (Wayland's
+    /// `wp_viewport`) rescales the buffer to the surface's logical size, so
+    /// presenting at the producer's size keeps content 1:1.
     FollowFrame,
-    /// The swapchain tracks the target extent set via [`GpuPainter::resize`]
-    /// (the parent-derived window size), clamped to device limits — NOT the
-    /// incoming frame size. Frames render 1:1 into the top-left; a frame smaller
-    /// than the target leaves a transparent strip, a larger one is clipped. Used
-    /// on X11, where the swapchain IS the window drawable and its geometry owner
-    /// (the geometry thread) sizes the window, not the painter.
+    /// Track the target extent set via [`Surface::resize`] (the parent-derived
+    /// window size), clamped to device limits — NOT the incoming frame size.
+    /// Frames render 1:1 into the top-left; a frame smaller than the target
+    /// leaves a transparent strip, a larger one is clipped. Used where the
+    /// swapchain IS the window drawable and its geometry owner sizes the
+    /// window, not the painter.
     FollowTarget,
 }
 
-pub struct GpuPainter {
-    ctx: Arc<GpuContext>,
+impl SizePolicy {
+    const fn for_target(target: &WindowTarget) -> Self {
+        match target {
+            // The swapchain is the window drawable.
+            WindowTarget::Xcb { .. } => Self::FollowTarget,
+            // `wp_viewport` rescales the buffer to the surface's logical size.
+            WindowTarget::Wayland { .. } => Self::FollowFrame,
+        }
+    }
+}
+
+pub struct Surface<'a> {
+    ctx: &'a Surfaces,
     // 'static is a lie that wgpu accepts via `create_surface_unsafe`;
     // the caller guarantees the window outlives the painter (X11 owns
     // the xcb_window for the surface lifetime, Wayland likewise).
@@ -57,6 +66,7 @@ pub struct GpuPainter {
     pending_size: (u32, u32),
     visible: bool,
     policy: SizePolicy,
+    mode: Option<PaintMode>,
 }
 
 struct UploadTexture {
@@ -70,9 +80,9 @@ struct UploadTexture {
 }
 
 impl UploadTexture {
-    fn write(&mut self, queue: &wgpu::Queue, frame: &PixelFrame<'_>, cw: u32, ch: u32) {
-        let bound_w = frame.width.min(cw) as i32;
-        let bound_h = frame.height.min(ch) as i32;
+    fn write(&mut self, queue: &wgpu::Queue, frame: &Pixels<'_>, cw: u32, ch: u32) {
+        let bound_w = frame.size.w.min(cw as i32);
+        let bound_h = frame.size.h.min(ch as i32);
         if self.needs_base || frame.dirty.is_empty() {
             write_rect(queue, self, frame, 0, 0, bound_w, bound_h);
             self.needs_base = false;
@@ -88,33 +98,23 @@ impl UploadTexture {
     }
 }
 
-impl GpuPainter {
-    pub fn new(
-        ctx: Arc<GpuContext>,
+impl<'a> Surface<'a> {
+    pub(crate) fn new(
+        ctx: &'a Surfaces,
         target: WindowTarget,
-        size: (u32, u32),
-    ) -> Result<Self, GpuPaintError> {
-        Self::with_policy(ctx, target, size, SizePolicy::FollowFrame)
-    }
-
-    pub fn with_policy(
-        ctx: Arc<GpuContext>,
-        target: WindowTarget,
-        size: (u32, u32),
-        policy: SizePolicy,
-    ) -> Result<Self, GpuPaintError> {
-        if size.0 == 0 || size.1 == 0 {
-            return Err(GpuPaintError::BadDimensions(size.0, size.1));
-        }
+        size: PhysicalSize,
+    ) -> Result<Self, SurfaceLost> {
+        let policy = SizePolicy::for_target(&target);
+        let extent = texels(size).ok_or(Kind::BadDimensions(size))?;
         let max = ctx.device.limits().max_texture_dimension_2d;
-        if size.0 > max || size.1 > max {
-            return Err(GpuPaintError::BadDimensions(size.0, size.1));
+        if extent.0 > max || extent.1 > max {
+            return Err(Kind::BadDimensions(size).into());
         }
 
         let surface = unsafe { create_surface(&ctx.instance, target)? };
 
         if !ctx.adapter.is_surface_supported(&surface) {
-            return Err(GpuPaintError::SurfaceUnsupported);
+            return Err(Kind::SurfaceUnsupported.into());
         }
 
         let caps = surface.get_capabilities(&ctx.adapter);
@@ -123,8 +123,8 @@ impl GpuPainter {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: SURFACE_FORMAT,
-            width: size.0,
-            height: size.1,
+            width: extent.0,
+            height: extent.1,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode,
@@ -225,9 +225,10 @@ impl GpuPainter {
             bind_layout,
             sampler,
             upload: None,
-            pending_size: size,
+            pending_size: extent,
             visible: true,
             policy,
+            mode: None,
         })
     }
 
@@ -236,97 +237,127 @@ impl GpuPainter {
         (size.0.clamp(1, max), size.1.clamp(1, max))
     }
 
-    /// Store a new target size. Does not reconfigure the swapchain —
-    /// next matching-size `push_pixels` does that. Mirrors the wayland
-    /// `transitioning` gate: gaps acceptable during resize, stretching
-    /// forbidden.
-    pub fn resize(&mut self, size: (u32, u32)) {
-        if size.0 == 0 || size.1 == 0 {
-            return;
+    /// Store a new target size. Does not reconfigure the swapchain — the next
+    /// matching-size present does that. Gaps during a resize are acceptable;
+    /// stretching is not.
+    pub fn resize(&mut self, size: PhysicalSize) {
+        if let Some(size) = texels(size) {
+            self.pending_size = size;
         }
-        self.pending_size = size;
     }
 
     pub fn set_visible(&mut self, v: bool) {
         self.visible = v;
     }
 
-    pub fn push_pixels(
+    /// Present one frame.
+    ///
+    /// `on_present` runs between submit and present, so a caller can latch
+    /// state against the frame actually being shown (Wayland sets its viewport
+    /// source there) without that state applying to a frame that was skipped.
+    pub fn present(
         &mut self,
-        frame: PixelFrame<'_>,
+        frame: Frame<'_>,
         on_present: impl FnOnce(),
-    ) -> Result<PresentOutcome, GpuPaintError> {
-        if frame.width == 0 || frame.height == 0 {
-            return Err(GpuPaintError::BadDimensions(frame.width, frame.height));
+    ) -> Result<Presented, SurfaceLost> {
+        // A surface latches its frame kind from the first frame it presents and
+        // will not take the other kind afterwards: `Copied` maintains a
+        // persistent upload texture that a `Shared` frame would leave stale,
+        // and the next dirty-only frame would then patch onto a base two frames
+        // old. CEF fixes the kind per browser via `shared_texture_enabled`, so
+        // a mismatch means something upstream is wrong, not that this surface
+        // is lost — drop the frame and say so.
+        match self.mode {
+            Some(mode) if mode != frame.mode() => {
+                tracing::warn!("gpu_paint: frame kind changed on a live surface; dropping frame");
+                return Ok(Presented::Skipped);
+            }
+            Some(_) => {}
+            None => self.mode = Some(frame.mode()),
         }
+        match frame {
+            Frame::Copied(px) => self.present_pixels(px, on_present),
+            Frame::Shared(tex) => self.present_shared(tex, on_present),
+        }
+    }
+
+    /// The swapchain extent for this frame. `FollowFrame` tracks the producer's
+    /// size (another layer rescales it); `FollowTarget` tracks the
+    /// parent-derived window size set through `resize` — the swapchain IS the
+    /// window drawable, so it must match the window its geometry owner sized,
+    /// not the (possibly lagging) frame.
+    fn extent_for(&self, frame: (u32, u32)) -> (u32, u32) {
+        match self.policy {
+            SizePolicy::FollowFrame => frame,
+            SizePolicy::FollowTarget => self.clamp_extent(self.pending_size),
+        }
+    }
+
+    /// Reconfigure if the extent moved. Drops the upload texture so a frame
+    /// smaller than the swapchain leaves a transparent remainder rather than
+    /// stale pixels.
+    fn reconfigure_to(&mut self, cw: u32, ch: u32) {
+        if (self.config.width, self.config.height) == (cw, ch) {
+            return;
+        }
+        self.config.width = cw;
+        self.config.height = ch;
+        self.ctx.configure_surface(&self.surface, &self.config);
+        self.upload = None;
+        if self.policy == SizePolicy::FollowFrame {
+            self.pending_size = (cw, ch);
+        }
+    }
+
+    /// The frame's extent in texels, rejecting anything the device cannot hold.
+    fn frame_extent(&self, size: PhysicalSize) -> Result<(u32, u32), SurfaceLost> {
+        let (w, h) = texels(size).ok_or(Kind::BadDimensions(size))?;
         let max = self.ctx.device.limits().max_texture_dimension_2d;
-        if frame.width > max || frame.height > max {
-            return Err(GpuPaintError::BadDimensions(frame.width, frame.height));
+        if w > max || h > max {
+            return Err(Kind::BadDimensions(size).into());
         }
+        Ok((w, h))
+    }
+
+    fn present_pixels(
+        &mut self,
+        frame: Pixels<'_>,
+        on_present: impl FnOnce(),
+    ) -> Result<Presented, SurfaceLost> {
+        let (fw, fh) = self.frame_extent(frame.size)?;
         if !self.visible {
-            return Ok(PresentOutcome::Skipped);
+            return Ok(Presented::Skipped);
         }
 
-        // Choose the swapchain extent. `FollowFrame` tracks the producer's size
-        // (Wayland rescales via viewport). `FollowTarget` tracks the
-        // parent-derived window size set through `resize` — the swapchain IS the
-        // X11 window drawable, so it must match the window the geometry thread
-        // sized, not the (possibly lagging) frame.
-        let (cw, ch) = match self.policy {
-            SizePolicy::FollowFrame => (frame.width, frame.height),
-            SizePolicy::FollowTarget => self.clamp_extent(self.pending_size),
-        };
-        if (self.config.width, self.config.height) != (cw, ch) {
-            self.config.width = cw;
-            self.config.height = ch;
-            self.ctx.configure_surface(&self.surface, &self.config);
-            // Fresh (transparent) upload so a frame smaller than the swapchain
-            // leaves a transparent remainder rather than stale pixels.
-            self.upload = None;
-            if self.policy == SizePolicy::FollowFrame {
-                self.pending_size = (cw, ch);
-            }
-        }
+        let (cw, ch) = self.extent_for((fw, fh));
+        self.reconfigure_to(cw, ch);
 
         // Upload matches the swapchain, so the fullscreen quad is always 1:1.
         self.ensure_upload(cw, ch);
         let Some(upload) = self.upload.as_mut() else {
-            return Ok(PresentOutcome::Skipped);
+            return Ok(Presented::Skipped);
         };
         upload.write(&self.ctx.queue, &frame, cw, ch);
 
         let Some(upload) = self.upload.as_ref() else {
-            return Ok(PresentOutcome::Skipped);
+            return Ok(Presented::Skipped);
         };
         let bind_group = &upload.bind_group;
         self.draw_and_present(bind_group, None, None, on_present)
     }
 
-    pub fn push_dmabuf(&mut self, frame: DmabufFrame) -> Result<PresentOutcome, GpuPaintError> {
-        if frame.width == 0 || frame.height == 0 {
-            return Err(GpuPaintError::BadDimensions(frame.width, frame.height));
-        }
-        let max = self.ctx.device.limits().max_texture_dimension_2d;
-        if frame.width > max || frame.height > max {
-            return Err(GpuPaintError::BadDimensions(frame.width, frame.height));
-        }
+    fn present_shared(
+        &mut self,
+        frame: &SharedTexture,
+        on_present: impl FnOnce(),
+    ) -> Result<Presented, SurfaceLost> {
+        let (fw, fh) = self.frame_extent(frame.coded())?;
         if !self.visible {
-            return Ok(PresentOutcome::Skipped);
+            return Ok(Presented::Skipped);
         }
 
-        let (cw, ch) = match self.policy {
-            SizePolicy::FollowFrame => (frame.width, frame.height),
-            SizePolicy::FollowTarget => self.clamp_extent(self.pending_size),
-        };
-        if (self.config.width, self.config.height) != (cw, ch) {
-            self.config.width = cw;
-            self.config.height = ch;
-            self.ctx.configure_surface(&self.surface, &self.config);
-            self.upload = None;
-            if self.policy == SizePolicy::FollowFrame {
-                self.pending_size = (cw, ch);
-            }
-        }
+        let (cw, ch) = self.extent_for((fw, fh));
+        self.reconfigure_to(cw, ch);
 
         // FollowTarget: the imported frame texture is frame-sized; render it 1:1
         // into the top-left of the (window-sized) swapchain via the viewport, so
@@ -334,15 +365,20 @@ impl GpuPainter {
         // stretch. FollowFrame draws fullscreen (swapchain == frame).
         let viewport = match self.policy {
             SizePolicy::FollowFrame => None,
-            SizePolicy::FollowTarget => Some((
-                0.0,
-                0.0,
-                frame.width.min(cw) as f32,
-                frame.height.min(ch) as f32,
-            )),
+            SizePolicy::FollowTarget => Some((0.0, 0.0, fw.min(cw) as f32, fh.min(ch) as f32)),
         };
 
-        let (texture, image) = unsafe { crate::dmabuf_import::import(&self.ctx.device, &frame) }?;
+        // A failed import is not a lost surface: a shared frame has no CPU
+        // pixels, so there is nowhere to degrade to. Drop it and keep the last
+        // good frame on screen.
+        let imported = unsafe { crate::shared_import::import(&self.ctx.device, frame) };
+        let (texture, image) = match imported {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "gpu_paint: shared-texture import failed");
+                return Ok(Presented::Skipped);
+            }
+        };
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self
             .ctx
@@ -362,14 +398,7 @@ impl GpuPainter {
                 ],
             });
 
-        self.draw_and_present(&bind_group, Some(image), viewport, || {})
-    }
-
-    pub fn shutdown(self) {
-        // Drop order matters: surface before device queue; wgpu handles
-        // it via field order. Explicit method is here so callers
-        // signal intent and we can extend later if needed.
-        drop(self);
+        self.draw_and_present(&bind_group, Some(image), viewport, on_present)
     }
 
     // ----- internals -----
@@ -425,7 +454,7 @@ impl GpuPainter {
         external_image: Option<u64>,
         viewport: Option<(f32, f32, f32, f32)>,
         on_present: impl FnOnce(),
-    ) -> Result<PresentOutcome, GpuPaintError> {
+    ) -> Result<Presented, SurfaceLost> {
         use wgpu::CurrentSurfaceTexture::*;
         // Hold the read side of the submit gate across the whole
         // acquire→submit→present so concurrent surfaces submit in parallel but
@@ -454,8 +483,8 @@ impl GpuPainter {
                 }
                 // Transient (occluded, timed out, or still stale after reconfigure):
                 // skip without faulting — an Err would degrade the backend to SHM.
-                Lost | Outdated | Timeout | Occluded => return Ok(PresentOutcome::Skipped),
-                Validation => return Err(GpuPaintError::Acquire("validation")),
+                Lost | Outdated | Timeout | Occluded => return Ok(Presented::Skipped),
+                Validation => return Err(Kind::Acquire("validation").into()),
             }
         };
         let view = frame
@@ -471,7 +500,7 @@ impl GpuPainter {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("jfn_gpu_paint dmabuf acquire enc"),
                     });
-            crate::dmabuf_import::acquire_barrier(&self.ctx.device, &mut acquire_encoder, image);
+            crate::shared_import::acquire_barrier(&self.ctx.device, &mut acquire_encoder, image);
             self.ctx
                 .queue
                 .submit(std::iter::once(acquire_encoder.finish()));
@@ -524,7 +553,17 @@ impl GpuPainter {
         if suboptimal {
             self.ctx.configure_surface(&self.surface, &self.config);
         }
-        Ok(PresentOutcome::Presented)
+        Ok(Presented::Yes)
+    }
+}
+
+/// A physical size as texels, or `None` when it is not a positive extent.
+/// Sizes cross the ABI as `c_int` because that is what the window systems and
+/// CEF use; wgpu wants unsigned, and a non-positive one is never presentable.
+fn texels(size: PhysicalSize) -> Option<(u32, u32)> {
+    match (u32::try_from(size.w).ok()?, u32::try_from(size.h).ok()?) {
+        (0, _) | (_, 0) => None,
+        wh => Some(wh),
     }
 }
 
@@ -560,7 +599,7 @@ fn clip_rect(x: i32, y: i32, w: i32, h: i32, fw: i32, fh: i32) -> (i32, i32, i32
 fn write_rect(
     queue: &wgpu::Queue,
     upload: &UploadTexture,
-    frame: &PixelFrame<'_>,
+    frame: &Pixels<'_>,
     x: i32,
     y: i32,
     w: i32,
@@ -606,7 +645,7 @@ fn pick_alpha_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode
 unsafe fn create_surface(
     instance: &wgpu::Instance,
     target: WindowTarget,
-) -> Result<wgpu::Surface<'static>, GpuPaintError> {
+) -> Result<wgpu::Surface<'static>, SurfaceLost> {
     let (display, window) = match target {
         WindowTarget::Xcb {
             connection,
@@ -615,9 +654,8 @@ unsafe fn create_surface(
             visual,
         } => {
             let display = XcbDisplayHandle::new(Some(connection.cast()), screen);
-            let mut wh = XcbWindowHandle::new(
-                NonZeroU32::new(window).ok_or(GpuPaintError::SurfaceUnsupported)?,
-            );
+            let mut wh =
+                XcbWindowHandle::new(NonZeroU32::new(window).ok_or(Kind::SurfaceUnsupported)?);
             wh.visual_id = NonZeroU32::new(visual);
             (RawDisplayHandle::Xcb(display), RawWindowHandle::Xcb(wh))
         }
@@ -634,4 +672,56 @@ unsafe fn create_surface(
         })?
     };
     Ok(surface)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    fn dangling() -> NonNull<c_void> {
+        NonNull::dangling()
+    }
+
+    // The policy is a fact about the window system, not a caller preference:
+    // an X11 swapchain IS the window drawable, so it must track the extent its
+    // geometry owner set; a Wayland one is rescaled by `wp_viewport`, so it
+    // tracks the producer and stays 1:1.
+    #[test]
+    fn size_policy_follows_the_window_target() {
+        let xcb = WindowTarget::Xcb {
+            connection: dangling(),
+            window: 1,
+            screen: 0,
+            visual: 0,
+        };
+        let wl = WindowTarget::Wayland {
+            display: dangling(),
+            surface: dangling(),
+        };
+        assert_eq!(SizePolicy::for_target(&xcb), SizePolicy::FollowTarget);
+        assert_eq!(SizePolicy::for_target(&wl), SizePolicy::FollowFrame);
+    }
+
+    #[test]
+    fn clip_rect_clamps_negative_origin() {
+        assert_eq!(clip_rect(-2, -2, 4, 4, 10, 10), (0, 0, 2, 2));
+    }
+
+    #[test]
+    fn clip_rect_clamps_overflow() {
+        assert_eq!(clip_rect(8, 8, 10, 10, 10, 10), (8, 8, 2, 2));
+    }
+
+    #[test]
+    fn clip_rect_passes_through_in_bounds() {
+        assert_eq!(clip_rect(1, 2, 3, 4, 10, 10), (1, 2, 3, 4));
+    }
+
+    #[test]
+    fn clip_rect_collapses_fully_off_frame() {
+        assert_eq!(clip_rect(10, 0, 4, 4, 10, 10), (9, 0, 0, 4));
+        assert_eq!(clip_rect(0, 10, 4, 4, 10, 10), (0, 9, 4, 0));
+    }
 }

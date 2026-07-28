@@ -9,11 +9,13 @@ name = "jfn_gpu_paint"
 crate-type = ["rlib"]
 
 [dependencies]
+jfn-platform-abi = { path = "../platform_abi" }
 parking_lot.workspace = true
 
 # The crate is `#![cfg(target_os = "linux")]`; empty rlib elsewhere so the
 # workspace builds uniformly on every platform.
 [target.'cfg(target_os = "linux")'.dependencies]
+jfn-linux-util = { path = "../linux_util" }
 tracing.workspace = true
 nix.workspace = true
 thiserror = "2"

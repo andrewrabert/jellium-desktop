@@ -25,7 +25,7 @@ pub(crate) enum PresentError {
     #[error("pixel buffer too small: have {have}, need {need}")]
     ShortBuffer { have: usize, need: usize },
     #[error("gpu paint failed: {0}")]
-    Gpu(#[from] jfn_gpu_paint::GpuPaintError),
+    Gpu(#[from] jfn_gpu_paint::SurfaceLost),
     #[error("shm buffer allocation failed")]
     ShmAlloc,
     #[error("dmabuf buffer creation failed")]

@@ -6,7 +6,9 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::Ordering;
 
-pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform, WindowDecorations};
+pub use jfn_platform_abi::{
+    DisplayBackend, JfnPopupRequest, JfnRect, PaintFrame, Platform, WindowDecorations,
+};
 
 mod compositor;
 mod dropdown;
@@ -18,8 +20,8 @@ pub use compositor::{
     jfn_win_begin_transition_locked, jfn_win_cleanup_compositor, jfn_win_init_compositor,
     jfn_win_update_surface_size, jfn_win_wndproc_begin_transition_locked,
     jfn_win_wndproc_end_transition_locked, win_alloc_surface, win_end_transition, win_free_surface,
-    win_restack, win_set_expected_size, win_surface_present, win_surface_present_software,
-    win_surface_resize, win_surface_set_visible,
+    win_restack, win_set_expected_size, win_surface_present, win_surface_resize,
+    win_surface_set_visible,
 };
 pub use input::{
     jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
@@ -356,19 +358,12 @@ impl Platform for WindowsPlatform {
         win_free_surface(s.as_ptr());
     }
 
-    fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
-        win_surface_present(s.as_ptr(), info)
-    }
-
-    fn surface_present_software(
-        &self,
-        s: SurfaceHandle,
-        dirty: &[JfnRect],
-        buffer: *const c_void,
-        w: c_int,
-        h: c_int,
-    ) -> bool {
-        win_surface_present_software(s.as_ptr(), dirty.as_ptr(), dirty.len(), buffer, w, h)
+    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
+        match frame {
+            PaintFrame::Accelerated(tex) => win_surface_present(s.as_ptr(), &tex),
+            // Windows is shared-textures-only in practice.
+            PaintFrame::Software { .. } => false,
+        }
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
