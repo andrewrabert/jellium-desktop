@@ -91,8 +91,7 @@
         settings: {
             main: { enableMPV: true, fullscreen: false, userWebClient: '__SERVER_URL__' },
             playback: {
-                hwdec: _savedSettings.hwdec || 'auto',
-                subtitleScale: _savedSettings.subtitleScale || ''
+                hwdec: _savedSettings.hwdec || 'auto'
             },
             audio: {
                 audioPassthrough: _savedSettings.audioPassthrough || '',
@@ -190,12 +189,25 @@
     // each playback start (the web value is the source of truth).
     function readWebSubtitleAppearance() {
         try {
+            // Entries are per-user ("<userId>-localplayersubtitleappearance3"),
+            // and a shared device can hold several. Match the logged-in user
+            // when the web client can tell us who that is; treat "no entry" as
+            // defaults ({}) so a user switch resets every field. Fall back to
+            // the first match only when the user id is unavailable.
+            const uid = window.ApiClient && typeof window.ApiClient.getCurrentUserId === 'function'
+                ? window.ApiClient.getCurrentUserId()
+                : null;
+            let fallback = null;
             for (let i = 0; i < localStorage.length; i++) {
                 const k = localStorage.key(i);
-                if (k && /localplayersubtitleappearance/i.test(k)) {
-                    return JSON.parse(localStorage.getItem(k) || '{}');
+                if (!k || !/localplayersubtitleappearance/i.test(k)) continue;
+                if (uid) {
+                    if (k.indexOf(uid) === 0) return JSON.parse(localStorage.getItem(k) || '{}');
+                } else if (fallback === null) {
+                    fallback = k;
                 }
             }
+            return fallback !== null ? JSON.parse(localStorage.getItem(fallback) || '{}') : {};
         } catch (e) {
             console.error('[Media] subtitle appearance read failed:', e);
         }
@@ -216,17 +228,19 @@
         // mpv sub-pos (100 = bottom, lower = higher). Calibrated so the web
         // default (-3) lands near sub-pos 95.
         const vp = parseInt(a.verticalPosition, 10);
-        if (!isNaN(vp)) set('subtitlePos', Math.max(0, Math.min(150, Math.round(100 + vp * (5 / 3)))));
+        set('subtitlePos', Math.max(0, Math.min(150, Math.round(100 + (isNaN(vp) ? -3 : vp) * (5 / 3)))));
 
-        // Text color — hex passes straight through to mpv.
-        if (a.textColor) set('subtitleColor', a.textColor);
+        // Text color — hex passes straight through to mpv; unset falls back to
+        // mpv's default white so a cleared panel takes effect without restart.
+        set('subtitleColor', a.textColor || '#ffffff');
 
         // Text weight.
         set('subtitleBold', a.textWeight === 'bold');
 
         // Font: jellyfin-web stores a token (e.g. 'typewriter'), not a usable
         // family name — map each to a real Windows font mpv can resolve.
-        // '' (Default) and unmapped tokens (e.g. 'smallcaps') leave mpv's default.
+        // '' (Default) and unmapped tokens (e.g. 'smallcaps') reset to mpv's
+        // default family so switching back takes effect without a restart.
         const FONT = {
             typewriter: 'Courier New',
             print:      'Times New Roman',
@@ -234,7 +248,7 @@
             casual:     'Comic Sans MS',
             cursive:    'Segoe Script'
         };
-        if (a.font) { const fam = FONT[String(a.font).toLowerCase()]; if (fam) set('subtitleFont', fam); }
+        set('subtitleFont', FONT[String(a.font || '').toLowerCase()] || 'sans-serif');
 
         // Text background box ('transparent' -> disable the box).
         set('subtitleBackColor', (a.textBackground && a.textBackground !== 'transparent') ? a.textBackground : '#00000000');
