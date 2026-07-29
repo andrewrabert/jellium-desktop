@@ -234,7 +234,6 @@ pub fn macos_query_window_position(x: &mut c_int, y: &mut c_int) -> bool {
 
 pub fn macos_begin_transition() {
     compositor::gate_begin();
-    compositor::drop_input_textures();
 }
 
 pub fn macos_in_transition() -> bool {
@@ -590,7 +589,8 @@ mod mpv_host;
 mod ns_menu;
 use compositor::{
     macos_alloc_surface, macos_free_surface, macos_restack, macos_set_expected_size,
-    macos_surface_present, macos_surface_resize, macos_surface_set_visible,
+    macos_surface_present, macos_surface_present_software, macos_surface_resize,
+    macos_surface_set_visible,
 };
 
 // =====================================================================
@@ -647,9 +647,14 @@ impl Platform for MacosPlatform {
         match frame {
             PaintFrame::Accelerated(tex) => macos_surface_present(s.as_ptr(), &tex),
             // CEF on macOS runs hardware-accelerated
-            // (shared_texture_supported = true); the software path is never
-            // exercised.
-            PaintFrame::Software { .. } => false,
+            // (shared_texture_supported = true), so this is only reachable
+            // with --disable-gpu-compositing; the painter draws both frame
+            // kinds, so there is nothing to gain by refusing one.
+            PaintFrame::Software {
+                size,
+                pixels,
+                dirty,
+            } => macos_surface_present_software(s.as_ptr(), pixels, size, dirty),
         }
     }
 

@@ -42,9 +42,13 @@ pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<Opened, SurfaceLost
     })
 }
 
-/// One-deep cache keyed on the `IOSurfaceRef`'s identity and extent: CEF
+/// One-deep cache keyed on the `IOSurfaceRef`'s identity **and extent**: CEF
 /// recycles a small pool of surfaces, so consecutive frames usually arrive on
 /// the one already wrapped.
+///
+/// The extent is part of the key because CEF hands the same address back at a
+/// new size after a relayout; keying on identity alone samples a wrapper built
+/// over the old size.
 pub(crate) struct Importer {
     cached: Option<Cached>,
 }
@@ -154,10 +158,6 @@ impl Importer {
             texture,
             acquire: None,
         })
-    }
-
-    pub(crate) fn clear_cache(&mut self) {
-        self.cached = None;
     }
 }
 

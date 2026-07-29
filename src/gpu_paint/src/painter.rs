@@ -475,13 +475,6 @@ impl<'a> Surface<'a> {
         self.draw_and_present(&bind_group, imported.acquire, viewport, on_present)
     }
 
-    /// Drop anything the importer is holding across frames. Touches no
-    /// swapchain, no drawable and no configure — only the imported textures,
-    /// which wgpu keeps alive until the submissions using them retire.
-    pub fn clear_import_cache(&mut self) {
-        self.importer.clear_cache();
-    }
-
     // ----- internals -----
 
     fn ensure_upload(&mut self, w: u32, h: u32) {

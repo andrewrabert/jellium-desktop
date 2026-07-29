@@ -11,6 +11,7 @@ crate-type = ["rlib"]
 [target.'cfg(target_os = "macos")'.dependencies]
 jfn-cef = { path = "../jfn_cef" }
 jfn-compositor-core = { path = "../compositor_core" }
+jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-input = { path = "../input" }
 jfn-logging = { path = "../logging" }
 jfn-macos-sink = { path = "../macos_sink" }

@@ -2379,6 +2379,7 @@ dependencies = [
  "cef",
  "jfn-cef",
  "jfn-compositor-core",
+ "jfn-gpu-paint",
  "jfn-input",
  "jfn-logging",
  "jfn-macos-sink",

@@ -120,8 +120,6 @@ impl Importer {
             acquire: Some(image),
         })
     }
-
-    pub(crate) fn clear_cache(&mut self) {}
 }
 
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;

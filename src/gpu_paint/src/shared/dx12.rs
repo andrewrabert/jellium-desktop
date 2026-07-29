@@ -150,8 +150,6 @@ impl Importer {
             acquire: None,
         })
     }
-
-    pub(crate) fn clear_cache(&mut self) {}
 }
 
 fn wgpu_format(format: DXGI_FORMAT) -> Option<wgpu::TextureFormat> {

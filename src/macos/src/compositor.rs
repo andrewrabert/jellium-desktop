@@ -1,33 +1,55 @@
-//! CAMetalLayer-based per-surface compositor.
+//! `CAMetalLayer`-based per-surface compositor.
 //!
 //! All AppKit operations must run on the main thread; if Browsers calls
 //! alloc/free/restack/resize/set_visible off-main we `dispatch_sync` (or
-//! `dispatch_async` for fire-and-forget) onto the main queue. CEF's
-//! accelerated-paint thread calls `surface_present` directly — CAMetalLayer
-//! tolerates `nextDrawable` + Metal command-encoding off the main thread,
-//! but layer-tree mutations (adding subviews, setting frame) still need
-//! main-thread dispatch.
+//! `dispatch_async` for fire-and-forget) onto the main queue. On this platform
+//! CEF's UI thread *is* the app main thread (CEF runs under an external message
+//! pump serviced from the main `CFRunLoop`), so alloc, free, restack and
+//! present all run there and the `run_on_main_*` helpers take their inline
+//! fast path; `surface_resize` / `surface_set_visible` are the two entry points
+//! that genuinely arrive from other threads.
+//!
+//! Pixels go through `jfn-gpu-paint`, which owns the device and the layer's
+//! swapchain. The one rule that adds: configuring a surface *is* a
+//! `CAMetalLayer` mutation, so it only ever happens inside a main-thread
+//! closure — surface construction and `Surface::resize`, never a present.
 //!
 //! Per-surface state is owned by `Box<Surface>`. The opaque pointer
 //! returned from `macos_alloc_surface` is `Box::into_raw`; `macos_free_surface`
-//! reconstitutes via `Box::from_raw` after detaching the AppKit subview.
+//! reconstitutes via `Box::from_raw` after detaching the AppKit subview. Every
+//! entry point resolves its pointer through the registry's live set before
+//! dereferencing it, because deferred work reached through `run_on_main_async`
+//! may not run until after a free.
 
 use parking_lot::Mutex;
 use std::ffi::{c_int, c_void};
 use std::ptr;
+use std::ptr::NonNull;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use objc2::encode::{Encode, Encoding};
 use objc2::runtime::AnyObject;
 
 use jfn_compositor_core::stack::SurfaceStack;
 use jfn_compositor_core::transition::TransitionGate;
-use jfn_platform_abi::SharedTexture;
+use jfn_gpu_paint::{Frame, Pixels, Surface as Painter, Surfaces, WindowTarget};
+use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
 
 use crate::init::{jfn_macos_get_input_view, jfn_macos_get_window};
 
 unsafe extern "C" {
     static _dispatch_main_q: c_void;
     fn dispatch_async_f(
+        queue: *mut c_void,
+        ctx: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
+
+    // dispatch_sync_f — bounce onto the main queue and block until the
+    // work item returns. Used by macos_alloc_surface / macos_free_surface
+    // / macos_restack which need their AppKit mutations done before
+    // returning to the caller.
+    fn dispatch_sync_f(
         queue: *mut c_void,
         ctx: *mut c_void,
         work: unsafe extern "C" fn(*mut c_void),
@@ -47,216 +69,6 @@ fn is_main_thread() -> bool {
     }
 }
 
-// =====================================================================
-// CoreFoundation / CoreGraphics / IOSurface / Metal externs.
-//
-// We avoid pulling in objc2-quartz-core / objc2-metal / objc2-io-surface
-// for parity with the rest of this crate (raw msg_send! plus narrow
-// extern decls). Classes are looked up via `objc2::class!` and messages
-// dispatched via `objc2::msg_send!`.
-// =====================================================================
-
-type CFTypeRef = *const c_void;
-type CFStringRef = *const c_void;
-type CFTypeID = usize;
-type CGColorSpaceRef = *mut c_void;
-type IOSurfaceRef = *mut c_void;
-
-unsafe extern "C" {
-    fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
-    fn CFStringGetTypeID() -> CFTypeID;
-    fn CFRelease(cf: CFTypeRef);
-
-    fn CGColorSpaceCreateWithName(name: CFStringRef) -> CGColorSpaceRef;
-    fn CGColorSpaceRelease(cs: CGColorSpaceRef);
-
-    static kCGColorSpaceSRGB: CFStringRef;
-
-    fn IOSurfaceGetWidth(surface: IOSurfaceRef) -> usize;
-    fn IOSurfaceGetHeight(surface: IOSurfaceRef) -> usize;
-    fn IOSurfaceCopyValue(surface: IOSurfaceRef, key: CFStringRef) -> CFTypeRef;
-
-    static kIOSurfaceColorSpace: CFStringRef;
-
-    // dispatch_sync_f — bounce onto the main queue and block until the
-    // work item returns. Used by macos_alloc_surface / macos_free_surface
-    // / macos_restack which need their AppKit mutations done before
-    // returning to the caller.
-    fn dispatch_sync_f(
-        queue: *mut c_void,
-        ctx: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
-}
-
-// =====================================================================
-// Geometry types (NSRect / CGSize / CGPoint). We use objc2-foundation's
-// NSRect to match the rest of the crate; CGSize / CGPoint are repr(C).
-// =====================================================================
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGSize {
-    width: f64,
-    height: f64,
-}
-
-unsafe impl Encode for CGSize {
-    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
-}
-
-// =====================================================================
-// MTLPixelFormatBGRA8Unorm = 80. MTLLoadActionClear=2, MTLStoreActionStore=1.
-// MTLPrimitiveTypeTriangle = 3. MTLTextureUsageShaderRead = 1.
-// MTLStorageModeShared = 0. (Enum values stable since Metal 1.0.)
-// =====================================================================
-
-const MTL_PIXEL_FORMAT_BGRA8_UNORM: u64 = 80;
-const MTL_LOAD_ACTION_CLEAR: u64 = 2;
-const MTL_STORE_ACTION_STORE: u64 = 1;
-const MTL_PRIMITIVE_TYPE_TRIANGLE: u64 = 3;
-const MTL_TEXTURE_USAGE_SHADER_READ: u64 = 1;
-const MTL_STORAGE_MODE_SHARED: u64 = 0;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MTLClearColor {
-    red: f64,
-    green: f64,
-    blue: f64,
-    alpha: f64,
-}
-
-unsafe impl Encode for MTLClearColor {
-    const ENCODING: Encoding = Encoding::Struct(
-        "",
-        &[f64::ENCODING, f64::ENCODING, f64::ENCODING, f64::ENCODING],
-    );
-}
-
-// =====================================================================
-// Per-surface state. One per CefLayer (allocated by macos_alloc_surface,
-// destroyed by macos_free_surface).
-// =====================================================================
-
-struct Surface {
-    /// NSView hosting `layer`. Owned (+1 retain) when non-null.
-    view: *mut AnyObject,
-    /// CAMetalLayer the present path renders into. Owned by `view`'s
-    /// layer property; non-retained here.
-    layer: *mut AnyObject,
-    /// Cached input IOSurface identity — when the next CEF frame
-    /// arrives on the same IOSurface we skip the texture re-wrap.
-    cached_input: IOSurfaceRef,
-    /// MTLTexture wrapping `cached_input` for sampling. Owned (+1
-    /// retain).
-    input_texture: *mut AnyObject,
-}
-
-unsafe impl Send for Surface {}
-
-impl Surface {
-    fn new() -> Self {
-        Self {
-            view: ptr::null_mut(),
-            layer: ptr::null_mut(),
-            cached_input: ptr::null_mut(),
-            input_texture: ptr::null_mut(),
-        }
-    }
-
-    /// Drop the cached input-texture wrapper so the next paint re-wraps
-    /// at the (possibly new) IOSurface size.
-    fn drop_input_texture(&mut self) {
-        if !self.input_texture.is_null() {
-            unsafe {
-                let _: () = objc2::msg_send![self.input_texture, release];
-            }
-            self.input_texture = ptr::null_mut();
-        }
-        self.cached_input = ptr::null_mut();
-    }
-}
-
-// =====================================================================
-// Surface registry — current stack order bottom-to-top, as last applied
-// via macos_restack. stack[0] is the cef-main surface for transition
-// gating in macos_surface_present.
-//
-// Stored as raw *mut Surface (not Box) because the same pointer is
-// handed to / from C/Rust callers across the vtable. We Box::from_raw
-// only when macos_free_surface is called.
-// =====================================================================
-
-#[derive(Clone, Copy, PartialEq)]
-struct SurfacePtr(*mut Surface);
-unsafe impl Send for SurfacePtr {}
-
-static G_SURFACE_STACK: Mutex<SurfaceStack<SurfacePtr>> = Mutex::new(SurfaceStack::new());
-
-// Fullscreen/resize transition gate. set_expected_size arms the expected
-// post-transition size; the present path clears the gate when an incoming
-// IOSurface matches it. macOS never captures a pre-resize size (it gates on
-// the expected-size match, not a Windows-style begin/end size compare).
-static G_GATE: Mutex<TransitionGate> = Mutex::new(TransitionGate::new());
-
-/// Enter the transition (set by `macos_begin_transition` in lib.rs).
-pub(crate) fn gate_begin() {
-    G_GATE.lock().begin();
-}
-
-/// Whether the main surface is currently gated (read by `macos_in_transition`
-/// and the present path).
-pub(crate) fn gate_in_transition() -> bool {
-    G_GATE.lock().in_transition()
-}
-
-// =====================================================================
-// Metal device / queue / pipeline. Lazy-init on first alloc_surface so
-// macos_init no longer has to bring up Metal.
-// =====================================================================
-
-struct MetalState {
-    device: *mut AnyObject,   // id<MTLDevice>, retained
-    queue: *mut AnyObject,    // id<MTLCommandQueue>, retained
-    pipeline: *mut AnyObject, // id<MTLRenderPipelineState>, retained
-}
-unsafe impl Send for MetalState {}
-
-static G_METAL: Mutex<Option<MetalState>> = Mutex::new(None);
-
-const SHADER_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct VertexOut {
-    float4 position [[position]];
-    float2 texCoord;
-};
-
-vertex VertexOut vertexShader(uint vertexID [[vertex_id]]) {
-    float2 positions[3] = { float2(-1,-1), float2(3,-1), float2(-1,3) };
-    float2 texCoords[3] = { float2(0,1), float2(2,1), float2(0,-1) };
-    VertexOut out;
-    out.position = float4(positions[vertexID], 0.0, 1.0);
-    out.texCoord = texCoords[vertexID];
-    return out;
-}
-
-fragment float4 fragmentShader(VertexOut in [[stage_in]],
-                                texture2d<float> tex [[texture(0)]]) {
-    constexpr sampler s(mag_filter::linear, min_filter::linear);
-    float4 color = tex.sample(s, in.texCoord);
-    color.rgb *= color.a;
-    return color;
-}
-"#;
-
-unsafe extern "C" {
-    /// MTLCreateSystemDefaultDevice is a free function in /System/Library/Frameworks/Metal.framework.
-    fn MTLCreateSystemDefaultDevice() -> *mut AnyObject;
-}
-
 /// Build an NSString from a Rust &str (UTF-8). The returned object is
 /// retained (+1) by NSString init; the caller `release`s when done.
 unsafe fn nsstring_from_str(s: &str) -> *mut AnyObject {
@@ -273,88 +85,85 @@ unsafe fn nsstring_from_str(s: &str) -> *mut AnyObject {
     }
 }
 
-/// Lazy-init Metal device, command queue and the straight→premultiplied
-/// alpha render pipeline. Returns None on driver failure (logged once).
-fn ensure_metal() -> bool {
-    let mut guard = G_METAL.lock();
-    if guard.is_some() {
-        return true;
+// =====================================================================
+// Per-surface state. One per CefLayer (allocated by macos_alloc_surface,
+// destroyed by macos_free_surface).
+// =====================================================================
+
+struct Surface {
+    /// NSView hosting `layer`. Owned (+1 retain) when non-null.
+    view: *mut AnyObject,
+    /// `CAMetalLayer` the painter presents into. Owned by `view`'s layer
+    /// property; non-retained here.
+    layer: *mut AnyObject,
+    /// `None` until the layer exists, and again once it is torn down.
+    painter: Mutex<Option<Painter<'static>>>,
+}
+
+// `view` and `layer` are written once inside the alloc closure and afterwards
+// only read or cleared on the main thread; `painter` is behind the mutex.
+unsafe impl Send for Surface {}
+unsafe impl Sync for Surface {}
+
+impl Surface {
+    fn new() -> Self {
+        Self {
+            view: ptr::null_mut(),
+            layer: ptr::null_mut(),
+            painter: Mutex::new(None),
+        }
     }
-    unsafe {
-        let device = MTLCreateSystemDefaultDevice();
-        if device.is_null() {
-            tracing::error!("[METAL] MTLCreateSystemDefaultDevice failed");
-            return false;
-        }
-        let queue: *mut AnyObject = objc2::msg_send![device, newCommandQueue];
-        if queue.is_null() {
-            let _: () = objc2::msg_send![device, release];
-            tracing::error!("[METAL] newCommandQueue failed");
-            return false;
-        }
+}
 
-        // Compile the shader source into an MTLLibrary.
-        let src_ns = nsstring_from_str(SHADER_SRC);
-        let mut err: *mut AnyObject = ptr::null_mut();
-        let library: *mut AnyObject = objc2::msg_send![
-            device,
-            newLibraryWithSource: src_ns,
-            options: ptr::null_mut::<AnyObject>(),
-            error: &mut err as *mut *mut AnyObject
-        ];
-        let _: () = objc2::msg_send![src_ns, release];
-        if library.is_null() {
-            tracing::error!("[METAL] newLibraryWithSource failed");
-            let _: () = objc2::msg_send![queue, release];
-            let _: () = objc2::msg_send![device, release];
-            return false;
-        }
+// =====================================================================
+// Surface registry — current stack order bottom-to-top, as last applied
+// via macos_restack, plus the live set every entry point resolves its
+// pointer through. stack[0] is the cef-main surface for transition gating
+// in macos_surface_present.
+//
+// Stored as raw *mut Surface (not Box) because the same pointer is
+// handed to / from C/Rust callers across the vtable. We Box::from_raw
+// only when macos_free_surface is called.
+// =====================================================================
 
-        let vfn_name = nsstring_from_str("vertexShader");
-        let ffn_name = nsstring_from_str("fragmentShader");
-        let vfn: *mut AnyObject = objc2::msg_send![library, newFunctionWithName: vfn_name];
-        let ffn: *mut AnyObject = objc2::msg_send![library, newFunctionWithName: ffn_name];
-        let _: () = objc2::msg_send![vfn_name, release];
-        let _: () = objc2::msg_send![ffn_name, release];
+#[derive(Clone, Copy, PartialEq)]
+struct SurfacePtr(*mut Surface);
+unsafe impl Send for SurfacePtr {}
 
-        // MTLRenderPipelineDescriptor: vertex/fragment fn + colour
-        // attachment 0 = BGRA8Unorm, blendingEnabled = NO.
-        let pipe_desc_cls = objc2::class!(MTLRenderPipelineDescriptor);
-        let pipe_desc: *mut AnyObject = objc2::msg_send![pipe_desc_cls, alloc];
-        let pipe_desc: *mut AnyObject = objc2::msg_send![pipe_desc, init];
-        let _: () = objc2::msg_send![pipe_desc, setVertexFunction: vfn];
-        let _: () = objc2::msg_send![pipe_desc, setFragmentFunction: ffn];
+static G_SURFACE_STACK: Mutex<SurfaceStack<SurfacePtr>> = Mutex::new(SurfaceStack::new());
 
-        let attachments: *mut AnyObject = objc2::msg_send![pipe_desc, colorAttachments];
-        let attach0: *mut AnyObject =
-            objc2::msg_send![attachments, objectAtIndexedSubscript: 0usize];
-        let _: () = objc2::msg_send![attach0, setPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM];
-        let _: () = objc2::msg_send![attach0, setBlendingEnabled: false];
+/// Whether this pointer is still one of ours. Resolved before every
+/// dereference: a `run_on_main_async` closure may not run until after a free.
+fn is_live(p: *mut Surface) -> bool {
+    G_SURFACE_STACK.lock().live().contains(&SurfacePtr(p))
+}
 
-        let mut err2: *mut AnyObject = ptr::null_mut();
-        let pipeline: *mut AnyObject = objc2::msg_send![
-            device,
-            newRenderPipelineStateWithDescriptor: pipe_desc,
-            error: &mut err2 as *mut *mut AnyObject
-        ];
-        let _: () = objc2::msg_send![vfn, release];
-        let _: () = objc2::msg_send![ffn, release];
-        let _: () = objc2::msg_send![pipe_desc, release];
-        let _: () = objc2::msg_send![library, release];
-        if pipeline.is_null() {
-            tracing::error!("[METAL] newRenderPipelineStateWithDescriptor failed");
-            let _: () = objc2::msg_send![queue, release];
-            let _: () = objc2::msg_send![device, release];
-            return false;
-        }
+// Fullscreen/resize transition gate. set_expected_size arms the expected
+// post-transition size; the present path clears the gate when an incoming
+// frame matches it. macOS never captures a pre-resize size (it gates on
+// the expected-size match, not a Windows-style begin/end size compare).
+static G_GATE: Mutex<TransitionGate> = Mutex::new(TransitionGate::new());
 
-        *guard = Some(MetalState {
-            device,
-            queue,
-            pipeline,
-        });
-        true
-    }
+/// Enter the transition (set by `macos_begin_transition` in lib.rs).
+pub(crate) fn gate_begin() {
+    G_GATE.lock().begin();
+}
+
+/// Whether the main surface is currently gated (read by `macos_in_transition`
+/// and the present path).
+pub(crate) fn gate_in_transition() -> bool {
+    G_GATE.lock().in_transition()
+}
+
+// =====================================================================
+// The process's GPU device. Lazy-init on first alloc_surface, on the calling
+// thread, before the main-thread bounce.
+// =====================================================================
+
+static GPU: OnceLock<Option<Surfaces>> = OnceLock::new();
+
+fn gpu() -> Option<&'static Surfaces> {
+    GPU.get_or_init(|| Surfaces::init(None)).as_ref()
 }
 
 /// Run a closure on the AppKit main thread. Used for layer-tree mutations
@@ -421,11 +230,6 @@ unsafe fn create_content_layer(
     scale: f64,
 ) -> (*mut AnyObject, *mut AnyObject) {
     unsafe {
-        let Some(device) = G_METAL.lock().as_ref().map(|m| m.device) else {
-            tracing::warn!("[METAL] content layer skipped: metal not initialized");
-            return (std::ptr::null_mut(), std::ptr::null_mut());
-        };
-
         // NSView alloc/initWithFrame:
         let view_cls = objc2::class!(NSView);
         let view: *mut AnyObject = objc2::msg_send![view_cls, alloc];
@@ -434,22 +238,14 @@ unsafe fn create_content_layer(
         // NSViewWidthSizable | NSViewHeightSizable = 2 | 16 (per AppKit).
         let _: () = objc2::msg_send![view, setAutoresizingMask: 2u64 | 16u64];
 
-        // CAMetalLayer alloc + configure.
+        // CAMetalLayer alloc + geometry. Device, pixel format, colorspace,
+        // drawable size and framebuffer-only belong to the painter, which
+        // writes them from its first configure and overwrites anything set
+        // behind it.
         let layer_cls = objc2::class!(CAMetalLayer);
         let layer: *mut AnyObject = objc2::msg_send![layer_cls, layer];
-        let _: () = objc2::msg_send![layer, setDevice: device];
-        let _: () = objc2::msg_send![layer, setPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM];
-
-        let srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-        let _: () = objc2::msg_send![layer, setColorspace: srgb];
-        if !srgb.is_null() {
-            CGColorSpaceRelease(srgb);
-        }
-
-        let _: () = objc2::msg_send![layer, setFramebufferOnly: true];
         let _: () = objc2::msg_send![layer, setFrame: frame];
         let _: () = objc2::msg_send![layer, setContentsScale: scale];
-        let _: () = objc2::msg_send![layer, setOpaque: false];
 
         // Disable implicit animations on property changes — present
         // writes contents every frame and CA shouldn't cross-fade them.
@@ -488,161 +284,6 @@ unsafe fn create_content_layer(
 }
 
 // =====================================================================
-// Input-IOSurface caching. Wrap the CEF IOSurface as an MTLTexture for
-// sampling; recreate when identity changes. Updates the layer's
-// colorspace from the IOSurface's kIOSurfaceColorSpace tag.
-// =====================================================================
-
-unsafe fn wrap_input_surface(s: &mut Surface, surface: IOSurfaceRef, w: u64, h: u64) -> bool {
-    if surface == s.cached_input && !s.input_texture.is_null() {
-        return true;
-    }
-    unsafe {
-        let device = match G_METAL.lock().as_ref() {
-            Some(m) => m.device,
-            None => return false,
-        };
-        let desc_cls = objc2::class!(MTLTextureDescriptor);
-        let desc: *mut AnyObject = objc2::msg_send![
-            desc_cls,
-            texture2DDescriptorWithPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM,
-            width: w as usize,
-            height: h as usize,
-            mipmapped: false
-        ];
-        let _: () = objc2::msg_send![desc, setUsage: MTL_TEXTURE_USAGE_SHADER_READ];
-        let _: () = objc2::msg_send![desc, setStorageMode: MTL_STORAGE_MODE_SHARED];
-
-        let tex: *mut AnyObject = objc2::msg_send![
-            device,
-            newTextureWithDescriptor: desc,
-            iosurface: surface,
-            plane: 0usize
-        ];
-        if tex.is_null() {
-            tracing::error!("[METAL] wrap input IOSurface failed");
-            return false;
-        }
-        // Replace cached texture (release previous).
-        if !s.input_texture.is_null() {
-            let _: () = objc2::msg_send![s.input_texture, release];
-        }
-        s.input_texture = tex;
-        s.cached_input = surface;
-
-        let cs = IOSurfaceCopyValue(surface, kIOSurfaceColorSpace);
-        if !cs.is_null() && CFGetTypeID(cs) == CFStringGetTypeID() {
-            let cg = CGColorSpaceCreateWithName(cs as CFStringRef);
-            if !cg.is_null() {
-                let _: () = objc2::msg_send![s.layer, setColorspace: cg];
-                CGColorSpaceRelease(cg);
-            }
-        }
-        if !cs.is_null() {
-            CFRelease(cs);
-        }
-        true
-    }
-}
-
-// =====================================================================
-// Present: render CEF's straight-alpha IOSurface into the CAMetalLayer's
-// next drawable with premultiplied alpha. Off-main-thread safe.
-// =====================================================================
-
-unsafe fn present_iosurface(s: &mut Surface, tex: &SharedTexture) {
-    if s.layer.is_null() {
-        tracing::warn!("[METAL] present skipped: layer null");
-        return;
-    }
-    let (metal_q, metal_pipe) = match G_METAL.lock().as_ref() {
-        Some(m) => (m.queue, m.pipeline),
-        None => {
-            tracing::warn!("[METAL] present skipped: metal not initialized");
-            return;
-        }
-    };
-
-    let surface = tex.io_surface() as IOSurfaceRef;
-    if surface.is_null() {
-        tracing::warn!("[METAL] present skipped: null IOSurface");
-        return;
-    }
-    let w = unsafe { IOSurfaceGetWidth(surface) } as u64;
-    let h = unsafe { IOSurfaceGetHeight(surface) } as u64;
-
-    if !unsafe { wrap_input_surface(s, surface, w, h) } {
-        return;
-    }
-
-    unsafe {
-        // Update drawableSize if needed.
-        let cur: CGSize = objc2::msg_send![s.layer, drawableSize];
-        if cur.width as u64 != w || cur.height as u64 != h {
-            let _: () = objc2::msg_send![
-                s.layer,
-                setDrawableSize: CGSize { width: w as f64, height: h as f64 }
-            ];
-        }
-
-        // @autoreleasepool — bracket the per-frame AppKit allocations.
-        let pool: *mut AnyObject = objc2::msg_send![objc2::class!(NSAutoreleasePool), new];
-
-        let drawable: *mut AnyObject = objc2::msg_send![s.layer, nextDrawable];
-        if drawable.is_null() {
-            tracing::warn!("[METAL] nextDrawable returned nil");
-            let _: () = objc2::msg_send![pool, drain];
-            return;
-        }
-        let drawable_tex: *mut AnyObject = objc2::msg_send![drawable, texture];
-
-        let pass_cls = objc2::class!(MTLRenderPassDescriptor);
-        let pass: *mut AnyObject = objc2::msg_send![pass_cls, renderPassDescriptor];
-        let attachments: *mut AnyObject = objc2::msg_send![pass, colorAttachments];
-        let attach0: *mut AnyObject =
-            objc2::msg_send![attachments, objectAtIndexedSubscript: 0usize];
-        let _: () = objc2::msg_send![attach0, setTexture: drawable_tex];
-        let _: () = objc2::msg_send![attach0, setLoadAction: MTL_LOAD_ACTION_CLEAR];
-        let _: () = objc2::msg_send![attach0, setStoreAction: MTL_STORE_ACTION_STORE];
-        let _: () = objc2::msg_send![
-            attach0,
-            setClearColor: MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 }
-        ];
-
-        let cmd_buf: *mut AnyObject = objc2::msg_send![metal_q, commandBuffer];
-        let enc: *mut AnyObject =
-            objc2::msg_send![cmd_buf, renderCommandEncoderWithDescriptor: pass];
-        let _: () = objc2::msg_send![enc, setRenderPipelineState: metal_pipe];
-        let _: () = objc2::msg_send![enc, setFragmentTexture: s.input_texture, atIndex: 0usize];
-        let _: () = objc2::msg_send![
-            enc,
-            drawPrimitives: MTL_PRIMITIVE_TYPE_TRIANGLE,
-            vertexStart: 0usize,
-            vertexCount: 3usize
-        ];
-        let _: () = objc2::msg_send![enc, endEncoding];
-        let _: () = objc2::msg_send![cmd_buf, presentDrawable: drawable];
-        let _: () = objc2::msg_send![cmd_buf, commit];
-
-        let _: () = objc2::msg_send![pool, drain];
-    }
-}
-
-// =====================================================================
-// Transition helpers
-// =====================================================================
-
-pub(crate) fn drop_input_textures() {
-    let stack = G_SURFACE_STACK.lock();
-    for entry in stack.stack() {
-        if entry.0.is_null() {
-            continue;
-        }
-        unsafe { (*entry.0).drop_input_texture() };
-    }
-}
-
-// =====================================================================
 // Vtable-exposed compositor functions
 // =====================================================================
 
@@ -654,11 +295,20 @@ pub fn macos_alloc_surface() -> *mut c_void {
     // Allocate the Surface up front; the AppKit setup happens on the
     // main thread but writes into this stable heap address.
     let surf_ptr = Box::into_raw(Box::new(Surface::new()));
-    if !ensure_metal() {
+    // Register next to the `Box::into_raw` that mints the pointer and before
+    // the bounce, so it is live for exactly as long as the handle is public.
+    // `register`, not `add_live`: this platform derives its main surface from
+    // `stack.first()`, and seeding `main` here would change is-main — and with
+    // it transition gating — before the first restack.
+    G_SURFACE_STACK.lock().register(SurfacePtr(surf_ptr));
+
+    let Some(gpu) = gpu() else {
         // Allocation must still return a valid opaque handle so Browsers
-        // can later free it; the surface will simply have no layer.
+        // can later free it; the surface will simply have no layer, and
+        // every present is dropped.
+        tracing::error!("[GPU] device init failed; surface has no painter");
         return surf_ptr as *mut c_void;
-    }
+    };
 
     let s_addr = surf_ptr as usize;
     run_on_main_sync(move || unsafe {
@@ -676,6 +326,19 @@ pub fn macos_alloc_surface() -> *mut c_void {
         let surf = &mut *(s_addr as *mut Surface);
         surf.view = view;
         surf.layer = layer;
+
+        // The first configure lands here, on the thread that owns the layer.
+        let Some(layer) = NonNull::new(layer.cast::<c_void>()) else {
+            return;
+        };
+        let size = PhysicalSize {
+            w: (frame.size.width * scale) as c_int,
+            h: (frame.size.height * scale) as c_int,
+        };
+        match gpu.new_surface(WindowTarget::CoreAnimationLayer { layer }, size) {
+            Ok(painter) => *surf.painter.lock() = Some(painter),
+            Err(e) => tracing::error!("[GPU] surface creation failed: {e}"),
+        }
     });
     surf_ptr as *mut c_void
 }
@@ -686,14 +349,18 @@ pub fn macos_free_surface(s: *mut c_void) {
     }
     let s_ptr = s as *mut Surface;
 
-    // Remove from the stack first — keeps is-cef-main coherent while
-    // we're tearing down. Browsers normally restacks to a smaller order
-    // right after this, but the defensive remove matches the C++ path.
-    G_SURFACE_STACK.lock().remove(SurfacePtr(s_ptr));
+    // Leave the registry first, on the calling thread: the pointer stops
+    // being resolvable before the bounce, so no entry point will reach it
+    // again and there is nothing left to race the `Box::from_raw`.
+    // `deregister`, not `remove`: `remove`'s live fallback would name a main
+    // surface that is not `stack.first()`.
+    G_SURFACE_STACK.lock().deregister(SurfacePtr(s_ptr));
 
     let s_addr = s_ptr as usize;
     run_on_main_sync(move || unsafe {
         let surf = &mut *(s_addr as *mut Surface);
+        // First, so wgpu releases its CAMetalLayer retain on the main thread.
+        drop(surf.painter.lock().take());
         if !surf.view.is_null() {
             let _: () = objc2::msg_send![surf.view, removeFromSuperview];
             let _: () = objc2::msg_send![surf.view, release];
@@ -701,7 +368,6 @@ pub fn macos_free_surface(s: *mut c_void) {
         }
         // layer is owned by the view; do not release.
         surf.layer = ptr::null_mut();
-        surf.drop_input_texture();
     });
 
     // Reclaim the heap allocation.
@@ -709,41 +375,99 @@ pub fn macos_free_surface(s: *mut c_void) {
 }
 
 pub fn macos_surface_present(s: *mut c_void, tex: &SharedTexture) -> bool {
+    present_frame(s, tex.coded(), Frame::Shared(tex))
+}
+
+pub fn macos_surface_present_software(
+    s: *mut c_void,
+    pixels: &[u8],
+    size: PhysicalSize,
+    dirty: &[JfnRect],
+) -> bool {
+    if pixels.is_empty() || size.w <= 0 || size.h <= 0 {
+        return false;
+    }
+    present_frame(
+        s,
+        size,
+        // CEF's OnPaint buffer is tightly packed.
+        Frame::Copied(Pixels {
+            size,
+            stride: size.w as u32 * 4,
+            bgra: pixels,
+            dirty,
+        }),
+    )
+}
+
+/// Present inline, on whatever thread CEF called us on — which on this
+/// platform is the main thread, because that is where CEF's UI thread is.
+///
+/// Configures nothing: under `ConfigureSite::Owner` the extent is whatever
+/// `macos_surface_resize` last set from its main-thread closure. The painter
+/// lock is held for the present alone and released before re-entering the
+/// registry locks, which is the lock order every other entry point follows.
+fn present_frame(s: *mut c_void, size: PhysicalSize, frame: Frame<'_>) -> bool {
     if s.is_null() {
         return false;
     }
+    warn_once_if_off_main();
     let s_ptr = s as *mut Surface;
 
-    // is-cef-main = bottom-of-stack check.
-    let is_main = G_SURFACE_STACK.lock().is_main(SurfacePtr(s_ptr));
-
-    if is_main {
-        if G_GATE.lock().in_transition() {
+    // is-cef-main = bottom-of-stack check, plus the liveness resolve every
+    // entry point does — the same lock acquisition doing one more thing.
+    let is_main = {
+        let stack = G_SURFACE_STACK.lock();
+        if !stack.live().contains(&SurfacePtr(s_ptr)) {
             return false;
         }
-        unsafe { present_iosurface(&mut *s_ptr, tex) };
-        // Clear the gate when the incoming frame matches the expected
-        // post-transition size.
-        let surface = tex.io_surface() as IOSurfaceRef;
-        if !surface.is_null() {
-            let w = unsafe { IOSurfaceGetWidth(surface) } as c_int;
-            let h = unsafe { IOSurfaceGetHeight(surface) } as c_int;
-            G_GATE.lock().note_present_size((w, h));
-        }
-        return true;
+        stack.is_main(SurfacePtr(s_ptr))
+    };
+
+    if is_main && G_GATE.lock().in_transition() {
+        return false;
     }
-    unsafe { present_iosurface(&mut *s_ptr, tex) };
+
+    {
+        // SAFETY: the live set says this pointer is still ours.
+        let surf = unsafe { &*s_ptr };
+        let mut painter = surf.painter.lock();
+        match painter.as_mut() {
+            Some(painter) => {
+                if let Err(e) = painter.present(frame, || {}) {
+                    tracing::error!("[GPU] present failed: {e}");
+                }
+            }
+            None => tracing::warn!("[GPU] present skipped: no painter"),
+        }
+    }
+
+    if is_main {
+        // Clear the gate when the frame matches the expected post-transition
+        // size. `coded` is the allocation size.
+        G_GATE.lock().note_present_size((size.w, size.h));
+    }
     true
+}
+
+fn warn_once_if_off_main() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !is_main_thread() && !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("[GPU] present arrived off the main thread");
+    }
 }
 
 pub fn macos_surface_resize(s: *mut c_void, lw: c_int, _lh: c_int, pw: c_int, ph: c_int) {
     if s.is_null() {
         return;
     }
-    let s_ptr = s as *mut Surface;
-    let s_addr = s_ptr as usize;
+    let s_addr = s as usize;
     run_on_main_async(move || unsafe {
-        let surf = &*(s_addr as *mut Surface);
+        let s_ptr = s_addr as *mut Surface;
+        if !is_live(s_ptr) {
+            return;
+        }
+        let surf = &*s_ptr;
         if surf.view.is_null() || surf.layer.is_null() {
             return;
         }
@@ -764,10 +488,10 @@ pub fn macos_surface_resize(s: *mut c_void, lw: c_int, _lh: c_int, pw: c_int, ph
         };
         let _: () = objc2::msg_send![surf.layer, setContentsScale: scale];
         if pw > 0 && ph > 0 {
-            let _: () = objc2::msg_send![
-                surf.layer,
-                setDrawableSize: CGSize { width: pw as f64, height: ph as f64 }
-            ];
+            // The drawable resize, on the thread that owns the layer.
+            if let Some(painter) = surf.painter.lock().as_mut() {
+                painter.resize(PhysicalSize { w: pw, h: ph });
+            }
         }
     });
 }
@@ -778,7 +502,11 @@ pub fn macos_surface_set_visible(s: *mut c_void, visible: bool) {
     }
     let s_addr = s as usize;
     run_on_main_async(move || unsafe {
-        let surf = &*(s_addr as *mut Surface);
+        let s_ptr = s_addr as *mut Surface;
+        if !is_live(s_ptr) {
+            return;
+        }
+        let surf = &*s_ptr;
         if !surf.view.is_null() {
             let _: () = objc2::msg_send![surf.view, setHidden: !visible];
         }
@@ -797,13 +525,22 @@ pub fn macos_restack(ordered: *const *mut c_void, n: usize) {
     };
 
     let apply = move || unsafe {
-        {
+        // Drop anything the caller named that is not (or is no longer) ours,
+        // so the views below are only dereferenced for live surfaces.
+        let order: Vec<usize> = {
+            let mut stack = G_SURFACE_STACK.lock();
+            let order: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|p| stack.live().contains(&SurfacePtr(*p as *mut Surface)))
+                .collect();
             let ordered: Vec<SurfacePtr> = order
                 .iter()
                 .map(|p| SurfacePtr(*p as *mut Surface))
                 .collect();
-            G_SURFACE_STACK.lock().replace_stack(&ordered);
-        }
+            stack.replace_stack(&ordered);
+            order
+        };
         let win = jfn_macos_get_window();
         if win.is_null() {
             return;
@@ -815,9 +552,6 @@ pub fn macos_restack(ordered: *const *mut c_void, n: usize) {
         let mut prev: *mut AnyObject = ptr::null_mut();
         for raw in &order {
             let s_ptr = *raw as *mut Surface;
-            if s_ptr.is_null() {
-                continue;
-            }
             let view = (*s_ptr).view;
             if view.is_null() {
                 continue;
@@ -848,8 +582,8 @@ pub fn macos_restack(ordered: *const *mut c_void, n: usize) {
 
 // =====================================================================
 // Compositor teardown — called from C++ macos_cleanup via the narrow
-// jfn_macos_compositor_cleanup accessor. Drops any stragglers, releases
-// Metal, clears the stack.
+// jfn_macos_compositor_cleanup accessor. Drops any stragglers and clears
+// the stack.
 // =====================================================================
 
 pub fn jfn_macos_compositor_cleanup() {
@@ -866,13 +600,14 @@ pub fn jfn_macos_compositor_cleanup() {
         }
         unsafe {
             let surf = &mut *(raw as *mut Surface);
+            // First, for the same retain-release reason as the free path.
+            drop(surf.painter.lock().take());
             if !surf.view.is_null() {
                 let _: () = objc2::msg_send![surf.view, removeFromSuperview];
                 let _: () = objc2::msg_send![surf.view, release];
                 surf.view = ptr::null_mut();
             }
             surf.layer = ptr::null_mut();
-            surf.drop_input_texture();
             // We don't own the Box — Browsers will call free_surface on
             // each surface during its own teardown, which will reclaim
             // the heap allocation. We just zero our cached AppKit refs.
@@ -880,13 +615,4 @@ pub fn jfn_macos_compositor_cleanup() {
     }
 
     G_GATE.lock().end();
-
-    let mut metal = G_METAL.lock();
-    if let Some(m) = metal.take() {
-        unsafe {
-            let _: () = objc2::msg_send![m.pipeline, release];
-            let _: () = objc2::msg_send![m.queue, release];
-            let _: () = objc2::msg_send![m.device, release];
-        }
-    }
 }
