@@ -5,17 +5,17 @@
 
 use std::num::NonZeroU32;
 
+#[cfg(target_os = "linux")]
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, XcbDisplayHandle,
     XcbWindowHandle,
 };
 
-use crate::context::Surfaces;
+use crate::context::{SURFACE_FORMAT, Surfaces};
 use crate::error::{Kind, SurfaceLost};
+use crate::shared::Importer;
 use crate::types::{Frame, PaintMode, Pixels, Presented, WindowTarget};
 use jfn_platform_abi::{PhysicalSize, SharedTexture};
-
-const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 /// How a surface chooses its swapchain extent.
 ///
@@ -24,8 +24,9 @@ const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SizePolicy {
     /// Track each incoming frame's size. Used where another layer (Wayland's
-    /// `wp_viewport`) rescales the buffer to the surface's logical size, so
-    /// presenting at the producer's size keeps content 1:1.
+    /// `wp_viewport`, DirectComposition's 1:1 visual) shows the buffer at the
+    /// surface's logical size, so presenting at the producer's size keeps
+    /// content 1:1.
     FollowFrame,
     /// Track the target extent set via [`Surface::resize`] (the parent-derived
     /// window size), clamped to device limits — NOT the incoming frame size.
@@ -43,6 +44,87 @@ impl SizePolicy {
             WindowTarget::Xcb { .. } => Self::FollowTarget,
             // `wp_viewport` rescales the buffer to the surface's logical size.
             WindowTarget::Wayland { .. } => Self::FollowFrame,
+            // DirectComposition shows the swapchain 1:1 under the visual.
+            WindowTarget::CompositionVisual { .. } => Self::FollowFrame,
+            // The layer is the drawable, and its owner sizes it.
+            WindowTarget::CoreAnimationLayer { .. } => Self::FollowTarget,
+        }
+    }
+}
+
+/// What the producer's alpha means, and so whether the shader has to
+/// premultiply before handing pixels to the compositor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AlphaSource {
+    /// The surface composites premultiplied, which is what CEF delivers.
+    Premultiplied,
+    /// The surface has no premultiplied composite mode (metal offers only
+    /// `PostMultiplied` and `Opaque`) but its compositor still expects
+    /// premultiplied pixels, so the shader does it.
+    Straight,
+}
+
+impl AlphaSource {
+    const fn for_target(target: &WindowTarget) -> Self {
+        match target {
+            WindowTarget::Xcb { .. }
+            | WindowTarget::Wayland { .. }
+            | WindowTarget::CompositionVisual { .. } => Self::Premultiplied,
+            WindowTarget::CoreAnimationLayer { .. } => Self::Straight,
+        }
+    }
+}
+
+/// The present mode this target's backend actually advertises.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PresentPolicy {
+    Fifo,
+    /// dx12 only: `Mailbox` maps to `Present(0, 0)`.
+    Mailbox,
+}
+
+impl PresentPolicy {
+    const fn for_target(target: &WindowTarget) -> Self {
+        match target {
+            WindowTarget::Xcb { .. }
+            | WindowTarget::Wayland { .. }
+            | WindowTarget::CoreAnimationLayer { .. } => Self::Fifo,
+            WindowTarget::CompositionVisual { .. } => Self::Mailbox,
+        }
+    }
+
+    const fn mode(self) -> wgpu::PresentMode {
+        match self {
+            Self::Fifo => wgpu::PresentMode::Fifo,
+            Self::Mailbox => wgpu::PresentMode::Mailbox,
+        }
+    }
+}
+
+/// Who is allowed to configure the swapchain.
+///
+/// This exists for exactly one reason: a `configure` on metal writes the
+/// `CAMetalLayer` — device, pixel format, colorspace, drawable size — and layer
+/// writes belong to the layer's owner thread, which is the main thread. A
+/// present that reconfigured inline would move that write to whatever thread
+/// CEF painted on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConfigureSite {
+    /// The painter reconfigures from the present path when the extent moves or
+    /// the swapchain reports itself stale.
+    Painter,
+    /// Only [`Surface::resize`] configures, on the owner's thread; a present
+    /// that finds a stale swapchain skips the frame instead.
+    Owner,
+}
+
+impl ConfigureSite {
+    const fn for_target(target: &WindowTarget) -> Self {
+        match target {
+            WindowTarget::Xcb { .. }
+            | WindowTarget::Wayland { .. }
+            | WindowTarget::CompositionVisual { .. } => Self::Painter,
+            WindowTarget::CoreAnimationLayer { .. } => Self::Owner,
         }
     }
 }
@@ -54,9 +136,7 @@ pub struct Surface<'a> {
     // the xcb_window for the surface lifetime, Wayland likewise).
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    bind_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    importer: Importer,
     // Persistent upload texture sized to the swapchain. Recreated on
     // resize. `None` until the first frame establishes a size.
     upload: Option<UploadTexture>,
@@ -64,8 +144,18 @@ pub struct Surface<'a> {
     // the gate: we only reconfigure (and present) once an incoming
     // frame matches it.
     pending_size: (u32, u32),
+    // Set by `content_detached`: the target's owner severed the binding
+    // between the swapchain and what is on screen, so the next configure must
+    // happen even though the extent did not move.
+    needs_configure: bool,
     visible: bool,
     policy: SizePolicy,
+    alpha: AlphaSource,
+    configure_site: ConfigureSite,
+    // The `CAMetalLayer` this surface presents to, as an address; zero on
+    // every other target. Read only by the post-configure hook.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    metal_layer: usize,
     mode: Option<PaintMode>,
 }
 
@@ -105,6 +195,13 @@ impl<'a> Surface<'a> {
         size: PhysicalSize,
     ) -> Result<Self, SurfaceLost> {
         let policy = SizePolicy::for_target(&target);
+        let alpha = AlphaSource::for_target(&target);
+        let present = PresentPolicy::for_target(&target);
+        let configure_site = ConfigureSite::for_target(&target);
+        let metal_layer = match &target {
+            WindowTarget::CoreAnimationLayer { layer } => layer.as_ptr() as usize,
+            _ => 0,
+        };
         let extent = texels(size).ok_or(Kind::BadDimensions(size))?;
         let max = ctx.device.limits().max_texture_dimension_2d;
         if extent.0 > max || extent.1 > max {
@@ -125,125 +222,91 @@ impl<'a> Surface<'a> {
             format: SURFACE_FORMAT,
             width: extent.0,
             height: extent.1,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode: present.mode(),
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
-        // Other surfaces may be submitting on the shared device while this
-        // painter is created, so the first configure must be gated too.
-        ctx.configure_surface(&surface, &config);
 
-        let shader = ctx
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("jfn_gpu_paint overlay"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/overlay.wgsl").into()),
-            });
-
-        let bind_layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("jfn_gpu_paint bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                        count: None,
-                    },
-                ],
-            });
-
-        let pipeline_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("jfn_gpu_paint pl"),
-                bind_group_layouts: &[Some(&bind_layout)],
-                immediate_size: 0,
-            });
-
-        let pipeline = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("jfn_gpu_paint pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: SURFACE_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-
-        // Nearest, no anisotropy — 1:1 sampling, never stretch.
-        let sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("jfn_gpu_paint sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-
-        Ok(Self {
+        let painter = Self {
             ctx,
             surface,
             config,
-            pipeline,
-            bind_layout,
-            sampler,
+            importer: Importer::new(),
             upload: None,
             pending_size: extent,
+            needs_configure: false,
             visible: true,
             policy,
+            alpha,
+            configure_site,
+            metal_layer,
             mode: None,
-        })
+        };
+        // Other surfaces may be submitting on the shared device while this
+        // painter is created, so the first configure must be gated too.
+        painter.configure_now();
+        Ok(painter)
     }
+
+    /// Configure the swapchain and restore anything wgpu overwrote doing it.
+    fn configure_now(&self) {
+        self.ctx.configure_surface(&self.surface, &self.config);
+        self.after_configure();
+    }
+
+    /// `metal::Surface::configure` clears `allowsNextDrawableTimeout`
+    /// unconditionally, and on macOS `nextDrawable` runs on the main thread —
+    /// the runloop, the CEF pump and input. Unbounded there wedges the app;
+    /// with the timeout back, a drawable that never arrives is a skipped
+    /// frame.
+    #[cfg(target_os = "macos")]
+    fn after_configure(&self) {
+        if self.metal_layer == 0 {
+            return;
+        }
+        let layer = self.metal_layer as *mut objc2::runtime::AnyObject;
+        unsafe {
+            let _: () = objc2::msg_send![layer, setAllowsNextDrawableTimeout: true];
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn after_configure(&self) {}
 
     fn clamp_extent(&self, size: (u32, u32)) -> (u32, u32) {
         let max = self.ctx.device.limits().max_texture_dimension_2d.max(1);
         (size.0.clamp(1, max), size.1.clamp(1, max))
     }
 
-    /// Store a new target size. Does not reconfigure the swapchain — the next
-    /// matching-size present does that. Gaps during a resize are acceptable;
-    /// stretching is not.
+    /// Store a new target size.
+    ///
+    /// Under [`ConfigureSite::Painter`] this does not reconfigure the
+    /// swapchain — the next matching-size present does that. Gaps during a
+    /// resize are acceptable; stretching is not. Under
+    /// [`ConfigureSite::Owner`] this *is* the configure, because the caller is
+    /// the thread that owns the drawable; an unchanged extent still costs
+    /// nothing, since the configure is skipped.
     pub fn resize(&mut self, size: PhysicalSize) {
-        if let Some(size) = texels(size) {
-            self.pending_size = size;
+        let Some(size) = texels(size) else { return };
+        self.pending_size = size;
+        if self.configure_site == ConfigureSite::Owner {
+            let (w, h) = self.clamp_extent(size);
+            self.reconfigure_to(w, h);
         }
+    }
+
+    /// The target's content binding was severed by its owner. Rebind — i.e.
+    /// reconfigure — before the next present, whatever the extent says.
+    ///
+    /// On dx12 the swapchain is bound to the composition visual *inside*
+    /// `configure` and nowhere else, so an owner that calls `SetContent(None)`
+    /// leaves a painter whose extent is unchanged and whose content is
+    /// unbound. Destroying the painter instead would mean a present-queue-idle
+    /// wait on the thread that detached it.
+    pub fn content_detached(&mut self) {
+        self.needs_configure = true;
     }
 
     pub fn set_visible(&mut self, v: bool) {
@@ -281,31 +344,43 @@ impl<'a> Surface<'a> {
         }
     }
 
-    /// The swapchain extent for this frame. `FollowFrame` tracks the producer's
-    /// size (another layer rescales it); `FollowTarget` tracks the
-    /// parent-derived window size set through `resize` — the swapchain IS the
-    /// window drawable, so it must match the window its geometry owner sized,
-    /// not the (possibly lagging) frame.
-    fn extent_for(&self, frame: (u32, u32)) -> (u32, u32) {
-        match self.policy {
-            SizePolicy::FollowFrame => frame,
-            SizePolicy::FollowTarget => self.clamp_extent(self.pending_size),
+    /// The swapchain extent to draw this frame into, reconfiguring first where
+    /// the painter is the one allowed to.
+    ///
+    /// `FollowFrame` tracks the producer's size (another layer shows it 1:1);
+    /// `FollowTarget` tracks the parent-derived window size set through
+    /// `resize` — the swapchain IS the window drawable, so it must match the
+    /// window its geometry owner sized, not the (possibly lagging) frame.
+    /// Under [`ConfigureSite::Owner`] neither applies here: the extent is
+    /// whatever the owner last configured.
+    fn extent_for(&mut self, frame: (u32, u32)) -> (u32, u32) {
+        if self.configure_site == ConfigureSite::Painter {
+            let (cw, ch) = match self.policy {
+                SizePolicy::FollowFrame => frame,
+                SizePolicy::FollowTarget => self.clamp_extent(self.pending_size),
+            };
+            self.reconfigure_to(cw, ch);
         }
+        (self.config.width, self.config.height)
     }
 
-    /// Reconfigure if the extent moved. Drops the upload texture so a frame
-    /// smaller than the swapchain leaves a transparent remainder rather than
-    /// stale pixels.
+    /// Reconfigure if the extent moved or the content binding was severed. An
+    /// extent change drops the upload texture so a frame smaller than the
+    /// swapchain leaves a transparent remainder rather than stale pixels.
     fn reconfigure_to(&mut self, cw: u32, ch: u32) {
-        if (self.config.width, self.config.height) == (cw, ch) {
+        let resized = (self.config.width, self.config.height) != (cw, ch);
+        if !configure_needed(resized, self.needs_configure) {
             return;
         }
         self.config.width = cw;
         self.config.height = ch;
-        self.ctx.configure_surface(&self.surface, &self.config);
-        self.upload = None;
-        if self.policy == SizePolicy::FollowFrame {
-            self.pending_size = (cw, ch);
+        self.needs_configure = false;
+        self.configure_now();
+        if resized {
+            self.upload = None;
+            if self.policy == SizePolicy::FollowFrame {
+                self.pending_size = (cw, ch);
+            }
         }
     }
 
@@ -330,7 +405,6 @@ impl<'a> Surface<'a> {
         }
 
         let (cw, ch) = self.extent_for((fw, fh));
-        self.reconfigure_to(cw, ch);
 
         // Upload matches the swapchain, so the fullscreen quad is always 1:1.
         self.ensure_upload(cw, ch);
@@ -357,7 +431,6 @@ impl<'a> Surface<'a> {
         }
 
         let (cw, ch) = self.extent_for((fw, fh));
-        self.reconfigure_to(cw, ch);
 
         // FollowTarget: the imported frame texture is frame-sized; render it 1:1
         // into the top-left of the (window-sized) swapchain via the viewport, so
@@ -371,21 +444,22 @@ impl<'a> Surface<'a> {
         // A failed import is not a lost surface: a shared frame has no CPU
         // pixels, so there is nowhere to degrade to. Drop it and keep the last
         // good frame on screen.
-        let imported = unsafe { crate::shared_import::import(&self.ctx.device, frame) };
-        let (texture, image) = match imported {
-            Ok(pair) => pair,
+        let imported = match self.importer.import(&self.ctx.device, frame) {
+            Ok(imported) => imported,
             Err(e) => {
-                tracing::warn!(error = %e, "gpu_paint: shared-texture import failed");
+                tracing::warn!("gpu_paint: {e}");
                 return Ok(Presented::Skipped);
             }
         };
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = imported
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self
             .ctx
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("jfn_gpu_paint dmabuf bg"),
-                layout: &self.bind_layout,
+                label: Some("jfn_gpu_paint shared bg"),
+                layout: &self.ctx.bind_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -393,12 +467,19 @@ impl<'a> Surface<'a> {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        resource: wgpu::BindingResource::Sampler(&self.ctx.sampler),
                     },
                 ],
             });
 
-        self.draw_and_present(&bind_group, Some(image), viewport, on_present)
+        self.draw_and_present(&bind_group, imported.acquire, viewport, on_present)
+    }
+
+    /// Drop anything the importer is holding across frames. Touches no
+    /// swapchain, no drawable and no configure — only the imported textures,
+    /// which wgpu keeps alive until the submissions using them retire.
+    pub fn clear_import_cache(&mut self) {
+        self.importer.clear_cache();
     }
 
     // ----- internals -----
@@ -426,7 +507,7 @@ impl<'a> Surface<'a> {
                 .device
                 .create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("jfn_gpu_paint bg"),
-                    layout: &self.bind_layout,
+                    layout: &self.ctx.bind_layout,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -434,7 +515,7 @@ impl<'a> Surface<'a> {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            resource: wgpu::BindingResource::Sampler(&self.ctx.sampler),
                         },
                     ],
                 });
@@ -468,6 +549,15 @@ impl<'a> Surface<'a> {
         let frame = loop {
             match self.surface.get_current_texture() {
                 Success(f) => break f,
+                // The owner configures, and it is not this thread. Skip; the
+                // owner's next resize rebuilds the swapchain. On metal these
+                // three are unreachable — `acquire_texture` returns only
+                // success, `Timeout` or `Occluded` — so this is a guard against
+                // a later edit reintroducing an off-main configure, not a live
+                // path.
+                Suboptimal(_) | Lost | Outdated if self.configure_site == ConfigureSite::Owner => {
+                    return Ok(Presented::Skipped);
+                }
                 Suboptimal(f) => {
                     suboptimal = true;
                     break f;
@@ -478,7 +568,7 @@ impl<'a> Surface<'a> {
                 Lost | Outdated if !reconfigured => {
                     reconfigured = true;
                     drop(read);
-                    self.ctx.configure_surface(&self.surface, &self.config);
+                    self.configure_now();
                     read = self.ctx.submit_gate.read();
                 }
                 // Transient (occluded, timed out, or still stale after reconfigure):
@@ -498,9 +588,9 @@ impl<'a> Surface<'a> {
                 self.ctx
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("jfn_gpu_paint dmabuf acquire enc"),
+                        label: Some("jfn_gpu_paint shared acquire enc"),
                     });
-            crate::shared_import::acquire_barrier(&self.ctx.device, &mut acquire_encoder, image);
+            crate::shared::acquire_barrier(&self.ctx.device, &mut acquire_encoder, image);
             self.ctx
                 .queue
                 .submit(std::iter::once(acquire_encoder.finish()));
@@ -529,7 +619,7 @@ impl<'a> Surface<'a> {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(self.ctx.pipeline(self.alpha));
             pass.set_bind_group(0, bind_group, &[]);
             // A viewport smaller than the attachment draws the frame 1:1 in the
             // top-left; the cleared remainder stays transparent.
@@ -551,10 +641,20 @@ impl<'a> Surface<'a> {
         // read guard first — configure takes the write side, which is exclusive.
         drop(read);
         if suboptimal {
-            self.ctx.configure_surface(&self.surface, &self.config);
+            self.configure_now();
         }
         Ok(Presented::Yes)
     }
+}
+
+/// Whether the swapchain has to be configured.
+///
+/// A detached target is the whole reason this is not just `resized`: on dx12
+/// the swapchain is bound to the visual inside `configure` and nowhere else, so
+/// a painter whose extent never moved still has to configure to get back on
+/// screen.
+const fn configure_needed(resized: bool, detached: bool) -> bool {
+    resized || detached
 }
 
 /// A physical size as texels, or `None` when it is not a positive extent.
@@ -646,7 +746,8 @@ unsafe fn create_surface(
     instance: &wgpu::Instance,
     target: WindowTarget,
 ) -> Result<wgpu::Surface<'static>, SurfaceLost> {
-    let (display, window) = match target {
+    let unsafe_target = match target {
+        #[cfg(target_os = "linux")]
         WindowTarget::Xcb {
             connection,
             window,
@@ -657,20 +758,32 @@ unsafe fn create_surface(
             let mut wh =
                 XcbWindowHandle::new(NonZeroU32::new(window).ok_or(Kind::SurfaceUnsupported)?);
             wh.visual_id = NonZeroU32::new(visual);
-            (RawDisplayHandle::Xcb(display), RawWindowHandle::Xcb(wh))
+            wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(RawDisplayHandle::Xcb(display)),
+                raw_window_handle: RawWindowHandle::Xcb(wh),
+            }
         }
+        #[cfg(target_os = "linux")]
         WindowTarget::Wayland { display, surface } => {
             let dh = WaylandDisplayHandle::new(display);
             let wh = WaylandWindowHandle::new(surface);
-            (RawDisplayHandle::Wayland(dh), RawWindowHandle::Wayland(wh))
+            wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(RawDisplayHandle::Wayland(dh)),
+                raw_window_handle: RawWindowHandle::Wayland(wh),
+            }
         }
+        #[cfg(windows)]
+        WindowTarget::CompositionVisual { visual } => {
+            wgpu::SurfaceTargetUnsafe::CompositionVisual(visual.as_ptr())
+        }
+        #[cfg(target_os = "macos")]
+        WindowTarget::CoreAnimationLayer { layer } => {
+            wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer.as_ptr())
+        }
+        // A target belonging to a window system this build cannot present to.
+        _ => return Err(Kind::SurfaceUnsupported.into()),
     };
-    let surface = unsafe {
-        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: Some(display),
-            raw_window_handle: window,
-        })?
-    };
+    let surface = unsafe { instance.create_surface_unsafe(unsafe_target)? };
     Ok(surface)
 }
 
@@ -684,24 +797,97 @@ mod tests {
         NonNull::dangling()
     }
 
-    // The policy is a fact about the window system, not a caller preference:
-    // an X11 swapchain IS the window drawable, so it must track the extent its
-    // geometry owner set; a Wayland one is rescaled by `wp_viewport`, so it
-    // tracks the producer and stays 1:1.
-    #[test]
-    fn size_policy_follows_the_window_target() {
-        let xcb = WindowTarget::Xcb {
+    fn xcb() -> WindowTarget {
+        WindowTarget::Xcb {
             connection: dangling(),
             window: 1,
             screen: 0,
             visual: 0,
-        };
-        let wl = WindowTarget::Wayland {
+        }
+    }
+
+    fn wayland() -> WindowTarget {
+        WindowTarget::Wayland {
             display: dangling(),
             surface: dangling(),
-        };
-        assert_eq!(SizePolicy::for_target(&xcb), SizePolicy::FollowTarget);
-        assert_eq!(SizePolicy::for_target(&wl), SizePolicy::FollowFrame);
+        }
+    }
+
+    fn composition_visual() -> WindowTarget {
+        WindowTarget::CompositionVisual { visual: dangling() }
+    }
+
+    fn core_animation_layer() -> WindowTarget {
+        WindowTarget::CoreAnimationLayer { layer: dangling() }
+    }
+
+    #[test]
+    fn size_policy_follows_the_window_target() {
+        assert_eq!(SizePolicy::for_target(&xcb()), SizePolicy::FollowTarget);
+        assert_eq!(SizePolicy::for_target(&wayland()), SizePolicy::FollowFrame);
+        assert_eq!(
+            SizePolicy::for_target(&composition_visual()),
+            SizePolicy::FollowFrame
+        );
+        assert_eq!(
+            SizePolicy::for_target(&core_animation_layer()),
+            SizePolicy::FollowTarget
+        );
+    }
+
+    #[test]
+    fn alpha_source_follows_the_window_target() {
+        assert_eq!(AlphaSource::for_target(&xcb()), AlphaSource::Premultiplied);
+        assert_eq!(
+            AlphaSource::for_target(&wayland()),
+            AlphaSource::Premultiplied
+        );
+        assert_eq!(
+            AlphaSource::for_target(&composition_visual()),
+            AlphaSource::Premultiplied
+        );
+        assert_eq!(
+            AlphaSource::for_target(&core_animation_layer()),
+            AlphaSource::Straight
+        );
+    }
+
+    #[test]
+    fn present_policy_follows_the_window_target() {
+        assert_eq!(PresentPolicy::for_target(&xcb()), PresentPolicy::Fifo);
+        assert_eq!(PresentPolicy::for_target(&wayland()), PresentPolicy::Fifo);
+        assert_eq!(
+            PresentPolicy::for_target(&composition_visual()),
+            PresentPolicy::Mailbox
+        );
+        assert_eq!(
+            PresentPolicy::for_target(&core_animation_layer()),
+            PresentPolicy::Fifo
+        );
+    }
+
+    #[test]
+    fn configure_site_follows_the_window_target() {
+        assert_eq!(ConfigureSite::for_target(&xcb()), ConfigureSite::Painter);
+        assert_eq!(
+            ConfigureSite::for_target(&wayland()),
+            ConfigureSite::Painter
+        );
+        assert_eq!(
+            ConfigureSite::for_target(&composition_visual()),
+            ConfigureSite::Painter
+        );
+        assert_eq!(
+            ConfigureSite::for_target(&core_animation_layer()),
+            ConfigureSite::Owner
+        );
+    }
+
+    #[test]
+    fn content_detached_forces_a_configure_at_an_unchanged_extent() {
+        assert!(!configure_needed(false, false));
+        assert!(configure_needed(false, true));
+        assert!(configure_needed(true, false));
     }
 
     #[test]

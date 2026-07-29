@@ -92,35 +92,96 @@ impl SharedTexture {
 #[cfg(windows)]
 pub struct SharedTexture {
     handle: *mut std::ffi::c_void,
+    coded: PhysicalSize,
+    visible_rect: PhysicalSize,
 }
 
 #[cfg(windows)]
 impl SharedTexture {
-    pub fn new(handle: *mut std::ffi::c_void) -> Self {
-        Self { handle }
+    pub fn new(
+        handle: *mut std::ffi::c_void,
+        coded: PhysicalSize,
+        visible_rect: PhysicalSize,
+    ) -> Self {
+        Self {
+            handle,
+            coded,
+            visible_rect,
+        }
     }
 
-    /// The D3D11 shared NT handle. Valid only for the duration of the paint
+    /// The shared NT handle. Valid only for the duration of the paint
     /// callback; the compositor opens it and uses it inline.
     pub fn handle(&self) -> *mut std::ffi::c_void {
         self.handle
+    }
+
+    /// The full allocation, which may be padded larger than the content.
+    pub fn coded(&self) -> PhysicalSize {
+        self.coded
+    }
+
+    /// CEF's visible rect exactly as given — may be zero when it supplied none.
+    /// Prefer [`Self::visible`] unless you specifically need the raw value.
+    pub fn visible_rect(&self) -> PhysicalSize {
+        self.visible_rect
+    }
+
+    /// The area CEF painted: its visible rect when it gave one, else `coded`.
+    pub fn visible(&self) -> PhysicalSize {
+        visible_or_coded(self.visible_rect, self.coded)
     }
 }
 
 #[cfg(target_os = "macos")]
 pub struct SharedTexture {
     io_surface: *mut std::ffi::c_void,
+    coded: PhysicalSize,
+    visible_rect: PhysicalSize,
 }
 
 #[cfg(target_os = "macos")]
 impl SharedTexture {
-    pub fn new(io_surface: *mut std::ffi::c_void) -> Self {
-        Self { io_surface }
+    pub fn new(
+        io_surface: *mut std::ffi::c_void,
+        coded: PhysicalSize,
+        visible_rect: PhysicalSize,
+    ) -> Self {
+        Self {
+            io_surface,
+            coded,
+            visible_rect,
+        }
     }
 
     /// The `IOSurfaceRef`. Unretained — valid only for the duration of the
     /// paint callback, so the compositor must not cache it past that.
     pub fn io_surface(&self) -> *mut std::ffi::c_void {
         self.io_surface
+    }
+
+    /// The full allocation, which may be padded larger than the content.
+    pub fn coded(&self) -> PhysicalSize {
+        self.coded
+    }
+
+    /// CEF's visible rect exactly as given — may be zero when it supplied none.
+    /// Prefer [`Self::visible`] unless you specifically need the raw value.
+    pub fn visible_rect(&self) -> PhysicalSize {
+        self.visible_rect
+    }
+
+    /// The area CEF painted: its visible rect when it gave one, else `coded`.
+    pub fn visible(&self) -> PhysicalSize {
+        visible_or_coded(self.visible_rect, self.coded)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn visible_or_coded(visible_rect: PhysicalSize, coded: PhysicalSize) -> PhysicalSize {
+    if visible_rect.w > 0 && visible_rect.h > 0 {
+        visible_rect
+    } else {
+        coded
     }
 }

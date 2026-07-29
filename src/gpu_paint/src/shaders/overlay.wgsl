@@ -26,3 +26,12 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOut {
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     return textureSample(tex, samp, in.uv);
 }
+
+// For targets whose composite-alpha mode is PostMultiplied but whose
+// compositor still expects premultiplied pixels (metal offers no
+// premultiplied mode; CoreAnimation composites premultiplied).
+@fragment
+fn fs_main_premultiplied(in: VertexOut) -> @location(0) vec4<f32> {
+    let c = textureSample(tex, samp, in.uv);
+    return vec4<f32>(c.rgb * c.a, c.a);
+}

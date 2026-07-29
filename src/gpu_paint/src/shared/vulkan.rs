@@ -7,15 +7,122 @@ use ash::vk::Handle;
 use ash::{ext, khr, vk};
 use wgpu_hal::vulkan;
 
-/// A shared-texture import that did not work.
-///
-/// Deliberately not a [`crate::SurfaceLost`]: a shared frame has no CPU pixels,
-/// so there is nothing to fall back to. The frame is logged and dropped and the
-/// surface stays usable, which is why this never reaches a caller.
-#[derive(Debug, thiserror::Error)]
-#[error("shared-texture import failed: {0}")]
-pub(crate) struct ImportFailed(pub(crate) &'static str);
 use jfn_platform_abi::{DmabufFormat, SharedTexture};
+
+use crate::error::{Kind, SurfaceLost};
+use crate::shared::{ImportFailed, Imported, Opened};
+
+/// The DRM render node CEF produces its shared buffers on, as `(major, minor)`.
+pub(crate) type ProducerId = (i64, i64);
+
+/// Ask the installed backend which ozone platform we are on rather than
+/// guessing — the probe needs the name. On Wayland it gets a null EGL display
+/// and yields `None`, which is what the caller passed explicitly before.
+///
+/// The probe asks CEF directly, so no frame is needed and `sample` is ignored.
+pub(crate) fn producer_id(_sample: Option<&SharedTexture>) -> Option<ProducerId> {
+    let ozone = match jfn_platform_abi::try_get().map(|p| p.display()) {
+        Some(jfn_platform_abi::DisplayBackend::Wayland) => c"wayland",
+        _ => c"x11",
+    };
+    unsafe { jfn_linux_util::dmabuf_probe::cef_render_node(ozone.as_ptr(), std::ptr::null_mut()) }
+}
+
+pub(crate) fn adapter_matches(adapter: &wgpu::Adapter, want: ProducerId) -> bool {
+    unsafe { adapter.as_hal::<vulkan::Api>() }
+        .and_then(|hal| {
+            drm_render_node(
+                hal.shared_instance().raw_instance(),
+                hal.raw_physical_device(),
+            )
+        })
+        .is_some_and(|node| node == want)
+}
+
+/// Open the device with the dmabuf extensions wgpu-hal does not enable itself,
+/// injected through the device-create callback.
+pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<Opened, SurfaceLost> {
+    let limits = adapter.limits();
+
+    let (want_import, extra_exts) = unsafe {
+        match adapter.as_hal::<vulkan::Api>() {
+            Some(hal) => {
+                let ash_instance = hal.shared_instance().raw_instance();
+                let phys = hal.raw_physical_device();
+                (
+                    import_supported(ash_instance, phys),
+                    extra_device_extensions(ash_instance, phys),
+                )
+            }
+            None => (false, Vec::new()),
+        }
+    };
+
+    let open_device = unsafe {
+        let hal = adapter.as_hal::<vulkan::Api>().ok_or(Kind::NoAdapter)?;
+        hal.open_with_callback(
+            wgpu::Features::empty(),
+            &limits,
+            &wgpu::MemoryHints::Performance,
+            Some(Box::new(move |args: vulkan::CreateDeviceCallbackArgs| {
+                for ext in &extra_exts {
+                    if !args.extensions.contains(ext) {
+                        args.extensions.push(*ext);
+                    }
+                }
+            })),
+        )
+        .map_err(|_| Kind::NoAdapter)?
+    };
+
+    let (device, queue) = unsafe {
+        adapter.create_device_from_hal::<vulkan::Api>(
+            open_device,
+            &wgpu::DeviceDescriptor {
+                label: Some("jfn_gpu_paint device"),
+                required_features: wgpu::Features::empty(),
+                // Adapter limits — the swapchain may be larger than the
+                // downlevel 2048×2048 cap on modern displays.
+                required_limits: limits,
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            },
+        )?
+    };
+
+    // Importing needs the extensions to be advertised *and* live on the
+    // device we actually opened.
+    let import_capable = want_import && required_extensions_enabled(&device);
+    Ok(Opened {
+        device,
+        queue,
+        import_capable,
+    })
+}
+
+/// Stateless: a dmabuf import is per-frame and owns nothing across frames.
+pub(crate) struct Importer;
+
+impl Importer {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn import(
+        &mut self,
+        device: &wgpu::Device,
+        frame: &SharedTexture,
+    ) -> Result<Imported, ImportFailed> {
+        let (texture, image) = unsafe { import(device, frame) }?;
+        Ok(Imported {
+            texture,
+            acquire: Some(image),
+        })
+    }
+
+    pub(crate) fn clear_cache(&mut self) {}
+}
 
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
@@ -48,7 +155,7 @@ fn device_extensions(
 
 /// Filtered to extensions the device advertises: pushing an unsupported
 /// extension makes `vkCreateDevice` hard-error.
-pub(crate) fn extra_device_extensions(
+fn extra_device_extensions(
     instance: &ash::Instance,
     phys: vk::PhysicalDevice,
 ) -> Vec<&'static CStr> {
@@ -59,10 +166,7 @@ pub(crate) fn extra_device_extensions(
         .collect()
 }
 
-pub(crate) fn drm_render_node(
-    instance: &ash::Instance,
-    phys: vk::PhysicalDevice,
-) -> Option<(i64, i64)> {
+fn drm_render_node(instance: &ash::Instance, phys: vk::PhysicalDevice) -> Option<(i64, i64)> {
     let available = device_extensions(instance, phys);
     if !available
         .iter()
@@ -84,7 +188,7 @@ fn required_extensions_present(instance: &ash::Instance, phys: vk::PhysicalDevic
         .all(|want| available.iter().any(|p| ext_name(p) == *want))
 }
 
-pub(crate) fn required_extensions_enabled(device: &wgpu::Device) -> bool {
+fn required_extensions_enabled(device: &wgpu::Device) -> bool {
     unsafe { device.as_hal::<vulkan::Api>() }
         .map(|d| {
             let enabled = d.enabled_device_extensions();
@@ -109,7 +213,7 @@ fn wgpu_format(format: DmabufFormat) -> wgpu::TextureFormat {
     }
 }
 
-pub(crate) fn import_supported(instance: &ash::Instance, phys: vk::PhysicalDevice) -> bool {
+fn import_supported(instance: &ash::Instance, phys: vk::PhysicalDevice) -> bool {
     if !required_extensions_present(instance, phys) {
         return false;
     }
@@ -172,7 +276,7 @@ unsafe fn format_importable(
 /// # Safety
 /// - `frame.planes()[0].fd` must be a valid dmabuf fd describing a
 ///   image of the frame's coded size in `frame.format()`/`frame.modifier()`.
-pub(crate) unsafe fn import(
+unsafe fn import(
     device: &wgpu::Device,
     frame: &SharedTexture,
 ) -> Result<(wgpu::Texture, u64), ImportFailed> {

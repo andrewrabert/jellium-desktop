@@ -8,15 +8,19 @@
 //!
 //! The two backends model the registry slightly differently, and this type
 //! is the faithful superset:
-//! - **macOS** has no separate "live" list — the stack *is* the registry
-//!   and the main surface is `stack.first()`. It uses [`replace_stack`],
-//!   [`remove`], [`is_main`], [`stack`], [`take_stack`].
+//! - **macOS** derives the main surface from `stack.first()`, so it tracks
+//!   `live` only to answer "is this pointer still valid" and registers
+//!   through [`register`], which leaves `main` alone. It uses
+//!   [`register`], [`replace_stack`], [`remove`], [`is_main`], [`stack`],
+//!   [`live`], [`take_stack`].
 //! - **Windows** tracks `live` (all allocated), `stack` (currently
 //!   parented), and an explicit `main` with a live fallback. It uses
 //!   [`add_live`], [`remove`], [`clear_stack`] + [`push_stack`] +
 //!   [`set_main_to_stack_first`] (its restack interleaves GPU calls),
 //!   [`is_main`], [`take_live`].
 //!
+//! [`register`]: SurfaceStack::register
+//! [`live`]: SurfaceStack::live
 //! [`replace_stack`]: SurfaceStack::replace_stack
 //! [`remove`]: SurfaceStack::remove
 //! [`is_main`]: SurfaceStack::is_main
@@ -31,7 +35,8 @@
 /// Bottom-to-top surface registry with main-surface tracking.
 #[derive(Debug, Clone)]
 pub struct SurfaceStack<T: Copy + PartialEq> {
-    /// All allocated surfaces (Windows). macOS never populates this.
+    /// All allocated surfaces. Windows adds through `add_live` (which seeds
+    /// `main`), macOS through `register` (which does not).
     live: Vec<T>,
     /// Current bottom-to-top stacking order.
     stack: Vec<T>,
@@ -60,10 +65,32 @@ impl<T: Copy + PartialEq> SurfaceStack<T> {
         }
     }
 
+    /// macOS alloc: register a newly allocated surface in the live set
+    /// *without* touching `main`.
+    ///
+    /// macOS derives the main surface from `stack.first()`; seeding `main`
+    /// here — as [`Self::add_live`] does — changes which surface `is_main`
+    /// names, and with it transition gating.
+    pub fn register(&mut self, h: T) {
+        self.live.push(h);
+    }
+
+    /// macOS free: the counterpart to [`Self::register`] — drop the surface
+    /// from both lists and re-derive `main` as `stack.first()` alone.
+    ///
+    /// [`Self::remove`]'s `live.first()` fallback names a main surface that is
+    /// not the bottom of the stack, which macOS's is-main check requires.
+    pub fn deregister(&mut self, h: T) {
+        self.live.retain(|&x| x != h);
+        self.stack.retain(|&x| x != h);
+        if self.main == Some(h) {
+            self.main = self.stack.first().copied();
+        }
+    }
+
     /// Remove a freed surface from both lists. If it was main, re-derive
     /// main as `stack.first()` then `live.first()` then `None` — matching
-    /// Windows `win_free_surface`. (macOS keeps `live` empty, so this
-    /// degrades to `stack.first()`, preserving `main == stack.first()`.)
+    /// Windows `win_free_surface`.
     pub fn remove(&mut self, h: T) {
         self.live.retain(|&x| x != h);
         self.stack.retain(|&x| x != h);
@@ -291,6 +318,40 @@ mod tests {
         s.remove(h(10));
         assert!(s.is_main(h(11)));
         assert_eq!(s.stack(), &[h(11)]);
+    }
+
+    #[test]
+    fn register_never_sets_main_but_add_live_does() {
+        let mut s = SurfaceStack::new();
+        s.register(h(1));
+        assert_eq!(s.main(), None);
+        assert_eq!(s.live(), &[h(1)]);
+
+        let mut w = SurfaceStack::new();
+        w.add_live(h(1));
+        assert!(w.is_main(h(1)));
+    }
+
+    #[test]
+    fn deregister_rederives_main_from_stack_only() {
+        let mut s = SurfaceStack::new();
+        s.register(h(1));
+        s.register(h(2));
+        s.replace_stack(&[h(1)]); // main = 1, h(2) live but unstacked
+        s.deregister(h(1));
+        assert_eq!(s.main(), None);
+        assert!(s.stack().is_empty());
+        assert_eq!(s.live(), &[h(2)]);
+    }
+
+    #[test]
+    fn deregister_keeps_main_equal_to_stack_first() {
+        let mut s = SurfaceStack::new();
+        s.register(h(1));
+        s.register(h(2));
+        s.replace_stack(&[h(1), h(2)]);
+        s.deregister(h(1));
+        assert!(s.is_main(h(2)));
     }
 
     #[test]

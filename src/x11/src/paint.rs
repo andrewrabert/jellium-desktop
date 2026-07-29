@@ -53,7 +53,7 @@ impl PaintTier {
             tracing::info!("paint: using SHM");
             (Self::SHM, Req::Shm)
         } else {
-            match Surfaces::init() {
+            match Surfaces::init(None) {
                 None => {
                     tracing::info!("paint: no usable GPU device; using SHM");
                     (Self::SHM, Req::Shm)

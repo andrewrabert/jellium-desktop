@@ -68,7 +68,12 @@ pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     if info.shared_texture_handle.is_null() {
         return None;
     }
-    Some(SharedTexture::new(info.shared_texture_handle))
+    let (coded, visible_rect) = extents(info)?;
+    Some(SharedTexture::new(
+        info.shared_texture_handle,
+        coded,
+        visible_rect,
+    ))
 }
 
 /// The compositor wraps the `IOSurface` in an `MTLTexture` inline, within this
@@ -78,5 +83,28 @@ pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     if info.shared_texture_io_surface.is_null() {
         return None;
     }
-    Some(SharedTexture::new(info.shared_texture_io_surface))
+    let (coded, visible_rect) = extents(info)?;
+    Some(SharedTexture::new(
+        info.shared_texture_io_surface,
+        coded,
+        visible_rect,
+    ))
+}
+
+/// The pair CEF states about every frame, on the platforms whose payload does
+/// not carry its own size. `None` when the coded size is not presentable.
+#[cfg(not(target_os = "linux"))]
+fn extents(info: &AcceleratedPaintInfo) -> Option<(PhysicalSize, PhysicalSize)> {
+    let coded = PhysicalSize {
+        w: info.extra.coded_size.width,
+        h: info.extra.coded_size.height,
+    };
+    if coded.w <= 0 || coded.h <= 0 {
+        return None;
+    }
+    let visible_rect = PhysicalSize {
+        w: info.extra.visible_rect.width.max(0),
+        h: info.extra.visible_rect.height.max(0),
+    };
+    Some((coded, visible_rect))
 }

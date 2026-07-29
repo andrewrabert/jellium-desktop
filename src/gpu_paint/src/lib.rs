@@ -20,15 +20,13 @@
 //! Creating windows, restacking them, placing them, and owning the threads that
 //! drive them all stay with the backends too.
 
-#![cfg(target_os = "linux")]
-
 mod context;
 mod error;
 mod painter;
-mod shared_import;
+mod shared;
 mod types;
 
-pub use context::Surfaces;
+pub use context::{Surfaces, any_adapter};
 pub use error::SurfaceLost;
 pub use painter::Surface;
 pub use types::{Frame, Pixels, Presented, WindowTarget};

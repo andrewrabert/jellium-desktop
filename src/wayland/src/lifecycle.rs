@@ -105,7 +105,7 @@ pub(crate) fn init() -> bool {
         // Held for the process: each layer's surface borrows it, and it is
         // never replaced.
         static GPU: std::sync::OnceLock<jfn_gpu_paint::Surfaces> = std::sync::OnceLock::new();
-        match jfn_gpu_paint::Surfaces::init() {
+        match jfn_gpu_paint::Surfaces::init(None) {
             Some(gpu) => {
                 let gpu = GPU.get_or_init(|| gpu);
                 crate::wl_state::install_gpu_paint(gpu);

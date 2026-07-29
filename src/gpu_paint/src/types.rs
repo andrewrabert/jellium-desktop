@@ -26,6 +26,15 @@ pub enum WindowTarget {
         display: NonNull<c_void>,
         surface: NonNull<c_void>,
     },
+    /// Windows — `visual` is an `IDCompositionVisual*`. wgpu binds its
+    /// swapchain to the visual inside `configure` and nowhere else, which is
+    /// what [`crate::Surface::content_detached`] exists for; the app keeps
+    /// ownership of the visual and its tree.
+    CompositionVisual { visual: NonNull<c_void> },
+    /// macOS — `layer` is a `CAMetalLayer*`. Configuring the surface *is* the
+    /// layer mutation (wgpu writes device, format, colorspace, drawable size
+    /// and more), so it belongs to the layer's owner thread.
+    CoreAnimationLayer { layer: NonNull<c_void> },
 }
 
 /// Which kind of frame a surface carries. Latched from the first frame and

@@ -44,6 +44,8 @@ nix = { version = "0.30", features = ["event", "fs", "poll", "signal", "socket",
 objc2 = "0.6"
 parking_lot = "0.12"
 objc2-foundation = "0.3"
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
 serde_json = "1"
 slotmap = "1"
 tempfile = "3"
