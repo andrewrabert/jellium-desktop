@@ -2546,6 +2546,7 @@ version = "0.1.0-dev"
 dependencies = [
  "cef",
  "jfn-compositor-core",
+ "jfn-gpu-paint",
  "jfn-input",
  "jfn-mpv",
  "jfn-platform-abi",

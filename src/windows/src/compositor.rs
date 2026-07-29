@@ -1,40 +1,51 @@
-//! D3D11 + DirectComposition per-surface compositor.
+//! DirectComposition per-surface compositor.
 //!
-//! Owns all D3D / DComp / per-surface state. The platform module keeps only
-//! HWND, cached scale, fullscreen bookkeeping, the WndProc hook, and the
-//! input thread; it calls into this module via the narrow `jfn_win_*`
-//! accessors at the bottom of the file to initialize, tear down, and drive
-//! the transition-locked routines.
+//! Owns all DComp / per-surface state; the pixels themselves go through
+//! `jfn-gpu-paint`, which owns the device and every swapchain. The platform
+//! module keeps only HWND, cached scale, fullscreen bookkeeping, the WndProc
+//! hook, and the input thread; it calls into this module via the narrow
+//! `jfn_win_*` accessors at the bottom of the file to initialize, tear down,
+//! and drive the transition-locked routines.
+//!
+//! Threading: the CEF UI thread presents, allocates and frees; the app main
+//! thread initializes; the WndProc thread resizes and transitions. `STATE` is
+//! what joins them. No wgpu call which waits on the GPU — configure, and
+//! dropping a painter — may run while `STATE` is held, because the WndProc
+//! blocks on `STATE`.
 
 #![allow(non_snake_case)]
 
 use parking_lot::Mutex;
 use std::ffi::{c_int, c_void};
+use std::ptr::NonNull;
+use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{HANDLE, HWND};
-use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
-};
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice,
-    ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D,
-};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
-};
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-};
-use windows::Win32::Graphics::Dxgi::{
-    DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1,
 };
 use windows_core::Interface;
 
 use jfn_compositor_core::stack::SurfaceStack;
 use jfn_compositor_core::transition::{PresentDecision, TransitionGate};
-use jfn_platform_abi::SharedTexture;
+use jfn_gpu_paint::{Frame, Pixels, Presented, Surface as Painter, Surfaces, WindowTarget};
+use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
+
+// =====================================================================
+// The process's GPU device. Built once and borrowed by every painter —
+// which is why it is a `static` rather than a field of `State`: painters
+// are `Painter<'static>`.
+//
+// Built at the first present rather than at init, because the adapter it
+// must open on is the one CEF produced the frame on, and a shared handle
+// is the only thing that names that adapter.
+// =====================================================================
+
+static GPU: OnceLock<Option<Surfaces>> = OnceLock::new();
+
+fn gpu(sample: Option<&SharedTexture>) -> Option<&'static Surfaces> {
+    GPU.get_or_init(|| Surfaces::init(sample)).as_ref()
+}
 
 // =====================================================================
 // Per-surface state. Stored as `Box<Surface>` and exposed across the C
@@ -42,33 +53,27 @@ use jfn_platform_abi::SharedTexture;
 // =====================================================================
 
 pub(crate) struct Surface {
-    swap_chain: Option<IDXGISwapChain1>,
     visual: Option<IDCompositionVisual>,
-    sw: i32,
-    sh: i32,
+    /// `None` means "not built yet, or checked out by the present in
+    /// flight" — the two are told apart by whether the surface is live.
+    painter: Option<Painter<'static>>,
     visible: bool,
     in_tree: bool,
 
     popup_visual: Option<IDCompositionVisual>,
-    popup_swap_chain: Option<IDXGISwapChain1>,
-    popup_sw: i32,
-    popup_sh: i32,
+    popup_painter: Option<Painter<'static>>,
     popup_visible: bool,
 }
 
 impl Surface {
     fn new() -> Self {
         Self {
-            swap_chain: None,
             visual: None,
-            sw: 0,
-            sh: 0,
+            painter: None,
             visible: true,
             in_tree: false,
             popup_visual: None,
-            popup_swap_chain: None,
-            popup_sw: 0,
-            popup_sh: 0,
+            popup_painter: None,
             popup_visible: false,
         }
     }
@@ -81,9 +86,6 @@ impl Surface {
 // =====================================================================
 
 struct CompositorDevices {
-    d3d_device: ID3D11Device1,
-    d3d_context: ID3D11DeviceContext,
-    dxgi_factory: IDXGIFactory2,
     dcomp_device: IDCompositionDevice,
     // Held only to keep the composition target (and its bound root) alive for
     // the lifetime of the compositor; never read after construction.
@@ -93,8 +95,8 @@ struct CompositorDevices {
 }
 
 // COM interfaces are Send+Sync-by-COM-spec for the apartment we created them
-// in (MTA via D3D11CreateDevice). We serialize all access under STATE's
-// Mutex so the apartment-confinement isn't violated.
+// in. We serialize all access under STATE's Mutex so the apartment-confinement
+// isn't violated.
 unsafe impl Send for CompositorDevices {}
 unsafe impl Send for Surface {}
 
@@ -134,10 +136,18 @@ pub(crate) fn gate_in_transition() -> bool {
 // Compositor init/cleanup — called from win_init/win_cleanup (C++).
 // =====================================================================
 
-/// Build D3D11 + DXGI + DComp devices and the root visual. Returns false
-/// on failure with the partial state torn down.
+/// Build the DComp device and the root visual. Returns false on failure with
+/// the partial state torn down.
+///
+/// The GPU device is deliberately not built here: *whether* this machine has a
+/// usable adapter is knowable now, but *which* adapter to open is not — that
+/// waits for CEF's first frame.
 pub fn jfn_win_init_compositor(hwnd: *mut c_void) -> bool {
     let hwnd = HWND(hwnd);
+    if !jfn_gpu_paint::any_adapter() {
+        tracing::error!(target: "platform", "compositor init failed: no usable GPU adapter");
+        return false;
+    }
     let mut st = STATE.lock();
     if st.devices.is_some() {
         return true;
@@ -156,41 +166,16 @@ pub fn jfn_win_init_compositor(hwnd: *mut c_void) -> bool {
 
 fn init_devices(hwnd: HWND) -> windows_core::Result<CompositorDevices> {
     unsafe {
-        // D3D11 device + immediate context.
-        let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
-        let mut base_device: Option<ID3D11Device> = None;
-        let mut context: Option<ID3D11DeviceContext> = None;
-        D3D11CreateDevice(
-            None::<&windows::Win32::Graphics::Dxgi::IDXGIAdapter>,
-            D3D_DRIVER_TYPE_HARDWARE,
-            windows::Win32::Foundation::HMODULE(std::ptr::null_mut()),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            Some(&levels),
-            D3D11_SDK_VERSION,
-            Some(&mut base_device),
-            None,
-            Some(&mut context),
-        )?;
-        let base_device = base_device.ok_or(windows_core::Error::from_thread())?;
-        let context = context.ok_or(windows_core::Error::from_thread())?;
-        let d3d_device: ID3D11Device1 = base_device.cast()?;
-
-        // DXGI factory via the device's adapter.
-        let dxgi_device: IDXGIDevice = d3d_device.cast()?;
-        let adapter: IDXGIAdapter = dxgi_device.GetAdapter()?;
-        let dxgi_factory: IDXGIFactory2 = adapter.GetParent()?;
-
-        // DComp device on the DXGI device.
-        let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
+        // NULL rendering device: this compositor only builds a visual tree,
+        // and the swapchains under it belong to wgpu.
+        let dcomp_device: IDCompositionDevice =
+            DCompositionCreateDevice(None::<&windows::Win32::Graphics::Dxgi::IDXGIDevice>)?;
         let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, false)?;
         let dcomp_root = dcomp_device.CreateVisual()?;
         dcomp_target.SetRoot(&dcomp_root)?;
         dcomp_device.Commit()?;
 
         Ok(CompositorDevices {
-            d3d_device,
-            d3d_context: context,
-            dxgi_factory,
             dcomp_device,
             dcomp_target,
             dcomp_root,
@@ -201,23 +186,35 @@ fn init_devices(hwnd: HWND) -> windows_core::Result<CompositorDevices> {
 /// Release all surfaces + devices. Called from win_cleanup (C++) after the
 /// WndProc hook is unhooked and the input thread is joined.
 pub fn jfn_win_cleanup_compositor() {
-    let mut st = STATE.lock();
-    // Free any remaining surfaces. Browsers should normally free them
-    // first, but be defensive.
-    let live: Vec<*mut Surface> = st.surfaces.take_live();
-    for ptr in live {
-        if !ptr.is_null() {
+    // Painters are dropped after STATE is released: dropping one unconfigures
+    // its swapchain, which waits for the present queue to idle.
+    let orphans = {
+        let mut st = STATE.lock();
+        let mut orphans = Vec::new();
+        // Free any remaining surfaces. Browsers should normally free them
+        // first, but be defensive.
+        let live: Vec<*mut Surface> = st.surfaces.take_live();
+        for ptr in live {
+            if ptr.is_null() {
+                continue;
+            }
             // SAFETY: we own these pointers via Box::into_raw.
             unsafe {
                 let mut s = Box::from_raw(ptr);
+                orphans.push(s.painter.take());
+                orphans.push(s.popup_painter.take());
                 detach_surface(&mut s, st.devices.as_ref());
                 drop(s);
             }
         }
-    }
-    st.devices = None;
+        st.devices = None;
+        orphans
+    };
+    drop(orphans);
 }
 
+/// Unbind a surface's visuals from the tree. COM only — no GPU wait — so it is
+/// safe under `STATE`; the painters are taken out separately.
 fn detach_surface(s: &mut Surface, devices: Option<&CompositorDevices>) {
     unsafe {
         if let Some(pv) = s.popup_visual.as_ref() {
@@ -227,7 +224,6 @@ fn detach_surface(s: &mut Surface, devices: Option<&CompositorDevices>) {
             let _ = pv.SetContent(None::<&windows_core::IUnknown>);
         }
         s.popup_visual = None;
-        s.popup_swap_chain = None;
         if let Some(v) = s.visual.as_ref() {
             if s.in_tree
                 && let Some(d) = devices
@@ -237,110 +233,59 @@ fn detach_surface(s: &mut Surface, devices: Option<&CompositorDevices>) {
             let _ = v.SetContent(None::<&windows_core::IUnknown>);
         }
         s.visual = None;
-        s.swap_chain = None;
     }
 }
 
 // =====================================================================
-// Swap-chain helpers (locked).
+// Painter helpers.
 // =====================================================================
 
-fn create_swap_chain(
-    devices: &CompositorDevices,
-    width: i32,
-    height: i32,
-) -> Option<IDXGISwapChain1> {
-    if width <= 0 || height <= 0 {
-        return None;
-    }
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
-        Width: width as u32,
-        Height: height as u32,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-        AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        ..Default::default()
-    };
-    unsafe {
-        match devices.dxgi_factory.CreateSwapChainForComposition(
-            &devices.d3d_device,
-            &desc,
-            None::<&windows::Win32::Graphics::Dxgi::IDXGIOutput>,
-        ) {
-            Ok(sc) => Some(sc),
-            Err(e) => {
-                tracing::error!(target: "platform", "CreateSwapChainForComposition failed: {e:?}");
-                None
-            }
-        }
-    }
-}
-
-/// Ensure `sc` is sized (w,h); resize in place if possible, otherwise
-/// recreate and rebind to `visual`. Updates `sw`/`sh` on success.
-fn ensure_swap_chain(
-    devices: &CompositorDevices,
-    sc: &mut Option<IDXGISwapChain1>,
-    sw: &mut i32,
-    sh: &mut i32,
+/// Bind a painter to `visual`. wgpu retains the visual for as long as the
+/// painter lives and calls `SetContent` itself from every configure; the
+/// caller publishes that with a `Commit`.
+fn build_painter(
     visual: &IDCompositionVisual,
-    w: i32,
-    h: i32,
-) {
-    if w <= 0 || h <= 0 {
-        return;
-    }
-    if let Some(existing) = sc.as_ref() {
-        if *sw == w && *sh == h {
-            return;
+    size: PhysicalSize,
+    sample: Option<&SharedTexture>,
+) -> Option<Painter<'static>> {
+    let gpu = gpu(sample)?;
+    let visual = NonNull::new(visual.as_raw())?;
+    match gpu.new_surface(WindowTarget::CompositionVisual { visual }, size) {
+        Ok(painter) => Some(painter),
+        Err(e) => {
+            tracing::error!(target: "platform", "gpu_paint surface creation failed: {e}");
+            None
         }
-        let resize = unsafe {
-            existing.ResizeBuffers(
-                2,
-                w as u32,
-                h as u32,
-                DXGI_FORMAT_B8G8R8A8_UNORM,
-                DXGI_SWAP_CHAIN_FLAG(0),
-            )
-        };
-        if resize.is_ok() {
-            *sw = w;
-            *sh = h;
-            return;
-        }
-        unsafe {
-            let _ = visual.SetContent(None::<&windows_core::IUnknown>);
-        }
-        *sc = None;
-    }
-
-    if let Some(new_sc) = create_swap_chain(devices, w, h) {
-        unsafe {
-            let _ = visual.SetContent(&new_sc);
-        }
-        *sc = Some(new_sc);
-        *sw = w;
-        *sh = h;
     }
 }
 
-fn present_to_swap_chain(devices: &CompositorDevices, sc: &IDXGISwapChain1, src: &ID3D11Texture2D) {
-    unsafe {
-        match sc.GetBuffer::<ID3D11Texture2D>(0) {
-            Ok(bb) => {
-                devices.d3d_context.CopyResource(&bb, src);
-                let _ = sc.Present(0, DXGI_PRESENT(0));
-                let _ = devices.dcomp_device.Commit();
-            }
-            Err(e) => tracing::error!(target: "platform", "GetBuffer failed: {e:?}"),
-        }
+/// Everything a present needs, taken out from under `STATE` so the present
+/// itself — which may configure, and so may wait on the GPU — runs with the
+/// lock released.
+struct CheckedOut {
+    painter: Option<Painter<'static>>,
+    visual: IDCompositionVisual,
+}
+
+/// Put a painter back, or hand it to the caller to drop when the surface it
+/// belonged to was freed mid-present. Returns whether it was re-installed.
+fn reinstall(
+    st: &mut State,
+    p: *mut Surface,
+    painter: Painter<'static>,
+    popup: bool,
+) -> Option<Painter<'static>> {
+    if !st.surfaces.live().contains(&p) {
+        return Some(painter);
     }
+    // SAFETY: the live set says this pointer is still ours.
+    let surf = unsafe { &mut *p };
+    if popup {
+        surf.popup_painter = Some(painter);
+    } else {
+        surf.painter = Some(painter);
+    }
+    None
 }
 
 // =====================================================================
@@ -397,18 +342,26 @@ pub fn win_free_surface(s: *mut c_void) {
     }
     let p = s as *mut Surface;
 
-    let mut st = STATE.lock();
-    st.surfaces.remove(p);
+    // Both painters leave the lock with us and die outside it: dropping one
+    // unconfigures its swapchain, which waits for the present queue to idle,
+    // and the WndProc thread blocks on STATE.
+    let orphans = {
+        let mut st = STATE.lock();
+        st.surfaces.remove(p);
 
-    let devices = st.devices.as_ref();
-    unsafe {
-        let mut s_box = Box::from_raw(p);
-        detach_surface(&mut s_box, devices);
-        if let Some(d) = devices {
-            let _ = d.dcomp_device.Commit();
+        let devices = st.devices.as_ref();
+        unsafe {
+            let mut s_box = Box::from_raw(p);
+            let orphans = (s_box.painter.take(), s_box.popup_painter.take());
+            detach_surface(&mut s_box, devices);
+            if let Some(d) = devices {
+                let _ = d.dcomp_device.Commit();
+            }
+            drop(s_box);
+            orphans
         }
-        drop(s_box);
-    }
+    };
+    drop(orphans);
 }
 
 /// Rebuild the child-list under `dcomp_root` in `ordered` order
@@ -483,120 +436,139 @@ pub fn win_restack(ordered: *const *mut c_void, n: usize) {
 // =====================================================================
 
 pub fn win_surface_present(s: *mut c_void, tex: &SharedTexture) -> bool {
-    if s.is_null() {
+    if s.is_null() || tex.handle().is_null() {
         return false;
     }
-    let handle = tex.handle();
-    if handle.is_null() {
-        return false;
-    }
+    present_frame(s as *mut Surface, tex.coded(), false, Frame::Shared(tex))
+}
 
+pub fn win_surface_present_software(
+    s: *mut c_void,
+    pixels: &[u8],
+    size: PhysicalSize,
+    dirty: &[JfnRect],
+) -> bool {
+    if s.is_null() || pixels.is_empty() || size.w <= 0 || size.h <= 0 {
+        return false;
+    }
+    present_frame(
+        s as *mut Surface,
+        size,
+        false,
+        // CEF's OnPaint buffer is tightly packed.
+        Frame::Copied(Pixels {
+            size,
+            stride: size.w as u32 * 4,
+            bgra: pixels,
+            dirty,
+        }),
+    )
+}
+
+/// The gates, then the present, then the commit — with the painter checked out
+/// of `STATE` for the middle step.
+///
+/// A present may configure (the first one, and every one after a
+/// `content_detached`), and a configure drains the shared device queue and
+/// waits for the present queue. `STATE` is what the WndProc blocks on for
+/// `WM_SIZE`, so that wait cannot happen underneath it. Nothing changes thread:
+/// the same CEF UI thread takes `STATE`, releases it, presents, and takes it
+/// again.
+fn present_frame(p: *mut Surface, size: PhysicalSize, popup: bool, frame: Frame<'_>) -> bool {
+    let Some(checked_out) = checkout(p, size, popup) else {
+        return false;
+    };
+    let CheckedOut { painter, visual } = checked_out;
+    // The frame that opens the device is also what names the adapter to open
+    // it on, so it has to reach `build_painter` and not just the present.
+    let sample = match &frame {
+        Frame::Shared(tex) => Some(*tex),
+        Frame::Copied(_) => None,
+    };
+    let mut painter = match painter.or_else(|| build_painter(&visual, size, sample)) {
+        Some(painter) => painter,
+        None => return false,
+    };
+
+    let presented = painter.present(frame, || {});
+
+    let orphan = {
+        let mut st = STATE.lock();
+        let orphan = reinstall(&mut st, p, painter, popup);
+        // Publishes wgpu's own SetContent when the present configured.
+        if let Some(d) = st.devices.as_ref() {
+            unsafe {
+                let _ = d.dcomp_device.Commit();
+            }
+        }
+        orphan
+    };
+    drop(orphan);
+
+    match presented {
+        Ok(p) => p == Presented::Yes,
+        Err(e) => {
+            tracing::error!(target: "platform", "gpu_paint present failed: {e}");
+            false
+        }
+    }
+}
+
+/// Evaluate every gate under `STATE` and hand back the painter for the caller
+/// to present with the lock released. `None` means the frame is rejected.
+fn checkout(p: *mut Surface, size: PhysicalSize, popup: bool) -> Option<CheckedOut> {
     let mut st = STATE.lock();
-    let Some(d3d_device) = st.devices.as_ref().map(|d| d.d3d_device.clone()) else {
-        return false;
-    };
-    let src: ID3D11Texture2D = unsafe {
-        match d3d_device.OpenSharedResource1::<ID3D11Texture2D>(HANDLE(handle)) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(target: "platform", "OpenSharedResource1 failed: {e:?}");
-                return false;
+    if !st.surfaces.live().contains(&p) {
+        return None;
+    }
+    st.devices.as_ref()?;
+
+    if !popup {
+        let is_main = st.surfaces.is_main(p);
+        // Transition logic applies only to the bottom-most ("main") surface.
+        if is_main {
+            match st.gate.main_present_decision((size.w, size.h)) {
+                PresentDecision::Reject => return None,
+                PresentDecision::EndTransitionThenPresent => {
+                    // The gate cleared the transition flags; clear the
+                    // (write-only) pending logical size too, matching the rest
+                    // of end_transition_locked.
+                    st.pending_lw = 0;
+                    st.pending_lh = 0;
+                }
+                PresentDecision::Present => {}
             }
         }
-    };
-
-    let mut td = D3D11_TEXTURE2D_DESC::default();
-    unsafe {
-        src.GetDesc(&mut td);
-    }
-    let w = td.Width as i32;
-    let h = td.Height as i32;
-
-    let p = s as *mut Surface;
-    let is_main = st.surfaces.is_main(p);
-
-    // Transition logic applies only to the bottom-most ("main") surface.
-    if is_main {
-        match st.gate.main_present_decision((w, h)) {
-            PresentDecision::Reject => return false,
-            PresentDecision::EndTransitionThenPresent => {
-                // The gate cleared the transition flags; clear the
-                // (write-only) pending logical size too, matching the rest
-                // of end_transition_locked.
-                st.pending_lw = 0;
-                st.pending_lh = 0;
-            }
-            PresentDecision::Present => {}
+        if is_main && st.mpv_pw > 0 && (size.w > st.mpv_pw + 2 || size.h > st.mpv_ph + 2) {
+            return None;
         }
     }
 
-    if is_main && st.mpv_pw > 0 && (w > st.mpv_pw + 2 || h > st.mpv_ph + 2) {
-        return false;
-    }
-
+    // SAFETY: the live set says this pointer is still ours.
     let surf = unsafe { &mut *p };
-    if !surf.visible {
-        return false;
-    }
-    let visual = match surf.visual.as_ref() {
-        Some(v) => v.clone(),
-        None => return false,
-    };
-
-    let Some(devices) = st.devices.as_ref() else {
-        return false;
-    };
-    ensure_swap_chain(
-        devices,
-        &mut surf.swap_chain,
-        &mut surf.sw,
-        &mut surf.sh,
-        &visual,
-        w,
-        h,
-    );
-    let sc = match surf.swap_chain.as_ref() {
-        Some(sc) => sc.clone(),
-        None => return false,
-    };
-    present_to_swap_chain(devices, &sc, &src);
-    true
-}
-
-pub fn win_surface_resize(s: *mut c_void, _lw: c_int, _lh: c_int, pw: c_int, ph: c_int) {
-    if s.is_null() || pw <= 0 || ph <= 0 {
-        return;
-    }
-    let st = STATE.lock();
-    let devices = match st.devices.as_ref() {
-        Some(d) => d,
-        None => return,
-    };
-    let surf = unsafe { &mut *(s as *mut Surface) };
-    // Only adjust the swap chain if it already exists — matches the prior
-    // overlay/about semantics that avoid forcing a stale physical size
-    // between a window resize and the next CEF paint. (ensure_swap_chain
-    // rebinds at present time.)
-    if surf.swap_chain.is_none() {
-        return;
-    }
-    let visual = match surf.visual.as_ref() {
-        Some(v) => v.clone(),
-        None => return,
-    };
-    ensure_swap_chain(
-        devices,
-        &mut surf.swap_chain,
-        &mut surf.sw,
-        &mut surf.sh,
-        &visual,
-        pw,
-        ph,
-    );
-    unsafe {
-        let _ = devices.dcomp_device.Commit();
+    if popup {
+        if !surf.popup_visible {
+            return None;
+        }
+        Some(CheckedOut {
+            painter: surf.popup_painter.take(),
+            visual: surf.popup_visual.as_ref()?.clone(),
+        })
+    } else {
+        if !surf.visible {
+            return None;
+        }
+        Some(CheckedOut {
+            painter: surf.painter.take(),
+            visual: surf.visual.as_ref()?.clone(),
+        })
     }
 }
+
+/// CEF content dims are non-authoritative here: a composition visual shows the
+/// swapchain 1:1, so the painter takes its extent from each frame and there is
+/// nothing for a resize to do.
+pub fn win_surface_resize(_s: *mut c_void, _lw: c_int, _lh: c_int, _pw: c_int, _ph: c_int) {}
 
 pub fn win_surface_set_visible(s: *mut c_void, visible: bool) {
     if s.is_null() {
@@ -607,7 +579,11 @@ pub fn win_surface_set_visible(s: *mut c_void, visible: bool) {
         Some(d) => d,
         None => return,
     };
-    let surf = unsafe { &mut *(s as *mut Surface) };
+    let p = s as *mut Surface;
+    if !st.surfaces.live().contains(&p) {
+        return;
+    }
+    let surf = unsafe { &mut *p };
     if surf.visible == visible {
         return;
     }
@@ -617,18 +593,30 @@ pub fn win_surface_set_visible(s: *mut c_void, visible: bool) {
         None => return,
     };
     if !visible {
-        // Detach content and drop the swap chain so we don't display a
-        // stale frame when the surface is shown again at a different size.
-        unsafe {
-            let _ = visual.SetContent(None::<&windows_core::IUnknown>);
-        }
-        surf.swap_chain = None;
-        surf.sw = 0;
-        surf.sh = 0;
+        // Detach content so we don't display a stale frame when the surface is
+        // shown again at a different size. The painter stays — destroying it
+        // would wait for the present queue to idle, under STATE — and is told
+        // to rebind on its next present.
+        detach_content(&visual, surf.painter.as_mut());
     }
-    // visible=true: content rebinds on next ensure_swap_chain via present.
+    // visible=true: content rebinds on the next present's configure.
     unsafe {
         let _ = devices.dcomp_device.Commit();
+    }
+}
+
+/// Sever the visual's content and tell the painter to rebind next present.
+///
+/// wgpu binds the swapchain to the visual inside `configure` and nowhere else,
+/// so an owner-side `SetContent(None)` leaves a painter whose extent never
+/// moved and whose content is unbound; `content_detached` is what makes the
+/// next present configure anyway.
+fn detach_content(visual: &IDCompositionVisual, painter: Option<&mut Painter<'static>>) {
+    unsafe {
+        let _ = visual.SetContent(None::<&windows_core::IUnknown>);
+    }
+    if let Some(painter) = painter {
+        painter.content_detached();
     }
 }
 
@@ -653,12 +641,9 @@ fn begin_transition_locked(st: &mut State) {
     };
     unsafe {
         let s = &mut *p;
-        if let Some(v) = s.visual.as_ref() {
-            let _ = v.SetContent(None::<&windows_core::IUnknown>);
+        if let Some(v) = s.visual.as_ref().cloned() {
+            detach_content(&v, s.painter.as_mut());
         }
-        s.swap_chain = None;
-        s.sw = 0;
-        s.sh = 0;
         let _ = devices.dcomp_device.Commit();
     }
 }
@@ -752,12 +737,7 @@ pub fn win_popup_hide(s: *mut c_void) {
         Some(v) => v.clone(),
         None => return,
     };
-    unsafe {
-        let _ = pv.SetContent(None::<&windows_core::IUnknown>);
-    }
-    surf.popup_swap_chain = None;
-    surf.popup_sw = 0;
-    surf.popup_sh = 0;
+    detach_content(&pv, surf.popup_painter.as_mut());
     if let Some(d) = st.devices.as_ref() {
         unsafe {
             let _ = d.dcomp_device.Commit();
@@ -766,56 +746,10 @@ pub fn win_popup_hide(s: *mut c_void) {
 }
 
 pub fn win_popup_present(s: *mut c_void, tex: &SharedTexture, _lw: c_int, _lh: c_int) {
-    if s.is_null() {
+    if s.is_null() || tex.handle().is_null() {
         return;
     }
-    let handle = tex.handle();
-    if handle.is_null() {
-        return;
-    }
-    let st = STATE.lock();
-    let devices = match st.devices.as_ref() {
-        Some(d) => d,
-        None => return,
-    };
-    let src: ID3D11Texture2D = unsafe {
-        match devices
-            .d3d_device
-            .OpenSharedResource1::<ID3D11Texture2D>(HANDLE(handle))
-        {
-            Ok(t) => t,
-            Err(_) => return,
-        }
-    };
-    let mut td = D3D11_TEXTURE2D_DESC::default();
-    unsafe {
-        src.GetDesc(&mut td);
-    }
-    let w = td.Width as i32;
-    let h = td.Height as i32;
-
-    let surf = unsafe { &mut *(s as *mut Surface) };
-    if !surf.popup_visible {
-        return;
-    }
-    let pv = match surf.popup_visual.as_ref() {
-        Some(v) => v.clone(),
-        None => return,
-    };
-    ensure_swap_chain(
-        devices,
-        &mut surf.popup_swap_chain,
-        &mut surf.popup_sw,
-        &mut surf.popup_sh,
-        &pv,
-        w,
-        h,
-    );
-    let sc = match surf.popup_swap_chain.as_ref() {
-        Some(sc) => sc.clone(),
-        None => return,
-    };
-    present_to_swap_chain(devices, &sc, &src);
+    present_frame(s as *mut Surface, tex.coded(), true, Frame::Shared(tex));
 }
 
 pub fn win_popup_present_software(
@@ -829,66 +763,18 @@ pub fn win_popup_present_software(
     if s.is_null() || pixels.is_empty() || pw <= 0 || ph <= 0 {
         return;
     }
-    let st = STATE.lock();
-    let devices = match st.devices.as_ref() {
-        Some(d) => d,
-        None => return,
-    };
-    let surf = unsafe { &mut *(s as *mut Surface) };
-    if !surf.popup_visible {
-        return;
-    }
-    let pv = match surf.popup_visual.as_ref() {
-        Some(v) => v.clone(),
-        None => return,
-    };
-
-    let desc = D3D11_TEXTURE2D_DESC {
-        Width: pw as u32,
-        Height: ph as u32,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-        ..Default::default()
-    };
-    let init = D3D11_SUBRESOURCE_DATA {
-        pSysMem: pixels.as_ptr().cast::<c_void>(),
-        SysMemPitch: pw as u32 * 4,
-        SysMemSlicePitch: 0,
-    };
-    let mut src: Option<ID3D11Texture2D> = None;
-    unsafe {
-        if devices
-            .d3d_device
-            .CreateTexture2D(&desc, Some(&init), Some(&mut src))
-            .is_err()
-        {
-            return;
-        }
-    }
-    let src = match src {
-        Some(t) => t,
-        None => return,
-    };
-
-    ensure_swap_chain(
-        devices,
-        &mut surf.popup_swap_chain,
-        &mut surf.popup_sw,
-        &mut surf.popup_sh,
-        &pv,
-        pw,
-        ph,
+    let size = PhysicalSize { w: pw, h: ph };
+    present_frame(
+        s as *mut Surface,
+        size,
+        true,
+        // CEF's OnPaint buffer is tightly packed, and an empty dirty list is a
+        // full write.
+        Frame::Copied(Pixels {
+            size,
+            stride: pw as u32 * 4,
+            bgra: pixels,
+            dirty: &[],
+        }),
     );
-    let sc = match surf.popup_swap_chain.as_ref() {
-        Some(sc) => sc.clone(),
-        None => return,
-    };
-    present_to_swap_chain(devices, &sc, &src);
 }

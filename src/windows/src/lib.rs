@@ -20,8 +20,8 @@ pub use compositor::{
     jfn_win_begin_transition_locked, jfn_win_cleanup_compositor, jfn_win_init_compositor,
     jfn_win_update_surface_size, jfn_win_wndproc_begin_transition_locked,
     jfn_win_wndproc_end_transition_locked, win_alloc_surface, win_end_transition, win_free_surface,
-    win_restack, win_set_expected_size, win_surface_present, win_surface_resize,
-    win_surface_set_visible,
+    win_restack, win_set_expected_size, win_surface_present, win_surface_present_software,
+    win_surface_resize, win_surface_set_visible,
 };
 pub use input::{
     jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
@@ -361,8 +361,13 @@ impl Platform for WindowsPlatform {
     fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
         match frame {
             PaintFrame::Accelerated(tex) => win_surface_present(s.as_ptr(), &tex),
-            // Windows is shared-textures-only in practice.
-            PaintFrame::Software { .. } => false,
+            // Only reachable with --disable-gpu-compositing: the painter draws
+            // both frame kinds, so there is nothing to gain by refusing one.
+            PaintFrame::Software {
+                size,
+                pixels,
+                dirty,
+            } => win_surface_present_software(s.as_ptr(), pixels, size, dirty),
         }
     }
 
