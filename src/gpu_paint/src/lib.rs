@@ -24,9 +24,14 @@ mod context;
 mod error;
 mod painter;
 mod shared;
+mod shared_texture;
 mod types;
 
 pub use context::{Surfaces, any_adapter};
 pub use error::SurfaceLost;
 pub use painter::Surface;
-pub use types::{Frame, Pixels, Presented, WindowTarget};
+pub use shared::ProducerId;
+#[cfg(target_os = "linux")]
+pub use shared_texture::{DmabufFormat, DmabufPlane};
+pub use shared_texture::{FrameSize, SharedTexture};
+pub use types::{DamageRect, Frame, Pixels, Presented, WindowTarget};

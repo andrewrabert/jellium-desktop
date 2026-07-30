@@ -9,7 +9,6 @@ name = "jfn_gpu_paint"
 crate-type = ["rlib"]
 
 [dependencies]
-jfn-platform-abi = { path = "../platform_abi" }
 parking_lot.workspace = true
 tracing.workspace = true
 thiserror = "2"
@@ -21,7 +20,6 @@ pollster = "1.0"
 # through them. One backend per platform — the same single choice the adapter
 # probe makes.
 [target.'cfg(target_os = "linux")'.dependencies]
-jfn-linux-util = { path = "../linux_util" }
 nix.workspace = true
 raw-window-handle = "0.6"
 wgpu-hal = { version = "=30.0.0", features = ["vulkan"] }

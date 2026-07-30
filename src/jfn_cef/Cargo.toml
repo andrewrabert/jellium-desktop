@@ -13,6 +13,7 @@ parking_lot.workspace = true
 cef = { workspace = true }
 jfn-color = { path = "../color" }
 jfn-config = { path = "../config" }
+jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-input = { path = "../input" }
 jfn-jellyfin = { path = "../jellyfin" }
 jfn-logging = { path = "../logging" }

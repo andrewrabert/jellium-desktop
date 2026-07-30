@@ -7,25 +7,17 @@ use ash::vk::Handle;
 use ash::{ext, khr, vk};
 use wgpu_hal::vulkan;
 
-use jfn_platform_abi::{DmabufFormat, SharedTexture};
-
 use crate::error::{Kind, SurfaceLost};
 use crate::shared::{ImportFailed, Imported, Opened};
+use crate::{DmabufFormat, SharedTexture};
 
 /// The DRM render node CEF produces its shared buffers on, as `(major, minor)`.
-pub(crate) type ProducerId = (i64, i64);
+pub type ProducerId = (i64, i64);
 
-/// Ask the installed backend which ozone platform we are on rather than
-/// guessing — the probe needs the name. On Wayland it gets a null EGL display
-/// and yields `None`, which is what the caller passed explicitly before.
-///
-/// The probe asks CEF directly, so no frame is needed and `sample` is ignored.
+/// Linux callers discover the producer before opening the GPU and pass it to
+/// [`crate::Surfaces::init`]. A frame itself does not name its DRM device.
 pub(crate) fn producer_id(_sample: Option<&SharedTexture>) -> Option<ProducerId> {
-    let ozone = match jfn_platform_abi::try_get().map(|p| p.display()) {
-        Some(jfn_platform_abi::DisplayBackend::Wayland) => c"wayland",
-        _ => c"x11",
-    };
-    unsafe { jfn_linux_util::dmabuf_probe::cef_render_node(ozone.as_ptr(), std::ptr::null_mut()) }
+    None
 }
 
 pub(crate) fn adapter_matches(adapter: &wgpu::Adapter, want: ProducerId) -> bool {

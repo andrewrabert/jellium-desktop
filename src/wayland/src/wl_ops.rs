@@ -5,7 +5,8 @@
 //! before returning so commits land in compositor order matching the
 //! C++ original.
 
-use jfn_platform_abi::{JfnRect, SharedTexture};
+use jfn_gpu_paint::SharedTexture;
+use jfn_platform_abi::JfnRect;
 use std::os::fd::AsFd;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;

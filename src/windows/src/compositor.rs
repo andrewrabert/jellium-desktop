@@ -28,8 +28,10 @@ use windows_core::Interface;
 
 use jfn_compositor_core::stack::SurfaceStack;
 use jfn_compositor_core::transition::{PresentDecision, TransitionGate};
-use jfn_gpu_paint::{Frame, Pixels, Presented, Surface as Painter, Surfaces, WindowTarget};
-use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
+use jfn_gpu_paint::{
+    Frame, FrameSize, Pixels, Presented, SharedTexture, Surface as Painter, Surfaces, WindowTarget,
+};
+use jfn_platform_abi::{JfnRect, PhysicalSize};
 
 // =====================================================================
 // The process's GPU device. Built once and borrowed by every painter —
@@ -44,7 +46,7 @@ use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
 static GPU: OnceLock<Option<Surfaces>> = OnceLock::new();
 
 fn gpu(sample: Option<&SharedTexture>) -> Option<&'static Surfaces> {
-    GPU.get_or_init(|| Surfaces::init(sample)).as_ref()
+    GPU.get_or_init(|| Surfaces::init(sample, None)).as_ref()
 }
 
 // =====================================================================
@@ -245,7 +247,7 @@ fn detach_surface(s: &mut Surface, devices: Option<&CompositorDevices>) {
 /// caller publishes that with a `Commit`.
 fn build_painter(
     visual: &IDCompositionVisual,
-    size: PhysicalSize,
+    size: FrameSize,
     sample: Option<&SharedTexture>,
 ) -> Option<Painter<'static>> {
     let gpu = gpu(sample)?;
@@ -453,11 +455,17 @@ pub fn win_surface_present_software(
     }
     present_frame(
         s as *mut Surface,
-        size,
+        FrameSize {
+            w: size.w,
+            h: size.h,
+        },
         false,
         // CEF's OnPaint buffer is tightly packed.
         Frame::Copied(Pixels {
-            size,
+            size: FrameSize {
+                w: size.w,
+                h: size.h,
+            },
             stride: size.w as u32 * 4,
             bgra: pixels,
             dirty,
@@ -474,7 +482,7 @@ pub fn win_surface_present_software(
 /// `WM_SIZE`, so that wait cannot happen underneath it. Nothing changes thread:
 /// the same CEF UI thread takes `STATE`, releases it, presents, and takes it
 /// again.
-fn present_frame(p: *mut Surface, size: PhysicalSize, popup: bool, frame: Frame<'_>) -> bool {
+fn present_frame(p: *mut Surface, size: FrameSize, popup: bool, frame: Frame<'_>) -> bool {
     let Some(checked_out) = checkout(p, size, popup) else {
         return false;
     };
@@ -516,7 +524,7 @@ fn present_frame(p: *mut Surface, size: PhysicalSize, popup: bool, frame: Frame<
 
 /// Evaluate every gate under `STATE` and hand back the painter for the caller
 /// to present with the lock released. `None` means the frame is rejected.
-fn checkout(p: *mut Surface, size: PhysicalSize, popup: bool) -> Option<CheckedOut> {
+fn checkout(p: *mut Surface, size: FrameSize, popup: bool) -> Option<CheckedOut> {
     let mut st = STATE.lock();
     if !st.surfaces.live().contains(&p) {
         return None;
@@ -763,7 +771,7 @@ pub fn win_popup_present_software(
     if s.is_null() || pixels.is_empty() || pw <= 0 || ph <= 0 {
         return;
     }
-    let size = PhysicalSize { w: pw, h: ph };
+    let size = FrameSize { w: pw, h: ph };
     present_frame(
         s as *mut Surface,
         size,

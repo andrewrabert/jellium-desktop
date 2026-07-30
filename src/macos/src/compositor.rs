@@ -32,8 +32,10 @@ use objc2::runtime::AnyObject;
 
 use jfn_compositor_core::stack::SurfaceStack;
 use jfn_compositor_core::transition::TransitionGate;
-use jfn_gpu_paint::{Frame, Pixels, Surface as Painter, Surfaces, WindowTarget};
-use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
+use jfn_gpu_paint::{
+    Frame, FrameSize, Pixels, SharedTexture, Surface as Painter, Surfaces, WindowTarget,
+};
+use jfn_platform_abi::{JfnRect, PhysicalSize};
 
 use crate::init::{jfn_macos_get_input_view, jfn_macos_get_window};
 
@@ -163,7 +165,7 @@ pub(crate) fn gate_in_transition() -> bool {
 static GPU: OnceLock<Option<Surfaces>> = OnceLock::new();
 
 fn gpu() -> Option<&'static Surfaces> {
-    GPU.get_or_init(|| Surfaces::init(None)).as_ref()
+    GPU.get_or_init(|| Surfaces::init(None, None)).as_ref()
 }
 
 /// Run a closure on the AppKit main thread. Used for layer-tree mutations
@@ -331,7 +333,7 @@ pub fn macos_alloc_surface() -> *mut c_void {
         let Some(layer) = NonNull::new(layer.cast::<c_void>()) else {
             return;
         };
-        let size = PhysicalSize {
+        let size = FrameSize {
             w: (frame.size.width * scale) as c_int,
             h: (frame.size.height * scale) as c_int,
         };
@@ -389,10 +391,16 @@ pub fn macos_surface_present_software(
     }
     present_frame(
         s,
-        size,
+        FrameSize {
+            w: size.w,
+            h: size.h,
+        },
         // CEF's OnPaint buffer is tightly packed.
         Frame::Copied(Pixels {
-            size,
+            size: FrameSize {
+                w: size.w,
+                h: size.h,
+            },
             stride: size.w as u32 * 4,
             bgra: pixels,
             dirty,
@@ -407,7 +415,7 @@ pub fn macos_surface_present_software(
 /// `macos_surface_resize` last set from its main-thread closure. The painter
 /// lock is held for the present alone and released before re-entering the
 /// registry locks, which is the lock order every other entry point follows.
-fn present_frame(s: *mut c_void, size: PhysicalSize, frame: Frame<'_>) -> bool {
+fn present_frame(s: *mut c_void, size: FrameSize, frame: Frame<'_>) -> bool {
     if s.is_null() {
         return false;
     }
@@ -490,7 +498,7 @@ pub fn macos_surface_resize(s: *mut c_void, lw: c_int, _lh: c_int, pw: c_int, ph
         if pw > 0 && ph > 0 {
             // The drawable resize, on the thread that owns the layer.
             if let Some(painter) = surf.painter.lock().as_mut() {
-                painter.resize(PhysicalSize { w: pw, h: ph });
+                painter.resize(FrameSize { w: pw, h: ph });
             }
         }
     });

@@ -4,7 +4,7 @@ use crate::error::{Kind, SurfaceLost};
 use crate::painter::{AlphaSource, Surface};
 use crate::shared;
 use crate::types::WindowTarget;
-use jfn_platform_abi::{PhysicalSize, SharedTexture};
+use crate::{FrameSize, ProducerId, SharedTexture};
 
 pub(crate) const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
@@ -67,8 +67,8 @@ impl Surfaces {
     /// connection on the real server and completes before mpv's VO thread is
     /// spawned, winning the loader-scan race that otherwise crashes NVIDIA
     /// proprietary (two threads reading a half-populated ICD dispatch table).
-    pub fn init(sample: Option<&SharedTexture>) -> Option<Self> {
-        match Self::open(shared::producer_id(sample)) {
+    pub fn init(sample: Option<&SharedTexture>, producer: Option<ProducerId>) -> Option<Self> {
+        match Self::open(producer.or_else(|| shared::producer_id(sample))) {
             Ok(surfaces) => Some(surfaces),
             Err(e) => {
                 tracing::info!("gpu_paint: device init failed: {e}");
@@ -184,7 +184,7 @@ impl Surfaces {
     pub fn new_surface(
         &self,
         target: WindowTarget,
-        size: PhysicalSize,
+        size: FrameSize,
     ) -> Result<Surface<'_>, SurfaceLost> {
         Surface::new(self, target, size)
     }

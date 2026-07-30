@@ -25,7 +25,6 @@ pub mod mpv_host;
 #[cfg_attr(unix, path = "process_unix.rs")]
 #[cfg_attr(not(unix), path = "process_other.rs")]
 mod process;
-pub mod shared_texture;
 #[cfg_attr(unix, path = "signal_unix.rs")]
 #[cfg_attr(not(unix), path = "signal_other.rs")]
 mod signal;
@@ -45,11 +44,9 @@ pub use geometry::{
     WindowPos,
 };
 pub use instance::{Instance, InstanceId};
+pub use jfn_gpu_paint::DamageRect as JfnRect;
 pub use media_sink::MediaSink;
 pub use mpv_host::{DefaultMpvHost, MpvHost};
-pub use shared_texture::SharedTexture;
-#[cfg(target_os = "linux")]
-pub use shared_texture::{DmabufFormat, DmabufPlane};
 pub use window_source::{
     WindowSnapshot, WindowSource, notify_window_changed, subscribe_window_changed,
 };
@@ -342,15 +339,6 @@ impl DecorationOptions {
     }
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct JfnRect {
-    pub x: c_int,
-    pub y: c_int,
-    pub w: c_int,
-    pub h: c_int,
-}
-
 /// One CEF paint callback's payload, decoded.
 ///
 /// CEF has exactly two output paths — `OnAcceleratedPaint` and `OnPaint` —
@@ -358,7 +346,7 @@ pub struct JfnRect {
 pub enum PaintFrame<'a> {
     /// A texture the app owns. By value, because a backend that presents off
     /// the callback thread (X11 and Wayland both do) has to keep it.
-    Accelerated(SharedTexture),
+    Accelerated(jfn_gpu_paint::SharedTexture),
     /// CPU pixels in BGRA, tightly packed, with the regions that changed.
     Software {
         size: PhysicalSize,

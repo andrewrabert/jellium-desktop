@@ -12,8 +12,10 @@
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
-use jfn_gpu_paint::{Frame, Pixels, Presented, WindowTarget};
-use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
+use jfn_gpu_paint::{
+    Frame, FrameSize as PhysicalSize, Pixels, Presented, SharedTexture, WindowTarget,
+};
+use jfn_platform_abi::JfnRect;
 use x11rb::connection::Connection;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xproto;

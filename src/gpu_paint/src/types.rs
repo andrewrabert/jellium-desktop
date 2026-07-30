@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
+use crate::{FrameSize, SharedTexture};
 
 /// Where a [`crate::Surface`] attaches its swapchain. One variant per window
 /// system; new platforms are added here rather than by reshaping the API.
@@ -59,12 +59,20 @@ pub enum Presented {
 
 /// A borrowed CPU frame plus the regions that changed since the last one.
 /// `stride` is in bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
 pub struct Pixels<'a> {
-    pub size: PhysicalSize,
+    pub size: FrameSize,
     pub stride: u32,
     pub bgra: &'a [u8],
-    /// Reuses CEF's own rect type, which is what these always are.
-    pub dirty: &'a [JfnRect],
+    pub dirty: &'a [DamageRect],
 }
 
 /// One frame handed to [`crate::Surface::present`]. The variant must match the

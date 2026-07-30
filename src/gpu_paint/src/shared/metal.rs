@@ -7,14 +7,13 @@ use objc2_metal::{
 };
 use wgpu_hal::metal;
 
-use jfn_platform_abi::SharedTexture;
-
+use crate::SharedTexture;
 use crate::error::SurfaceLost;
 use crate::shared::{ImportFailed, Imported, Opened};
 
 /// A Mac has one system default Metal device, so there is nothing to name and
 /// nothing to mismatch.
-pub(crate) type ProducerId = ();
+pub type ProducerId = ();
 
 pub(crate) fn producer_id(_sample: Option<&SharedTexture>) -> Option<ProducerId> {
     Some(())

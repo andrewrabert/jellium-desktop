@@ -15,7 +15,7 @@ use crate::context::{SURFACE_FORMAT, Surfaces};
 use crate::error::{Kind, SurfaceLost};
 use crate::shared::Importer;
 use crate::types::{Frame, PaintMode, Pixels, Presented, WindowTarget};
-use jfn_platform_abi::{PhysicalSize, SharedTexture};
+use crate::{FrameSize, SharedTexture};
 
 /// How a surface chooses its swapchain extent.
 ///
@@ -192,7 +192,7 @@ impl<'a> Surface<'a> {
     pub(crate) fn new(
         ctx: &'a Surfaces,
         target: WindowTarget,
-        size: PhysicalSize,
+        size: FrameSize,
     ) -> Result<Self, SurfaceLost> {
         let policy = SizePolicy::for_target(&target);
         let alpha = AlphaSource::for_target(&target);
@@ -288,7 +288,7 @@ impl<'a> Surface<'a> {
     /// [`ConfigureSite::Owner`] this *is* the configure, because the caller is
     /// the thread that owns the drawable; an unchanged extent still costs
     /// nothing, since the configure is skipped.
-    pub fn resize(&mut self, size: PhysicalSize) {
+    pub fn resize(&mut self, size: FrameSize) {
         let Some(size) = texels(size) else { return };
         self.pending_size = size;
         if self.configure_site == ConfigureSite::Owner {
@@ -385,7 +385,7 @@ impl<'a> Surface<'a> {
     }
 
     /// The frame's extent in texels, rejecting anything the device cannot hold.
-    fn frame_extent(&self, size: PhysicalSize) -> Result<(u32, u32), SurfaceLost> {
+    fn frame_extent(&self, size: FrameSize) -> Result<(u32, u32), SurfaceLost> {
         let (w, h) = texels(size).ok_or(Kind::BadDimensions(size))?;
         let max = self.ctx.device.limits().max_texture_dimension_2d;
         if w > max || h > max {
@@ -653,7 +653,7 @@ const fn configure_needed(resized: bool, detached: bool) -> bool {
 /// A physical size as texels, or `None` when it is not a positive extent.
 /// Sizes cross the ABI as `c_int` because that is what the window systems and
 /// CEF use; wgpu wants unsigned, and a non-positive one is never presentable.
-fn texels(size: PhysicalSize) -> Option<(u32, u32)> {
+fn texels(size: FrameSize) -> Option<(u32, u32)> {
     match (u32::try_from(size.w).ok()?, u32::try_from(size.h).ok()?) {
         (0, _) | (_, 0) => None,
         wh => Some(wh),

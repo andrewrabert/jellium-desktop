@@ -10,6 +10,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 cef.workspace = true
+jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-paths = { path = "../paths" }
 parking_lot.workspace = true
 serde = { version = "1", features = ["derive"] }

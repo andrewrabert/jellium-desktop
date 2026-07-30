@@ -18,9 +18,8 @@ mod backend;
 #[path = "metal.rs"]
 mod backend;
 
-pub(crate) use backend::{
-    Importer, ProducerId, acquire_barrier, adapter_matches, open_device, producer_id,
-};
+pub use backend::ProducerId;
+pub(crate) use backend::{Importer, acquire_barrier, adapter_matches, open_device, producer_id};
 
 /// A shared-texture import that did not work.
 ///

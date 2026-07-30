@@ -2258,6 +2258,7 @@ dependencies = [
  "gix",
  "jfn-color",
  "jfn-config",
+ "jfn-gpu-paint",
  "jfn-input",
  "jfn-jellyfin",
  "jfn-logging",
@@ -2298,8 +2299,6 @@ name = "jfn-gpu-paint"
 version = "0.1.0-dev"
 dependencies = [
  "ash",
- "jfn-linux-util",
- "jfn-platform-abi",
  "nix",
  "objc2",
  "objc2-io-surface",
@@ -2451,6 +2450,7 @@ name = "jfn-platform-abi"
 version = "0.1.0-dev"
 dependencies = [
  "cef",
+ "jfn-gpu-paint",
  "jfn-paths",
  "libc",
  "nix",

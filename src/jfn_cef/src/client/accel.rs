@@ -8,7 +8,7 @@
 
 use cef::AcceleratedPaintInfo;
 
-use crate::platform_ops::{PhysicalSize, SharedTexture};
+use crate::platform_ops::{FrameSize, SharedTexture};
 
 /// Take ownership of one accelerated-paint frame. `None` when it is unusable.
 ///
@@ -25,7 +25,7 @@ pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
         cef::sys::cef_color_type_t::CEF_COLOR_TYPE_RGBA_8888 => DmabufFormat::Rgba8,
         _ => return None,
     };
-    let coded = PhysicalSize {
+    let coded = FrameSize {
         w: info.extra.coded_size.width,
         h: info.extra.coded_size.height,
     };
@@ -51,7 +51,7 @@ pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     }
     Some(SharedTexture::new(
         coded,
-        PhysicalSize {
+        FrameSize {
             w: info.extra.visible_rect.width.max(0),
             h: info.extra.visible_rect.height.max(0),
         },
@@ -94,15 +94,15 @@ pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
 /// The pair CEF states about every frame, on the platforms whose payload does
 /// not carry its own size. `None` when the coded size is not presentable.
 #[cfg(not(target_os = "linux"))]
-fn extents(info: &AcceleratedPaintInfo) -> Option<(PhysicalSize, PhysicalSize)> {
-    let coded = PhysicalSize {
+fn extents(info: &AcceleratedPaintInfo) -> Option<(FrameSize, FrameSize)> {
+    let coded = FrameSize {
         w: info.extra.coded_size.width,
         h: info.extra.coded_size.height,
     };
     if coded.w <= 0 || coded.h <= 0 {
         return None;
     }
-    let visible_rect = PhysicalSize {
+    let visible_rect = FrameSize {
         w: info.extra.visible_rect.width.max(0),
         h: info.extra.visible_rect.height.max(0),
     };

@@ -7,7 +7,7 @@
 
 use std::ffi::c_int;
 
-use jfn_platform_abi::SharedTexture;
+use jfn_gpu_paint::SharedTexture;
 
 use crate::overlay_actor::OverlayActor;
 use crate::registry::{GeometryCommand, SurfaceId, SurfaceRecord, enqueue, registry};

@@ -53,7 +53,10 @@ impl PaintTier {
             tracing::info!("paint: using SHM");
             (Self::SHM, Req::Shm)
         } else {
-            match Surfaces::init(None) {
+            let producer = unsafe {
+                jfn_linux_util::dmabuf_probe::cef_render_node(c"x11".as_ptr(), std::ptr::null_mut())
+            };
+            match Surfaces::init(None, producer) {
                 None => {
                     tracing::info!("paint: no usable GPU device; using SHM");
                     (Self::SHM, Req::Shm)

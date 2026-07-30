@@ -1,4 +1,4 @@
-use jfn_platform_abi::PhysicalSize;
+use crate::FrameSize;
 use thiserror::Error;
 
 /// This surface can no longer present; the caller should abandon it.
@@ -28,7 +28,7 @@ pub(crate) enum Kind {
     #[error("swapchain acquire failed: {0}")]
     Acquire(&'static str),
     #[error("invalid frame dimensions: {}x{}", .0.w, .0.h)]
-    BadDimensions(PhysicalSize),
+    BadDimensions(FrameSize),
 }
 
 impl<E: Into<Kind>> From<E> for SurfaceLost {

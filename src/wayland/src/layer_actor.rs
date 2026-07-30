@@ -8,8 +8,8 @@ use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
-use jfn_gpu_paint::{Frame, Pixels, Presented, Surfaces};
-use jfn_platform_abi::{JfnRect, PhysicalSize, SharedTexture};
+use jfn_gpu_paint::{Frame, FrameSize as PhysicalSize, Pixels, Presented, SharedTexture, Surfaces};
+use jfn_platform_abi::JfnRect;
 
 use crate::layer::{FrameCommit, LayerSurface, Present, PresentError, ViewportState};
 use crate::wl_ops::dmabuf_pool_key;
@@ -1288,9 +1288,9 @@ mod tests {
         SharedTexture::new(
             size,
             size,
-            jfn_platform_abi::DmabufFormat::Bgra8,
+            jfn_gpu_paint::DmabufFormat::Bgra8,
             0,
-            vec![jfn_platform_abi::DmabufPlane {
+            vec![jfn_gpu_paint::DmabufPlane {
                 fd,
                 offset: 0,
                 stride: 0,

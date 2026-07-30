@@ -8,13 +8,12 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory2};
 
-use jfn_platform_abi::SharedTexture;
-
+use crate::SharedTexture;
 use crate::error::SurfaceLost;
 use crate::shared::{ImportFailed, Imported, Opened};
 
 /// An adapter LUID, packed into one integer so it compares by value.
-pub(crate) type ProducerId = i64;
+pub type ProducerId = i64;
 
 /// The adapter Chromium's GPU process produced `sample` on, read out of the
 /// frame itself: a shared resource names the adapter that created it, and that
