@@ -43,6 +43,9 @@ use wayland_protocols_plasma::server_decoration_palette::client::{
 
 use jfn_platform_abi::{EffectiveDecorations, WindowDecorations};
 
+use crate::input::SeatShared;
+use crate::runtime::WlRuntime;
+
 const APP_ID: &str = "net.nullsum.JelliumDesktop";
 const TITLE: &str = "Jellium Desktop";
 
@@ -72,23 +75,182 @@ enum DecorationRequest {
     ServerSide = 2,
 }
 
-static DECORATION_REQUEST: AtomicU8 = AtomicU8::new(DecorationRequest::Auto as u8);
-
-fn decoration_request() -> DecorationRequest {
-    match DECORATION_REQUEST.load(Ordering::Acquire) {
-        v if v == DecorationRequest::ClientSide as u8 => DecorationRequest::ClientSide,
-        v if v == DecorationRequest::ServerSide as u8 => DecorationRequest::ServerSide,
-        _ => DecorationRequest::Auto,
-    }
+/// The root window's cross-thread surface: everything the dispatch thread
+/// shares with its requesters. The thread's own `RootState` stays on its stack.
+pub(crate) struct RootShared {
+    decoration_request: AtomicU8,
+    effective: EffectiveState,
+    boot: Mutex<BootGeometry>,
+    started: AtomicBool,
+    scale_fallback_fed: AtomicBool,
+    commands: Mutex<Vec<WindowCommand>>,
+    pending_fs: AtomicU8,
+    maximized: AtomicBool,
+    pending_bg: AtomicU32,
+    pending_present: AtomicBool,
+    armed_gen: AtomicU64,
+    root_surface: OnceLock<RootSurfaceHandle>,
+    popup_shell: OnceLock<PopupShell>,
+    popup_role: Mutex<PopupRoleObjs>,
+    thread: OnceLock<RootThread>,
 }
 
-pub(crate) fn set_decorations(configured: Option<WindowDecorations>) {
-    let request = match configured {
-        None => DecorationRequest::Auto,
-        Some(WindowDecorations::Csd) => DecorationRequest::ClientSide,
-        Some(_) => DecorationRequest::ServerSide,
-    };
-    DECORATION_REQUEST.store(request as u8, Ordering::Release);
+#[derive(Copy, Clone)]
+struct BootGeometry {
+    w: i32,
+    h: i32,
+    maximized: bool,
+}
+
+impl RootShared {
+    pub(crate) fn new() -> Self {
+        Self {
+            decoration_request: AtomicU8::new(DecorationRequest::Auto as u8),
+            effective: EffectiveState(AtomicU8::new(0)),
+            boot: Mutex::new(BootGeometry {
+                w: DEFAULT_W,
+                h: DEFAULT_H,
+                maximized: false,
+            }),
+            started: AtomicBool::new(false),
+            scale_fallback_fed: AtomicBool::new(false),
+            commands: Mutex::new(Vec::new()),
+            pending_fs: AtomicU8::new(FS_NONE),
+            maximized: AtomicBool::new(false),
+            pending_bg: AtomicU32::new(0),
+            pending_present: AtomicBool::new(false),
+            armed_gen: AtomicU64::new(0),
+            root_surface: OnceLock::new(),
+            popup_shell: OnceLock::new(),
+            popup_role: Mutex::new(PopupRoleObjs {
+                xdg: None,
+                popup: None,
+                generation: None,
+            }),
+            thread: OnceLock::new(),
+        }
+    }
+
+    fn decoration_request(&self) -> DecorationRequest {
+        match self.decoration_request.load(Ordering::Acquire) {
+            v if v == DecorationRequest::ClientSide as u8 => DecorationRequest::ClientSide,
+            v if v == DecorationRequest::ServerSide as u8 => DecorationRequest::ServerSide,
+            _ => DecorationRequest::Auto,
+        }
+    }
+
+    pub(crate) fn set_decorations(&self, configured: Option<WindowDecorations>) {
+        let request = match configured {
+            None => DecorationRequest::Auto,
+            Some(WindowDecorations::Csd) => DecorationRequest::ClientSide,
+            Some(_) => DecorationRequest::ServerSide,
+        };
+        self.decoration_request
+            .store(request as u8, Ordering::Release);
+    }
+
+    pub(crate) fn effective_decorations(&self) -> EffectiveDecorations {
+        self.effective.load()
+    }
+
+    pub(crate) fn set_boot_geometry(&self, w: i32, h: i32, maximized: bool) {
+        let mut boot = self.boot.lock();
+        if let Some(size) = crate::window_state::WindowSize::new(w, h) {
+            boot.w = size.w();
+            boot.h = size.h();
+        }
+        boot.maximized = maximized;
+    }
+
+    fn boot_geometry(&self) -> BootGeometry {
+        *self.boot.lock()
+    }
+
+    pub(crate) fn popup_shell(&self) -> Option<&PopupShell> {
+        self.popup_shell.get()
+    }
+
+    pub(crate) fn root_surface_handle(&self) -> Option<RootSurfaceHandle> {
+        self.root_surface.get().copied()
+    }
+
+    fn wake(&self) {
+        if let Some(t) = self.thread.get() {
+            t.wake.signal();
+        }
+    }
+
+    /// Queue a request for the root thread and wake it. Sending and waking are
+    /// one operation so a queued request can't sit unnoticed.
+    fn send(&self, cmd: WindowCommand) {
+        self.commands.lock().push(cmd);
+        self.wake();
+    }
+
+    pub(crate) fn start_move(&self, seat: &SeatShared) {
+        self.send(WindowCommand::Move {
+            serial: seat.last_button_serial(),
+        });
+    }
+
+    pub(crate) fn start_resize(&self, seat: &SeatShared, edge: u32) {
+        self.send(WindowCommand::Resize {
+            serial: seat.last_button_serial(),
+            edge,
+        });
+    }
+
+    pub(crate) fn set_fullscreen(&self, on: bool) {
+        self.pending_fs
+            .store(if on { FS_ON } else { FS_OFF }, Ordering::Release);
+        self.wake();
+    }
+
+    pub(crate) fn toggle_fullscreen(&self) {
+        self.pending_fs.store(FS_TOGGLE, Ordering::Release);
+        self.wake();
+    }
+
+    pub(crate) fn set_maximized(&self, on: bool) {
+        self.send(WindowCommand::SetMaximized(on));
+    }
+
+    pub(crate) fn toggle_maximize(&self) {
+        let next = !self.maximized.load(Ordering::Relaxed);
+        self.maximized.store(next, Ordering::Relaxed);
+        self.set_maximized(next);
+    }
+
+    pub(crate) fn sync_maximized_command_state(&self, maximized: bool) {
+        self.maximized.store(maximized, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_minimized(&self) {
+        self.send(WindowCommand::Minimize);
+    }
+
+    pub(crate) fn set_background_color(&self, r: u8, g: u8, b: u8) {
+        let rgb = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        self.pending_bg.store(BG_SET | rgb, Ordering::Release);
+        self.wake();
+    }
+
+    fn pending_bg(&self) -> Option<[u8; 3]> {
+        let v = self.pending_bg.load(Ordering::Acquire);
+        (v & BG_SET != 0).then_some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+    }
+
+    pub(crate) fn request_present(&self) {
+        self.pending_present.store(true, Ordering::Release);
+        self.wake();
+    }
+
+    #[cfg(feature = "kde-palette")]
+    pub(crate) fn set_titlebar_palette(&self, path: &std::path::Path) {
+        if let Some(s) = path.to_str() {
+            self.send(WindowCommand::SetTitlebarPalette(s.to_owned()));
+        }
+    }
 }
 
 /// The decoration mode in effect. `ClientSide` until a decoration configure
@@ -118,33 +280,8 @@ impl EffectiveState {
     }
 }
 
-static EFFECTIVE: EffectiveState = EffectiveState(AtomicU8::new(0));
-
-pub(crate) fn effective_decorations() -> EffectiveDecorations {
-    EFFECTIVE.load()
-}
-
-static BOOT_W: AtomicU32 = AtomicU32::new(DEFAULT_W as u32);
-static BOOT_H: AtomicU32 = AtomicU32::new(DEFAULT_H as u32);
-static BOOT_MAX: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn set_boot_geometry(w: i32, h: i32, maximized: bool) {
-    if let Some(size) = crate::window_state::WindowSize::new(w, h) {
-        BOOT_W.store(size.w() as u32, Ordering::Release);
-        BOOT_H.store(size.h() as u32, Ordering::Release);
-    }
-    BOOT_MAX.store(maximized, Ordering::Release);
-}
-
-fn boot_geometry() -> (i32, i32, bool) {
-    (
-        BOOT_W.load(Ordering::Acquire) as i32,
-        BOOT_H.load(Ordering::Acquire) as i32,
-        BOOT_MAX.load(Ordering::Acquire),
-    )
-}
-
 struct RootState {
+    rt: &'static WlRuntime,
     conn: Connection,
     qh: QueueHandle<RootState>,
     surface: WlSurface,
@@ -185,10 +322,6 @@ struct RootState {
 /// Upper bound on the fallback probe: it round-trips on a second display
 /// connection, which a wedged compositor can stall forever.
 const SCALE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Set by the fallback probe thread once it has fed a scale; the root loop
-/// re-plans presentation when it observes this.
-static SCALE_FALLBACK_FED: AtomicBool = AtomicBool::new(false);
 
 mod floating_restore {
     use crate::window_state::{WindowMode, WindowSize};
@@ -376,7 +509,7 @@ impl RootState {
         let step = presentation::plan(presentation::Inputs {
             mapped: self.present.is_some(),
             pending_ack: self.pending_ack.is_some(),
-            scale_known: crate::window_state::known_scale().is_some(),
+            scale_known: self.rt.window().known_scale().is_some(),
             size: self.resolve_logical(),
         });
         match step {
@@ -395,14 +528,15 @@ impl RootState {
     fn service_scale_discovery(&mut self) {
         let (next, spawn) = self
             .scale_discovery
-            .after_batch_drained(crate::window_state::known_scale().is_some());
+            .after_batch_drained(self.rt.window().known_scale().is_some());
         self.scale_discovery = next;
         if !spawn {
             return;
         }
+        let rt = self.rt;
         let spawned = thread::Builder::new()
             .name("wl-scale-fallback".into())
-            .spawn(|| {
+            .spawn(move || {
                 match crate::scale_probe::probe_scale_bounded(
                     crate::scale_probe::ProbeTarget::FirstOutput,
                     SCALE_PROBE_TIMEOUT,
@@ -412,26 +546,24 @@ impl RootState {
                             target: "Main",
                             "root window: no preferred_scale before first configure; using probed scale {scale}"
                         );
-                        crate::window_state::feed_scale(
-                            scale,
-                            crate::window_state::ScaleProvenance::Provisional,
-                        );
+                        rt.window()
+                            .feed_scale(scale, crate::window_state::ScaleProvenance::Provisional);
                     }
                     Err(e) => {
                         tracing::warn!(
                             target: "Main",
                             "root window: no preferred_scale before first configure and probe failed ({e}); assuming scale 1.0"
                         );
-                        crate::window_state::feed_unit_scale();
+                        rt.window().feed_unit_scale();
                     }
                 }
-                SCALE_FALLBACK_FED.store(true, Ordering::Release);
-                wake_root_thread();
+                rt.root().scale_fallback_fed.store(true, Ordering::Release);
+                rt.root().wake();
             })
             .is_ok();
         if !spawned {
             // No thread, no probe: unblock presentation with the unit fallback.
-            crate::window_state::feed_unit_scale();
+            self.rt.window().feed_unit_scale();
             self.try_present();
         }
     }
@@ -468,10 +600,13 @@ impl RootState {
 
         // Pass logical (not physical) size: mpv and the overlay apply scale
         // themselves, so a physical size here would double-scale.
-        crate::mpv_proxy::set_window_size(size);
-        crate::window_state::publish(size, self.mode);
+        self.rt.proxy().set_window_size(size);
+        self.rt.window().publish(self.rt, size, self.mode);
 
-        PENDING_PRESENT.store(true, Ordering::Release);
+        self.rt
+            .root()
+            .pending_present
+            .store(true, Ordering::Release);
     }
 
     fn present_transaction(&mut self, _present: Presented) {
@@ -498,9 +633,7 @@ impl RootState {
             return;
         };
         new.attach_to(&self.surface, 0, 0);
-        if let Some(old) = self.bg_buffer.replace(new) {
-            crate::wl_state::retire_buffer(old);
-        }
+        drop(self.bg_buffer.replace(new));
         if let Some(vp) = &self.viewport {
             vp.set_destination(w, h);
         }
@@ -510,6 +643,7 @@ impl RootState {
     fn create_solid_buffer(&self) -> Option<crate::wl_state::OwnedBuffer> {
         let bg = self.bg;
         crate::wl_state::build_argb8888_shm_buffer(
+            self.rt.buffers(),
             &self.shm,
             &self.qh,
             "root-bg",
@@ -523,8 +657,6 @@ impl RootState {
         )
     }
 }
-
-static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Opaque handle to the app root `wl_surface`, carrying the live `wl_proxy`
 /// pointer — the only representation valid across the two wayland-client
@@ -544,12 +676,6 @@ impl RootSurfaceHandle {
     }
 }
 
-static ROOT_SURFACE: OnceLock<RootSurfaceHandle> = OnceLock::new();
-
-pub(crate) fn root_surface_handle() -> Option<RootSurfaceHandle> {
-    ROOT_SURFACE.get().copied()
-}
-
 // Window-control requests queued here and applied on the root thread by
 // `apply_command`. The toplevel/seat proxies are single-owner and live on that
 // thread, so requests cross this queue rather than caching proxy clones that
@@ -567,13 +693,6 @@ enum WindowCommand {
     Minimize,
     #[cfg(feature = "kde-palette")]
     SetTitlebarPalette(String),
-}
-
-static COMMANDS: Mutex<Vec<WindowCommand>> = Mutex::new(Vec::new());
-
-fn push_command(cmd: WindowCommand) {
-    COMMANDS.lock().push(cmd);
-    wake_root_thread();
 }
 
 fn apply_command(state: &mut RootState, cmd: WindowCommand) {
@@ -619,19 +738,6 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
     let _ = state.conn.flush();
 }
 
-pub(crate) fn start_move() {
-    push_command(WindowCommand::Move {
-        serial: crate::input::last_button_serial(),
-    });
-}
-
-pub(crate) fn start_resize(edge: u32) {
-    push_command(WindowCommand::Resize {
-        serial: crate::input::last_button_serial(),
-        edge,
-    });
-}
-
 // Fullscreen requests posted here and applied on the root thread by
 // `apply_fullscreen`. The mode read and the protocol request must stay on that
 // thread — the sole mutator/reader of `RootState.mode` — so a configure can't
@@ -640,18 +746,6 @@ const FS_NONE: u8 = 0;
 const FS_TOGGLE: u8 = 1;
 const FS_ON: u8 = 2;
 const FS_OFF: u8 = 3;
-static PENDING_FS: AtomicU8 = AtomicU8::new(FS_NONE);
-
-pub(crate) fn set_fullscreen(on: bool) {
-    PENDING_FS.store(if on { FS_ON } else { FS_OFF }, Ordering::Release);
-    wake_root_thread();
-}
-
-pub(crate) fn toggle_fullscreen() {
-    PENDING_FS.store(FS_TOGGLE, Ordering::Release);
-    wake_root_thread();
-}
-
 fn apply_fullscreen(state: &mut RootState, on: bool) {
     if on {
         // A fullscreen-enter received while already fullscreen must not overwrite
@@ -673,29 +767,9 @@ fn apply_fullscreen(state: &mut RootState, on: bool) {
     let _ = state.conn.flush();
 }
 
-pub(crate) fn set_maximized(on: bool) {
-    push_command(WindowCommand::SetMaximized(on));
-}
-
 // Commanded maximize state for the CSD toggle button. Mirrored from the
 // compositor on every configure so a compositor-initiated maximize doesn't
 // desync the toggle.
-static MAXIMIZED: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn toggle_maximize() {
-    let next = !MAXIMIZED.load(Ordering::Relaxed);
-    MAXIMIZED.store(next, Ordering::Relaxed);
-    set_maximized(next);
-}
-
-pub(crate) fn sync_maximized_command_state(maximized: bool) {
-    MAXIMIZED.store(maximized, Ordering::Relaxed);
-}
-
-pub(crate) fn set_minimized() {
-    push_command(WindowCommand::Minimize);
-}
-
 pub(crate) struct PopupShell {
     conn: Connection,
     qh: QueueHandle<RootState>,
@@ -705,12 +779,6 @@ pub(crate) struct PopupShell {
     wm_base: XdgWmBase,
     root_xdg: XdgSurface,
     seat: Option<WlSeat>,
-}
-
-static POPUP_SHELL: OnceLock<PopupShell> = OnceLock::new();
-
-pub(crate) fn popup_shell() -> Option<&'static PopupShell> {
-    POPUP_SHELL.get()
 }
 
 impl PopupShell {
@@ -726,11 +794,14 @@ impl PopupShell {
 
     pub(crate) fn create_shm_buffer(
         &self,
+        reg: &'static crate::wl_state::BufferRegistry,
         pixels: &[u8],
         w: i32,
         h: i32,
     ) -> Option<crate::wl_state::OwnedBuffer> {
-        crate::wl_state::build_shm_buffer_from_pixels(&self.shm, &self.qh, "menu-sw", pixels, w, h)
+        crate::wl_state::build_shm_buffer_from_pixels(
+            reg, &self.shm, &self.qh, "menu-sw", pixels, w, h,
+        )
     }
 
     pub(crate) fn flush(&self) {
@@ -750,19 +821,11 @@ struct PopupRoleObjs {
     popup: Option<XdgPopup>,
     generation: Option<NonZeroU64>,
 }
-static POPUP_ROLE: Mutex<PopupRoleObjs> = Mutex::new(PopupRoleObjs {
-    xdg: None,
-    popup: None,
-    generation: None,
-});
-
 // Highest menu generation ever armed; generations come from a monotonic counter.
 // create runs on the input/CEF thread while destroy/reposition run on the root
 // thread, so a call delayed past a newer arm carries a stale generation. Rejecting
 // against this stops a stale create from tearing down the newer popup and a stale
 // reposition from retargeting it.
-static ARMED_GEN: AtomicU64 = AtomicU64::new(0);
-
 fn build_menu_positioner(shell: &PopupShell, x: i32, y: i32, w: i32, h: i32) -> XdgPositioner {
     let p = shell.wm_base.create_positioner(&shell.qh, ());
     p.set_size(w.max(1), h.max(1));
@@ -782,6 +845,7 @@ fn build_menu_positioner(shell: &PopupShell, x: i32, y: i32, w: i32, h: i32) -> 
 /// press serial (button or key) — valid here only because every app connection
 /// shares one wl_client.
 pub(crate) fn popup_create(
+    rt: &WlRuntime,
     generation: NonZeroU64,
     x: i32,
     y: i32,
@@ -789,20 +853,22 @@ pub(crate) fn popup_create(
     h: i32,
     surface: &WlSurface,
 ) {
-    let Some(shell) = popup_shell() else {
+    let Some(shell) = rt.root().popup_shell() else {
         return;
     };
-    // Hold POPUP_ROLE across teardown of the old role and publication of the new
+    // Hold the role lock across teardown of the old role and publication of the new
     // one: without this a concurrent popup_destroy/popup_reposition could run in
     // the gap, observe an empty slot, and leave the just-created popup live but
     // unpublished — a torn create/use span.
-    let mut role = POPUP_ROLE.lock();
+    let mut role = rt.root().popup_role.lock();
     // Each generation drives exactly one create, so `<=` (not `<`) also blocks
-    // resurrecting a just-destroyed popup, since destroy leaves ARMED_GEN at its peak.
-    if generation.get() <= ARMED_GEN.load(Ordering::Acquire) {
+    // resurrecting a just-destroyed popup, since destroy leaves armed_gen at its peak.
+    if generation.get() <= rt.root().armed_gen.load(Ordering::Acquire) {
         return;
     }
-    ARMED_GEN.store(generation.get(), Ordering::Release);
+    rt.root()
+        .armed_gen
+        .store(generation.get(), Ordering::Release);
     destroy_role_objs(&mut role);
     let positioner = build_menu_positioner(shell, x, y, w, h);
     let xdg = shell
@@ -816,7 +882,7 @@ pub(crate) fn popup_create(
     );
     positioner.destroy();
     if let Some(seat) = &shell.seat {
-        popup.grab(seat, crate::input::last_input_serial());
+        popup.grab(seat, rt.seat().last_input_serial());
     }
     surface.commit();
     shell.flush();
@@ -826,16 +892,23 @@ pub(crate) fn popup_create(
 }
 
 /// Requires the popup to already be mapped.
-pub(crate) fn popup_reposition(generation: NonZeroU64, x: i32, y: i32, w: i32, h: i32) {
-    let Some(shell) = popup_shell() else {
+pub(crate) fn popup_reposition(
+    rt: &WlRuntime,
+    generation: NonZeroU64,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) {
+    let Some(shell) = rt.root().popup_shell() else {
         return;
     };
     let positioner = build_menu_positioner(shell, x, y, w, h);
     {
-        // Reposition must be issued under POPUP_ROLE: popup_destroy runs on the
-        // root thread and will otherwise destroy the popup mid-request, leaving
-        // this a request on a dead object that drops the client.
-        let role = POPUP_ROLE.lock();
+        // Reposition must be issued under the role lock: popup_destroy runs on
+        // the root thread and will otherwise destroy the popup mid-request,
+        // leaving this a request on a dead object that drops the client.
+        let role = rt.root().popup_role.lock();
         if role.generation == Some(generation)
             && let Some(popup) = role.popup.as_ref()
         {
@@ -862,61 +935,29 @@ fn destroy_role_objs(role: &mut PopupRoleObjs) {
 /// `arm` may have published a fresh role in the gap between a stale teardown
 /// deciding to destroy and this call, and must not be torn down by it. Unqualified
 /// force-destroy stays private (`destroy_role_objs`), reached only from
-/// `popup_create` under the `ARMED_GEN` guard.
-pub(crate) fn popup_destroy(generation: NonZeroU64) {
+/// `popup_create` under the `armed_gen` guard.
+pub(crate) fn popup_destroy(rt: &WlRuntime, generation: NonZeroU64) {
     {
-        let mut role = POPUP_ROLE.lock();
+        let mut role = rt.root().popup_role.lock();
         if role.generation != Some(generation) {
             return;
         }
         destroy_role_objs(&mut role);
     }
-    if let Some(shell) = popup_shell() {
+    if let Some(shell) = rt.root().popup_shell() {
         shell.flush();
     }
 }
 
 // High bit marks "set"; the low 24 bits are RGB. Applied on the dispatch thread,
 // which owns the surface, so commits don't race the configure handler.
-static PENDING_BG: AtomicU32 = AtomicU32::new(0);
 const BG_SET: u32 = 1 << 24;
-
-fn wake_root_thread() {
-    if let Some(t) = ROOT_THREAD.get() {
-        t.wake.signal();
-    }
-}
-
-pub(crate) fn set_background_color(r: u8, g: u8, b: u8) {
-    let rgb = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
-    PENDING_BG.store(BG_SET | rgb, Ordering::Release);
-    wake_root_thread();
-}
-
-fn pending_bg() -> Option<[u8; 3]> {
-    let v = PENDING_BG.load(Ordering::Acquire);
-    (v & BG_SET != 0).then_some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
-}
 
 // The root `wl_surface.commit` is issued by exactly one owner — this dispatch
 // thread. Every other producer (CEF paint paths, mpv) that needs to present
 // requests it here, so geometry, overlay and video always land in one
 // uninterruptible root commit; no other thread can commit the root between a
 // geometry change and its children.
-static PENDING_PRESENT: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn request_present() {
-    PENDING_PRESENT.store(true, Ordering::Release);
-    wake_root_thread();
-}
-
-#[cfg(feature = "kde-palette")]
-pub(crate) fn set_titlebar_palette(path: &std::path::Path) {
-    if let Some(s) = path.to_str() {
-        push_command(WindowCommand::SetTitlebarPalette(s.to_owned()));
-    }
-}
-
 // Teardown handle for the dispatch thread. Without it the thread sits in
 // `poll(-1)` holding a `wl_display` read barrier; when no video ever played the
 // display is quiet, so the barrier is never released and mpv's VO-teardown
@@ -926,16 +967,14 @@ struct RootThread {
     wake: Arc<jfn_wake_event::WakeEvent>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
-static ROOT_THREAD: OnceLock<RootThread> = OnceLock::new();
-
 /// Stop and join the dispatch thread, releasing its `wl_display` read barrier.
 /// Must run before mpv's VO teardown, or that roundtrip deadlocks on the barrier.
-pub(crate) fn cleanup() {
-    let Some(t) = ROOT_THREAD.get() else {
+pub(crate) fn cleanup(rt: &'static WlRuntime) {
+    let Some(t) = rt.root().thread.get() else {
         return;
     };
     t.stop.store(true, Ordering::Relaxed);
-    wake_root_thread();
+    rt.root().wake();
     if let Some(h) = t.handle.lock().take() {
         let _ = h.join();
         // The WakeEvent's fd is owned by this process-lifetime RootThread and
@@ -943,22 +982,22 @@ pub(crate) fn cleanup() {
     }
 }
 
-fn vo_display() -> Option<crate::app_conn::AppDisplay> {
-    crate::app_conn::app_display()
+fn vo_display(rt: &WlRuntime) -> Option<crate::app_conn::AppDisplay> {
+    crate::app_conn::app_display(rt)
 }
 
 /// Create the app-owned toplevel and start its dispatch thread. The toplevel
 /// must exist before the VO-wait gate (which reads its size + scale), but the
 /// mpv VO display it needs only appears mid-wait — so this is idempotent and
 /// polled each tick until the display is available.
-pub(crate) fn ensure_started() {
-    if STARTED.load(Ordering::Acquire) {
+pub(crate) fn ensure_started(rt: &'static WlRuntime) {
+    if rt.root().started.load(Ordering::Acquire) {
         return;
     }
-    let Some(display) = vo_display() else {
+    let Some(display) = vo_display(rt) else {
         return;
     };
-    if STARTED.swap(true, Ordering::AcqRel) {
+    if rt.root().started.swap(true, Ordering::AcqRel) {
         return;
     }
 
@@ -1003,14 +1042,15 @@ pub(crate) fn ensure_started() {
     // surface: same libwayland wl_display, but a different wayland-client Backend,
     // so it must be reconstructed there via ObjectId::from_ptr.
     if let Some(p) = std::ptr::NonNull::new(surface.id().as_ptr().cast()) {
-        let _ = ROOT_SURFACE.set(RootSurfaceHandle(p));
+        let _ = rt.root().root_surface.set(RootSurfaceHandle(p));
     }
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let toplevel = xdg_surface.get_toplevel(&qh, ());
     toplevel.set_title(TITLE.to_owned());
     toplevel.set_app_id(APP_ID.to_owned());
 
-    let (boot_w, boot_h, boot_max) = boot_geometry();
+    let boot = rt.root().boot_geometry();
+    let (boot_w, boot_h, boot_max) = (boot.w, boot.h, boot.maximized);
     if boot_max {
         toplevel.set_maximized();
     }
@@ -1030,13 +1070,13 @@ pub(crate) fn ensure_started() {
         // No preferred_scale will ever arrive, so satisfy the boot scale gate —
         // otherwise it waits forever.
         tracing::warn!(target: "Main", "root window: no wp_fractional_scale_manager_v1; assuming scale 1.0");
-        crate::window_state::feed_unit_scale();
+        rt.window().feed_unit_scale();
     }
 
     let deco_mgr: Option<ZxdgDecorationManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
     let decoration = deco_mgr.as_ref().map(|mgr| {
         let dec = mgr.get_toplevel_decoration(&toplevel, &qh, ());
-        match decoration_request() {
+        match rt.root().decoration_request() {
             DecorationRequest::ClientSide => dec.set_mode(DecorationMode::ClientSide),
             DecorationRequest::ServerSide => dec.set_mode(DecorationMode::ServerSide),
             // No set_mode: the compositor's preferred mode arrives in the
@@ -1046,9 +1086,9 @@ pub(crate) fn ensure_started() {
         dec
     });
     if deco_mgr.is_none() {
-        if decoration_request() == DecorationRequest::ServerSide {
+        if rt.root().decoration_request() == DecorationRequest::ServerSide {
             tracing::warn!(target: "Main", "root window: no zxdg_decoration_manager_v1; server-side requested, drawing no titlebar");
-            if EFFECTIVE.store(EffectiveDecorations::ServerSide) {
+            if rt.root().effective.store(EffectiveDecorations::ServerSide) {
                 jfn_platform_abi::notify_decorations_changed();
             }
         } else {
@@ -1064,7 +1104,7 @@ pub(crate) fn ensure_started() {
 
     let seat: Option<WlSeat> = globals.bind(&qh, 1..=8, ()).ok();
 
-    let _ = POPUP_SHELL.set(PopupShell {
+    let _ = rt.root().popup_shell.set(PopupShell {
         conn: conn.clone(),
         qh: qh.clone(),
         compositor: compositor.clone(),
@@ -1085,6 +1125,7 @@ pub(crate) fn ensure_started() {
     let _ = conn.flush();
 
     let state = RootState {
+        rt,
         conn: conn.clone(),
         qh,
         surface,
@@ -1096,7 +1137,7 @@ pub(crate) fn ensure_started() {
         shm: shm.clone(),
         viewport,
         bg_buffer: None,
-        bg: pending_bg().unwrap_or(BG),
+        bg: rt.root().pending_bg().unwrap_or(BG),
         frac_mgr,
         frac_scale,
         decoration,
@@ -1128,7 +1169,7 @@ pub(crate) fn ensure_started() {
         .spawn(move || root_loop(queue, state, wake_thread, stop_thread))
     {
         Ok(handle) => {
-            let _ = ROOT_THREAD.set(RootThread {
+            let _ = rt.root().thread.set(RootThread {
                 stop,
                 wake,
                 handle: Mutex::new(Some(handle)),
@@ -1144,7 +1185,7 @@ pub(crate) fn ensure_started() {
 // the root thread each iteration before it blocks, so a request enqueued before
 // the wake fd could ring is still serviced without waiting for another event.
 fn service_root_requests(state: &mut RootState) {
-    match PENDING_FS.swap(FS_NONE, Ordering::Acquire) {
+    match state.rt.root().pending_fs.swap(FS_NONE, Ordering::Acquire) {
         FS_ON => apply_fullscreen(state, true),
         FS_OFF => apply_fullscreen(state, false),
         FS_TOGGLE => {
@@ -1155,11 +1196,11 @@ fn service_root_requests(state: &mut RootState) {
     }
     // Drain into a local first so the queue lock isn't held while issuing
     // protocol requests.
-    let cmds = std::mem::take(&mut *COMMANDS.lock());
+    let cmds = std::mem::take(&mut *state.rt.root().commands.lock());
     for cmd in cmds {
         apply_command(state, cmd);
     }
-    if let Some(bg) = pending_bg()
+    if let Some(bg) = state.rt.root().pending_bg()
         && bg != state.bg
     {
         state.bg = bg;
@@ -1169,7 +1210,11 @@ fn service_root_requests(state: &mut RootState) {
             let (w, h) = (size.w(), size.h());
             state.rebuild_background(w, h, present);
             // Apply via the single owner commit, not a standalone one.
-            PENDING_PRESENT.store(true, Ordering::Release);
+            state
+                .rt
+                .root()
+                .pending_present
+                .store(true, Ordering::Release);
         }
     }
 }
@@ -1194,7 +1239,12 @@ fn root_loop(
         // has dispatched by now, so only a genuinely absent scale spawns the
         // fallback probe — and a completed probe re-plans presentation here,
         // on the thread that owns the surface.
-        if SCALE_FALLBACK_FED.swap(false, Ordering::AcqRel) {
+        if state
+            .rt
+            .root()
+            .scale_fallback_fed
+            .swap(false, Ordering::AcqRel)
+        {
             state.try_present();
         }
         state.service_scale_discovery();
@@ -1209,7 +1259,11 @@ fn root_loop(
         // Gate on the present capability so a pre-configure request stays
         // latched, not lost — swapping the latch only once we can present.
         if let Some(present) = state.present
-            && PENDING_PRESENT.swap(false, Ordering::Acquire)
+            && state
+                .rt
+                .root()
+                .pending_present
+                .swap(false, Ordering::Acquire)
         {
             state.present_transaction(present);
         }
@@ -1218,7 +1272,7 @@ fn root_loop(
         // A probe completion between the check above and here must not strand
         // its result until the next compositor event (its wake can be lost if
         // ROOT_THREAD isn't published yet); re-run the loop instead of polling.
-        if SCALE_FALLBACK_FED.load(Ordering::Acquire) {
+        if state.rt.root().scale_fallback_fed.load(Ordering::Acquire) {
             continue;
         }
         let guard = match queue.prepare_read() {
@@ -1252,7 +1306,7 @@ fn root_loop(
             // above distributes events to every queue on it. Pump the CEF
             // overlay queue so its `wl_buffer.release` events are processed and
             // retired buffers get destroyed.
-            crate::wl_state::pump_events();
+            crate::wl_state::pump_events(state.rt);
         } else {
             drop(guard);
         }
@@ -1269,9 +1323,7 @@ fn root_loop(
     // Do not drain the bg's release here: this thread shares the wl_display fd
     // with the other readers via prepare_read/poll, so a blocking roundtrip
     // would deadlock them.
-    if let Some(bg) = state.bg_buffer.take() {
-        crate::wl_state::retire_buffer(bg);
-    }
+    state.bg_buffer = None;
 }
 
 impl Dispatch<XdgWmBase, ()> for RootState {
@@ -1371,10 +1423,10 @@ impl Dispatch<WpFractionalScaleV1, ()> for RootState {
             let Some(scale) = crate::scale::Scale120::from_wire(scale) else {
                 return;
             };
-            crate::window_state::feed_scale(
-                scale,
-                crate::window_state::ScaleProvenance::Authoritative,
-            );
+            state
+                .rt
+                .window()
+                .feed_scale(scale, crate::window_state::ScaleProvenance::Authoritative);
             // Scale arrives without a configure (output change, or the first
             // scale completing a withheld configure), so drive a present here too.
             state.try_present();
@@ -1387,7 +1439,7 @@ impl Dispatch<WpFractionalScaleV1, ()> for RootState {
 // configure handler.
 impl Dispatch<XdgSurface, PopupRole> for RootState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         xdg: &XdgSurface,
         event: xdg_surface::Event,
         role: &PopupRole,
@@ -1396,14 +1448,14 @@ impl Dispatch<XdgSurface, PopupRole> for RootState {
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
             xdg.ack_configure(serial);
-            crate::popup::on_ready(role.generation);
+            crate::popup::on_ready(state.rt, role.generation);
         }
     }
 }
 
 impl Dispatch<XdgPopup, PopupRole> for RootState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &XdgPopup,
         event: xdg_popup::Event,
         role: &PopupRole,
@@ -1411,8 +1463,8 @@ impl Dispatch<XdgPopup, PopupRole> for RootState {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_popup::Event::PopupDone = event {
-            crate::popup::on_done(role.generation);
-            popup_destroy(role.generation);
+            crate::popup::on_done(state.rt, role.generation);
+            popup_destroy(state.rt, role.generation);
         }
     }
 }
@@ -1447,7 +1499,7 @@ noop_dispatch!(
 
 impl Dispatch<WlBuffer, ()> for RootState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         buffer: &WlBuffer,
         event: <WlBuffer as Proxy>::Event,
         _: &(),
@@ -1455,14 +1507,14 @@ impl Dispatch<WlBuffer, ()> for RootState {
         _: &QueueHandle<Self>,
     ) {
         if let wayland_client::protocol::wl_buffer::Event::Release = event {
-            crate::wl_state::note_buffer_release(buffer);
+            state.rt.buffers().note_release(buffer);
         }
     }
 }
 
 impl Dispatch<ZxdgToplevelDecorationV1, ()> for RootState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &ZxdgToplevelDecorationV1,
         event: zxdg_toplevel_decoration_v1::Event,
         _: &(),
@@ -1475,7 +1527,7 @@ impl Dispatch<ZxdgToplevelDecorationV1, ()> for RootState {
                 WEnum::Value(DecorationMode::ServerSide) => EffectiveDecorations::ServerSide,
                 _ => return,
             };
-            if EFFECTIVE.store(effective) {
+            if state.rt.root().effective.store(effective) {
                 tracing::info!(target: "Main", "decorations: compositor set {effective:?}");
                 jfn_platform_abi::notify_decorations_changed();
             }

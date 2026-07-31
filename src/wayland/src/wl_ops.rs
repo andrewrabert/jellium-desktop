@@ -1,6 +1,6 @@
 //! Surface lifecycle + paint ops.
 //!
-//! All entry points run under the [`wl_state::lock()`] mutex. Each
+//! All entry points run under the runtime's `WlState` mutex. Each
 //! protocol-touching op calls `WlState::flush()` (or `conn.flush()`)
 //! before returning so commits land in compositor order matching the
 //! C++ original.
@@ -13,9 +13,14 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
 use crate::layer::{LayerSurface, Present, PresentError, SurfaceRef, ViewportState};
 use crate::layer_actor::{LayerActor, LayerBackend};
+use crate::runtime::WlRuntime;
 use crate::wl_state::{
-    PlatformSurface, WlState, create_dmabuf_buffer, create_shm_buffer, lock, size_in_tolerance,
+    PlatformSurface, WlState, create_dmabuf_buffer, create_shm_buffer, size_in_tolerance,
 };
+
+fn core(rt: &WlRuntime) -> Option<parking_lot::MutexGuard<'_, WlState>> {
+    rt.try_core().map(parking_lot::Mutex::lock)
+}
 
 // =====================================================================
 // Lifetime helpers
@@ -41,9 +46,12 @@ unsafe fn surface_mut<'a>(p: *mut PlatformSurface) -> &'a mut PlatformSurface {
 // alloc / free / restack
 // =====================================================================
 
-pub(crate) fn alloc_surface() -> *mut PlatformSurface {
+pub(crate) fn alloc_surface(rt: &'static WlRuntime) -> *mut PlatformSurface {
+    // Take the lock before allocating: bailing out afterwards would leak the box.
+    let Some(mut st) = core(rt) else {
+        return std::ptr::null_mut();
+    };
     let ptr = new_boxed();
-    let mut st = lock();
     // SAFETY: ptr is freshly heap-allocated; no aliases yet.
     let s = unsafe { surface_mut(ptr) };
 
@@ -62,20 +70,21 @@ pub(crate) fn alloc_surface() -> *mut PlatformSurface {
     surface.commit();
     st.flush();
 
-    s.layer_actor = Some(build_actor(&st, &surface, &viewport, s.visible));
+    s.layer_actor = Some(build_actor(rt, &st, &surface, &viewport, s.visible));
     s.surface = Some(SurfaceRef::new(surface, viewport));
     crate::wl_state::parent_layer(&mut st, ptr);
 
     crate::scene::dispatch(
+        rt,
         &mut st,
         crate::scene::SceneEvent::LayerAdded(crate::scene::LayerId(ptr as usize)),
     );
     drop(st);
-    crate::root_window::request_present();
+    rt.root().request_present();
     ptr
 }
 
-pub(crate) fn free_surface(ptr: *mut PlatformSurface) {
+pub(crate) fn free_surface(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
     if ptr.is_null() {
         return;
     }
@@ -90,13 +99,14 @@ pub(crate) fn free_surface(ptr: *mut PlatformSurface) {
     }
 
     {
-        let mut st = lock();
+        let Some(mut st) = core(rt) else { return };
         // Drop from stack if still present.
         st.stack.retain(|p| *p != ptr);
 
         // Update the scene before tearing down wl objects: dismissing a menu
         // anchored here requires this layer's surface to still be alive.
         crate::scene::dispatch(
+            rt,
             &mut st,
             crate::scene::SceneEvent::LayerRemoved(crate::scene::LayerId(ptr as usize)),
         );
@@ -116,8 +126,8 @@ pub(crate) fn free_surface(ptr: *mut PlatformSurface) {
     unsafe { drop_boxed(ptr) };
 }
 
-pub(crate) fn restack(ordered: &[*mut PlatformSurface]) {
-    let mut st = lock();
+pub(crate) fn restack(rt: &'static WlRuntime, ordered: &[*mut PlatformSurface]) {
+    let Some(mut st) = core(rt) else { return };
     st.stack.clear();
     st.stack.extend_from_slice(ordered);
     let order: Vec<crate::scene::LayerId> = ordered
@@ -125,7 +135,7 @@ pub(crate) fn restack(ordered: &[*mut PlatformSurface]) {
         .filter(|p| !p.is_null())
         .map(|p| crate::scene::LayerId(*p as usize))
         .collect();
-    crate::scene::dispatch(&mut st, crate::scene::SceneEvent::Restack(order));
+    crate::scene::dispatch(rt, &mut st, crate::scene::SceneEvent::Restack(order));
 }
 
 // =====================================================================
@@ -133,6 +143,7 @@ pub(crate) fn restack(ordered: &[*mut PlatformSurface]) {
 // =====================================================================
 
 pub(crate) fn surface_set_visible(
+    rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
     visible: bool,
     bg_r: u8,
@@ -142,7 +153,7 @@ pub(crate) fn surface_set_visible(
     if ptr.is_null() {
         return;
     }
-    let st = lock();
+    let Some(st) = core(rt) else { return };
     let s = unsafe { surface_mut(ptr) };
     if s.visible == visible {
         return;
@@ -162,18 +173,25 @@ pub(crate) fn surface_set_visible(
         }
     }
     s.null_attached = !visible;
-    crate::root_window::request_present();
+    rt.root().request_present();
 }
 
 // =====================================================================
 // Popup
 // =====================================================================
 
-pub(crate) fn popup_show(ptr: *mut PlatformSurface, x: i32, y: i32, lw: i32, lh: i32) {
+pub(crate) fn popup_show(
+    rt: &'static WlRuntime,
+    ptr: *mut PlatformSurface,
+    x: i32,
+    y: i32,
+    lw: i32,
+    lh: i32,
+) {
     if ptr.is_null() {
         return;
     }
-    let st = lock();
+    let Some(st) = core(rt) else { return };
     let s = unsafe { surface_mut(ptr) };
     popup_create_locked(s, &st);
     s.popup_visible = true;
@@ -190,11 +208,11 @@ pub(crate) fn popup_show(ptr: *mut PlatformSurface, x: i32, y: i32, lw: i32, lh:
     st.flush();
 }
 
-pub(crate) fn popup_hide(ptr: *mut PlatformSurface) {
+pub(crate) fn popup_hide(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
     if ptr.is_null() {
         return;
     }
-    let st = lock();
+    let Some(st) = core(rt) else { return };
     let s = unsafe { surface_mut(ptr) };
     s.popup_visible = false;
     // Drain any popup commit the worker still owes before destroying the popup
@@ -234,9 +252,7 @@ fn popup_destroy_locked(s: &mut PlatformSurface) {
     if let Some(v) = s.popup_viewport.take() {
         v.destroy();
     }
-    if let Some(b) = s.popup_buffer.take() {
-        crate::wl_state::retire_buffer(b);
-    }
+    drop(s.popup_buffer.take());
     if let Some(sub) = s.popup_subsurface.take() {
         sub.destroy();
     }
@@ -260,6 +276,7 @@ pub(crate) fn dmabuf_pool_key(frame: &SharedTexture) -> Option<(u64, u64)> {
 }
 
 fn build_actor(
+    rt: &'static WlRuntime,
     st: &WlState,
     surface: &WlSurface,
     viewport: &Option<WpViewport>,
@@ -269,21 +286,24 @@ fn build_actor(
         (true, Some(ctx)) => LayerBackend::Gpu(ctx),
         _ => LayerBackend::Shm,
     };
-    let (lw, lh, pw, ph) = extent_or(0, 0);
+    let (lw, lh, pw, ph) = extent_or(rt, 0, 0);
     let layer = LayerSurface::new(st.conn.clone(), surface.clone(), viewport.clone());
     LayerActor::new(
         backend,
-        st.qh.clone(),
-        st.shm.clone(),
-        st.dmabuf.clone(),
+        crate::layer_actor::LayerDeps {
+            rt,
+            qh: st.qh.clone(),
+            shm: st.shm.clone(),
+            dmabuf: st.dmabuf.clone(),
+        },
         layer,
         ViewportState { lw, lh, pw, ph },
         visible,
     )
 }
 
-fn extent_or(w: i32, h: i32) -> (i32, i32, i32, i32) {
-    crate::window_state::window_extent().map_or((w, h, w, h), |ext| {
+fn extent_or(rt: &WlRuntime, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    rt.window().window_extent().map_or((w, h, w, h), |ext| {
         (
             ext.logical().w(),
             ext.logical().h(),
@@ -294,6 +314,7 @@ fn extent_or(w: i32, h: i32) -> (i32, i32, i32, i32) {
 }
 
 pub(crate) fn surface_present(
+    rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
     frame: SharedTexture,
 ) -> Result<Present, PresentError> {
@@ -303,17 +324,19 @@ pub(crate) fn surface_present(
     let (w, h) = (frame.coded().w, frame.coded().h);
     let (vw, vh) = (frame.visible_rect().w, frame.visible_rect().h);
 
-    let st = lock();
+    let Some(st) = core(rt) else {
+        return Ok(Present::Skipped);
+    };
     let s = unsafe { surface_mut(ptr) };
     if s.surface.is_none() || !s.visible || st.dmabuf.is_none() {
         return Ok(Present::Skipped);
     }
-    if !size_in_tolerance(vw, vh) && !s.null_attached {
+    if !size_in_tolerance(rt, vw, vh) && !s.null_attached {
         return Ok(Present::Skipped);
     }
 
     s.null_attached = false;
-    let (lw, lh, pw, ph) = extent_or(w, h);
+    let (lw, lh, pw, ph) = extent_or(rt, w, h);
 
     let Some(actor) = s.layer_actor.as_ref() else {
         return Ok(Present::Skipped);
@@ -324,6 +347,7 @@ pub(crate) fn surface_present(
 }
 
 pub(crate) fn surface_present_software(
+    rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
     dirty: &[JfnRect],
     pixels: &[u8],
@@ -334,14 +358,16 @@ pub(crate) fn surface_present_software(
         return Err(PresentError::BadDimensions(w, h));
     }
 
-    let _st = lock();
+    let Some(_st) = core(rt) else {
+        return Ok(Present::Skipped);
+    };
     let s = unsafe { surface_mut(ptr) };
     if s.surface.is_none() || !s.visible {
         return Ok(Present::Skipped);
     }
 
     s.null_attached = false;
-    let (lw, lh, pw, ph) = extent_or(w, h);
+    let (lw, lh, pw, ph) = extent_or(rt, w, h);
 
     let Some(actor) = s.layer_actor.as_ref() else {
         return Ok(Present::Skipped);
@@ -351,11 +377,17 @@ pub(crate) fn surface_present_software(
     actor.present_software(pixels, w, h, dirty)
 }
 
-pub(crate) fn popup_present(ptr: *mut PlatformSurface, frame: &SharedTexture, lw: i32, lh: i32) {
+pub(crate) fn popup_present(
+    rt: &'static WlRuntime,
+    ptr: *mut PlatformSurface,
+    frame: &SharedTexture,
+    lw: i32,
+    lh: i32,
+) {
     if ptr.is_null() || lw <= 0 || lh <= 0 {
         return;
     }
-    let st = lock();
+    let Some(st) = core(rt) else { return };
     let s = unsafe { surface_mut(ptr) };
     if s.popup_surface.is_none() || !s.popup_visible {
         return;
@@ -370,19 +402,20 @@ pub(crate) fn popup_present(ptr: *mut PlatformSurface, frame: &SharedTexture, lw
         return;
     };
     let Some(buf) = create_dmabuf_buffer(
+        rt.buffers(),
         dmabuf,
         &st.qh,
-        plane.fd.as_fd(),
-        plane.stride,
-        frame.modifier(),
-        w,
-        h,
+        crate::wl_state::DmabufPlane {
+            fd: plane.fd.as_fd(),
+            stride: plane.stride,
+            modifier: frame.modifier(),
+            w,
+            h,
+        },
     ) else {
         return;
     };
-    if let Some(old) = s.popup_buffer.take() {
-        crate::wl_state::retire_buffer(old);
-    }
+    drop(s.popup_buffer.take());
     if let Some(vp) = s.popup_viewport.as_ref() {
         vp.set_source(0.0, 0.0, vw as f64, vh as f64);
         vp.set_destination(lw, lh);
@@ -392,11 +425,12 @@ pub(crate) fn popup_present(ptr: *mut PlatformSurface, frame: &SharedTexture, lw
     };
     buf.attach_to(popup, 0, 0);
     popup.damage_buffer(0, 0, vw, vh);
-    commit_popup_via_actor(s, popup, &st);
+    commit_popup_via_actor(rt, s, popup, &st);
     s.popup_buffer = Some(buf);
 }
 
 pub(crate) fn popup_present_software(
+    rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
     pixels: &[u8],
     pw: i32,
@@ -407,17 +441,15 @@ pub(crate) fn popup_present_software(
     if ptr.is_null() || lw <= 0 || lh <= 0 {
         return;
     }
-    let st = lock();
+    let Some(st) = core(rt) else { return };
     let s = unsafe { surface_mut(ptr) };
     if s.popup_surface.is_none() || !s.popup_visible {
         return;
     }
-    let Some(buf) = create_shm_buffer(&st, pixels, pw, ph) else {
+    let Some(buf) = create_shm_buffer(rt.buffers(), &st, pixels, pw, ph) else {
         return;
     };
-    if let Some(old) = s.popup_buffer.take() {
-        crate::wl_state::retire_buffer(old);
-    }
+    drop(s.popup_buffer.take());
     if let Some(vp) = s.popup_viewport.as_ref() {
         vp.set_source(0.0, 0.0, pw as f64, ph as f64);
         vp.set_destination(lw, lh);
@@ -427,35 +459,40 @@ pub(crate) fn popup_present_software(
     };
     buf.attach_to(popup, 0, 0);
     popup.damage_buffer(0, 0, pw, ph);
-    commit_popup_via_actor(s, popup, &st);
+    commit_popup_via_actor(rt, s, popup, &st);
     s.popup_buffer = Some(buf);
 }
 
 /// Route the popup commit through the actor so it lands ordered after the
 /// layer's own commits; commit inline only when the surface has no actor.
-fn commit_popup_via_actor(s: &PlatformSurface, popup: &WlSurface, st: &WlState) {
+fn commit_popup_via_actor(
+    rt: &'static WlRuntime,
+    s: &PlatformSurface,
+    popup: &WlSurface,
+    st: &WlState,
+) {
     match s.layer_actor.as_ref() {
         Some(actor) => actor.commit_popup(popup.clone()),
         None => {
             popup.commit();
             st.flush();
-            crate::root_window::request_present();
+            rt.root().request_present();
         }
     }
 }
 
-pub(crate) fn on_configure(fullscreen: bool) {
-    let Some(ext) = crate::window_state::window_extent() else {
+pub(crate) fn on_configure(rt: &'static WlRuntime, fullscreen: bool) {
+    let Some(ext) = rt.window().window_extent() else {
         return;
     };
     let (lw, lh) = (ext.logical().w(), ext.logical().h());
     let (pw, ph) = (ext.physical().w(), ext.physical().h());
 
-    let mut st = lock();
+    let Some(mut st) = core(rt) else { return };
 
     st.was_fullscreen = fullscreen;
 
-    crate::wl_state::ensure_root_locked(&mut st);
+    crate::wl_state::ensure_root_locked(rt, &mut st);
 
     for &p in &st.stack {
         if p.is_null() {

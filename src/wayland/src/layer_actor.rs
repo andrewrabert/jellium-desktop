@@ -12,13 +12,21 @@ use jfn_gpu_paint::{Frame, FrameSize as PhysicalSize, Pixels, Presented, SharedT
 use jfn_platform_abi::JfnRect;
 
 use crate::layer::{FrameCommit, LayerSurface, Present, PresentError, ViewportState};
+use crate::runtime::WlRuntime;
 use crate::wl_ops::dmabuf_pool_key;
 use crate::wl_state::{
-    DispatchState, DmabufBuf, OwnedBuffer, buffer_is_idle, build_argb8888_shm_buffer,
-    build_shm_buffer_from_pixels, create_dmabuf_buffer, retire_buffer,
+    DispatchState, DmabufBuf, DmabufPlane, OwnedBuffer, build_argb8888_shm_buffer,
+    build_shm_buffer_from_pixels, create_dmabuf_buffer,
 };
 
 const DMABUF_POOL_CAP: usize = 16;
+
+pub(crate) struct LayerDeps {
+    pub(crate) rt: &'static WlRuntime,
+    pub(crate) qh: QueueHandle<DispatchState>,
+    pub(crate) shm: WlShm,
+    pub(crate) dmabuf: Option<ZwpLinuxDmabufV1>,
+}
 
 pub(crate) enum LayerBackend {
     Gpu(&'static Surfaces),
@@ -209,9 +217,7 @@ pub(crate) struct LayerActor {
 impl LayerActor {
     pub(crate) fn new(
         backend: LayerBackend,
-        qh: QueueHandle<DispatchState>,
-        shm: WlShm,
-        dmabuf: Option<ZwpLinuxDmabufV1>,
+        deps: LayerDeps,
         layer: LayerSurface,
         viewport_state: ViewportState,
         visible: bool,
@@ -227,17 +233,7 @@ impl LayerActor {
         let gpu_failed = Arc::new(AtomicBool::new(false));
         let worker_shared = Arc::clone(&shared);
         let worker_failed = Arc::clone(&gpu_failed);
-        let thread = thread::spawn(move || {
-            run(
-                backend,
-                qh,
-                shm,
-                dmabuf,
-                layer,
-                worker_shared,
-                worker_failed,
-            )
-        });
+        let thread = thread::spawn(move || run(backend, deps, layer, worker_shared, worker_failed));
         Self {
             kind,
             shared,
@@ -508,6 +504,7 @@ fn degrade(
 }
 
 struct Runner {
+    rt: &'static WlRuntime,
     qh: QueueHandle<DispatchState>,
     shm: WlShm,
     dmabuf: Option<ZwpLinuxDmabufV1>,
@@ -524,13 +521,17 @@ struct Runner {
 
 fn run(
     backend: LayerBackend,
-    qh: QueueHandle<DispatchState>,
-    shm: WlShm,
-    dmabuf: Option<ZwpLinuxDmabufV1>,
+    deps: LayerDeps,
     layer: LayerSurface,
     shared: Arc<(Mutex<Mailbox>, Condvar)>,
     gpu_failed: Arc<AtomicBool>,
 ) {
+    let LayerDeps {
+        rt,
+        qh,
+        shm,
+        dmabuf,
+    } = deps;
     let (backend, gpu) = match backend {
         LayerBackend::Gpu(gpu) => (Backend::Gpu { painter: None }, Some(gpu)),
         LayerBackend::Shm => (
@@ -541,6 +542,7 @@ fn run(
         ),
     };
     let mut runner = Runner {
+        rt,
         qh,
         shm,
         dmabuf,
@@ -684,7 +686,7 @@ fn run(
 
         if layer_committed || popup_commit.is_some() {
             layer.flush();
-            crate::root_window::request_present();
+            rt.root().request_present();
         }
     }
 
@@ -693,9 +695,6 @@ fn run(
 
 impl Runner {
     fn set_current(&mut self, buf: Option<OwnedBuffer>) {
-        if let Some(old) = self.current.take() {
-            retire_buffer(old);
-        }
         self.current = buf;
     }
 
@@ -755,13 +754,19 @@ impl Runner {
         bg: (u8, u8, u8),
     ) -> Result<Present, PresentError> {
         let (r, g, b) = bg;
-        let Some(buf) =
-            build_argb8888_shm_buffer(&self.shm, &self.qh, "layer-placeholder", 1, 1, |dst| {
+        let Some(buf) = build_argb8888_shm_buffer(
+            self.rt.buffers(),
+            &self.shm,
+            &self.qh,
+            "layer-placeholder",
+            1,
+            1,
+            |dst| {
                 // ARGB8888 little-endian byte order = [B, G, R, A].
                 dst.copy_from_slice(&[b, g, r, 0xFF]);
                 true
-            })
-        else {
+            },
+        ) else {
             return Err(PresentError::ShmAlloc);
         };
         layer.present(FrameCommit::new(&buf, 1, 1, 1, 1, vps.lw, vps.lh));
@@ -837,6 +842,7 @@ impl Runner {
         };
         compose_shm_shadow(shadow, p)?;
         let Some(buf) = build_shm_buffer_from_pixels(
+            self.rt.buffers(),
             &self.shm,
             &self.qh,
             "cef-sw-worker",
@@ -896,13 +902,16 @@ impl Runner {
         let plane = frame.planes().first()?;
         let Some(id) = dmabuf_pool_key(frame) else {
             let buf = create_dmabuf_buffer(
+                self.rt.buffers(),
                 dmabuf,
                 &self.qh,
-                plane.fd.as_fd(),
-                plane.stride,
-                frame.modifier(),
-                frame.coded().w,
-                frame.coded().h,
+                DmabufPlane {
+                    fd: plane.fd.as_fd(),
+                    stride: plane.stride,
+                    modifier: frame.modifier(),
+                    w: frame.coded().w,
+                    h: frame.coded().h,
+                },
             )?;
             return Some(DmabufLease::OneShot(buf));
         };
@@ -915,25 +924,28 @@ impl Runner {
                 && e.modifier == frame.modifier()
         });
         if let Some(pos) = hit {
-            if buffer_is_idle(&self.dmabuf_pool[pos].buf) {
+            if self.rt.buffers().is_idle(&self.dmabuf_pool[pos].buf) {
                 let entry = self.dmabuf_pool.remove(pos);
                 self.dmabuf_pool.insert(0, entry);
                 return Some(DmabufLease::Pooled);
             }
-            retire_buffer(self.dmabuf_pool.remove(pos).buf);
+            self.dmabuf_pool.remove(pos);
         }
         if let Some(stale) = self.dmabuf_pool.iter().position(|e| e.id == id) {
-            retire_buffer(self.dmabuf_pool.remove(stale).buf);
+            self.dmabuf_pool.remove(stale);
         }
 
         let buf = create_dmabuf_buffer(
+            self.rt.buffers(),
             dmabuf,
             &self.qh,
-            plane.fd.as_fd(),
-            plane.stride,
-            frame.modifier(),
-            frame.coded().w,
-            frame.coded().h,
+            DmabufPlane {
+                fd: plane.fd.as_fd(),
+                stride: plane.stride,
+                modifier: frame.modifier(),
+                w: frame.coded().w,
+                h: frame.coded().h,
+            },
         )?;
         self.dmabuf_pool.insert(
             0,
@@ -946,19 +958,13 @@ impl Runner {
                 buf,
             },
         );
-        while self.dmabuf_pool.len() > DMABUF_POOL_CAP {
-            if let Some(evicted) = self.dmabuf_pool.pop() {
-                retire_buffer(evicted.buf);
-            }
-        }
+        self.dmabuf_pool.truncate(DMABUF_POOL_CAP);
         Some(DmabufLease::Pooled)
     }
 
     fn shutdown(mut self) {
         self.set_current(None);
-        for entry in self.dmabuf_pool.drain(..) {
-            retire_buffer(entry.buf);
-        }
+        self.dmabuf_pool.clear();
         if let Backend::Gpu {
             painter: Some(painter),
         } = self.backend

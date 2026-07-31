@@ -466,9 +466,9 @@ pub trait Platform: Send + Sync {
     fn surface_set_visible(&self, _s: SurfaceHandle, _visible: bool) {}
     fn restack(&self, _ordered: &[SurfaceHandle]) {}
 
-    fn dropdown_backend(&self) -> &'static dyn DropdownBackend;
+    fn dropdown_backend(&self) -> &dyn DropdownBackend;
 
-    fn context_menu_backend(&self) -> &'static dyn ContextMenuBackend;
+    fn context_menu_backend(&self) -> &dyn ContextMenuBackend;
 
     /// How this platform hosts mpv's lifecycle (env prep, VO wait,
     /// teardown detach). Default: mpv needs nothing from the platform.
@@ -544,7 +544,7 @@ pub trait Platform: Send + Sync {
     /// Live window-geometry authority for this backend: the compositor-backed
     /// source where the backend owns its toplevel (Wayland), the mpv-backed
     /// source everywhere else.
-    fn window_source(&self) -> &'static dyn WindowSource;
+    fn window_source(&self) -> &dyn WindowSource;
 
     /// The mpv `--geometry` string for boot, or `None` when the backend owns
     /// its toplevel and sizes it itself. The default sizes via mpv; toplevel-

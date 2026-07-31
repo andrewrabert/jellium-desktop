@@ -5,12 +5,22 @@ use jfn_platform_abi::{
     LogicalSize, PhysicalSize, Scale, WindowExtent, WindowSnapshot, WindowSource,
 };
 
-pub struct WaylandWindowSource;
+use crate::runtime::WlRuntime;
+
+pub struct WaylandWindowSource {
+    rt: &'static WlRuntime,
+}
+
+impl WaylandWindowSource {
+    pub(crate) fn new(rt: &'static WlRuntime) -> Self {
+        Self { rt }
+    }
+}
 
 impl WindowSource for WaylandWindowSource {
     fn snapshot(&self) -> WindowSnapshot {
         // One snapshot so extent and mode can't span two generations.
-        let snap = crate::window_state::window_extent();
+        let snap = self.rt.window().window_extent();
         WindowSnapshot {
             extent: snap.map(|e| {
                 WindowExtent::with_logical(

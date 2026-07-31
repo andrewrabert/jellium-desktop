@@ -39,11 +39,13 @@ fn layer_surface(id: LayerId) -> Option<WlSurface> {
     s.surface.as_ref().map(|sr| sr.as_arg().clone())
 }
 
-pub struct WlSink;
+pub struct WlSink {
+    rt: &'static crate::runtime::WlRuntime,
+}
 
 impl WlSink {
-    pub fn new() -> Self {
-        Self
+    pub fn new(rt: &'static crate::runtime::WlRuntime) -> Self {
+        Self { rt }
     }
 
     fn place_above(&mut self, layer: LayerId, above: Above) {
@@ -69,17 +71,11 @@ impl WlSink {
     }
 }
 
-impl Default for WlSink {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SceneSink for WlSink {
     fn apply(&mut self, effect: &Effect) {
         match *effect {
             Effect::PlaceAbove { layer, above } => self.place_above(layer, above),
-            Effect::CommitParent => crate::root_window::request_present(),
+            Effect::CommitParent => self.rt.root().request_present(),
         }
     }
 }

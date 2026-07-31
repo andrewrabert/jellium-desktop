@@ -85,10 +85,10 @@ pub fn reduce(scene: &mut Scene, ev: SceneEvent) -> Vec<Effect> {
     }
 }
 
-pub(crate) fn dispatch(st: &mut WlState, ev: SceneEvent) {
+pub(crate) fn dispatch(rt: &'static crate::runtime::WlRuntime, st: &mut WlState, ev: SceneEvent) {
     let effects = reduce(&mut st.scene, ev);
     {
-        let mut s = sink::WlSink::new();
+        let mut s = sink::WlSink::new(rt);
         for e in &effects {
             s.apply(e);
         }

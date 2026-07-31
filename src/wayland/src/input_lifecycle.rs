@@ -10,9 +10,8 @@
 //! the Platform-vtable cursor setter.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::input::{Callbacks, InputThread};
+use crate::input::Callbacks;
 use jfn_platform_abi::cursor::CursorShape;
 
 use jfn_input::{
@@ -31,23 +30,21 @@ const CALLBACKS: Callbacks = Callbacks {
     char_: Some(jfn_input_dispatch_char),
 };
 
-static G_CTX: AtomicPtr<InputThread> = AtomicPtr::new(std::ptr::null_mut());
-
-pub fn lifecycle_init(display: *mut c_void) {
-    let ptr = unsafe { crate::input::init(display, &CALLBACKS) };
-    G_CTX.store(ptr, Ordering::Release);
+pub fn lifecycle_init(rt: &'static crate::runtime::WlRuntime, display: *mut c_void) {
+    let Some(thread) = crate::input::init(rt, display, &CALLBACKS) else {
+        return;
+    };
+    let _ = rt.set_input(thread);
 }
 
-pub fn lifecycle_cleanup() {
-    let ptr = G_CTX.swap(std::ptr::null_mut(), Ordering::AcqRel);
-    if !ptr.is_null() {
-        unsafe { crate::input::cleanup(ptr) };
+pub fn lifecycle_cleanup(rt: &'static crate::runtime::WlRuntime) {
+    if let Some(input) = rt.input() {
+        input.shutdown(rt);
     }
 }
 
-pub fn set_cursor_active(shape: CursorShape) {
-    let ptr = G_CTX.load(Ordering::Acquire);
-    if !ptr.is_null() {
-        unsafe { crate::input::set_cursor(ptr, shape.as_raw() as u32) };
+pub fn set_cursor_active(rt: &crate::runtime::WlRuntime, shape: CursorShape) {
+    if let Some(input) = rt.input() {
+        input.set_cursor(shape.as_raw() as u32);
     }
 }

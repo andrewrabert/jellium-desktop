@@ -3,14 +3,18 @@ use jfn_platform_abi::{
     JsMenuContextMenu, context_menu_style,
 };
 
-pub(crate) fn backend() -> &'static dyn ContextMenuBackend {
+use crate::runtime::WlRuntime;
+
+pub(crate) fn backend(rt: &'static WlRuntime) -> Box<dyn ContextMenuBackend> {
     match context_menu_style(DisplayBackend::Wayland) {
-        ContextMenuStyle::PlatformMenu => &XdgPopupContextMenu,
-        ContextMenuStyle::JsMenu => &JsMenuContextMenu,
+        ContextMenuStyle::PlatformMenu => Box::new(XdgPopupContextMenu { rt }),
+        ContextMenuStyle::JsMenu => Box::new(JsMenuContextMenu),
     }
 }
 
-struct XdgPopupContextMenu;
+struct XdgPopupContextMenu {
+    rt: &'static WlRuntime,
+}
 
 impl ContextMenuBackend for XdgPopupContextMenu {
     fn show(&self, req: JfnContextMenuRequest) {
@@ -28,6 +32,6 @@ impl ContextMenuBackend for XdgPopupContextMenu {
                 separator: i.separator,
             })
             .collect();
-        crate::popup::show(items, req.x, req.y, cb);
+        crate::popup::show(self.rt, items, req.x, req.y, cb);
     }
 }

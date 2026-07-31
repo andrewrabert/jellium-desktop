@@ -47,24 +47,24 @@ pub fn install_from_cli(cli: &crate::cli::Cli) {
                 }
             }
         };
-        if let Some(p) = cli.linux.platform_paint {
-            match backend {
-                DisplayBackend::Wayland => jfn_wayland::set_paint_override(match p {
+        if backend == DisplayBackend::X11
+            && let Some(p) = cli.linux.platform_paint
+        {
+            jfn_x11::set_paint_override(match p {
+                jfn_linux_util::cli::Paint::Dmabuf => jfn_x11::X11PaintOverride::Dmabuf,
+                jfn_linux_util::cli::Paint::Gpu => jfn_x11::X11PaintOverride::Gpu,
+                jfn_linux_util::cli::Paint::Shm => jfn_x11::X11PaintOverride::Shm,
+            });
+        }
+
+        let p: Box<dyn Platform> = match backend {
+            DisplayBackend::Wayland => jfn_wayland::make_platform::make_wayland_platform(
+                cli.linux.platform_paint.map(|p| match p {
                     jfn_linux_util::cli::Paint::Dmabuf => jfn_wayland::WlPaintOverride::Dmabuf,
                     jfn_linux_util::cli::Paint::Gpu => jfn_wayland::WlPaintOverride::Gpu,
                     jfn_linux_util::cli::Paint::Shm => jfn_wayland::WlPaintOverride::Shm,
                 }),
-                DisplayBackend::X11 => jfn_x11::set_paint_override(match p {
-                    jfn_linux_util::cli::Paint::Dmabuf => jfn_x11::X11PaintOverride::Dmabuf,
-                    jfn_linux_util::cli::Paint::Gpu => jfn_x11::X11PaintOverride::Gpu,
-                    jfn_linux_util::cli::Paint::Shm => jfn_x11::X11PaintOverride::Shm,
-                }),
-                _ => {}
-            }
-        }
-
-        let p: Box<dyn Platform> = match backend {
-            DisplayBackend::Wayland => jfn_wayland::make_platform::make_wayland_platform(),
+            ),
             DisplayBackend::X11 => jfn_x11::make_platform::make_x11_platform(),
             _ => unreachable!(),
         };

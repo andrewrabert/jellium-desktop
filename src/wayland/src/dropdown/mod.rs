@@ -8,10 +8,12 @@ use jfn_platform_abi::{
 use subsurface::SubsurfaceDropdown;
 use xdg_popup::XdgPopupDropdown;
 
-pub(crate) fn backend() -> &'static dyn DropdownBackend {
+use crate::runtime::WlRuntime;
+
+pub(crate) fn backend(rt: &'static WlRuntime) -> Box<dyn DropdownBackend> {
     match dropdown_style(DisplayBackend::Wayland) {
-        DropdownStyle::PlatformMenu => &XdgPopupDropdown,
-        DropdownStyle::Composited => &SubsurfaceDropdown,
-        DropdownStyle::JsMenu => &JsMenuDropdown,
+        DropdownStyle::PlatformMenu => Box::new(XdgPopupDropdown { rt }),
+        DropdownStyle::Composited => Box::new(SubsurfaceDropdown { rt }),
+        DropdownStyle::JsMenu => Box::new(JsMenuDropdown),
     }
 }

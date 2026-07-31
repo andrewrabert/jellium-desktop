@@ -1,11 +1,13 @@
 //! The single owner of Wayland window geometry/scale state. Everything lives
-//! in ONE `RwLock<State>`: the last fed scale (with its provenance) and the
+//! in ONE `RwLock<Inner>`: the last fed scale (with its provenance) and the
 //! last published extent. Readers that need several fields coherently take a
-//! single [`window_extent`] snapshot; the per-field accessors read one field
-//! each and must not be composed into a geometry that spans two generations.
+//! single [`WindowState::window_extent`] snapshot; the per-field accessors read
+//! one field each and must not be composed into a geometry that spans two
+//! generations.
 
 use parking_lot::RwLock;
 
+use crate::runtime::WlRuntime;
 use crate::scale::Scale120;
 use crate::wl_ops;
 
@@ -88,20 +90,14 @@ impl WindowExtent {
     }
 }
 
-struct State {
+struct Inner {
     scale: Option<KnownScale>,
     extent: Option<WindowExtent>,
     generation: u64,
 }
 
-static STATE: RwLock<State> = RwLock::new(State {
-    scale: None,
-    extent: None,
-    generation: 0,
-});
-
-fn extent() -> Option<WindowExtent> {
-    STATE.read().extent
+pub(crate) struct WindowState {
+    inner: RwLock<Inner>,
 }
 
 /// A coherent view of the window geometry from one lock acquisition.
@@ -140,69 +136,105 @@ impl WindowExtentSnapshot {
     }
 }
 
-pub(crate) fn window_extent() -> Option<WindowExtentSnapshot> {
-    extent().map(|e| WindowExtentSnapshot::from_extent(&e))
-}
+impl WindowState {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: RwLock::new(Inner {
+                scale: None,
+                extent: None,
+                generation: 0,
+            }),
+        }
+    }
 
-pub(crate) fn known_scale() -> Option<Scale120> {
-    STATE.read().scale.map(|k| k.scale)
-}
+    fn extent(&self) -> Option<WindowExtent> {
+        self.inner.read().extent
+    }
 
-pub(crate) fn scale_known() -> bool {
-    known_scale().is_some()
-}
+    pub(crate) fn window_extent(&self) -> Option<WindowExtentSnapshot> {
+        self.extent().map(|e| WindowExtentSnapshot::from_extent(&e))
+    }
 
-pub(crate) fn cached_scale() -> f32 {
-    let st = STATE.read();
-    st.extent
-        .map(|e| e.scale.scale)
-        .or(st.scale.map(|k| k.scale))
-        .map_or(1.0, Scale120::ratio_f32)
-}
+    pub(crate) fn known_scale(&self) -> Option<Scale120> {
+        self.inner.read().scale.map(|k| k.scale)
+    }
 
-pub(crate) fn window_maximized() -> bool {
-    matches!(extent().map(|e| e.mode), Some(WindowMode::Maximized))
-}
+    pub(crate) fn scale_known(&self) -> bool {
+        self.known_scale().is_some()
+    }
 
-/// The consumer notifications below read the value back through the accessors,
-/// so they must run after the write lock is released or they deadlock.
-pub(crate) fn publish(logical: WindowSize, mode: WindowMode) {
-    let Some(extent) = ({
-        let mut st = STATE.write();
-        let Some(scale) = st.scale else {
+    pub(crate) fn cached_scale(&self) -> f32 {
+        let st = self.inner.read();
+        st.extent
+            .map(|e| e.scale.scale)
+            .or(st.scale.map(|k| k.scale))
+            .map_or(1.0, Scale120::ratio_f32)
+    }
+
+    pub(crate) fn window_maximized(&self) -> bool {
+        matches!(self.extent().map(|e| e.mode), Some(WindowMode::Maximized))
+    }
+
+    /// The consumer notifications below read the value back through the
+    /// accessors, so they must run after the write lock is released or they
+    /// deadlock.
+    pub(crate) fn publish(&self, rt: &'static WlRuntime, logical: WindowSize, mode: WindowMode) {
+        let Some(extent) = ({
+            let mut st = self.inner.write();
+            let Some(scale) = st.scale else {
+                return;
+            };
+            st.generation += 1;
+            let extent = WindowExtent::build(logical, scale, mode, st.generation);
+            if let Some(e) = extent {
+                st.extent = Some(e);
+            }
+            extent
+        }) else {
             return;
         };
-        st.generation += 1;
-        let extent = WindowExtent::build(logical, scale, mode, st.generation);
-        if let Some(e) = extent {
-            st.extent = Some(e);
+        tracing::debug!(
+            target: "Main",
+            "window extent gen={} logical={}x{} physical={}x{} scale={}",
+            extent.generation, extent.logical.w, extent.logical.h,
+            extent.physical.w, extent.physical.h, extent.scale.scale
+        );
+
+        let fullscreen = mode == WindowMode::Fullscreen;
+        rt.root()
+            .sync_maximized_command_state(mode == WindowMode::Maximized);
+        if rt.try_core().is_some() {
+            wl_ops::on_configure(rt, fullscreen);
         }
-        extent
-    }) else {
-        return;
-    };
-    tracing::debug!(
-        target: "Main",
-        "window extent gen={} logical={}x{} physical={}x{} scale={}",
-        extent.generation, extent.logical.w, extent.logical.h, extent.physical.w, extent.physical.h,
-        extent.scale.scale
-    );
-
-    let fullscreen = mode == WindowMode::Fullscreen;
-    crate::root_window::sync_maximized_command_state(mode == WindowMode::Maximized);
-    if crate::wl_state::try_state().is_some() {
-        wl_ops::on_configure(fullscreen);
+        jfn_platform_abi::notify_window_changed();
+        // Wake any thread parked in `mpv_wait_event` (the boot-time VO-wait loop
+        // polls the window source rather than receiving an mpv event).
+        jfn_mpv::api::jfn_mpv_wakeup();
     }
-    jfn_platform_abi::notify_window_changed();
-    // Wake any thread parked in `mpv_wait_event` (the boot-time VO-wait loop
-    // polls the window source rather than receiving an mpv event).
-    jfn_mpv::api::jfn_mpv_wakeup();
-}
 
-/// Satisfy the boot scale gate when no `wp_fractional_scale_manager_v1` exists,
-/// so it doesn't wait forever for a `preferred_scale` that never arrives.
-pub(crate) fn feed_unit_scale() {
-    feed_scale(Scale120::UNIT, ScaleProvenance::Provisional);
+    /// Satisfy the boot scale gate when no `wp_fractional_scale_manager_v1`
+    /// exists, so it doesn't wait forever for a `preferred_scale` that never
+    /// arrives.
+    pub(crate) fn feed_unit_scale(&self) {
+        self.feed_scale(Scale120::UNIT, ScaleProvenance::Provisional);
+    }
+
+    /// Record a scale, subject to [`scale_displaces`].
+    pub(crate) fn feed_scale(&self, scale: Scale120, provenance: ScaleProvenance) {
+        let first = {
+            let mut st = self.inner.write();
+            let first = st.scale.is_none();
+            if !scale_displaces(st.scale.map(|k| k.provenance), provenance) {
+                return;
+            }
+            st.scale = Some(KnownScale { scale, provenance });
+            first
+        };
+        if first {
+            tracing::info!(target: "Main", "scale known: {scale}");
+        }
+        jfn_mpv::api::jfn_mpv_wakeup();
+    }
 }
 
 /// Pure arbitration: an authoritative scale always wins; a provisional one
@@ -213,23 +245,6 @@ pub(crate) fn scale_displaces(current: Option<ScaleProvenance>, incoming: ScaleP
         (None, _) | (Some(_), ScaleProvenance::Authoritative) => true,
         (Some(cur), ScaleProvenance::Provisional) => cur == ScaleProvenance::Provisional,
     }
-}
-
-/// Record a scale, subject to [`scale_displaces`].
-pub(crate) fn feed_scale(scale: Scale120, provenance: ScaleProvenance) {
-    let first = {
-        let mut st = STATE.write();
-        let first = st.scale.is_none();
-        if !scale_displaces(st.scale.map(|k| k.provenance), provenance) {
-            return;
-        }
-        st.scale = Some(KnownScale { scale, provenance });
-        first
-    };
-    if first {
-        tracing::info!(target: "Main", "scale known: {scale}");
-    }
-    jfn_mpv::api::jfn_mpv_wakeup();
 }
 
 pub(crate) fn feed_suspended(suspended: bool) {

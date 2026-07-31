@@ -14,7 +14,17 @@ struct PaletteState {
     current_path: Option<CString>,
 }
 
-static STATE: Mutex<Option<PaletteState>> = Mutex::new(None);
+pub(crate) struct Palette {
+    state: Mutex<Option<PaletteState>>,
+}
+
+impl Palette {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+}
 
 fn write_color_scheme(r: u8, g: u8, b: u8, path: &std::path::Path) -> std::io::Result<()> {
     let bg = format!("{},{},{}", r, g, b);
@@ -49,27 +59,33 @@ fn make_colors_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-pub(crate) fn init() -> bool {
-    if STATE.lock().is_some() {
+pub(crate) fn init(rt: &crate::runtime::WlRuntime) -> bool {
+    if rt.palette().state.lock().is_some() {
         return true;
     }
     let Some(colors_dir) = make_colors_dir() else {
         return false;
     };
-    *STATE.lock() = Some(PaletteState {
+    *rt.palette().state.lock() = Some(PaletteState {
         colors_dir,
         current_path: None,
     });
     true
 }
 
-pub(crate) fn set_color(r: u8, g: u8, b: u8, hex: &std::ffi::CStr) {
+pub(crate) fn set_color(
+    rt: &'static crate::runtime::WlRuntime,
+    r: u8,
+    g: u8,
+    b: u8,
+    hex: &std::ffi::CStr,
+) {
     let hex_str = match hex.to_str() {
         Ok(s) if s.len() == 7 && s.starts_with('#') => &s[1..],
         _ => return,
     };
 
-    let mut guard = STATE.lock();
+    let mut guard = rt.palette().state.lock();
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return,
@@ -96,12 +112,12 @@ pub(crate) fn set_color(r: u8, g: u8, b: u8, hex: &std::ffi::CStr) {
         let _ = fs::remove_file(old_path);
     }
 
-    crate::root_window::set_titlebar_palette(&new_path);
+    rt.root().set_titlebar_palette(&new_path);
     state.current_path = Some(new_path_c);
 }
 
-pub(crate) fn post_window_cleanup() {
-    let mut guard = STATE.lock();
+pub(crate) fn post_window_cleanup(rt: &crate::runtime::WlRuntime) {
+    let mut guard = rt.palette().state.lock();
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return,

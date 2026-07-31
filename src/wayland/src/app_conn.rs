@@ -35,16 +35,26 @@ enum DisplayState {
     Failed,
 }
 
-static APP_DISPLAY: Mutex<DisplayState> = Mutex::new(DisplayState::Unattempted);
+pub(crate) struct AppConn {
+    display: Mutex<DisplayState>,
+}
 
-pub(crate) fn app_display() -> Option<AppDisplay> {
-    let mut state = APP_DISPLAY.lock();
+impl AppConn {
+    pub(crate) fn new() -> Self {
+        Self {
+            display: Mutex::new(DisplayState::Unattempted),
+        }
+    }
+}
+
+pub(crate) fn app_display(rt: &crate::runtime::WlRuntime) -> Option<AppDisplay> {
+    let mut state = rt.app_conn().display.lock();
     match &*state {
         DisplayState::Connected(a) => return Some(*a),
         DisplayState::Failed => return None,
         DisplayState::Unattempted => {}
     }
-    let Some(fd) = crate::mpv_proxy::app_client_fd() else {
+    let Some(fd) = rt.proxy().app_client_fd() else {
         tracing::error!(target: "Main", "app_display: no app client fd available");
         return None;
     };

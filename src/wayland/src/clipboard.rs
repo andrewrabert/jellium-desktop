@@ -431,47 +431,56 @@ fn init_impl() -> Option<JfnClipboardWayland> {
     })
 }
 
-// Process-global singleton mirroring the previous C++ `detail::instance()`.
-// The wayland lifecycle drives init/cleanup; the read path looks the
-// instance up here.
-static INSTANCE: Mutex<Option<Box<JfnClipboardWayland>>> = Mutex::new(None);
-
-pub fn clipboard_init() {
-    let mut g = INSTANCE.lock();
-    if g.is_some() {
-        return;
-    }
-    if let Some(c) = init_impl() {
-        *g = Some(Box::new(c));
-    }
+/// The wayland lifecycle drives init/cleanup; the read path goes through the
+/// runtime's slot.
+pub struct Clipboard {
+    inner: Mutex<Option<Box<JfnClipboardWayland>>>,
 }
 
-pub fn clipboard_available() -> bool {
-    INSTANCE.lock().is_some()
-}
-
-pub fn clipboard_read_text_async(cb: Box<dyn FnOnce(&str) + Send>) {
-    let g = INSTANCE.lock();
-    let Some(c) = g.as_ref() else {
-        // No clipboard: deliver an empty read so the caller's promise resolves.
-        cb("");
-        return;
-    };
-    {
-        let mut q = c.shared.queued.lock();
-        q.push(PendingCb { cb });
+impl Clipboard {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
     }
-    c.shared.wake.signal();
-}
 
-pub fn clipboard_cleanup() {
-    let Some(mut boxed) = INSTANCE.lock().take() else {
-        return;
-    };
-    boxed.shared.stop.store(true, Ordering::Relaxed);
-    boxed.shared.wake.signal();
-    if let Some(w) = boxed.worker.take() {
-        let _ = w.join();
+    pub fn init(&self) {
+        let mut g = self.inner.lock();
+        if g.is_some() {
+            return;
+        }
+        if let Some(c) = init_impl() {
+            *g = Some(Box::new(c));
+        }
     }
-    // The WakeEvent closes its fd when the last Arc<Shared> drops.
+
+    pub fn available(&self) -> bool {
+        self.inner.lock().is_some()
+    }
+
+    pub fn read_text_async(&self, cb: Box<dyn FnOnce(&str) + Send>) {
+        let g = self.inner.lock();
+        let Some(c) = g.as_ref() else {
+            // No clipboard: deliver an empty read so the caller's promise resolves.
+            cb("");
+            return;
+        };
+        {
+            let mut q = c.shared.queued.lock();
+            q.push(PendingCb { cb });
+        }
+        c.shared.wake.signal();
+    }
+
+    pub fn cleanup(&self) {
+        let Some(mut boxed) = self.inner.lock().take() else {
+            return;
+        };
+        boxed.shared.stop.store(true, Ordering::Relaxed);
+        boxed.shared.wake.signal();
+        if let Some(w) = boxed.worker.take() {
+            let _ = w.join();
+        }
+        // The WakeEvent closes its fd when the last Arc<Shared> drops.
+    }
 }

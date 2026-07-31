@@ -18,10 +18,9 @@
 //! would risk null-attach vs. commit ordering races.
 
 use nix::sys::memfd::MFdFlags;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::sync::OnceLock;
 
 use jfn_gpu_paint::Surfaces;
 
@@ -108,30 +107,26 @@ impl SyncSubsurface {
     }
 }
 
-/// Sole owner of a `wl_buffer`; destruction goes through [`retire_buffer`],
-/// which honors the pending-release invariant.
 pub(crate) struct OwnedBuffer {
     buf: WlBuffer,
+    registry: &'static BufferRegistry,
 }
 
 impl OwnedBuffer {
-    fn adopt(buf: WlBuffer) -> Self {
-        MANAGED.lock().push(ManagedBuffer {
-            id: buf.id(),
-            released: true,
-            doomed: None,
-        });
-        Self { buf }
-    }
-
     fn id(&self) -> ObjectId {
         self.buf.id()
     }
 
     /// Marks the buffer in-use until its next release.
     pub(crate) fn attach_to(&self, surface: &WlSurface, x: i32, y: i32) {
-        mark_attached(&self.id());
+        self.registry.mark_attached(&self.id());
         surface.attach(Some(&self.buf), x, y);
+    }
+}
+
+impl Drop for OwnedBuffer {
+    fn drop(&mut self) {
+        self.registry.retire(self.buf.clone());
     }
 }
 
@@ -219,19 +214,14 @@ pub(crate) struct WlState {
 // that wraps the WlState itself.
 unsafe impl Send for WlState {}
 
-/// Zero-state Dispatch sink — we ignore all protocol events.
-pub(crate) struct DispatchState;
-
-static STATE: OnceLock<Mutex<WlState>> = OnceLock::new();
-
-pub(crate) fn try_state() -> Option<&'static Mutex<WlState>> {
-    STATE.get()
+pub(crate) struct DispatchState {
+    buffers: &'static BufferRegistry,
 }
 
-// Post-init accessor; `try_state()` is the fallible sibling for early paths.
-#[allow(clippy::expect_used)] // boot invariant: init runs before any lock()
-pub(crate) fn lock() -> MutexGuard<'static, WlState> {
-    STATE.get().expect("wl_state used before init").lock()
+impl DispatchState {
+    pub(crate) fn new(buffers: &'static BufferRegistry) -> Self {
+        Self { buffers }
+    }
 }
 
 // =====================================================================
@@ -298,69 +288,91 @@ struct ManagedBuffer {
     doomed: Option<WlBuffer>,
 }
 
-static MANAGED: Mutex<Vec<ManagedBuffer>> = Mutex::new(Vec::new());
-
-fn mark_attached(id: &ObjectId) {
-    let mut mgd = MANAGED.lock();
-    if let Some(m) = mgd.iter_mut().find(|m| &m.id == id) {
-        m.released = false;
-    }
+pub(crate) struct BufferRegistry {
+    managed: Mutex<Vec<ManagedBuffer>>,
 }
 
-pub(crate) fn buffer_is_idle(buf: &OwnedBuffer) -> bool {
-    let id = buf.id();
-    MANAGED
-        .lock()
-        .iter()
-        .find(|m| m.id == id)
-        .is_some_and(|m| m.released && m.doomed.is_none())
+impl BufferRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            managed: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn adopt(&'static self, buf: WlBuffer) -> OwnedBuffer {
+        self.managed.lock().push(ManagedBuffer {
+            id: buf.id(),
+            released: true,
+            doomed: None,
+        });
+        OwnedBuffer {
+            buf,
+            registry: self,
+        }
+    }
+
+    fn mark_attached(&self, id: &ObjectId) {
+        let mut mgd = self.managed.lock();
+        if let Some(m) = mgd.iter_mut().find(|m| &m.id == id) {
+            m.released = false;
+        }
+    }
+
+    pub(crate) fn is_idle(&self, buf: &OwnedBuffer) -> bool {
+        let id = buf.id();
+        self.managed
+            .lock()
+            .iter()
+            .find(|m| m.id == id)
+            .is_some_and(|m| m.released && m.doomed.is_none())
+    }
+
+    fn retire(&self, buf: WlBuffer) {
+        let id = buf.id();
+        let mut mgd = self.managed.lock();
+        match mgd.iter().position(|m| m.id == id) {
+            Some(pos) if mgd[pos].released => {
+                mgd.swap_remove(pos);
+                buf.destroy();
+            }
+            Some(pos) => mgd[pos].doomed = Some(buf),
+            None => {
+                debug_assert!(
+                    false,
+                    "retire: untracked buffer — a release may have been missed"
+                );
+                tracing::error!("retire: untracked buffer — a release may have been missed");
+                mgd.push(ManagedBuffer {
+                    id,
+                    released: false,
+                    doomed: Some(buf),
+                });
+            }
+        }
+    }
+
+    pub(crate) fn note_release(&self, buffer: &WlBuffer) {
+        let id = buffer.id();
+        let mut mgd = self.managed.lock();
+        if let Some(pos) = mgd.iter().position(|m| m.id == id) {
+            if mgd[pos].doomed.is_some() {
+                if let Some(doomed) = mgd.swap_remove(pos).doomed {
+                    doomed.destroy();
+                }
+            } else {
+                mgd[pos].released = true;
+            }
+        }
+    }
 }
 
 pub(crate) fn damage_all(surface: &WlSurface) {
     surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
 }
 
-pub(crate) fn retire_buffer(buf: OwnedBuffer) {
-    let id = buf.id();
-    let mut mgd = MANAGED.lock();
-    match mgd.iter().position(|m| m.id == id) {
-        Some(pos) if mgd[pos].released => {
-            mgd.swap_remove(pos);
-            buf.buf.destroy();
-        }
-        Some(pos) => mgd[pos].doomed = Some(buf.buf),
-        None => {
-            debug_assert!(
-                false,
-                "retire_buffer: untracked buffer — a release may have been missed"
-            );
-            tracing::error!("retire_buffer: untracked buffer — a release may have been missed");
-            mgd.push(ManagedBuffer {
-                id,
-                released: false,
-                doomed: Some(buf.buf),
-            });
-        }
-    }
-}
-
-pub(crate) fn note_buffer_release(buffer: &WlBuffer) {
-    let id = buffer.id();
-    let mut mgd = MANAGED.lock();
-    if let Some(pos) = mgd.iter().position(|m| m.id == id) {
-        if mgd[pos].doomed.is_some() {
-            if let Some(doomed) = mgd.swap_remove(pos).doomed {
-                doomed.destroy();
-            }
-        } else {
-            mgd[pos].released = true;
-        }
-    }
-}
-
 impl Dispatch<WlBuffer, ()> for DispatchState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         buffer: &WlBuffer,
         event: <WlBuffer as Proxy>::Event,
         _: &(),
@@ -368,18 +380,20 @@ impl Dispatch<WlBuffer, ()> for DispatchState {
         _: &QueueHandle<Self>,
     ) {
         if let wayland_client::protocol::wl_buffer::Event::Release = event {
-            note_buffer_release(buffer);
+            state.buffers.note_release(buffer);
         }
     }
 }
 
 /// Dispatch the CEF connection's pending events (notably `wl_buffer.release`).
 /// Called from the root-window read loop, the only reader of the shared display.
-pub(crate) fn pump_events() {
-    if let Some(state) = STATE.get() {
+pub(crate) fn pump_events(rt: &'static crate::runtime::WlRuntime) {
+    if let Some(state) = rt.try_core() {
         let mut st = state.lock();
         let st = &mut *st;
-        let _ = st.queue.dispatch_pending(&mut DispatchState);
+        let _ = st
+            .queue
+            .dispatch_pending(&mut DispatchState::new(rt.buffers()));
     }
 }
 
@@ -389,10 +403,10 @@ pub(crate) fn pump_events() {
 // =====================================================================
 
 /// SAFETY: `display_ptr` must be a live `*mut wl_display` owned by mpv.
-pub(crate) unsafe fn init(display_ptr: *mut c_void) -> Result<(), String> {
-    if STATE.get().is_some() {
-        return Err("wl_state already initialised".into());
-    }
+pub(crate) unsafe fn init(
+    rt: &'static crate::runtime::WlRuntime,
+    display_ptr: *mut c_void,
+) -> Result<WlState, String> {
     if display_ptr.is_null() {
         return Err("null display".into());
     }
@@ -433,12 +447,9 @@ pub(crate) unsafe fn init(display_ptr: *mut c_void) -> Result<(), String> {
         menu_io: crate::popup::MenuIo::default(),
     };
 
-    ensure_root_locked(&mut state);
+    ensure_root_locked(rt, &mut state);
 
-    STATE
-        .set(Mutex::new(state))
-        .map_err(|_| "wl_state lost init race".to_string())?;
-    Ok(())
+    Ok(state)
 }
 
 fn surface_from_handle(
@@ -488,11 +499,11 @@ fn parent_layer_locked(st: &mut WlState, ptr: *mut PlatformSurface) {
     s.subsurface = Some(sub);
 }
 
-pub(crate) fn ensure_root_locked(st: &mut WlState) {
+pub(crate) fn ensure_root_locked(rt: &'static crate::runtime::WlRuntime, st: &mut WlState) {
     if st.root_surface.is_some() {
         return;
     }
-    let Some(handle) = crate::root_window::root_surface_handle() else {
+    let Some(handle) = rt.root().root_surface_handle() else {
         return;
     };
     let Some(root) = surface_from_handle(&st.conn, handle, "overlay root") else {
@@ -521,19 +532,17 @@ impl WlState {
     }
 }
 
-/// Adopt the process's GPU device for the copied-frame path. `'static` because
-/// the device is opened once at init and never replaced, which is what lets
-/// each layer's surface borrow it for its whole life.
-pub fn install_gpu_paint(gpu: &'static Surfaces) {
-    let mut st = lock();
-    st.gpu = Some(gpu);
-    st.use_gpu_paint = true;
+impl WlState {
+    pub(crate) fn install_gpu_paint(&mut self, gpu: &'static Surfaces) {
+        self.gpu = Some(gpu);
+        self.use_gpu_paint = true;
+    }
 }
 
 // Does an incoming frame's visible size match the authoritative physical window
 // size (within tolerance)? Reads the single source, not a per-layer copy.
-pub(crate) fn size_in_tolerance(vw: i32, vh: i32) -> bool {
-    let Some(ext) = crate::window_state::window_extent() else {
+pub(crate) fn size_in_tolerance(rt: &crate::runtime::WlRuntime, vw: i32, vh: i32) -> bool {
+    let Some(ext) = rt.window().window_extent() else {
         return true;
     };
     let (pw, ph) = (ext.physical().w(), ext.physical().h());
@@ -547,6 +556,7 @@ pub(crate) fn size_in_tolerance(vw: i32, vh: i32) -> bool {
 /// Build an ARGB8888 `wl_shm` buffer of `w`×`h`, handing `fill` a mapping of
 /// exactly `stride*h` bytes to populate (`false` aborts).
 pub(crate) fn build_argb8888_shm_buffer<D>(
+    reg: &'static BufferRegistry,
     shm: &WlShm,
     qh: &QueueHandle<D>,
     label: &str,
@@ -572,11 +582,12 @@ where
     let pool = shm.create_pool(fd.as_fd(), size, qh, ());
     let buf = pool.create_buffer(0, w, h, stride, Format::Argb8888, qh, ());
     pool.destroy();
-    Some(OwnedBuffer::adopt(buf))
+    Some(reg.adopt(buf))
 }
 
 /// Copy `pixels` into a fresh ARGB8888 shm buffer, or `None` if it's too short.
 pub(crate) fn build_shm_buffer_from_pixels<D>(
+    reg: &'static BufferRegistry,
     shm: &WlShm,
     qh: &QueueHandle<D>,
     label: &str,
@@ -587,7 +598,7 @@ pub(crate) fn build_shm_buffer_from_pixels<D>(
 where
     D: Dispatch<WlShmPool, ()> + Dispatch<WlBuffer, ()> + 'static,
 {
-    build_argb8888_shm_buffer(shm, qh, label, w, h, |dst| {
+    build_argb8888_shm_buffer(reg, shm, qh, label, w, h, |dst| {
         if pixels.len() < dst.len() {
             return false;
         }
@@ -598,36 +609,49 @@ where
 
 /// Create a wl_shm ARGB8888 buffer from a CPU pixel array.
 pub(crate) fn create_shm_buffer(
+    reg: &'static BufferRegistry,
     state: &WlState,
     pixels: &[u8],
     w: i32,
     h: i32,
 ) -> Option<OwnedBuffer> {
-    build_shm_buffer_from_pixels(&state.shm, &state.qh, "cef-sw", pixels, w, h)
+    build_shm_buffer_from_pixels(reg, &state.shm, &state.qh, "cef-sw", pixels, w, h)
+}
+
+pub(crate) struct DmabufPlane<'a> {
+    pub(crate) fd: BorrowedFd<'a>,
+    pub(crate) stride: u32,
+    pub(crate) modifier: u64,
+    pub(crate) w: i32,
+    pub(crate) h: i32,
 }
 
 /// Create a dmabuf-backed wl_buffer from a single-plane fd.
 pub(crate) fn create_dmabuf_buffer(
+    reg: &'static BufferRegistry,
     dmabuf: &ZwpLinuxDmabufV1,
     qh: &QueueHandle<DispatchState>,
-    fd: BorrowedFd<'_>,
-    stride: u32,
-    modifier: u64,
-    w: i32,
-    h: i32,
+    plane: DmabufPlane<'_>,
 ) -> Option<OwnedBuffer> {
     let params: ZwpLinuxBufferParamsV1 = dmabuf.create_params(qh, ());
     params.add(
-        fd,
+        plane.fd,
         0,
         0,
-        stride,
-        (modifier >> 32) as u32,
-        (modifier & 0xffff_ffff) as u32,
+        plane.stride,
+        (plane.modifier >> 32) as u32,
+        (plane.modifier & 0xffff_ffff) as u32,
     );
-    let buf = params.create_immed(w, h, DRM_FORMAT_ARGB8888, DmabufFlags::empty(), qh, ());
+    let buf = params.create_immed(
+        plane.w,
+        plane.h,
+        DRM_FORMAT_ARGB8888,
+        DmabufFlags::empty(),
+        qh,
+        (),
+    );
     params.destroy();
-    Some(OwnedBuffer::adopt(buf))
+    Some(reg.adopt(buf))
 }
 
 /// Create a CLOEXEC anonymous memfd of the given size and truncate it.
