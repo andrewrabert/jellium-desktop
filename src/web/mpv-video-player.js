@@ -18,6 +18,26 @@
         return mediaStreams.find(s => s.Index === index) || null;
     }
 
+    // Third-party themes/plugins (custom CSS plugins, injected scripts) can set
+    // an opaque background on body & friends with !important, which paints over
+    // the transparent window and hides the mpv video underneath. Outrank them
+    // with higher-specificity rules scoped to jellyfin-web's transparentDocument
+    // playback state.
+    function ensureTransparencyGuard() {
+        if (document.getElementById('mpvTransparencyGuard')) return;
+        const style = document.createElement('style');
+        style.id = 'mpvTransparencyGuard';
+        style.textContent = `
+            html.transparentDocument,
+            .transparentDocument body,
+            .transparentDocument .backgroundContainer,
+            .transparentDocument .skinBody,
+            .transparentDocument .videoPlayerContainer {
+                background: transparent !important;
+            }`;
+        document.head.appendChild(style);
+    }
+
     class mpvVideoPlayer extends window.MpvPlayerBase {
         constructor(args) {
             super(args);
@@ -264,6 +284,7 @@
         }
 
         createMediaElement(options) {
+            ensureTransparencyGuard();
             let dlg = document.querySelector('.videoPlayerContainer');
             const isNewDlg = !dlg;
             if (isNewDlg) {
