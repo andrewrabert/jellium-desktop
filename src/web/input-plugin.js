@@ -29,15 +29,27 @@
                 Album: item.Album || '',
                 Artists: item.Artists || [],
                 IndexNumber: item.IndexNumber || 0,
+                ParentIndexNumber: item.ParentIndexNumber || 0,
+                ProductionYear: item.ProductionYear || 0,
                 RunTimeTicks: item.RunTimeTicks || 0,
-                Id: item.Id || ''
+                Id: item.Id || '',
+                ProviderIds: item.ProviderIds || {},
+                ImageUrl: this.getImageUrl(item, this.serverBaseUrl()) || ''
             };
             console.debug('[Media] notifyMetadata:', meta.Name);
             window.jmpNative.notifyMetadata(JSON.stringify(meta));
             this.fetchAlbumArt(item);
         }
 
+        serverBaseUrl() {
+            if (window.ApiClient && window.ApiClient.serverAddress) {
+                return window.ApiClient.serverAddress() || '';
+            }
+            return '';
+        }
+
         getImageUrl(item, baseUrl) {
+            if (!baseUrl) return null;
             const imageTags = item.ImageTags || {};
             const itemType = item.Type || '';
             const mediaType = item.MediaType || '';
@@ -75,10 +87,7 @@
                 this.artworkAbortController = null;
             }
 
-            let baseUrl = '';
-            if (window.ApiClient && window.ApiClient.serverAddress) {
-                baseUrl = window.ApiClient.serverAddress();
-            }
+            const baseUrl = this.serverBaseUrl();
             if (!baseUrl) return;
 
             const imageUrl = this.getImageUrl(item, baseUrl);

@@ -4,6 +4,7 @@ members = [
     "color",
     "compositor_core",
     "config",
+    "discord",
     "gpu_paint",
     "input",
     "jellyfin",

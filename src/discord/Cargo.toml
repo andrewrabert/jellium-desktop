@@ -1,0 +1,21 @@
+[package]
+name = "jfn-discord"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "jfn_discord"
+crate-type = ["rlib"]
+
+# Deliberately not target-gated: Discord's local RPC transport exists on all
+# three platforms, so unlike jfn-mpris this crate is real code everywhere.
+[dependencies]
+jfn-config = { path = "../config" }
+jfn-playback = { path = "../playback" }
+parking_lot.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

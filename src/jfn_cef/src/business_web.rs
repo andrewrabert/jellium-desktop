@@ -31,7 +31,9 @@ use jfn_mpv::api::{
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_playback::ingest_driver::jfn_playback_fullscreen;
 use jfn_playback::shutdown::jfn_shutdown_initiate;
-use jfn_playback::{Input as PbInput, MediaType as PbMediaType, post as pb_post};
+use jfn_playback::{
+    Input as PbInput, ItemKind as PbItemKind, MediaType as PbMediaType, post as pb_post,
+};
 
 use jfn_mpv::api::JfnMpvLoadOptions;
 
@@ -47,8 +49,15 @@ struct MediaMetadata {
     artist: String,
     album: String,
     track_number: i32,
+    season_number: i32,
+    year: i32,
     duration_us: i64,
+    art_url: String,
     media_type: u8,
+    kind: PbItemKind,
+    imdb_id: String,
+    tmdb_id: String,
+    anilist_id: String,
 }
 
 struct WebState {
@@ -150,6 +159,12 @@ fn parse_metadata_json(json: &str) -> MediaMetadata {
     if let Some(n) = d.get("IndexNumber").and_then(Value::as_i64) {
         out.track_number = n as i32;
     }
+    if let Some(n) = d.get("ParentIndexNumber").and_then(Value::as_i64) {
+        out.season_number = n as i32;
+    }
+    if let Some(n) = d.get("ProductionYear").and_then(Value::as_i64) {
+        out.year = n as i32;
+    }
     if let Some(t) = d.get("RunTimeTicks") {
         let ticks = t
             .as_f64()
@@ -157,10 +172,31 @@ fn parse_metadata_json(json: &str) -> MediaMetadata {
             .unwrap_or(0.0);
         out.duration_us = ticks as i64 / 10;
     }
-    out.media_type = match get_str("Type").as_str() {
-        "Audio" => MT_AUDIO,
-        "Movie" | "Episode" | "Video" | "MusicVideo" => MT_VIDEO,
-        _ => MT_UNKNOWN,
+    out.art_url = get_str("ImageUrl");
+    if let Some(p) = d.get("ProviderIds").and_then(Value::as_object) {
+        let get_provider = |name: &str| {
+            p.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .and_then(|(_, v)| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        out.imdb_id = get_provider("Imdb");
+        out.tmdb_id = get_provider("Tmdb");
+        out.anilist_id = get_provider("AniList");
+    }
+    out.kind = match get_str("Type").as_str() {
+        "Movie" => PbItemKind::Movie,
+        "Episode" => PbItemKind::Episode,
+        "Audio" => PbItemKind::Music,
+        "MusicVideo" => PbItemKind::MusicVideo,
+        "Video" => PbItemKind::Video,
+        _ => PbItemKind::Unknown,
+    };
+    out.media_type = match out.kind.media_type() {
+        PbMediaType::Audio => MT_AUDIO,
+        PbMediaType::Video => MT_VIDEO,
+        PbMediaType::Unknown => MT_UNKNOWN,
     };
     out
 }
@@ -174,17 +210,23 @@ fn media_type_to_pb(t: u8) -> PbMediaType {
 }
 
 fn post_metadata(meta: &MediaMetadata) {
-    pb_post(PbInput::Metadata(jfn_playback::MediaMetadata {
+    pb_post(PbInput::Metadata(Box::new(jfn_playback::MediaMetadata {
         id: meta.id.clone(),
         title: meta.title.clone(),
         artist: meta.artist.clone(),
         album: meta.album.clone(),
         track_number: meta.track_number,
+        season_number: meta.season_number,
+        year: meta.year,
         duration_us: meta.duration_us,
-        art_url: String::new(),
+        art_url: meta.art_url.clone(),
         art_data_uri: String::new(),
         media_type: media_type_to_pb(meta.media_type),
-    }));
+        kind: meta.kind,
+        imdb_id: meta.imdb_id.clone(),
+        tmdb_id: meta.tmdb_id.clone(),
+        anilist_id: meta.anilist_id.clone(),
+    })));
 }
 
 fn handle_player_load(args: &ListValue) {

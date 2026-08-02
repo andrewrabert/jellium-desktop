@@ -59,6 +59,8 @@ struct SettingsData {
     force_transcoding: bool,
     window_decorations: Option<WindowDecorations>,
     hide_scrollbar: bool,
+    discord_rich_presence: bool,
+    discord_application_id: String,
 }
 
 impl Default for SettingsData {
@@ -77,6 +79,8 @@ impl Default for SettingsData {
             force_transcoding: false,
             window_decorations: None,
             hide_scrollbar: true,
+            discord_rich_presence: false,
+            discord_application_id: String::new(),
         }
     }
 }
@@ -154,6 +158,12 @@ impl SettingsData {
         if let Some(b) = v.get("hideScrollbar").and_then(Value::as_bool) {
             self.hide_scrollbar = b;
         }
+        if let Some(b) = v.get("discordRichPresence").and_then(Value::as_bool) {
+            self.discord_rich_presence = b;
+        }
+        if let Some(s) = v.get("discordApplicationId").and_then(Value::as_str) {
+            self.discord_application_id = s.into();
+        }
     }
 
     fn to_json(&self) -> Value {
@@ -223,6 +233,15 @@ impl SettingsData {
         if !self.device_name.is_empty() {
             o.insert("deviceName".into(), Value::String(self.device_name.clone()));
         }
+        if self.discord_rich_presence {
+            o.insert("discordRichPresence".into(), Value::Bool(true));
+        }
+        if !self.discord_application_id.is_empty() {
+            o.insert(
+                "discordApplicationId".into(),
+                Value::String(self.discord_application_id.clone()),
+            );
+        }
         Value::Object(o)
     }
 
@@ -265,6 +284,14 @@ impl SettingsData {
         if !self.device_name.is_empty() {
             o.insert("deviceName".into(), Value::String(self.device_name.clone()));
         }
+        o.insert(
+            "discordRichPresence".into(),
+            Value::Bool(self.discord_rich_presence),
+        );
+        o.insert(
+            "discordApplicationId".into(),
+            Value::String(self.discord_application_id.clone()),
+        );
         o.insert(
             "deviceNameDefault".into(),
             Value::String(default_device_name()),
@@ -517,6 +544,18 @@ bool_accessors!(
     transparent_titlebar
 );
 bool_accessors!(force_transcoding, set_force_transcoding, force_transcoding);
+bool_accessors!(
+    discord_rich_presence,
+    set_discord_rich_presence,
+    discord_rich_presence
+);
+pub fn discord_application_id() -> String {
+    state().lock().data.discord_application_id.clone()
+}
+
+pub fn set_discord_application_id(v: &str) {
+    state().lock().data.discord_application_id = v.trim().to_string();
+}
 /// The user's explicit decoration choice, unresolved; `None` when unset.
 pub fn configured_window_decorations() -> Option<WindowDecorations> {
     state().lock().data.window_decorations
@@ -590,9 +629,37 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_device_name;
+    use super::{SettingsData, Value, normalize_device_name};
 
     const PLATFORM: &str = "platform-host";
+
+    #[test]
+    fn discord_settings_survive_a_load_save_cycle() {
+        let mut d = SettingsData::default();
+        d.overlay_json(&serde_json::json!({
+            "discordRichPresence": true,
+            "discordApplicationId": "1533503787145363616",
+        }));
+        assert!(d.discord_rich_presence);
+        assert_eq!(d.discord_application_id, "1533503787145363616");
+
+        let out = d.to_json();
+        assert_eq!(
+            out.get("discordRichPresence").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            out.get("discordApplicationId").and_then(Value::as_str),
+            Some("1533503787145363616")
+        );
+    }
+
+    #[test]
+    fn saving_drops_keys_the_running_binary_does_not_know() {
+        let mut d = SettingsData::default();
+        d.overlay_json(&serde_json::json!({ "someFutureKey": "value" }));
+        assert!(d.to_json().get("someFutureKey").is_none());
+    }
 
     #[test]
     fn trims_leading_and_trailing_whitespace() {

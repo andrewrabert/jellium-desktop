@@ -14,6 +14,29 @@ pub enum MediaType {
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum ItemKind {
+    #[default]
+    Unknown = 0,
+    Movie = 1,
+    Episode = 2,
+    Music = 3,
+    MusicVideo = 4,
+    Video = 5,
+}
+
+impl ItemKind {
+    #[must_use]
+    pub fn media_type(self) -> MediaType {
+        match self {
+            Self::Music => MediaType::Audio,
+            Self::Movie | Self::Episode | Self::MusicVideo | Self::Video => MediaType::Video,
+            Self::Unknown => MediaType::Unknown,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum PlayerPresence {
     #[default]
     None = 0,
@@ -45,10 +68,16 @@ pub struct MediaMetadata {
     pub artist: String,
     pub album: String,
     pub track_number: i32,
+    pub season_number: i32,
+    pub year: i32,
     pub duration_us: i64,
     pub art_url: String,
     pub art_data_uri: String,
     pub media_type: MediaType,
+    pub kind: ItemKind,
+    pub imdb_id: String,
+    pub tmdb_id: String,
+    pub anilist_id: String,
 }
 
 #[repr(C)]

@@ -2272,6 +2272,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "jfn-discord"
+version = "0.1.0-dev"
+dependencies = [
+ "jfn-config",
+ "jfn-playback",
+ "parking_lot",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "jfn-gpu-paint"
 version = "0.1.0-dev"
 dependencies = [
@@ -2433,6 +2444,7 @@ dependencies = [
  "jfn-cef",
  "jfn-color",
  "jfn-config",
+ "jfn-discord",
  "jfn-jellyfin",
  "jfn-linux-util",
  "jfn-logging",

@@ -378,6 +378,7 @@ fn start_playback_coordination() -> bool {
     ));
 
     plat().media_session().start();
+    jfn_discord::start();
 
     jfn_playback::ingest_driver::jfn_playback_set_scale_provider(|| {
         let s = plat().get_scale();
@@ -415,6 +416,7 @@ fn shutdown_runtime(manager_thread: std::thread::JoinHandle<()>) {
 
     jfn_color::theme::jfn_theme_color_shutdown();
     plat().media_session().stop();
+    jfn_discord::stop();
 
     jfn_playback::ingest_driver::jfn_playback_stop_mpv_event_thread();
 

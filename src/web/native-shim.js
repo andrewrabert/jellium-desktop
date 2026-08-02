@@ -86,7 +86,8 @@
             { key: 'playback', order: 0 },
             { key: 'audio', order: 1 },
             { key: 'transcode', order: 2 },
-            { key: 'advanced', order: 3 }
+            { key: 'discord', order: 3 },
+            { key: 'advanced', order: 4 }
         ],
         settings: {
             main: { enableMPV: true, fullscreen: false, userWebClient: '__SERVER_URL__' },
@@ -100,6 +101,10 @@
             },
             transcode: {
                 forceTranscoding: !!_savedSettings.forceTranscoding
+            },
+            discord: {
+                discordRichPresence: !!_savedSettings.discordRichPresence,
+                discordApplicationId: _savedSettings.discordApplicationId || ''
             },
             advanced: {
                 transparentTitlebar: _savedSettings.transparentTitlebar !== false,
@@ -125,6 +130,10 @@
             ],
             transcode: [
                 { key: 'forceTranscoding', displayName: 'Force Transcoding', help: 'Always request a transcoded stream from the server, even when direct play would work.' }
+            ],
+            discord: [
+                { key: 'discordRichPresence', displayName: 'Discord Rich Presence', help: 'Show what you are watching on your Discord profile: title, episode, and playback progress. Your Discord friends will see it. Requires restart.' },
+                { key: 'discordApplicationId', displayName: 'Discord Application ID', help: 'The numeric ID of the application you created at discord.com/developers. Upload art assets named "logo" and "pause" to it. Leave blank to use the built-in ID.', inputType: 'text', maxLength: 32, placeholder: '000000000000000000' }
             ],
             advanced: [
                 { key: 'hideScrollbar', displayName: 'Hide Scrollbar', help: 'Hide scrollbars throughout the app. Scrolling with the wheel, trackpad, and keyboard still works. Requires restart.' },

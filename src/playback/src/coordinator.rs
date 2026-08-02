@@ -38,7 +38,7 @@ pub enum Input {
     },
     BufferedRanges(Vec<PlaybackBufferedRange>),
     DisplayHz(f64),
-    Metadata(MediaMetadata),
+    Metadata(Box<MediaMetadata>),
     Artwork(String),
     QueueCaps {
         can_go_next: bool,
@@ -240,7 +240,7 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
             // tracks metadata changes (idle inhibit reads it).
             let mut events = sm.on_media_type(m.media_type);
             let mut ev = PlaybackEvent::new(PlaybackEventKind::MetadataChanged);
-            ev.metadata = m;
+            ev.metadata = *m;
             events.push(ev);
             events
         }
