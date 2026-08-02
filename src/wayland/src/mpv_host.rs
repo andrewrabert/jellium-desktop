@@ -55,7 +55,15 @@ unsafe fn start_proxy(configured: Option<WindowDecorations>) {
         unsafe { stop(p) };
         return;
     }
-    tracing::info!(target: "Main", "proxy listening on {disp}");
+    // Record the compositor's socket before the override below: everything we
+    // spawn inherits this env, and a client that isn't mpv gets its toplevel
+    // demoted and then kills the connection we share with mpv.
+    let host_display = std::env::var("WAYLAND_DISPLAY").ok();
+    tracing::info!(
+        target: "Main",
+        "proxy listening on {disp}; spawned children keep WAYLAND_DISPLAY={host_display:?}"
+    );
+    jfn_linux_util::open_url::set_host_wayland_display(host_display);
     crate::root_window::set_decorations(configured);
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &disp) };
     let _ = PROXY.set(ProxySlot(p));
