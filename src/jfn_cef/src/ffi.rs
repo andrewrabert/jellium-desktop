@@ -230,9 +230,19 @@ pub fn jfn_cef_shutdown() {
 // ---- helpers ---------------------------------------------------------------
 
 fn log_severity_from_int(v: c_int) -> LogSeverity {
-    // cef_log_severity_t is a u32 C enum. Cast through the sys type so we
-    // don't depend on private repr details.
-    let raw: sys::cef_log_severity_t = unsafe { std::mem::transmute(v as u32) };
+    // Integers passed through `jfn_cef_set_log_severity` and CEF console
+    // callbacks are `cef_log_severity_t` ABI values, not Chromium's older
+    // signed log levels (-1..2). Keep this table in sync with
+    // `client/events.rs` and the constants in `jfn_rust::app`:
+    //   0 DEFAULT, 1 VERBOSE, 2 INFO, 3 WARNING, 4 ERROR, 5 FATAL
+    let raw = match v {
+        1 => sys::cef_log_severity_t::LOGSEVERITY_VERBOSE,
+        2 => sys::cef_log_severity_t::LOGSEVERITY_INFO,
+        3 => sys::cef_log_severity_t::LOGSEVERITY_WARNING,
+        4 => sys::cef_log_severity_t::LOGSEVERITY_ERROR,
+        5 => sys::cef_log_severity_t::LOGSEVERITY_FATAL,
+        _ => sys::cef_log_severity_t::LOGSEVERITY_DEFAULT,
+    };
     LogSeverity::from(raw)
 }
 
