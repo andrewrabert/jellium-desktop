@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
+use smithay_client_toolkit::shm::slot::SlotPool;
 use wayland_client::QueueHandle;
-use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
@@ -15,8 +15,8 @@ use crate::layer::{FrameCommit, LayerSurface, Present, PresentError, ViewportSta
 use crate::runtime::WlRuntime;
 use crate::wl_ops::dmabuf_pool_key;
 use crate::wl_state::{
-    DispatchState, DmabufBuf, DmabufPlane, OwnedBuffer, build_argb8888_shm_buffer,
-    build_shm_buffer_from_pixels, create_dmabuf_buffer,
+    AttachedBuffer, DispatchState, DmabufBuf, DmabufBuffer, DmabufPlane, FrameBuffer, ShmGlobal,
+    create_dmabuf_buffer, draw_argb8888, draw_from_pixels, new_slot_pool,
 };
 
 const DMABUF_POOL_CAP: usize = 16;
@@ -24,7 +24,7 @@ const DMABUF_POOL_CAP: usize = 16;
 pub(crate) struct LayerDeps {
     pub(crate) rt: &'static WlRuntime,
     pub(crate) qh: QueueHandle<DispatchState>,
-    pub(crate) shm: WlShm,
+    pub(crate) shm: ShmGlobal,
     pub(crate) dmabuf: Option<ZwpLinuxDmabufV1>,
 }
 
@@ -506,7 +506,7 @@ fn degrade(
 struct Runner {
     rt: &'static WlRuntime,
     qh: QueueHandle<DispatchState>,
-    shm: WlShm,
+    shm_pool: Option<SlotPool>,
     dmabuf: Option<ZwpLinuxDmabufV1>,
     backend: Backend,
     gpu: Option<&'static Surfaces>,
@@ -516,7 +516,7 @@ struct Runner {
     dmabuf_pool: Vec<DmabufBuf>,
     /// Held until the compositor releases it: an attached buffer must outlive
     /// its use by the compositor.
-    current: Option<OwnedBuffer>,
+    current: Option<AttachedBuffer>,
 }
 
 fn run(
@@ -544,7 +544,7 @@ fn run(
     let mut runner = Runner {
         rt,
         qh,
-        shm,
+        shm_pool: new_slot_pool(&shm, "cef layer"),
         dmabuf,
         backend,
         gpu,
@@ -694,7 +694,7 @@ fn run(
 }
 
 impl Runner {
-    fn set_current(&mut self, buf: Option<OwnedBuffer>) {
+    fn set_current(&mut self, buf: Option<AttachedBuffer>) {
         self.current = buf;
     }
 
@@ -754,23 +754,26 @@ impl Runner {
         bg: (u8, u8, u8),
     ) -> Result<Present, PresentError> {
         let (r, g, b) = bg;
-        let Some(buf) = build_argb8888_shm_buffer(
-            self.rt.buffers(),
-            &self.shm,
-            &self.qh,
-            "layer-placeholder",
-            1,
-            1,
-            |dst| {
-                // ARGB8888 little-endian byte order = [B, G, R, A].
-                dst.copy_from_slice(&[b, g, r, 0xFF]);
-                true
-            },
-        ) else {
+        let Some(pool) = self.shm_pool.as_mut() else {
             return Err(PresentError::ShmAlloc);
         };
-        layer.present(FrameCommit::new(&buf, 1, 1, 1, 1, vps.lw, vps.lh));
-        self.set_current(Some(buf));
+        let Some(buf) = draw_argb8888(pool, 1, 1, |dst| {
+            // ARGB8888 little-endian byte order = [B, G, R, A].
+            dst.copy_from_slice(&[b, g, r, 0xFF]);
+            true
+        }) else {
+            return Err(PresentError::ShmAlloc);
+        };
+        layer.present(FrameCommit::new(
+            FrameBuffer::Shm(&buf),
+            1,
+            1,
+            1,
+            1,
+            vps.lw,
+            vps.lh,
+        ));
+        self.set_current(Some(AttachedBuffer::Shm(buf)));
         Ok(Present::Committed)
     }
 
@@ -841,19 +844,14 @@ impl Runner {
             return Ok(Present::Skipped);
         };
         compose_shm_shadow(shadow, p)?;
-        let Some(buf) = build_shm_buffer_from_pixels(
-            self.rt.buffers(),
-            &self.shm,
-            &self.qh,
-            "cef-sw-worker",
-            &shadow.pixels,
-            width,
-            height,
-        ) else {
+        let Some(pool) = self.shm_pool.as_mut() else {
+            return Err(PresentError::ShmAlloc);
+        };
+        let Some(buf) = draw_from_pixels(pool, &shadow.pixels, width, height) else {
             return Err(PresentError::ShmAlloc);
         };
         layer.present(FrameCommit::new(
-            &buf,
+            FrameBuffer::Shm(&buf),
             width,
             height,
             width.min(vps.pw),
@@ -861,7 +859,7 @@ impl Runner {
             vps.lw,
             vps.lh,
         ));
-        self.set_current(Some(buf));
+        self.set_current(Some(AttachedBuffer::Shm(buf)));
         Ok(Present::Committed)
     }
 
@@ -879,7 +877,7 @@ impl Runner {
         match pos {
             DmabufLease::Pooled => {
                 layer.present(FrameCommit::new(
-                    &self.dmabuf_pool[0].buf,
+                    FrameBuffer::Dmabuf(&self.dmabuf_pool[0].buf),
                     cw,
                     ch,
                     vw,
@@ -890,8 +888,16 @@ impl Runner {
                 self.set_current(None);
             }
             DmabufLease::OneShot(buf) => {
-                layer.present(FrameCommit::new(&buf, cw, ch, vw, vh, vps.lw, vps.lh));
-                self.set_current(Some(buf));
+                layer.present(FrameCommit::new(
+                    FrameBuffer::Dmabuf(&buf),
+                    cw,
+                    ch,
+                    vw,
+                    vh,
+                    vps.lw,
+                    vps.lh,
+                ));
+                self.set_current(Some(AttachedBuffer::Dmabuf(buf)));
             }
         }
         Ok(Present::Committed)
@@ -976,7 +982,7 @@ impl Runner {
 
 enum DmabufLease {
     Pooled,
-    OneShot(OwnedBuffer),
+    OneShot(DmabufBuffer),
 }
 
 fn compose_shm_shadow(shadow: &mut ShmShadow, payload: &ShmPayload) -> Result<(), PresentError> {

@@ -12,7 +12,7 @@ use std::num::NonZeroU32;
 
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-use smithay_client_toolkit::{delegate_output, delegate_registry, registry_handlers};
+use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_output;
 use wayland_client::{Connection, QueueHandle};
@@ -141,7 +141,7 @@ impl ProvidesRegistryState for State {
     registry_handlers![OutputState];
 }
 
-delegate_output!(State);
+delegate_dispatch2!(State);
 delegate_registry!(State);
 
 fn transform_swaps_axes(t: wl_output::Transform) -> bool {

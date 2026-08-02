@@ -15,7 +15,8 @@ use crate::layer::{LayerSurface, Present, PresentError, SurfaceRef, ViewportStat
 use crate::layer_actor::{LayerActor, LayerBackend};
 use crate::runtime::WlRuntime;
 use crate::wl_state::{
-    PlatformSurface, WlState, create_dmabuf_buffer, create_shm_buffer, size_in_tolerance,
+    AttachedBuffer, PlatformSurface, WlState, create_dmabuf_buffer, draw_from_pixels,
+    size_in_tolerance,
 };
 
 fn core(rt: &WlRuntime) -> Option<parking_lot::MutexGuard<'_, WlState>> {
@@ -58,9 +59,9 @@ pub(crate) fn alloc_surface(rt: &'static WlRuntime) -> *mut PlatformSurface {
     let surface = st.compositor.create_surface(&st.qh, ());
 
     // No input region on subsurface — keystrokes/clicks go to parent only.
-    let empty = st.compositor.create_region(&st.qh, ());
-    surface.set_input_region(Some(&empty));
-    empty.destroy();
+    if let Some(empty) = st.empty_region() {
+        surface.set_input_region(Some(empty.wl_region()));
+    }
 
     let viewport = st
         .viewporter
@@ -236,9 +237,9 @@ fn popup_create_locked(s: &mut PlatformSurface, st: &WlState) {
     let surf = st.compositor.create_surface(&st.qh, ());
     let sub =
         crate::wl_state::SyncSubsurface::create(&st.subcompositor, &surf, parent.as_arg(), &st.qh);
-    let empty = st.compositor.create_region(&st.qh, ());
-    surf.set_input_region(Some(&empty));
-    empty.destroy();
+    if let Some(empty) = st.empty_region() {
+        surf.set_input_region(Some(empty.wl_region()));
+    }
     let vp = st
         .viewporter
         .as_ref()
@@ -415,6 +416,7 @@ pub(crate) fn popup_present(
     ) else {
         return;
     };
+    let buf = AttachedBuffer::Dmabuf(buf);
     drop(s.popup_buffer.take());
     if let Some(vp) = s.popup_viewport.as_ref() {
         vp.set_source(0.0, 0.0, vw as f64, vh as f64);
@@ -423,7 +425,7 @@ pub(crate) fn popup_present(
     let Some(popup) = s.popup_surface.as_ref() else {
         return;
     };
-    buf.attach_to(popup, 0, 0);
+    buf.attach_to(popup);
     popup.damage_buffer(0, 0, vw, vh);
     commit_popup_via_actor(rt, s, popup, &st);
     s.popup_buffer = Some(buf);
@@ -441,15 +443,21 @@ pub(crate) fn popup_present_software(
     if ptr.is_null() || lw <= 0 || lh <= 0 {
         return;
     }
-    let Some(st) = core(rt) else { return };
+    let Some(mut st) = core(rt) else { return };
     let s = unsafe { surface_mut(ptr) };
     if s.popup_surface.is_none() || !s.popup_visible {
         return;
     }
-    let Some(buf) = create_shm_buffer(rt.buffers(), &st, pixels, pw, ph) else {
+    // Retire the outgoing buffer first: its slot can only be reused for this
+    // frame once nothing owns it but the compositor.
+    drop(s.popup_buffer.take());
+    let Some(pool) = st.shm_pool.as_mut() else {
         return;
     };
-    drop(s.popup_buffer.take());
+    let Some(buf) = draw_from_pixels(pool, pixels, pw, ph) else {
+        return;
+    };
+    let buf = AttachedBuffer::Shm(buf);
     if let Some(vp) = s.popup_viewport.as_ref() {
         vp.set_source(0.0, 0.0, pw as f64, ph as f64);
         vp.set_destination(lw, lh);
@@ -457,7 +465,7 @@ pub(crate) fn popup_present_software(
     let Some(popup) = s.popup_surface.as_ref() else {
         return;
     };
-    buf.attach_to(popup, 0, 0);
+    buf.attach_to(popup);
     popup.damage_buffer(0, 0, pw, ph);
     commit_popup_via_actor(rt, s, popup, &st);
     s.popup_buffer = Some(buf);

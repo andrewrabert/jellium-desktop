@@ -33,15 +33,13 @@ libc.workspace = true
 libloading = "0.9"
 nix.workspace = true
 wl-proxy = { version = "0.1.4", features = ["all-protocols"] }
-memmap2 = "0.9"
 tracing.workspace = true
-smithay-client-toolkit = { version = "0.20", default-features = false }
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["xkbcommon"] }
 thiserror = "2"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"], optional = true }
-wayland-scanner = "0.31"
 xkbcommon = "0.9"
 
 [lints]

@@ -17,27 +17,29 @@
 //! path holds the lock during commit/flush, and finer-grained locking
 //! would risk null-attach vs. commit ordering races.
 
-use nix::sys::memfd::MFdFlags;
 use parking_lot::Mutex;
 use std::ffi::c_void;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::BorrowedFd;
 
 use jfn_gpu_paint::Surfaces;
 
 use crate::layer::SurfaceRef;
 use crate::layer_actor::LayerActor;
 
-use memmap2::MmapOptions;
+use smithay_client_toolkit::compositor::Region;
+use smithay_client_toolkit::error::GlobalError;
+use wayland_client::globals::BindError;
+
+use smithay_client_toolkit::globals::ProvidesBoundGlobal;
+use smithay_client_toolkit::shm::slot::{Buffer as SlotBuffer, SlotPool};
 use wayland_backend::client::Backend;
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
     wl_compositor::WlCompositor,
-    wl_region::WlRegion,
     wl_registry::WlRegistry,
     wl_shm::{Format, WlShm},
-    wl_shm_pool::WlShmPool,
     wl_subcompositor::WlSubcompositor,
     wl_subsurface::WlSubsurface,
     wl_surface::WlSurface,
@@ -107,24 +109,24 @@ impl SyncSubsurface {
     }
 }
 
-pub(crate) struct OwnedBuffer {
+pub(crate) struct DmabufBuffer {
     buf: WlBuffer,
-    registry: &'static BufferRegistry,
+    registry: &'static DmabufRegistry,
 }
 
-impl OwnedBuffer {
+impl DmabufBuffer {
     fn id(&self) -> ObjectId {
         self.buf.id()
     }
 
     /// Marks the buffer in-use until its next release.
-    pub(crate) fn attach_to(&self, surface: &WlSurface, x: i32, y: i32) {
+    pub(crate) fn attach_to(&self, surface: &WlSurface) {
         self.registry.mark_attached(&self.id());
-        surface.attach(Some(&self.buf), x, y);
+        surface.attach(Some(&self.buf), 0, 0);
     }
 }
 
-impl Drop for OwnedBuffer {
+impl Drop for DmabufBuffer {
     fn drop(&mut self) {
         self.registry.retire(self.buf.clone());
     }
@@ -136,7 +138,116 @@ pub(crate) struct DmabufBuf {
     pub h: i32,
     pub stride: u32,
     pub modifier: u64,
-    pub buf: OwnedBuffer,
+    pub buf: DmabufBuffer,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FrameBuffer<'a> {
+    Shm(&'a SlotBuffer),
+    Dmabuf(&'a DmabufBuffer),
+}
+
+impl FrameBuffer<'_> {
+    pub(crate) fn attach_to(&self, surface: &WlSurface) {
+        match self {
+            Self::Shm(buf) => {
+                if let Err(e) = buf.attach_to(surface) {
+                    tracing::error!(target: "Main", "attach shm buffer: {e}");
+                }
+            }
+            Self::Dmabuf(buf) => buf.attach_to(surface),
+        }
+    }
+}
+
+pub(crate) enum AttachedBuffer {
+    Shm(SlotBuffer),
+    Dmabuf(DmabufBuffer),
+}
+
+impl AttachedBuffer {
+    pub(crate) fn borrow(&self) -> FrameBuffer<'_> {
+        match self {
+            Self::Shm(buf) => FrameBuffer::Shm(buf),
+            Self::Dmabuf(buf) => FrameBuffer::Dmabuf(buf),
+        }
+    }
+
+    pub(crate) fn attach_to(&self, surface: &WlSurface) {
+        self.borrow().attach_to(surface);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CompositorGlobal(WlCompositor);
+
+impl ProvidesBoundGlobal<WlCompositor, 6> for CompositorGlobal {
+    fn bound_global(&self) -> Result<WlCompositor, GlobalError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ShmGlobal(WlShm);
+
+impl ShmGlobal {
+    pub(crate) fn new(shm: WlShm) -> Self {
+        Self(shm)
+    }
+}
+
+impl ProvidesBoundGlobal<WlShm, 1> for ShmGlobal {
+    fn bound_global(&self) -> Result<WlShm, GlobalError> {
+        Ok(self.0.clone())
+    }
+}
+
+const POOL_INITIAL_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) fn new_slot_pool(shm: &ShmGlobal, what: &str) -> Option<SlotPool> {
+    match SlotPool::new(POOL_INITIAL_BYTES, shm) {
+        Ok(pool) => Some(pool),
+        Err(e) => {
+            tracing::error!(target: "Main", "{what}: shm pool: {e}");
+            None
+        }
+    }
+}
+
+pub(crate) fn draw_argb8888(
+    pool: &mut SlotPool,
+    w: i32,
+    h: i32,
+    fill: impl FnOnce(&mut [u8]) -> bool,
+) -> Option<SlotBuffer> {
+    let stride = w.checked_mul(4)?;
+    if stride <= 0 || h <= 0 {
+        return None;
+    }
+    // The pool rounds slots up to a 64-byte boundary, so the canvas it hands
+    // back can be longer than the buffer's pixel data. Trim it to what the
+    // compositor will actually read.
+    let len = (h as usize).checked_mul(stride as usize)?;
+    let (buffer, canvas) = pool.create_buffer(w, h, stride, Format::Argb8888).ok()?;
+    if !fill(canvas.get_mut(..len)?) {
+        return None;
+    }
+    Some(buffer)
+}
+
+pub(crate) fn draw_from_pixels(
+    pool: &mut SlotPool,
+    pixels: &[u8],
+    w: i32,
+    h: i32,
+) -> Option<SlotBuffer> {
+    draw_argb8888(pool, w, h, |dst| {
+        if pixels.len() < dst.len() {
+            return false;
+        }
+        dst.copy_from_slice(&pixels[..dst.len()]);
+        true
+    })
 }
 
 pub(crate) struct PlatformSurface {
@@ -148,7 +259,7 @@ pub(crate) struct PlatformSurface {
     pub popup_surface: Option<WlSurface>,
     pub popup_subsurface: Option<SyncSubsurface>,
     pub popup_viewport: Option<WpViewport>,
-    pub popup_buffer: Option<OwnedBuffer>,
+    pub popup_buffer: Option<AttachedBuffer>,
     pub popup_visible: bool,
 
     pub layer_actor: Option<LayerActor>,
@@ -185,7 +296,8 @@ pub(crate) struct WlState {
 
     pub compositor: WlCompositor,
     pub subcompositor: WlSubcompositor,
-    pub shm: WlShm,
+    pub shm: ShmGlobal,
+    pub shm_pool: Option<SlotPool>,
     pub dmabuf: Option<ZwpLinuxDmabufV1>,
     pub viewporter: Option<WpViewporter>,
 
@@ -215,20 +327,14 @@ pub(crate) struct WlState {
 unsafe impl Send for WlState {}
 
 pub(crate) struct DispatchState {
-    buffers: &'static BufferRegistry,
+    buffers: &'static DmabufRegistry,
 }
 
 impl DispatchState {
-    pub(crate) fn new(buffers: &'static BufferRegistry) -> Self {
+    pub(crate) fn new(buffers: &'static DmabufRegistry) -> Self {
         Self { buffers }
     }
 }
-
-// =====================================================================
-// Dispatch impls — all no-ops; events we'd care about (wl_buffer.release,
-// dmabuf format/modifier) are intentionally ignored to match the C++
-// implementation's behavior.
-// =====================================================================
 
 impl Dispatch<WlRegistry, GlobalListContents> for DispatchState {
     fn event(
@@ -241,6 +347,12 @@ impl Dispatch<WlRegistry, GlobalListContents> for DispatchState {
     ) {
     }
 }
+
+// =====================================================================
+// Dispatch impls — all no-ops; events we'd care about (wl_buffer.release,
+// dmabuf format/modifier) are intentionally ignored to match the C++
+// implementation's behavior.
+// =====================================================================
 
 macro_rules! noop_dispatch {
     ($($ty:ty),+ $(,)?) => {
@@ -264,17 +376,15 @@ noop_dispatch!(
     WlSubcompositor,
     WlSurface,
     WlSubsurface,
-    WlRegion,
     WlShm,
-    WlShmPool,
     ZwpLinuxDmabufV1,
     ZwpLinuxBufferParamsV1,
     WpViewporter,
     WpViewport,
 );
 
-// Release-state metadata for a live buffer, keyed by protocol identity rather
-// than an owning proxy clone (which would make this a second owner).
+// Release-state metadata for a live dmabuf buffer, keyed by protocol identity
+// rather than an owning proxy clone (which would make this a second owner).
 //
 // Under a synchronized subsurface the compositor keeps reading a buffer for a
 // frame after it is replaced. Destroying or re-attaching one while `released`
@@ -288,24 +398,24 @@ struct ManagedBuffer {
     doomed: Option<WlBuffer>,
 }
 
-pub(crate) struct BufferRegistry {
+pub(crate) struct DmabufRegistry {
     managed: Mutex<Vec<ManagedBuffer>>,
 }
 
-impl BufferRegistry {
+impl DmabufRegistry {
     pub(crate) fn new() -> Self {
         Self {
             managed: Mutex::new(Vec::new()),
         }
     }
 
-    fn adopt(&'static self, buf: WlBuffer) -> OwnedBuffer {
+    fn adopt(&'static self, buf: WlBuffer) -> DmabufBuffer {
         self.managed.lock().push(ManagedBuffer {
             id: buf.id(),
             released: true,
             doomed: None,
         });
-        OwnedBuffer {
+        DmabufBuffer {
             buf,
             registry: self,
         }
@@ -318,7 +428,7 @@ impl BufferRegistry {
         }
     }
 
-    pub(crate) fn is_idle(&self, buf: &OwnedBuffer) -> bool {
+    pub(crate) fn is_idle(&self, buf: &DmabufBuffer) -> bool {
         let id = buf.id();
         self.managed
             .lock()
@@ -402,30 +512,46 @@ pub(crate) fn pump_events(rt: &'static crate::runtime::WlRuntime) {
 // (mpv-owned) wl_display.
 // =====================================================================
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InitError {
+    #[error("null display")]
+    NullDisplay,
+    #[error("registry init: {0}")]
+    Registry(#[from] wayland_client::globals::GlobalError),
+    #[error("bind {interface}: {source}")]
+    Bind {
+        interface: &'static str,
+        #[source]
+        source: BindError,
+    },
+}
+
+pub(crate) fn bind_error(interface: &'static str) -> impl FnOnce(BindError) -> InitError {
+    move |source| InitError::Bind { interface, source }
+}
+
 /// SAFETY: `display_ptr` must be a live `*mut wl_display` owned by mpv.
 pub(crate) unsafe fn init(
     rt: &'static crate::runtime::WlRuntime,
     display_ptr: *mut c_void,
-) -> Result<WlState, String> {
+) -> Result<WlState, InitError> {
     if display_ptr.is_null() {
-        return Err("null display".into());
+        return Err(InitError::NullDisplay);
     }
 
     let backend = unsafe { Backend::from_foreign_display(display_ptr.cast()) };
     let conn = Connection::from_backend(backend);
-    let (globals, queue) =
-        registry_queue_init::<DispatchState>(&conn).map_err(|e| format!("registry init: {e}"))?;
+    let (globals, queue) = registry_queue_init::<DispatchState>(&conn)?;
     let qh = queue.handle();
 
     let compositor: WlCompositor = globals
         .bind(&qh, 1..=4, ())
-        .map_err(|e| format!("bind wl_compositor: {e}"))?;
+        .map_err(bind_error("wl_compositor"))?;
     let subcompositor: WlSubcompositor = globals
         .bind(&qh, 1..=1, ())
-        .map_err(|e| format!("bind wl_subcompositor: {e}"))?;
-    let shm: WlShm = globals
-        .bind(&qh, 1..=1, ())
-        .map_err(|e| format!("bind wl_shm: {e}"))?;
+        .map_err(bind_error("wl_subcompositor"))?;
+    let shm = ShmGlobal::new(globals.bind(&qh, 1..=1, ()).map_err(bind_error("wl_shm"))?);
+    let shm_pool = new_slot_pool(&shm, "cef overlay");
     let dmabuf: Option<ZwpLinuxDmabufV1> = globals.bind(&qh, 1..=4, ()).ok();
     let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
 
@@ -436,6 +562,7 @@ pub(crate) unsafe fn init(
         compositor,
         subcompositor,
         shm,
+        shm_pool,
         dmabuf,
         viewporter,
         root_surface: None,
@@ -530,6 +657,12 @@ impl WlState {
     pub(crate) fn flush(&self) {
         let _ = self.conn.flush();
     }
+
+    pub(crate) fn empty_region(&self) -> Option<Region> {
+        Region::new(&CompositorGlobal(self.compositor.clone()))
+            .inspect_err(|e| tracing::error!(target: "Main", "empty input region: {e}"))
+            .ok()
+    }
 }
 
 impl WlState {
@@ -550,73 +683,8 @@ pub(crate) fn size_in_tolerance(rt: &crate::runtime::WlRuntime, vw: i32, vh: i32
 }
 
 // =====================================================================
-// Buffer creation
+// Dmabuf buffer creation
 // =====================================================================
-
-/// Build an ARGB8888 `wl_shm` buffer of `w`×`h`, handing `fill` a mapping of
-/// exactly `stride*h` bytes to populate (`false` aborts).
-pub(crate) fn build_argb8888_shm_buffer<D>(
-    reg: &'static BufferRegistry,
-    shm: &WlShm,
-    qh: &QueueHandle<D>,
-    label: &str,
-    w: i32,
-    h: i32,
-    fill: impl FnOnce(&mut [u8]) -> bool,
-) -> Option<OwnedBuffer>
-where
-    D: Dispatch<WlShmPool, ()> + Dispatch<WlBuffer, ()> + 'static,
-{
-    let stride = w.checked_mul(4)?;
-    let size = stride.checked_mul(h)?;
-    if size <= 0 {
-        return None;
-    }
-    let fd = memfd_anon(label, size as usize)?;
-    {
-        let mut mmap = unsafe { MmapOptions::new().len(size as usize).map_mut(&fd) }.ok()?;
-        if !fill(&mut mmap) {
-            return None;
-        }
-    }
-    let pool = shm.create_pool(fd.as_fd(), size, qh, ());
-    let buf = pool.create_buffer(0, w, h, stride, Format::Argb8888, qh, ());
-    pool.destroy();
-    Some(reg.adopt(buf))
-}
-
-/// Copy `pixels` into a fresh ARGB8888 shm buffer, or `None` if it's too short.
-pub(crate) fn build_shm_buffer_from_pixels<D>(
-    reg: &'static BufferRegistry,
-    shm: &WlShm,
-    qh: &QueueHandle<D>,
-    label: &str,
-    pixels: &[u8],
-    w: i32,
-    h: i32,
-) -> Option<OwnedBuffer>
-where
-    D: Dispatch<WlShmPool, ()> + Dispatch<WlBuffer, ()> + 'static,
-{
-    build_argb8888_shm_buffer(reg, shm, qh, label, w, h, |dst| {
-        if pixels.len() < dst.len() {
-            return false;
-        }
-        dst.copy_from_slice(&pixels[..dst.len()]);
-        true
-    })
-}
-
-/// Create a wl_shm ARGB8888 buffer from a CPU pixel array.
-pub(crate) fn create_shm_buffer(
-    reg: &'static BufferRegistry,
-    state: &WlState,
-    pixels: &[u8],
-    w: i32,
-    h: i32,
-) -> Option<OwnedBuffer> {
-    build_shm_buffer_from_pixels(reg, &state.shm, &state.qh, "cef-sw", pixels, w, h)
-}
 
 pub(crate) struct DmabufPlane<'a> {
     pub(crate) fd: BorrowedFd<'a>,
@@ -628,11 +696,11 @@ pub(crate) struct DmabufPlane<'a> {
 
 /// Create a dmabuf-backed wl_buffer from a single-plane fd.
 pub(crate) fn create_dmabuf_buffer(
-    reg: &'static BufferRegistry,
+    reg: &'static DmabufRegistry,
     dmabuf: &ZwpLinuxDmabufV1,
     qh: &QueueHandle<DispatchState>,
     plane: DmabufPlane<'_>,
-) -> Option<OwnedBuffer> {
+) -> Option<DmabufBuffer> {
     let params: ZwpLinuxBufferParamsV1 = dmabuf.create_params(qh, ());
     params.add(
         plane.fd,
@@ -652,12 +720,4 @@ pub(crate) fn create_dmabuf_buffer(
     );
     params.destroy();
     Some(reg.adopt(buf))
-}
-
-/// Create a CLOEXEC anonymous memfd of the given size and truncate it.
-pub(crate) fn memfd_anon(name: &str, size: usize) -> Option<OwnedFd> {
-    let c = std::ffi::CString::new(name).ok()?;
-    let owned = nix::sys::memfd::memfd_create(c.as_c_str(), MFdFlags::MFD_CLOEXEC).ok()?;
-    nix::unistd::ftruncate(&owned, size as i64).ok()?;
-    Some(owned)
 }

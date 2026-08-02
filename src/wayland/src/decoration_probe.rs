@@ -2,9 +2,10 @@
 
 use std::time::Duration;
 
-use wayland_client::globals::{GlobalListContents, registry_queue_init};
-use wayland_client::protocol::wl_registry;
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::{delegate_registry, registry_handlers};
+use wayland_client::Connection;
+use wayland_client::globals::registry_queue_init;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct DecorationGlobals {
@@ -12,19 +13,20 @@ pub(crate) struct DecorationGlobals {
     pub(crate) kde_palette: bool,
 }
 
-struct ProbeState;
+const KDE_PALETTE_MANAGER: &str = "org_kde_kwin_server_decoration_palette_manager";
 
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ProbeState {
-    fn event(
-        _: &mut Self,
-        _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
-        _: &GlobalListContents,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
+struct ProbeState {
+    registry_state: RegistryState,
 }
+
+impl ProvidesRegistryState for ProbeState {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![];
+}
+
+delegate_registry!(ProbeState);
 
 fn probe() -> DecorationGlobals {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("WAYLAND_SOCKET").is_none()
@@ -37,15 +39,12 @@ fn probe() -> DecorationGlobals {
     let Ok((globals, _queue)) = registry_queue_init::<ProbeState>(&conn) else {
         return DecorationGlobals::default();
     };
-    let mut found = DecorationGlobals::default();
-    globals.contents().with_list(|list| {
-        for global in list {
-            if global.interface == "org_kde_kwin_server_decoration_palette_manager" {
-                found.kde_palette = true;
-            }
-        }
-    });
-    found
+    DecorationGlobals {
+        kde_palette: RegistryState::new(&globals)
+            .globals_by_interface(KDE_PALETTE_MANAGER)
+            .next()
+            .is_some(),
+    }
 }
 
 /// [`probe`] on a throwaway thread, abandoned on timeout: the round trip

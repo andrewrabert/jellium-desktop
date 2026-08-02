@@ -17,8 +17,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
-use wayland_client::globals::{GlobalListContents, registry_queue_init};
-use wayland_client::protocol::{wl_registry, wl_seat};
+use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::{delegate_registry, registry_handlers};
+use wayland_client::globals::registry_queue_init;
+use wayland_client::protocol::wl_seat;
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, event_created_child};
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self as dc_device, ExtDataControlDeviceV1},
@@ -80,6 +82,7 @@ struct Shared {
 }
 
 struct State {
+    registry_state: RegistryState,
     // Held to keep the Wayland proxies alive for the lifetime of the worker.
     #[allow(dead_code)]
     seat: Option<wl_seat::WlSeat>,
@@ -101,17 +104,14 @@ pub struct JfnClipboardWayland {
     worker: Option<JoinHandle<()>>,
 }
 
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
-    fn event(
-        _: &mut Self,
-        _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
-        _: &GlobalListContents,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+impl ProvidesRegistryState for State {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
     }
+    registry_handlers![];
 }
+
+delegate_registry!(State);
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
     fn event(
@@ -410,6 +410,7 @@ fn init_impl() -> Option<JfnClipboardWayland> {
     let device = mgr.get_data_device(&seat, &qh, ());
 
     let mut state = State {
+        registry_state: RegistryState::new(&globals),
         seat: Some(seat),
         mgr: Some(mgr),
         device: Some(device),

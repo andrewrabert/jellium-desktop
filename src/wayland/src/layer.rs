@@ -8,7 +8,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
 use jfn_gpu_paint::WindowTarget;
 
-use crate::wl_state::OwnedBuffer;
+use crate::wl_state::FrameBuffer;
 
 /// Success outcome of a present/enqueue. A `Skipped` is a deliberate no-op, not
 /// a failure, so it must never be mapped to an `Err`.
@@ -79,7 +79,7 @@ impl LayerSurface {
 
     pub(crate) fn present(&self, frame: FrameCommit<'_>) {
         self.set_viewport(frame.src_w, frame.src_h, frame.dst_w, frame.dst_h);
-        frame.buf.attach_to(&self.surface, 0, 0);
+        frame.buf.attach_to(&self.surface);
         self.surface.damage_buffer(0, 0, frame.buf_w, frame.buf_h);
         self.surface.commit();
     }
@@ -94,7 +94,7 @@ impl LayerSurface {
 }
 
 pub(crate) struct FrameCommit<'a> {
-    buf: &'a OwnedBuffer,
+    buf: FrameBuffer<'a>,
     buf_w: i32,
     buf_h: i32,
     src_w: i32,
@@ -107,7 +107,7 @@ impl<'a> FrameCommit<'a> {
     /// Clamps `src_*` to the buffer dimensions: a `wp_viewport` source larger
     /// than the attached buffer is a fatal protocol error that kills the client.
     pub(crate) fn new(
-        buf: &'a OwnedBuffer,
+        buf: FrameBuffer<'a>,
         buf_w: i32,
         buf_h: i32,
         src_w: i32,

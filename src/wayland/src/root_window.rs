@@ -6,17 +6,31 @@ use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::thread::{self, JoinHandle};
 
 use parking_lot::Mutex;
 
-use wayland_client::globals::{GlobalListContents, registry_queue_init};
-use wayland_client::protocol::{
-    wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_registry::WlRegistry, wl_seat::WlSeat,
-    wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface,
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Surface};
+use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::csd_frame::WindowState;
+use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::shell::WaylandSurface;
+use smithay_client_toolkit::shell::xdg::popup::{Popup, PopupConfigure, PopupHandler};
+use smithay_client_toolkit::shell::xdg::window::{
+    self as sctk_window, Window, WindowConfigure, WindowHandler,
 };
-use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use smithay_client_toolkit::shell::xdg::{XdgPositioner, XdgShell, XdgSurface as _};
+use smithay_client_toolkit::shm::slot::{Buffer as SlotBuffer, SlotPool};
+use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
+use wayland_client::globals::registry_queue_init;
+use wayland_client::protocol::{
+    wl_output::{Transform, WlOutput},
+    wl_seat::WlSeat,
+    wl_shm::WlShm,
+    wl_surface::WlSurface,
+};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
@@ -24,16 +38,9 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
-use wayland_protocols::xdg::decoration::zv1::client::{
-    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
-    zxdg_toplevel_decoration_v1::{self, Mode as DecorationMode, ZxdgToplevelDecorationV1},
-};
 use wayland_protocols::xdg::shell::client::{
-    xdg_popup::{self, XdgPopup},
-    xdg_positioner::{Anchor, ConstraintAdjustment, Gravity, XdgPositioner},
-    xdg_surface::{self, XdgSurface},
-    xdg_toplevel::{self, XdgToplevel},
-    xdg_wm_base::{self, XdgWmBase},
+    xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
+    xdg_toplevel,
 };
 #[cfg(feature = "kde-palette")]
 use wayland_protocols_plasma::server_decoration_palette::client::{
@@ -45,6 +52,7 @@ use jfn_platform_abi::{EffectiveDecorations, WindowDecorations};
 
 use crate::input::SeatShared;
 use crate::runtime::WlRuntime;
+use crate::wl_state::{InitError, ShmGlobal, bind_error, new_slot_pool};
 
 const APP_ID: &str = "net.nullsum.JelliumDesktop";
 const TITLE: &str = "Jellium Desktop";
@@ -55,15 +63,6 @@ const BG: [u8; 3] = [0x10, 0x10, 0x10];
 const DEFAULT_W: i32 = 1280;
 const DEFAULT_H: i32 = 720;
 
-const STATE_MAXIMIZED: u32 = 1;
-const STATE_FULLSCREEN: u32 = 2;
-const STATE_SUSPENDED: u32 = 9;
-// xdg_toplevel tiled edges (5..=8); any of them means compositor-tiled.
-const STATE_TILED_LEFT: u32 = 5;
-const STATE_TILED_RIGHT: u32 = 6;
-const STATE_TILED_TOP: u32 = 7;
-const STATE_TILED_BOTTOM: u32 = 8;
-
 /// The user's explicit decoration preference; `Auto` sends no `set_mode`, so
 /// the compositor's preferred mode (delivered in the decoration configure)
 /// decides.
@@ -73,6 +72,16 @@ enum DecorationRequest {
     Auto = 0,
     ClientSide = 1,
     ServerSide = 2,
+}
+
+impl DecorationRequest {
+    fn to_sctk(self) -> sctk_window::WindowDecorations {
+        match self {
+            Self::Auto => sctk_window::WindowDecorations::ServerDefault,
+            Self::ClientSide => sctk_window::WindowDecorations::RequestClient,
+            Self::ServerSide => sctk_window::WindowDecorations::RequestServer,
+        }
+    }
 }
 
 /// The root window's cross-thread surface: everything the dispatch thread
@@ -88,10 +97,17 @@ pub(crate) struct RootShared {
     maximized: AtomicBool,
     pending_bg: AtomicU32,
     pending_present: AtomicBool,
-    armed_gen: AtomicU64,
+    /// Protocol id of the most recent menu popup `wl_surface`, overwritten by
+    /// each create and never cleared: the keyboard-leave that follows a
+    /// teardown names the surface that is already gone, and the input thread
+    /// must still read it as menu plumbing rather than real focus loss.
+    menu_surface_id: AtomicU32,
     root_surface: OnceLock<RootSurfaceHandle>,
-    popup_shell: OnceLock<PopupShell>,
-    popup_role: Mutex<PopupRoleObjs>,
+    /// The toplevel, parked for the life of the process. SCTK's `Window`
+    /// destroys the root `wl_surface` when its last handle drops, and the CEF
+    /// and mpv subsurfaces name that surface as their parent — so one handle
+    /// must outlive the root thread's `RootState`.
+    window: OnceLock<Window>,
     thread: OnceLock<RootThread>,
 }
 
@@ -119,14 +135,9 @@ impl RootShared {
             maximized: AtomicBool::new(false),
             pending_bg: AtomicU32::new(0),
             pending_present: AtomicBool::new(false),
-            armed_gen: AtomicU64::new(0),
+            menu_surface_id: AtomicU32::new(0),
             root_surface: OnceLock::new(),
-            popup_shell: OnceLock::new(),
-            popup_role: Mutex::new(PopupRoleObjs {
-                xdg: None,
-                popup: None,
-                generation: None,
-            }),
+            window: OnceLock::new(),
             thread: OnceLock::new(),
         }
     }
@@ -166,8 +177,8 @@ impl RootShared {
         *self.boot.lock()
     }
 
-    pub(crate) fn popup_shell(&self) -> Option<&PopupShell> {
-        self.popup_shell.get()
+    pub(crate) fn menu_surface_id(&self) -> u32 {
+        self.menu_surface_id.load(Ordering::Acquire)
     }
 
     pub(crate) fn root_surface_handle(&self) -> Option<RootSurfaceHandle> {
@@ -282,28 +293,35 @@ impl EffectiveState {
 
 struct RootState {
     rt: &'static WlRuntime,
+    registry_state: RegistryState,
+    output_state: OutputState,
     conn: Connection,
-    qh: QueueHandle<RootState>,
-    surface: WlSurface,
-    xdg_surface: XdgSurface,
-    #[allow(dead_code)] // held to keep the toplevel role alive
-    toplevel: XdgToplevel,
+    qh: QueueHandle<Self>,
+    window: Window,
+    decorations_negotiated: bool,
     // Single-owner protocol objects for window-control commands, owned by this
     // thread. `seat` also drives interactive move/resize grabs.
     seat: Option<WlSeat>,
     #[cfg(feature = "kde-palette")]
     palette: Option<OrgKdeKwinServerDecorationPalette>,
-    shm: WlShm,
+    shm_pool: Option<SlotPool>,
+    compositor: CompositorState,
+    xdg_shell: XdgShell,
+    viewporter: Option<WpViewporter>,
+    menu_pool: Option<SlotPool>,
+    menu: MenuPopup,
+    /// Highest menu generation ever created. Generations are handed out under
+    /// the core lock but the creates carrying them are posted after that lock
+    /// drops, so two menus racing can queue their creates out of order.
+    armed_gen: u64,
     viewport: Option<WpViewport>,
-    bg_buffer: Option<crate::wl_state::OwnedBuffer>,
+    bg_buffer: Option<SlotBuffer>,
     bg: [u8; 3],
     // Held alive so the compositor keeps delivering preferred_scale.
     #[allow(dead_code)]
     frac_mgr: Option<WpFractionalScaleManagerV1>,
     #[allow(dead_code)]
     frac_scale: Option<WpFractionalScaleV1>,
-    #[allow(dead_code)]
-    decoration: Option<ZxdgToplevelDecorationV1>,
 
     current_size: Option<crate::window_state::WindowSize>,
     pending_w: Option<NonZeroI32>,
@@ -311,12 +329,16 @@ struct RootState {
     mode: crate::window_state::WindowMode,
     suspended: bool,
     floating: FloatingRestore,
-    pending_ack: Option<ConfigureSerial>,
-    /// `Some` once the first configure has been acked (the window is "mapped").
-    /// Holds the capability that gates buffer attach/commit.
+    pending_configure: Option<Presented>,
     present: Option<Presented>,
     scale_discovery: ScaleDiscovery,
     pre_fs_maximized: bool,
+}
+
+impl RootState {
+    fn surface(&self) -> &WlSurface {
+        self.window.wl_surface()
+    }
 }
 
 /// Upper bound on the fallback probe: it round-trips on a second display
@@ -345,28 +367,20 @@ mod floating_restore {
 }
 use floating_restore::FloatingRestore;
 
-/// Capability proving a configure has been acked. Buffer attach/commit take a
-/// [`Presented`], and the only way to mint one is [`ack`] — so the protocol rule
-/// "never commit a buffer before acking a configure" is enforced by the type
-/// system, not by comments and a `mapped` bool.
+/// Buffer attach/commit take a [`Presented`], mintable only by [`acked`] from a
+/// [`WindowConfigure`] — so "never commit a buffer before acking a configure" is
+/// a type error rather than a review comment.
 mod present_cap {
-    use super::XdgSurface;
+    use super::WindowConfigure;
 
-    /// A configure serial awaiting ack, consumed by [`ack`].
-    #[derive(Clone, Copy)]
-    pub(super) struct ConfigureSerial(pub(super) u32);
-
-    /// Zero-sized proof of an acked configure. Its field is private, so it can
-    /// only be obtained from [`ack`].
     #[derive(Clone, Copy)]
     pub(super) struct Presented(());
 
-    pub(super) fn ack(xdg: &XdgSurface, serial: ConfigureSerial) -> Presented {
-        xdg.ack_configure(serial.0);
+    pub(super) fn acked(_: &WindowConfigure) -> Presented {
         Presented(())
     }
 }
-use present_cap::{ConfigureSerial, Presented};
+use present_cap::Presented;
 
 /// Pure presentation state machine. Given what the root window currently
 /// knows — mapped or not, pending configure or not, scale known or not, and
@@ -381,10 +395,8 @@ mod presentation {
     /// Everything `plan` needs, free of protocol objects so it is unit-testable.
     #[derive(Clone, Copy)]
     pub(super) struct Inputs {
-        /// A configure has been acked before (the window is mapped).
         pub(super) mapped: bool,
-        /// An unacked configure is pending.
-        pub(super) pending_ack: bool,
+        pub(super) pending_configure: bool,
         pub(super) scale_known: bool,
         pub(super) size: Option<WindowSize>,
     }
@@ -442,15 +454,15 @@ mod presentation {
         /// A first configure is waiting but no scale is known; scale discovery
         /// must run, then planning re-runs.
         DiscoverScale,
-        /// Ack (if a configure is pending), update geometry, and request the
-        /// root commit.
+        /// Consume the pending configure (if any), update geometry, and request
+        /// the root commit.
         Present,
     }
 
     pub(super) fn plan(i: Inputs) -> Step {
-        // Never commit a buffer before acking a configure (protocol violation);
-        // before the first map that means waiting for one.
-        if !i.pending_ack && !i.mapped {
+        // Never commit a buffer before a configure was acked (protocol
+        // violation); before the first map that means waiting for one.
+        if !i.pending_configure && !i.mapped {
             return Step::Wait;
         }
         if !i.scale_known {
@@ -508,7 +520,7 @@ impl RootState {
     fn try_present(&mut self) {
         let step = presentation::plan(presentation::Inputs {
             mapped: self.present.is_some(),
-            pending_ack: self.pending_ack.is_some(),
+            pending_configure: self.pending_configure.is_some(),
             scale_known: self.rt.window().known_scale().is_some(),
             size: self.resolve_logical(),
         });
@@ -575,12 +587,7 @@ impl RootState {
         let (w, h) = (size.w(), size.h());
 
         let first = self.present.is_none();
-        // Acking a pending configure is the only way to mint the Presented that
-        // the buffer ops below require, so the ack necessarily precedes them. On
-        // a size/scale-driven re-present (no new configure) we reuse the token
-        // from the first ack.
-        let present = if let Some(serial) = self.pending_ack.take() {
-            let p = present_cap::ack(&self.xdg_surface, serial);
+        let present = if let Some(p) = self.pending_configure.take() {
             self.present = Some(p);
             p
         } else if let Some(p) = self.present {
@@ -590,7 +597,7 @@ impl RootState {
         };
         // Never commit the root here: the loop's latch drain issues the one root
         // commit that presents geometry with the overlay/video subtree.
-        self.xdg_surface.set_window_geometry(0, 0, w, h);
+        self.window.xdg_surface().set_window_geometry(0, 0, w, h);
         self.fill_background(w, h, present);
         self.current_size = Some(size);
         self.floating.record(self.mode, w, h);
@@ -610,7 +617,7 @@ impl RootState {
     }
 
     fn present_transaction(&mut self, _present: Presented) {
-        self.surface.commit();
+        self.surface().commit();
     }
 
     fn fill_background(&mut self, w: i32, h: i32, _present: Presented) {
@@ -619,11 +626,9 @@ impl RootState {
         }
         if self.bg_buffer.is_none() {
             self.bg_buffer = self.create_solid_buffer();
-            if let Some(buf) = &self.bg_buffer {
-                buf.attach_to(&self.surface, 0, 0);
-            }
+            self.attach_background();
         }
-        crate::wl_state::damage_all(&self.surface);
+        crate::wl_state::damage_all(self.surface());
     }
 
     fn rebuild_background(&mut self, w: i32, h: i32, _present: Presented) {
@@ -632,29 +637,30 @@ impl RootState {
         let Some(new) = self.create_solid_buffer() else {
             return;
         };
-        new.attach_to(&self.surface, 0, 0);
         drop(self.bg_buffer.replace(new));
+        self.attach_background();
         if let Some(vp) = &self.viewport {
             vp.set_destination(w, h);
         }
-        crate::wl_state::damage_all(&self.surface);
+        crate::wl_state::damage_all(self.surface());
     }
 
-    fn create_solid_buffer(&self) -> Option<crate::wl_state::OwnedBuffer> {
+    fn attach_background(&self) {
+        let Some(buf) = self.bg_buffer.as_ref() else {
+            return;
+        };
+        if let Err(e) = buf.attach_to(self.surface()) {
+            tracing::error!(target: "Main", "root window: attach background: {e}");
+        }
+    }
+
+    fn create_solid_buffer(&mut self) -> Option<SlotBuffer> {
         let bg = self.bg;
-        crate::wl_state::build_argb8888_shm_buffer(
-            self.rt.buffers(),
-            &self.shm,
-            &self.qh,
-            "root-bg",
-            1,
-            1,
-            move |dst| {
-                // ARGB8888 little-endian byte order = [B, G, R, A].
-                dst.copy_from_slice(&[bg[2], bg[1], bg[0], 0xFF]);
-                true
-            },
-        )
+        crate::wl_state::draw_argb8888(self.shm_pool.as_mut()?, 1, 1, move |dst| {
+            // ARGB8888 little-endian byte order = [B, G, R, A].
+            dst.copy_from_slice(&[bg[2], bg[1], bg[0], 0xFF]);
+            true
+        })
     }
 }
 
@@ -693,13 +699,56 @@ enum WindowCommand {
     Minimize,
     #[cfg(feature = "kde-palette")]
     SetTitlebarPalette(String),
+    Popup(PopupCommand),
+}
+
+/// Menu-popup requests. Create, paint, reposition and destroy must reach the
+/// compositor in the order they were issued — a reposition ahead of the paint
+/// that maps the popup is a protocol error — so they share one queue.
+enum PopupCommand {
+    Create {
+        generation: NonZeroU64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        /// The press or key serial the grab cites. Captured on the input
+        /// thread at request time; by the time this is applied the seat's last
+        /// serial has moved on.
+        serial: u32,
+    },
+    Reposition {
+        generation: NonZeroU64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    },
+    Paint(PopupPaint),
+    Destroy {
+        generation: NonZeroU64,
+    },
+}
+
+pub(crate) struct PopupPaint {
+    pub(crate) generation: NonZeroU64,
+    /// BGRA, `pw` x `ph`.
+    pub(crate) pixels: Vec<u8>,
+    pub(crate) pw: i32,
+    pub(crate) ph: i32,
+    /// Scroll offset into the buffer, physical px.
+    pub(crate) scroll: i32,
+    /// Visible height of the crop, physical px.
+    pub(crate) view_ph: i32,
+    pub(crate) lw: i32,
+    pub(crate) lh: i32,
 }
 
 fn apply_command(state: &mut RootState, cmd: WindowCommand) {
     match cmd {
         WindowCommand::Move { serial } => {
             if let Some(seat) = &state.seat {
-                state.toplevel._move(seat, serial);
+                state.window.move_(seat, serial);
             } else {
                 // Not re-queued: the serial is only valid for the input event it
                 // came from, so replaying it once a seat exists would be stale.
@@ -709,7 +758,7 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
         WindowCommand::Resize { serial, edge } => {
             if let Some(seat) = &state.seat {
                 match xdg_toplevel::ResizeEdge::try_from(edge) {
-                    Ok(e) => state.toplevel.resize(seat, serial, e),
+                    Ok(e) => state.window.resize(seat, serial, e),
                     Err(_) => {
                         tracing::warn!(target: "Main", "interactive resize dropped: bad edge {edge}");
                     }
@@ -720,12 +769,12 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
         }
         WindowCommand::SetMaximized(on) => {
             if on {
-                state.toplevel.set_maximized();
+                state.window.set_maximized();
             } else {
-                state.toplevel.unset_maximized();
+                state.window.unset_maximized();
             }
         }
-        WindowCommand::Minimize => state.toplevel.set_minimized(),
+        WindowCommand::Minimize => state.window.set_minimized(),
         #[cfg(feature = "kde-palette")]
         WindowCommand::SetTitlebarPalette(path) => {
             if let Some(p) = &state.palette {
@@ -734,6 +783,25 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
                 tracing::warn!(target: "Main", "titlebar palette dropped: no palette manager");
             }
         }
+        WindowCommand::Popup(cmd) => match cmd {
+            PopupCommand::Create {
+                generation,
+                x,
+                y,
+                w,
+                h,
+                serial,
+            } => state.create_menu_popup(generation, x, y, w, h, serial),
+            PopupCommand::Reposition {
+                generation,
+                x,
+                y,
+                w,
+                h,
+            } => state.reposition_menu_popup(generation, x, y, w, h),
+            PopupCommand::Paint(paint) => state.paint_menu_popup(paint),
+            PopupCommand::Destroy { generation } => state.destroy_menu_popup(generation),
+        },
     }
     let _ = state.conn.flush();
 }
@@ -754,80 +822,39 @@ fn apply_fullscreen(state: &mut RootState, on: bool) {
             state.pre_fs_maximized =
                 matches!(state.mode, crate::window_state::WindowMode::Maximized);
         }
-        state.toplevel.set_fullscreen(None);
+        state.window.set_fullscreen(None);
     } else {
-        state.toplevel.unset_fullscreen();
+        state.window.unset_fullscreen();
         // The compositor need not restore the pre-fullscreen maximized state, so
         // re-request it (the final mode is still confirmed via a configure).
         if state.pre_fs_maximized {
-            state.toplevel.set_maximized();
+            state.window.set_maximized();
             state.pre_fs_maximized = false;
         }
     }
     let _ = state.conn.flush();
 }
 
-// Commanded maximize state for the CSD toggle button. Mirrored from the
-// compositor on every configure so a compositor-initiated maximize doesn't
-// desync the toggle.
-pub(crate) struct PopupShell {
-    conn: Connection,
-    qh: QueueHandle<RootState>,
-    compositor: WlCompositor,
-    viewporter: Option<WpViewporter>,
-    shm: WlShm,
-    wm_base: XdgWmBase,
-    root_xdg: XdgSurface,
-    seat: Option<WlSeat>,
-}
-
-impl PopupShell {
-    pub(crate) fn create_surface(&self) -> WlSurface {
-        self.compositor.create_surface(&self.qh, ())
-    }
-
-    pub(crate) fn create_viewport(&self, surface: &WlSurface) -> Option<WpViewport> {
-        self.viewporter
-            .as_ref()
-            .map(|v| v.get_viewport(surface, &self.qh, ()))
-    }
-
-    pub(crate) fn create_shm_buffer(
-        &self,
-        reg: &'static crate::wl_state::BufferRegistry,
-        pixels: &[u8],
-        w: i32,
-        h: i32,
-    ) -> Option<crate::wl_state::OwnedBuffer> {
-        crate::wl_state::build_shm_buffer_from_pixels(
-            reg, &self.shm, &self.qh, "menu-sw", pixels, w, h,
-        )
-    }
-
-    pub(crate) fn flush(&self) {
-        let _ = self.conn.flush();
-    }
-}
-
-// Ties a configure/popup_done back to the menu generation that owns it, so a
-// late event from a torn-down popup is ignored.
-#[derive(Clone, Copy)]
-struct PopupRole {
-    generation: NonZeroU64,
-}
-
-struct PopupRoleObjs {
-    xdg: Option<XdgSurface>,
-    popup: Option<XdgPopup>,
+/// SCTK's `Popup` destroys the menu `wl_surface` when it drops, so the
+/// viewport and buffer naming that surface live and die with it.
+#[derive(Default)]
+struct MenuPopup {
+    popup: Option<Popup>,
+    viewport: Option<WpViewport>,
+    buffer: Option<crate::wl_state::AttachedBuffer>,
     generation: Option<NonZeroU64>,
 }
-// Highest menu generation ever armed; generations come from a monotonic counter.
-// create runs on the input/CEF thread while destroy/reposition run on the root
-// thread, so a call delayed past a newer arm carries a stale generation. Rejecting
-// against this stops a stale create from tearing down the newer popup and a stale
-// reposition from retargeting it.
-fn build_menu_positioner(shell: &PopupShell, x: i32, y: i32, w: i32, h: i32) -> XdgPositioner {
-    let p = shell.wm_base.create_positioner(&shell.qh, ());
+
+fn build_menu_positioner(
+    xdg_shell: &XdgShell,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> Option<XdgPositioner> {
+    let p = XdgPositioner::new(xdg_shell)
+        .inspect_err(|e| tracing::error!(target: "Main", "menu positioner: {e}"))
+        .ok()?;
     p.set_size(w.max(1), h.max(1));
     p.set_anchor_rect(x, y, 1, 1);
     p.set_anchor(Anchor::TopLeft);
@@ -838,60 +865,162 @@ fn build_menu_positioner(shell: &PopupShell, x: i32, y: i32, w: i32, h: i32) -> 
             | ConstraintAdjustment::SlideX
             | ConstraintAdjustment::SlideY,
     );
-    p
+    Some(p)
 }
 
-/// Create the grab popup for `surface`. The grab cites the input thread's last
-/// press serial (button or key) — valid here only because every app connection
-/// shares one wl_client.
-pub(crate) fn popup_create(
-    rt: &WlRuntime,
-    generation: NonZeroU64,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    surface: &WlSurface,
-) {
-    let Some(shell) = rt.root().popup_shell() else {
-        return;
-    };
-    // Hold the role lock across teardown of the old role and publication of the new
-    // one: without this a concurrent popup_destroy/popup_reposition could run in
-    // the gap, observe an empty slot, and leave the just-created popup live but
-    // unpublished — a torn create/use span.
-    let mut role = rt.root().popup_role.lock();
-    // Each generation drives exactly one create, so `<=` (not `<`) also blocks
-    // resurrecting a just-destroyed popup, since destroy leaves armed_gen at its peak.
-    if generation.get() <= rt.root().armed_gen.load(Ordering::Acquire) {
-        return;
+impl RootState {
+    /// Create the grab popup, replacing whatever menu still stands. The grab
+    /// cites the input thread's last press serial (button or key) — valid here
+    /// only because every app connection shares one wl_client.
+    fn create_menu_popup(
+        &mut self,
+        generation: NonZeroU64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        serial: u32,
+    ) {
+        // Each generation drives exactly one create, so `<=` (not `<`) also
+        // blocks resurrecting a just-destroyed popup: teardown leaves armed_gen
+        // at its peak.
+        if generation.get() <= self.armed_gen {
+            return;
+        }
+        self.armed_gen = generation.get();
+        self.tear_down_menu_popup();
+        let Some(positioner) = build_menu_positioner(&self.xdg_shell, x, y, w, h) else {
+            return;
+        };
+        let surface = match Surface::new(&self.compositor, &self.qh) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(target: "Main", "menu surface: {e}");
+                return;
+            }
+        };
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(surface.wl_surface(), &self.qh, ()));
+        // xdg_popup.grab is only honored before the popup's first commit, so
+        // the grab and the commit below must stay in that order.
+        let popup = match Popup::from_surface(
+            Some(self.window.xdg_surface()),
+            &positioner,
+            &self.qh,
+            surface,
+            &self.xdg_shell,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(target: "Main", "menu popup: {e}");
+                if let Some(vp) = viewport {
+                    vp.destroy();
+                }
+                return;
+            }
+        };
+        if let Some(seat) = &self.seat {
+            popup.xdg_popup().grab(seat, serial);
+        }
+        popup.wl_surface().commit();
+        self.rt
+            .root()
+            .menu_surface_id
+            .store(popup.wl_surface().id().protocol_id(), Ordering::Release);
+        self.menu = MenuPopup {
+            popup: Some(popup),
+            viewport,
+            buffer: None,
+            generation: Some(generation),
+        };
     }
-    rt.root()
-        .armed_gen
-        .store(generation.get(), Ordering::Release);
-    destroy_role_objs(&mut role);
-    let positioner = build_menu_positioner(shell, x, y, w, h);
-    let xdg = shell
-        .wm_base
-        .get_xdg_surface(surface, &shell.qh, PopupRole { generation });
-    let popup = xdg.get_popup(
-        Some(&shell.root_xdg),
-        &positioner,
-        &shell.qh,
-        PopupRole { generation },
-    );
-    positioner.destroy();
-    if let Some(seat) = &shell.seat {
-        popup.grab(seat, rt.seat().last_input_serial());
+
+    /// Requires the popup to already be mapped.
+    fn reposition_menu_popup(&mut self, generation: NonZeroU64, x: i32, y: i32, w: i32, h: i32) {
+        if self.menu.generation != Some(generation) {
+            return;
+        }
+        let Some(popup) = self.menu.popup.as_ref() else {
+            return;
+        };
+        let Some(positioner) = build_menu_positioner(&self.xdg_shell, x, y, w, h) else {
+            return;
+        };
+        popup.reposition(&positioner, 0);
     }
-    surface.commit();
-    shell.flush();
-    role.xdg = Some(xdg);
-    role.popup = Some(popup);
-    role.generation = Some(generation);
+
+    fn paint_menu_popup(&mut self, paint: PopupPaint) {
+        if self.menu.generation != Some(paint.generation) {
+            return;
+        }
+        let buf = self
+            .menu_pool
+            .as_mut()
+            .and_then(|pool| {
+                crate::wl_state::draw_from_pixels(pool, &paint.pixels, paint.pw, paint.ph)
+            })
+            .map(crate::wl_state::AttachedBuffer::Shm);
+        let (Some(buf), Some(popup)) = (buf, self.menu.popup.as_ref()) else {
+            return;
+        };
+        let surface = popup.wl_surface();
+        if let Some(vp) = self.menu.viewport.as_ref() {
+            vp.set_source(
+                0.0,
+                f64::from(paint.scroll),
+                f64::from(paint.pw),
+                f64::from(paint.view_ph),
+            );
+            vp.set_destination(paint.lw, paint.lh);
+        }
+        buf.attach_to(surface);
+        surface.damage_buffer(0, 0, paint.pw, paint.ph);
+        surface.commit();
+        drop(self.menu.buffer.replace(buf));
+    }
+
+    /// Tear the popup down, but only if `generation` still owns it — a newer
+    /// menu may have taken the role in the gap between a stale teardown being
+    /// decided and this call, and must not be torn down by it.
+    fn destroy_menu_popup(&mut self, generation: NonZeroU64) {
+        if self.menu.generation != Some(generation) {
+            return;
+        }
+        self.tear_down_menu_popup();
+    }
+
+    /// Unqualified teardown, safe only behind the `armed_gen` guard; every
+    /// other caller goes through `destroy_menu_popup`.
+    fn tear_down_menu_popup(&mut self) {
+        // The viewport names the wl_surface that dropping the popup destroys,
+        // so it goes first.
+        if let Some(vp) = self.menu.viewport.take() {
+            vp.destroy();
+        }
+        self.menu = MenuPopup::default();
+    }
+
+    fn menu_generation(&self, popup: &Popup) -> Option<NonZeroU64> {
+        if self.menu.popup.as_ref()? != popup {
+            return None;
+        }
+        self.menu.generation
+    }
 }
 
-/// Requires the popup to already be mapped.
+pub(crate) fn popup_create(rt: &WlRuntime, generation: NonZeroU64, x: i32, y: i32, w: i32, h: i32) {
+    rt.root().send(WindowCommand::Popup(PopupCommand::Create {
+        generation,
+        x,
+        y,
+        w,
+        h,
+        serial: rt.seat().last_input_serial(),
+    }));
+}
+
 pub(crate) fn popup_reposition(
     rt: &WlRuntime,
     generation: NonZeroU64,
@@ -900,53 +1029,24 @@ pub(crate) fn popup_reposition(
     w: i32,
     h: i32,
 ) {
-    let Some(shell) = rt.root().popup_shell() else {
-        return;
-    };
-    let positioner = build_menu_positioner(shell, x, y, w, h);
-    {
-        // Reposition must be issued under the role lock: popup_destroy runs on
-        // the root thread and will otherwise destroy the popup mid-request,
-        // leaving this a request on a dead object that drops the client.
-        let role = rt.root().popup_role.lock();
-        if role.generation == Some(generation)
-            && let Some(popup) = role.popup.as_ref()
-        {
-            popup.reposition(&positioner, 0);
-            shell.flush();
-        }
-    }
-    positioner.destroy();
+    rt.root()
+        .send(WindowCommand::Popup(PopupCommand::Reposition {
+            generation,
+            x,
+            y,
+            w,
+            h,
+        }));
 }
 
-/// Destroys only the popup role objects, not the menu wl_surface — that surface
-/// is persistent (owned by crate::popup) and re-roled on the next open.
-fn destroy_role_objs(role: &mut PopupRoleObjs) {
-    if let Some(p) = role.popup.take() {
-        p.destroy();
-    }
-    if let Some(x) = role.xdg.take() {
-        x.destroy();
-    }
-    role.generation = None;
+pub(crate) fn popup_paint(rt: &WlRuntime, paint: PopupPaint) {
+    rt.root()
+        .send(WindowCommand::Popup(PopupCommand::Paint(paint)));
 }
 
-/// Tear down the popup role, but only if `generation` still owns it — a newer
-/// `arm` may have published a fresh role in the gap between a stale teardown
-/// deciding to destroy and this call, and must not be torn down by it. Unqualified
-/// force-destroy stays private (`destroy_role_objs`), reached only from
-/// `popup_create` under the `armed_gen` guard.
 pub(crate) fn popup_destroy(rt: &WlRuntime, generation: NonZeroU64) {
-    {
-        let mut role = rt.root().popup_role.lock();
-        if role.generation != Some(generation) {
-            return;
-        }
-        destroy_role_objs(&mut role);
-    }
-    if let Some(shell) = rt.root().popup_shell() {
-        shell.flush();
-    }
+    rt.root()
+        .send(WindowCommand::Popup(PopupCommand::Destroy { generation }));
 }
 
 // High bit marks "set"; the low 24 bits are RGB. Applied on the dispatch thread,
@@ -986,6 +1086,30 @@ fn vo_display(rt: &WlRuntime) -> Option<crate::app_conn::AppDisplay> {
     crate::app_conn::app_display(rt)
 }
 
+struct Required {
+    compositor: CompositorState,
+    shm: ShmGlobal,
+    xdg_shell: XdgShell,
+}
+
+fn bind_required(
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<RootState>,
+) -> Result<Required, InitError> {
+    Ok(Required {
+        compositor: CompositorState::bind(globals, qh).map_err(bind_error("wl_compositor"))?,
+        shm: ShmGlobal::new(globals.bind(qh, 1..=1, ()).map_err(bind_error("wl_shm"))?),
+        xdg_shell: XdgShell::bind(globals, qh).map_err(bind_error("xdg_wm_base"))?,
+    })
+}
+
+fn has_decoration_manager(globals: &wayland_client::globals::GlobalList) -> bool {
+    globals.contents().with_list(|list| {
+        list.iter()
+            .any(|g| g.interface == "zxdg_decoration_manager_v1")
+    })
+}
+
 /// Create the app-owned toplevel and start its dispatch thread. The toplevel
 /// must exist before the VO-wait gate (which reads its size + scale), but the
 /// mpv VO display it needs only appears mid-wait — so this is idempotent and
@@ -1007,52 +1131,45 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
     let (globals, queue) = match registry_queue_init::<RootState>(&conn) {
         Ok(g) => g,
         Err(e) => {
-            tracing::error!(target: "Main", "root window: registry init: {e}");
+            tracing::error!(target: "Main", "root window: {}", InitError::from(e));
             return;
         }
     };
     let qh = queue.handle();
 
-    let compositor: WlCompositor = match globals.bind(&qh, 1..=4, ()) {
-        Ok(c) => c,
+    let Required {
+        compositor,
+        shm,
+        xdg_shell,
+    } = match bind_required(&globals, &qh) {
+        Ok(bound) => bound,
         Err(e) => {
-            tracing::error!(target: "Main", "root window: bind wl_compositor: {e}");
-            return;
-        }
-    };
-    let shm: WlShm = match globals.bind(&qh, 1..=1, ()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(target: "Main", "root window: bind wl_shm: {e}");
+            tracing::error!(target: "Main", "root window: {e}");
             return;
         }
     };
     let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
 
-    let wm_base: XdgWmBase = match globals.bind(&qh, 1..=6, ()) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(target: "Main", "root window: bind xdg_wm_base: {e}");
-            return;
-        }
-    };
-
-    let surface = compositor.create_surface(&qh, ());
+    let decoration_request = rt.root().decoration_request();
+    let window = xdg_shell.create_window(
+        compositor.create_surface(&qh),
+        decoration_request.to_sctk(),
+        &qh,
+    );
+    let surface = window.wl_surface().clone();
     // Publish the root wl_proxy so wl_state can parent its CEF overlay under this
     // surface: same libwayland wl_display, but a different wayland-client Backend,
     // so it must be reconstructed there via ObjectId::from_ptr.
     if let Some(p) = std::ptr::NonNull::new(surface.id().as_ptr().cast()) {
         let _ = rt.root().root_surface.set(RootSurfaceHandle(p));
     }
-    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-    let toplevel = xdg_surface.get_toplevel(&qh, ());
-    toplevel.set_title(TITLE.to_owned());
-    toplevel.set_app_id(APP_ID.to_owned());
+    window.set_title(TITLE);
+    window.set_app_id(APP_ID);
 
     let boot = rt.root().boot_geometry();
     let (boot_w, boot_h, boot_max) = (boot.w, boot.h, boot.maximized);
     if boot_max {
-        toplevel.set_maximized();
+        window.set_maximized();
     }
 
     let viewport = viewporter
@@ -1073,20 +1190,9 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
         rt.window().feed_unit_scale();
     }
 
-    let deco_mgr: Option<ZxdgDecorationManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
-    let decoration = deco_mgr.as_ref().map(|mgr| {
-        let dec = mgr.get_toplevel_decoration(&toplevel, &qh, ());
-        match rt.root().decoration_request() {
-            DecorationRequest::ClientSide => dec.set_mode(DecorationMode::ClientSide),
-            DecorationRequest::ServerSide => dec.set_mode(DecorationMode::ServerSide),
-            // No set_mode: the compositor's preferred mode arrives in the
-            // decoration configure, which we obey either way.
-            DecorationRequest::Auto => {}
-        }
-        dec
-    });
-    if deco_mgr.is_none() {
-        if rt.root().decoration_request() == DecorationRequest::ServerSide {
+    let decorations_negotiated = has_decoration_manager(&globals);
+    if !decorations_negotiated {
+        if decoration_request == DecorationRequest::ServerSide {
             tracing::warn!(target: "Main", "root window: no zxdg_decoration_manager_v1; server-side requested, drawing no titlebar");
             if rt.root().effective.store(EffectiveDecorations::ServerSide) {
                 jfn_platform_abi::notify_decorations_changed();
@@ -1104,18 +1210,9 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
 
     let seat: Option<WlSeat> = globals.bind(&qh, 1..=8, ()).ok();
 
-    let _ = rt.root().popup_shell.set(PopupShell {
-        conn: conn.clone(),
-        qh: qh.clone(),
-        compositor: compositor.clone(),
-        viewporter: viewporter.clone(),
-        shm: shm.clone(),
-        wm_base: wm_base.clone(),
-        root_xdg: xdg_surface.clone(),
-        seat: seat.clone(),
-    });
-
-    xdg_surface.set_window_geometry(0, 0, boot_w, boot_h);
+    window
+        .xdg_surface()
+        .set_window_geometry(0, 0, boot_w, boot_h);
     // Roleless commit (no buffer attached) to elicit the first
     // xdg_surface.configure — and, on compositors that send preferred_scale only
     // in response to a commit, the first scale. It must not be gated on scale:
@@ -1124,23 +1221,31 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
     surface.commit();
     let _ = conn.flush();
 
+    let _ = rt.root().window.set(window.clone());
+
     let state = RootState {
         rt,
+        registry_state: RegistryState::new(&globals),
+        output_state: OutputState::new(&globals, &qh),
         conn: conn.clone(),
-        qh,
-        surface,
-        xdg_surface,
-        toplevel,
+        qh: qh.clone(),
+        window,
+        decorations_negotiated,
         seat,
         #[cfg(feature = "kde-palette")]
         palette,
-        shm: shm.clone(),
+        shm_pool: new_slot_pool(&shm, "root window"),
+        compositor,
+        xdg_shell,
+        viewporter,
+        menu_pool: new_slot_pool(&shm, "menu"),
+        menu: MenuPopup::default(),
+        armed_gen: 0,
         viewport,
         bg_buffer: None,
         bg: rt.root().pending_bg().unwrap_or(BG),
         frac_mgr,
         frac_scale,
-        decoration,
         current_size: None,
         pending_w: None,
         pending_h: None,
@@ -1151,7 +1256,7 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
             f.record(crate::window_state::WindowMode::Floating, boot_w, boot_h);
             f
         },
-        pending_ack: None,
+        pending_configure: None,
         present: None,
         scale_discovery: ScaleDiscovery::Idle,
         pre_fs_maximized: false,
@@ -1326,88 +1431,114 @@ fn root_loop(
     state.bg_buffer = None;
 }
 
-impl Dispatch<XdgWmBase, ()> for RootState {
-    fn event(
-        _: &mut Self,
-        wm_base: &XdgWmBase,
-        event: xdg_wm_base::Event,
-        _: &(),
+/// Scaling is owned by `wp_fractional_scale_v1`, which SCTK does not implement,
+/// so every compositor callback here is deliberately inert.
+impl CompositorHandler for RootState {
+    fn scale_factor_changed(
+        &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
+        _: &WlSurface,
+        _: i32,
     ) {
-        if let xdg_wm_base::Event::Ping { serial } = event {
-            wm_base.pong(serial);
-        }
+    }
+
+    fn transform_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlSurface,
+        _: Transform,
+    ) {
+    }
+
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {}
+
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlSurface,
+        _: &WlOutput,
+    ) {
+    }
+
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlSurface,
+        _: &WlOutput,
+    ) {
     }
 }
 
-impl Dispatch<XdgSurface, ()> for RootState {
-    fn event(
-        state: &mut Self,
-        _: &XdgSurface,
-        event: xdg_surface::Event,
-        _: &(),
+impl OutputHandler for RootState {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+}
+
+impl WindowHandler for RootState {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {
+        jfn_playback::shutdown::jfn_shutdown_initiate();
+    }
+
+    /// SCTK has already acked the serial and coalesced the toplevel size,
+    /// states, and decoration mode into `configure`.
+    fn configure(
+        &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
+        _: &Window,
+        configure: WindowConfigure,
+        _: u32,
     ) {
-        if let xdg_surface::Event::Configure { serial } = event {
-            // Coalesce to the latest serial; the toplevel.configure that carries
-            // the size/states precedes this in wire order, so pending_w/h + mode
-            // are already current.
-            state.pending_ack = Some(ConfigureSerial(serial));
-            state.try_present();
+        let (w, h) = configure.new_size;
+        self.pending_w = w.and_then(logical_extent);
+        self.pending_h = h.and_then(logical_extent);
+
+        self.mode = if configure.is_fullscreen() {
+            crate::window_state::WindowMode::Fullscreen
+        } else if configure.is_maximized() {
+            crate::window_state::WindowMode::Maximized
+        } else if configure.state.intersects(WindowState::TILED) {
+            // Any single tiled edge means compositor-tiled; `is_tiled` demands
+            // all four.
+            crate::window_state::WindowMode::Tiled
+        } else {
+            crate::window_state::WindowMode::Floating
+        };
+
+        let suspended = configure.state.contains(WindowState::SUSPENDED);
+        if suspended != self.suspended {
+            self.suspended = suspended;
+            crate::window_state::feed_suspended(suspended);
         }
+
+        // Absent the decoration protocol SCTK reports its client-side default,
+        // which would overwrite the boot-time decision.
+        if self.decorations_negotiated {
+            let effective = match configure.decoration_mode {
+                sctk_window::DecorationMode::Client => EffectiveDecorations::ClientSide,
+                sctk_window::DecorationMode::Server => EffectiveDecorations::ServerSide,
+            };
+            if self.rt.root().effective.store(effective) {
+                tracing::info!(target: "Main", "decorations: compositor set {effective:?}");
+                jfn_platform_abi::notify_decorations_changed();
+            }
+        }
+
+        self.pending_configure = Some(present_cap::acked(&configure));
+        self.try_present();
     }
 }
 
-impl Dispatch<XdgToplevel, ()> for RootState {
-    fn event(
-        state: &mut Self,
-        _: &XdgToplevel,
-        event: xdg_toplevel::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            xdg_toplevel::Event::Configure {
-                width,
-                height,
-                states,
-            } => {
-                state.pending_w = NonZeroI32::new(width);
-                state.pending_h = NonZeroI32::new(height);
-                let (mut fs, mut max, mut tiled, mut suspended) = (false, false, false, false);
-                for chunk in states.chunks_exact(4) {
-                    match u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) {
-                        STATE_FULLSCREEN => fs = true,
-                        STATE_MAXIMIZED => max = true,
-                        STATE_TILED_LEFT | STATE_TILED_RIGHT | STATE_TILED_TOP
-                        | STATE_TILED_BOTTOM => tiled = true,
-                        STATE_SUSPENDED => suspended = true,
-                        _ => {}
-                    }
-                }
-                state.mode = if fs {
-                    crate::window_state::WindowMode::Fullscreen
-                } else if max {
-                    crate::window_state::WindowMode::Maximized
-                } else if tiled {
-                    crate::window_state::WindowMode::Tiled
-                } else {
-                    crate::window_state::WindowMode::Floating
-                };
-                if suspended != state.suspended {
-                    state.suspended = suspended;
-                    crate::window_state::feed_suspended(suspended);
-                }
-            }
-            xdg_toplevel::Event::Close => {
-                jfn_playback::shutdown::jfn_shutdown_initiate();
-            }
-            _ => {}
-        }
-    }
+fn logical_extent(v: std::num::NonZeroU32) -> Option<NonZeroI32> {
+    NonZeroI32::new(i32::try_from(v.get()).ok()?)
 }
 
 impl Dispatch<WpFractionalScaleV1, ()> for RootState {
@@ -1434,38 +1565,28 @@ impl Dispatch<WpFractionalScaleV1, ()> for RootState {
     }
 }
 
-// Distinct PopupRole userdata keeps this off the root toplevel's `()`-keyed
-// XdgSurface dispatch; sharing `()` would route popup configures into the root's
-// configure handler.
-impl Dispatch<XdgSurface, PopupRole> for RootState {
-    fn event(
-        state: &mut Self,
-        xdg: &XdgSurface,
-        event: xdg_surface::Event,
-        role: &PopupRole,
+impl PopupHandler for RootState {
+    /// SCTK has already acked the serial.
+    fn configure(
+        &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
+        popup: &Popup,
+        _: PopupConfigure,
     ) {
-        if let xdg_surface::Event::Configure { serial } = event {
-            xdg.ack_configure(serial);
-            crate::popup::on_ready(state.rt, role.generation);
+        if let Some(generation) = self.menu_generation(popup) {
+            crate::popup::on_ready(self.rt, generation);
         }
     }
-}
 
-impl Dispatch<XdgPopup, PopupRole> for RootState {
-    fn event(
-        state: &mut Self,
-        _: &XdgPopup,
-        event: xdg_popup::Event,
-        role: &PopupRole,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_popup::Event::PopupDone = event {
-            crate::popup::on_done(state.rt, role.generation);
-            popup_destroy(state.rt, role.generation);
-        }
+    fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
+        let Some(generation) = self.menu_generation(popup) else {
+            return;
+        };
+        crate::popup::on_done(self.rt, generation);
+        // SCTK holds its own handle to `popup` for the length of this call, so
+        // the teardown has to happen after it returns.
+        popup_destroy(self.rt, generation);
     }
 }
 
@@ -1485,55 +1606,12 @@ macro_rules! noop_dispatch {
 }
 
 noop_dispatch!(
-    WlSurface,
-    WlCompositor,
     WlShm,
-    WlShmPool,
     WpViewporter,
     WpViewport,
     WpFractionalScaleManagerV1,
-    ZxdgDecorationManagerV1,
     WlSeat,
-    XdgPositioner,
 );
-
-impl Dispatch<WlBuffer, ()> for RootState {
-    fn event(
-        state: &mut Self,
-        buffer: &WlBuffer,
-        event: <WlBuffer as Proxy>::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wayland_client::protocol::wl_buffer::Event::Release = event {
-            state.rt.buffers().note_release(buffer);
-        }
-    }
-}
-
-impl Dispatch<ZxdgToplevelDecorationV1, ()> for RootState {
-    fn event(
-        state: &mut Self,
-        _: &ZxdgToplevelDecorationV1,
-        event: zxdg_toplevel_decoration_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = event {
-            let effective = match mode {
-                WEnum::Value(DecorationMode::ClientSide) => EffectiveDecorations::ClientSide,
-                WEnum::Value(DecorationMode::ServerSide) => EffectiveDecorations::ServerSide,
-                _ => return,
-            };
-            if state.rt.root().effective.store(effective) {
-                tracing::info!(target: "Main", "decorations: compositor set {effective:?}");
-                jfn_platform_abi::notify_decorations_changed();
-            }
-        }
-    }
-}
 
 #[cfg(feature = "kde-palette")]
 impl Dispatch<OrgKdeKwinServerDecorationPaletteManager, ()> for RootState {
@@ -1561,17 +1639,15 @@ impl Dispatch<OrgKdeKwinServerDecorationPalette, ()> for RootState {
     }
 }
 
-impl Dispatch<WlRegistry, GlobalListContents> for RootState {
-    fn event(
-        _: &mut Self,
-        _: &WlRegistry,
-        _: <WlRegistry as Proxy>::Event,
-        _: &GlobalListContents,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+impl ProvidesRegistryState for RootState {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
     }
+    registry_handlers![OutputState];
 }
+
+delegate_dispatch2!(RootState);
+delegate_registry!(RootState);
 
 #[cfg(test)]
 mod model_tests {
@@ -1579,24 +1655,25 @@ mod model_tests {
     //! [`Model`] mirrors the effect layer exactly — every decision routes
     //! through the same pure functions the live code uses (`plan`,
     //! `ScaleDiscovery::{request, after_batch_drained}`, `scale_displaces`) —
-    //! while recording effects (acks, commits, probe spawns) for assertion.
+    //! while recording effects (configures presented, commits, probe spawns)
+    //! for assertion.
 
     use super::presentation::{Inputs, ScaleDiscovery, Step, plan};
     use crate::window_state::{ScaleProvenance, WindowSize, scale_displaces};
 
     struct Model {
         mapped: bool,
-        pending_ack: bool,
+        pending_configure: bool,
         scale: Option<ScaleProvenance>,
         discovery: ScaleDiscovery,
-        acks: u32,
+        configures: u32,
         commits: u32,
         probe_spawns: u32,
     }
 
     #[derive(Clone, Copy)]
     enum Ev {
-        /// xdg_surface.configure dispatches (toplevel size/states precede it).
+        /// WindowHandler::configure dispatches (SCTK has acked the serial).
         Configure,
         /// wp_fractional_scale.preferred_scale dispatches.
         PreferredScale,
@@ -1613,10 +1690,10 @@ mod model_tests {
         fn new() -> Self {
             Self {
                 mapped: false,
-                pending_ack: false,
+                pending_configure: false,
                 scale: None,
                 discovery: ScaleDiscovery::Idle,
-                acks: 0,
+                configures: 0,
                 commits: 0,
                 probe_spawns: 0,
             }
@@ -1632,7 +1709,7 @@ mod model_tests {
         fn drive(&mut self) {
             let step = plan(Inputs {
                 mapped: self.mapped,
-                pending_ack: self.pending_ack,
+                pending_configure: self.pending_configure,
                 scale_known: self.scale.is_some(),
                 // The boot floating size is always recorded, so a floating
                 // root always resolves; size-resolution corner cases are
@@ -1643,15 +1720,13 @@ mod model_tests {
                 Step::Wait => {}
                 Step::DiscoverScale => self.discovery = self.discovery.request(),
                 Step::Present => {
-                    // Protocol invariant: buffer operations only ever follow a
-                    // configure ack (fresh here, or the one that mapped us).
                     assert!(
-                        self.pending_ack || self.mapped,
-                        "present without any acked configure"
+                        self.pending_configure || self.mapped,
+                        "present without any configure"
                     );
-                    if self.pending_ack {
-                        self.pending_ack = false;
-                        self.acks += 1;
+                    if self.pending_configure {
+                        self.pending_configure = false;
+                        self.configures += 1;
                         self.mapped = true;
                     }
                     // One latch raise = exactly one root commit per transaction.
@@ -1663,7 +1738,7 @@ mod model_tests {
         fn ev(&mut self, e: Ev) {
             match e {
                 Ev::Configure => {
-                    self.pending_ack = true;
+                    self.pending_configure = true;
                     self.drive();
                 }
                 Ev::PreferredScale => {
@@ -1699,7 +1774,7 @@ mod model_tests {
         // Scale alone must not touch the surface before the first configure.
         assert_eq!(m.commits, 0);
         m.run(&[Ev::Configure, Ev::BatchDrained]);
-        assert_eq!((m.acks, m.commits, m.probe_spawns), (1, 1, 0));
+        assert_eq!((m.configures, m.commits, m.probe_spawns), (1, 1, 0));
         assert_eq!(m.discovery, ScaleDiscovery::Idle);
     }
 
@@ -1711,7 +1786,7 @@ mod model_tests {
         assert_eq!(m.discovery, ScaleDiscovery::Requested);
         assert_eq!(m.commits, 0);
         m.run(&[Ev::PreferredScale, Ev::BatchDrained]);
-        assert_eq!((m.acks, m.commits, m.probe_spawns), (1, 1, 0));
+        assert_eq!((m.configures, m.commits, m.probe_spawns), (1, 1, 0));
         assert_eq!(m.discovery, ScaleDiscovery::Idle);
     }
 
@@ -1723,13 +1798,11 @@ mod model_tests {
         assert_eq!(m.probe_spawns, 1);
         assert_eq!(m.commits, 0);
         m.run(&[Ev::ProbeCompletes]);
-        assert_eq!((m.acks, m.commits), (1, 1));
+        assert_eq!((m.configures, m.commits), (1, 1));
         assert_eq!(m.scale, Some(ScaleProvenance::Provisional));
-        // The authoritative scale after map displaces the provisional one and
-        // re-presents without a new configure (and without a new ack).
         m.run(&[Ev::PreferredScale]);
         assert_eq!(m.scale, Some(ScaleProvenance::Authoritative));
-        assert_eq!((m.acks, m.commits), (1, 2));
+        assert_eq!((m.configures, m.commits), (1, 2));
     }
 
     #[test]
@@ -1738,7 +1811,7 @@ mod model_tests {
         // startup still completes.
         let mut m = Model::new();
         m.run(&[Ev::Configure, Ev::BatchDrained, Ev::ProbeCompletes]);
-        assert_eq!((m.acks, m.commits), (1, 1));
+        assert_eq!((m.configures, m.commits), (1, 1));
         assert_eq!(m.scale, Some(ScaleProvenance::Provisional));
     }
 
@@ -1758,7 +1831,7 @@ mod model_tests {
     fn no_fractional_scale_manager_uses_unit_scale_without_discovery() {
         let mut m = Model::new();
         m.run(&[Ev::BootUnitScale, Ev::Configure, Ev::BatchDrained]);
-        assert_eq!((m.acks, m.commits, m.probe_spawns), (1, 1, 0));
+        assert_eq!((m.configures, m.commits, m.probe_spawns), (1, 1, 0));
         assert_eq!(m.discovery, ScaleDiscovery::Idle);
     }
 
@@ -1767,7 +1840,7 @@ mod model_tests {
         let mut m = Model::new();
         m.run(&[Ev::PreferredScale, Ev::Configure, Ev::BatchDrained]);
         m.run(&[Ev::PreferredScale, Ev::PreferredScale, Ev::BatchDrained]);
-        assert_eq!((m.acks, m.commits, m.probe_spawns), (1, 3, 0));
+        assert_eq!((m.configures, m.commits, m.probe_spawns), (1, 3, 0));
     }
 
     #[test]
@@ -1776,16 +1849,15 @@ mod model_tests {
         m.run(&[Ev::PreferredScale, Ev::Configure, Ev::BatchDrained]);
         // Moving to another output delivers only a new preferred_scale.
         m.run(&[Ev::PreferredScale, Ev::BatchDrained]);
-        assert_eq!((m.acks, m.commits), (1, 2));
+        assert_eq!((m.configures, m.commits), (1, 2));
     }
 
     #[test]
     fn bare_configure_ack_after_map() {
         let mut m = Model::new();
         m.run(&[Ev::PreferredScale, Ev::Configure, Ev::BatchDrained]);
-        // A size-less configure (states-only change) still acks and commits.
         m.run(&[Ev::Configure, Ev::BatchDrained]);
-        assert_eq!((m.acks, m.commits), (2, 2));
+        assert_eq!((m.configures, m.commits), (2, 2));
     }
 
     #[test]
@@ -1856,10 +1928,10 @@ mod tests {
         }
     }
 
-    fn inputs(mapped: bool, pending_ack: bool, scale_known: bool, size: bool) -> Inputs {
+    fn inputs(mapped: bool, pending_configure: bool, scale_known: bool, size: bool) -> Inputs {
         Inputs {
             mapped,
-            pending_ack,
+            pending_configure,
             scale_known,
             size: size.then(|| WindowSize::new(1280, 720).unwrap()),
         }
@@ -1968,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn last_completed_size_bridges_a_bare_ack() {
+    fn last_completed_size_bridges_a_bare_configure() {
         assert_eq!(
             resolve_logical_size(
                 NONE,

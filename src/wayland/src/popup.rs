@@ -1,11 +1,5 @@
 //! Context menu / `<select>` dropdown as a real `xdg_popup`.
 //!
-//! The menu `wl_surface` is **persistent** — created once and re-roled for each
-//! menu. Destroying it would race teardown of its role objects (a
-//! `wl_surface`-destroyed-before-its-role protocol error); reusing it sidesteps
-//! that. Each show clears its buffer first so the surface is role-free and
-//! buffer-free when it is re-roled.
-//!
 //! `xdg_popup.grab` is only honored in response to the triggering input event,
 //! with that event's serial — but CEF hands us the menu model later, via an
 //! async callback. So [`arm`] creates+grabs the popup at the press (valid
@@ -14,14 +8,11 @@
 
 use std::num::NonZeroU64;
 
-use wayland_client::Proxy;
-use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
-
 use jfn_menu::MenuItem;
 use jfn_menu::interaction_fsm::{self, MenuEffect, MenuEvent, MenuState as FsmState};
 use jfn_menu::render::{self, Fonts, Layout};
 
+use crate::root_window::PopupPaint;
 use crate::runtime::WlRuntime;
 use crate::wl_state::WlState;
 
@@ -41,13 +32,10 @@ enum Phase {
 
 pub struct MenuIo {
     fonts: Option<Fonts>,
-    surface: Option<WlSurface>,
-    viewport: Option<WpViewport>,
-    buffer: Option<crate::wl_state::OwnedBuffer>,
     menu: Option<Menu>,
     phase: Phase,
     /// `None` when no popup is active; a live generation only exists alongside
-    /// the menu/surface state that carries it.
+    /// the menu state that carries it.
     generation: Option<NonZeroU64>,
     active: bool,
     // True from the grab request in `arm` until teardown. Our menu's xdg_popup
@@ -65,9 +53,6 @@ impl Default for MenuIo {
     fn default() -> Self {
         Self {
             fonts: None,
-            surface: None,
-            viewport: None,
-            buffer: None,
             menu: None,
             phase: Phase::default(),
             generation: None,
@@ -169,14 +154,10 @@ pub fn arm(rt: &'static WlRuntime, x: i32, y: i32) {
     // Mutter activates the grab at the initial commit inside popup_create; the
     // grab-induced keyboard-leave must already observe `engaged`.
     st.menu_io.engaged = true;
-    ensure_surface_locked(rt, &mut st);
     st.menu_io.phase = Phase::AwaitPlaceholder;
-    let surface = st.menu_io.surface.clone();
     drop(st);
 
-    if let Some(surface) = surface {
-        crate::root_window::popup_create(rt, generation, x, y, 1, 1, &surface);
-    }
+    crate::root_window::popup_create(rt, generation, x, y, 1, 1);
 }
 
 pub fn show(
@@ -269,13 +250,9 @@ pub fn show_highlighted(
             st.menu_io.generation = Some(generation);
             let lw = logical_dim(pw, scale);
             let lh = logical_dim(view_ph, scale);
-            ensure_surface_locked(rt, &mut st);
             st.menu_io.phase = Phase::AwaitMenu;
-            let surface = st.menu_io.surface.clone();
             drop(st);
-            if let Some(surface) = surface {
-                crate::root_window::popup_create(rt, generation, x, y, lw, lh, &surface);
-            }
+            crate::root_window::popup_create(rt, generation, x, y, lw, lh);
         }
         // Configure is still pending; on_ready() maps the replacement menu.
         Phase::AwaitMenu => {
@@ -288,7 +265,7 @@ pub fn show_highlighted(
             if let Some(menu) = st.menu_io.menu.as_mut() {
                 menu.mapped = true;
             }
-            paint_and_attach_locked(rt, &mut st);
+            paint_and_post_locked(rt, &mut st);
             let repos = st.menu_io.menu.as_ref().map(|m| {
                 (
                     m.anchor.0,
@@ -306,32 +283,6 @@ pub fn show_highlighted(
     }
 }
 
-// The menu surface and all its buffers live on the root connection (where the
-// app toplevel — the popup's parent — lives), so it can be parented as an
-// xdg_popup without crossing wl_client boundaries.
-fn ensure_surface_locked(rt: &'static WlRuntime, st: &mut WlState) -> u32 {
-    let Some(shell) = rt.root().popup_shell() else {
-        return 0;
-    };
-    if st.menu_io.surface.is_none() {
-        let surface = shell.create_surface();
-        let viewport = shell.create_viewport(&surface);
-        st.menu_io.surface = Some(surface);
-        st.menu_io.viewport = viewport;
-    }
-    drop(st.menu_io.buffer.take());
-    if let Some(surface) = st.menu_io.surface.as_ref() {
-        surface.attach(None, 0, 0);
-        surface.commit();
-    }
-    shell.flush();
-    st.menu_io
-        .surface
-        .as_ref()
-        .map(|s| s.id().protocol_id())
-        .unwrap_or(0)
-}
-
 fn begin_menu_locked(rt: &'static WlRuntime, st: &mut WlState) -> Option<(i32, i32, i32, i32)> {
     st.menu_io.active = true;
     // Before the map below: mapping activates the grab, and the grab-induced
@@ -346,26 +297,24 @@ fn begin_menu_locked(rt: &'static WlRuntime, st: &mut WlState) -> Option<(i32, i
     Some((x, y, lw, lh))
 }
 
-fn paint_placeholder_locked(rt: &'static WlRuntime, st: &mut WlState) {
-    let pixels = [0u8; 4]; // 1×1 transparent BGRA — maps the popup invisibly.
-    let Some(shell) = rt.root().popup_shell() else {
+fn paint_placeholder_locked(rt: &'static WlRuntime, st: &WlState) {
+    let Some(generation) = st.menu_io.generation else {
         return;
     };
-    let Some(buf) = shell.create_shm_buffer(rt.buffers(), &pixels, 1, 1) else {
-        return;
-    };
-    let Some(surface) = st.menu_io.surface.clone() else {
-        return;
-    };
-    if let Some(vp) = st.menu_io.viewport.as_ref() {
-        vp.set_source(0.0, 0.0, 1.0, 1.0);
-        vp.set_destination(1, 1);
-    }
-    buf.attach_to(&surface, 0, 0);
-    crate::wl_state::damage_all(&surface);
-    surface.commit();
-    drop(st.menu_io.buffer.replace(buf));
-    st.flush();
+    crate::root_window::popup_paint(
+        rt,
+        PopupPaint {
+            generation,
+            // 1×1 transparent BGRA — maps the popup invisibly.
+            pixels: vec![0u8; 4],
+            pw: 1,
+            ph: 1,
+            scroll: 0,
+            view_ph: 1,
+            lw: 1,
+            lh: 1,
+        },
+    );
 }
 
 pub(crate) fn on_ready(rt: &'static WlRuntime, generation: NonZeroU64) {
@@ -388,7 +337,7 @@ pub(crate) fn on_ready(rt: &'static WlRuntime, generation: NonZeroU64) {
             }
         }
         Phase::AwaitMenu => {
-            paint_and_attach_locked(rt, &mut st);
+            paint_and_post_locked(rt, &mut st);
             if let Some(menu) = st.menu_io.menu.as_mut() {
                 menu.mapped = true;
             }
@@ -467,28 +416,14 @@ pub fn is_engaged(rt: &'static WlRuntime) -> bool {
 }
 
 pub fn surface_matches(rt: &'static WlRuntime, surface_id: u32) -> bool {
-    let Some(st) = core(rt) else {
-        return false;
-    };
-    st.menu_io.menu.is_some()
-        && st
-            .menu_io
-            .surface
-            .as_ref()
-            .is_some_and(|s| s.id().protocol_id() == surface_id)
+    is_menu_surface(rt, surface_id) && core(rt).is_some_and(|st| st.menu_io.menu.is_some())
 }
 
-/// True if `surface_id` is the persistent menu surface — unlike
-/// [`surface_matches`], also when no menu is shown (the teardown
-/// keyboard-leave arrives after the menu is already cleared).
+/// True if `surface_id` is a menu surface — unlike [`surface_matches`], also
+/// when no menu is shown (the teardown keyboard-leave arrives after the menu is
+/// already cleared, naming a surface that no longer exists).
 pub fn is_menu_surface(rt: &'static WlRuntime, surface_id: u32) -> bool {
-    let Some(st) = core(rt) else {
-        return false;
-    };
-    st.menu_io
-        .surface
-        .as_ref()
-        .is_some_and(|s| s.id().protocol_id() == surface_id)
+    surface_id != 0 && rt.root().menu_surface_id() == surface_id
 }
 
 pub fn handle_motion(rt: &'static WlRuntime, local_x: i32, local_y: i32) {
@@ -534,7 +469,7 @@ pub fn handle_scroll(rt: &'static WlRuntime, dy: i32) {
         return;
     }
     menu.scroll = new;
-    paint_and_attach_locked(rt, &mut st);
+    paint_and_post_locked(rt, &mut st);
 }
 
 pub fn handle_outside_press(rt: &'static WlRuntime) {
@@ -568,7 +503,7 @@ fn step_locked(rt: &'static WlRuntime, st: &mut WlState, ev: MenuEvent) {
         match e {
             MenuEffect::Redraw => {
                 if st.menu_io.menu.as_ref().is_some_and(|m| m.mapped) {
-                    paint_and_attach_locked(rt, st);
+                    paint_and_post_locked(rt, st);
                 }
             }
             MenuEffect::Close(id) => {
@@ -584,7 +519,10 @@ fn step_locked(rt: &'static WlRuntime, st: &mut WlState, ev: MenuEvent) {
     }
 }
 
-fn paint_and_attach_locked(rt: &'static WlRuntime, st: &mut WlState) {
+fn paint_and_post_locked(rt: &'static WlRuntime, st: &mut WlState) {
+    let Some(generation) = st.menu_io.generation else {
+        return;
+    };
     let Some(menu) = st.menu_io.menu.as_ref() else {
         return;
     };
@@ -605,24 +543,19 @@ fn paint_and_attach_locked(rt: &'static WlRuntime, st: &mut WlState) {
         paint_bgra(fonts, &layout, &items, active)
     };
     let Some(pixels) = pixels else { return };
-    let Some(shell) = rt.root().popup_shell() else {
-        return;
-    };
-    let Some(buf) = shell.create_shm_buffer(rt.buffers(), &pixels, pw, ph) else {
-        return;
-    };
-    let Some(surface) = st.menu_io.surface.clone() else {
-        return;
-    };
-    if let Some(vp) = st.menu_io.viewport.as_ref() {
-        vp.set_source(0.0, scroll as f64, pw as f64, view_ph as f64);
-        vp.set_destination(lw, lh);
-    }
-    buf.attach_to(&surface, 0, 0);
-    surface.damage_buffer(0, 0, pw, ph);
-    surface.commit();
-    drop(st.menu_io.buffer.replace(buf));
-    st.flush();
+    crate::root_window::popup_paint(
+        rt,
+        PopupPaint {
+            generation,
+            pixels,
+            pw,
+            ph,
+            scroll,
+            view_ph,
+            lw,
+            lh,
+        },
+    );
 }
 
 fn fire_locked(st: &mut WlState, id: i32) {
