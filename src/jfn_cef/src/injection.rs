@@ -13,9 +13,7 @@ use cef::{
 };
 
 use crate::cef_string::userfree_to_string;
-use jfn_platform_abi::{
-    ContextMenuBackend, ContextMenuScript, DropdownBackend, DropdownScript, WindowDecorations,
-};
+use jfn_platform_abi::{MenuKind, MenuScript, WindowDecorations};
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
@@ -214,15 +212,10 @@ impl InjectedScript {
         }
     }
 
-    fn from_dropdown(script: DropdownScript) -> Self {
+    fn from_menu(script: MenuScript) -> InjectedScript {
         match script {
-            DropdownScript::SelectMenu => Self::SelectMenu,
-        }
-    }
-
-    fn from_context_menu(script: ContextMenuScript) -> Self {
-        match script {
-            ContextMenuScript::ContextMenu => Self::ContextMenu,
+            MenuScript::ContextMenu => Self::ContextMenu,
+            MenuScript::SelectMenu => Self::SelectMenu,
         }
     }
 }
@@ -465,7 +458,6 @@ fn build_extra_info(
     add_ctx_menu: bool,
     add_window: bool,
     shared_textures_enabled: bool,
-    ctx_menu: &'static dyn ContextMenuBackend,
 ) -> ExtraInfo {
     let mut functions = functions.to_vec();
     if add_window {
@@ -484,11 +476,10 @@ fn build_extra_info(
     }
     if add_ctx_menu {
         scripts.extend(
-            ctx_menu
-                .scripts()
+            jfn_platform_abi::menu_scripts(MenuKind::ContextMenu)
                 .iter()
                 .copied()
-                .map(InjectedScript::from_context_menu),
+                .map(InjectedScript::from_menu),
         );
     }
 
@@ -506,8 +497,6 @@ pub(crate) fn build_for_kind(
     kind: &str,
     add_ctx_menu: bool,
     shared_textures_enabled: bool,
-    dropdown: &'static dyn DropdownBackend,
-    ctx_menu: &'static dyn ContextMenuBackend,
 ) -> Option<ExtraInfo> {
     match kind {
         "web" => {
@@ -517,7 +506,6 @@ pub(crate) fn build_for_kind(
                 add_ctx_menu,
                 true,
                 shared_textures_enabled,
-                ctx_menu,
             );
             if let Some(json) = DEVICE_PROFILE_JSON.get()
                 && !json.is_empty()
@@ -532,11 +520,10 @@ pub(crate) fn build_for_kind(
                     p.window_decoration_options().iter().collect();
             }
             extra_info.scripts.extend(
-                dropdown
-                    .scripts()
+                jfn_platform_abi::menu_scripts(MenuKind::Dropdown)
                     .iter()
                     .copied()
-                    .map(InjectedScript::from_dropdown),
+                    .map(InjectedScript::from_menu),
             );
             Some(extra_info)
         }
@@ -546,7 +533,6 @@ pub(crate) fn build_for_kind(
             add_ctx_menu,
             true,
             shared_textures_enabled,
-            ctx_menu,
         )),
         "about" => Some(build_extra_info(
             ABOUT_FUNCTIONS,
@@ -554,7 +540,6 @@ pub(crate) fn build_for_kind(
             add_ctx_menu,
             true,
             shared_textures_enabled,
-            ctx_menu,
         )),
         _ => None,
     }

@@ -20,14 +20,12 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
 
-pub use jfn_platform_abi::{
-    DisplayBackend, JfnPopupRequest, JfnRect, PaintFrame, Platform, WindowDecorations,
-};
+pub use jfn_platform_abi::{DisplayBackend, JfnRect, PaintFrame, Platform, WindowDecorations};
 
 mod compositor;
-mod dropdown;
 mod input;
 mod mpv_host;
+mod osr_popup;
 mod platform;
 mod process;
 pub use compositor::{
@@ -251,12 +249,8 @@ impl Platform for WindowsPlatform {
         win_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
-    fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {
-        &dropdown::CompositorDropdown
-    }
-
-    fn context_menu_backend(&self) -> &'static dyn jfn_platform_abi::ContextMenuBackend {
-        &jfn_platform_abi::JsMenuContextMenu
+    fn osr_popup_surface(&self) -> &dyn jfn_platform_abi::OsrPopupSurface {
+        &osr_popup::WinOsrPopup
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {

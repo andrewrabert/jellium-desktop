@@ -9,8 +9,8 @@ use crate::surface;
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    DisplayBackend, IdleInhibitLevel, JfnContextMenuRequest, JfnPopupRequest, JfnRect, PaintFrame,
-    Platform, SurfaceHandle, SurfaceSize, WindowDecorations, WindowGeometry, WindowPos,
+    DisplayBackend, IdleInhibitLevel, JfnRect, PaintFrame, Platform, SurfaceHandle, SurfaceSize,
+    WindowDecorations, WindowGeometry, WindowPos,
 };
 
 pub struct X11Platform;
@@ -81,12 +81,8 @@ impl Platform for X11Platform {
         surface::restack(&ids);
     }
 
-    fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {
-        &jfn_platform_abi::JsMenuDropdown
-    }
-
-    fn context_menu_backend(&self) -> &'static dyn jfn_platform_abi::ContextMenuBackend {
-        crate::context_menu::backend()
+    fn menu(&self) -> Option<&'static dyn jfn_platform_abi::MenuHost> {
+        Some(crate::menu::host())
     }
 
     fn media_session(&self) -> &dyn jfn_platform_abi::MediaSink {

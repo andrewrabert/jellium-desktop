@@ -124,11 +124,11 @@ impl SeatShared {
         self.last_input_serial.load(Ordering::Acquire)
     }
 
-    fn suppress_focus_loss(&self) {
+    pub(crate) fn suppress_focus_loss(&self) {
         self.suppressed_focus_loss.store(true, Ordering::Release);
     }
 
-    fn discard_suppressed_focus_loss(&self) {
+    pub(crate) fn discard_suppressed_focus_loss(&self) {
         self.suppressed_focus_loss.store(false, Ordering::Release);
     }
 
@@ -321,7 +321,7 @@ impl State {
         };
         // Don't leak a stale repeat into the main surface while a popup
         // has the keyboard.
-        if crate::popup::active(self.rt) {
+        if self.rt.menu().is_active() {
             self.disarm_repeat();
             return;
         }
@@ -486,7 +486,7 @@ impl State {
                 self.ptr_x = surface_x;
                 self.ptr_y = surface_y;
                 if self.menu_focus {
-                    crate::popup::handle_motion(self.rt, surface_x as i32, surface_y as i32);
+                    self.rt.menu().motion(surface_x as i32, surface_y as i32);
                     return;
                 }
                 self.main_ptr_x = surface_x;
@@ -522,9 +522,9 @@ impl State {
                     self.main_ptr_x = surface_x;
                     self.main_ptr_y = surface_y;
                 }
-                if crate::popup::active(self.rt) {
+                if self.rt.menu().is_active() {
                     if self.menu_focus {
-                        crate::popup::handle_motion(self.rt, surface_x as i32, surface_y as i32);
+                        self.rt.menu().motion(surface_x as i32, surface_y as i32);
                     }
                     return;
                 }
@@ -551,22 +551,17 @@ impl State {
                         .store(serial, Ordering::Release);
                 }
                 let flag = Self::mouse_button_flag(button);
-                if crate::popup::active(self.rt) {
+                if self.rt.menu().is_active() {
                     if pressed {
                         if let Some(flag) = flag {
                             self.popup_swallowed_buttons |= flag;
                         }
                         if self.menu_focus {
-                            crate::popup::handle_button(
-                                self.rt,
-                                self.ptr_x as i32,
-                                self.ptr_y as i32,
-                                pressed,
-                            );
+                            self.rt.menu().press(self.ptr_x as i32, self.ptr_y as i32);
                         } else {
                             // Click on our own window outside the menu: the popup grab
                             // won't dismiss same-client clicks, so do it ourselves.
-                            crate::popup::handle_outside_press(self.rt);
+                            self.rt.menu().dismiss();
                         }
                     } else if let Some(flag) = flag {
                         if self.mouse_button_modifiers & flag != 0 {
@@ -618,7 +613,9 @@ impl State {
                 // `<select>` dropdown (CEF tells us asynchronously if one opened).
                 if (button == BTN_RIGHT || button == BTN_LEFT) && pressed {
                     self.disarm_repeat();
-                    crate::popup::arm(self.rt, self.ptr_x as i32, self.ptr_y as i32);
+                    self.rt
+                        .menu()
+                        .arm(self.ptr_x as i32, self.ptr_y as i32, serial);
                 }
                 if pressed {
                     self.mouse_button_modifiers |= flag;
@@ -635,14 +632,8 @@ impl State {
                     );
                 }
                 // Drop the grab armed on the press if this click opened no menu (#494).
-                if (button == BTN_RIGHT || button == BTN_LEFT)
-                    && !pressed
-                    && crate::popup::dismiss_if_speculative(self.rt)
-                {
-                    // The window still holds compositor focus here — teardown
-                    // returns the keyboard to the main surface, so a leave
-                    // swallowed at arm time was our own grab, not a real loss.
-                    self.rt.seat().discard_suppressed_focus_loss();
+                if (button == BTN_RIGHT || button == BTN_LEFT) && !pressed {
+                    self.rt.menu().dismiss_if_speculative();
                 }
             }
             PointerEventKind::Axis {
@@ -695,12 +686,12 @@ impl State {
         if dx == 0 && dy == 0 {
             return;
         }
-        if crate::popup::active(self.rt) {
+        if self.rt.menu().is_active() {
             // Wheel must not reach CEF while a <select> popup is open —
             // a wheel event outside Blink's popup rect cancels its
             // widget out from under the native menu.
             if self.menu_focus {
-                crate::popup::handle_scroll(self.rt, dy);
+                self.rt.menu().scroll(dy);
             }
             return;
         }
@@ -752,7 +743,7 @@ impl KeyboardHandler for State {
         if crate::popup::is_menu_surface(self.rt, surface.id().protocol_id()) {
             return;
         }
-        if crate::popup::is_engaged(self.rt) {
+        if self.rt.menu().is_engaged() {
             self.rt.seat().suppress_focus_loss();
             return;
         }
@@ -776,15 +767,17 @@ impl KeyboardHandler for State {
             .seat()
             .last_input_serial
             .store(serial, Ordering::Release);
-        if crate::popup::active(self.rt) {
-            crate::popup::handle_key(self.rt, event.keysym.raw(), true);
+        if self.rt.menu().is_active() {
+            self.rt.menu().key(event.keysym.raw());
             return;
         }
         if is_context_menu_key(event.keysym.raw(), self.modifiers) {
             // popup::active() only flips true once the async
             // configure lands, so disarm now rather than rely on it.
             self.disarm_repeat();
-            crate::popup::arm(self.rt, self.ptr_x as i32, self.ptr_y as i32);
+            self.rt
+                .menu()
+                .arm(self.ptr_x as i32, self.ptr_y as i32, serial);
         }
         self.send_key(&event, true);
         // A version-10 compositor repeats keys itself and delivers them through
@@ -803,13 +796,12 @@ impl KeyboardHandler for State {
         event: KeyEvent,
     ) {
         let armed = self.repeat_key.as_ref().map(|e| e.raw_code);
-        if crate::popup::active(self.rt) {
+        if self.rt.menu().is_active() {
             // Otherwise a repeat released here stays armed and
             // outlives the popup.
             if armed == Some(event.raw_code) {
                 self.disarm_repeat();
             }
-            crate::popup::handle_key(self.rt, event.keysym.raw(), false);
             return;
         }
         self.send_key(&event, false);
@@ -826,8 +818,8 @@ impl KeyboardHandler for State {
         _: u32,
         event: KeyEvent,
     ) {
-        if crate::popup::active(self.rt) {
-            crate::popup::handle_key(self.rt, event.keysym.raw(), true);
+        if self.rt.menu().is_active() {
+            self.rt.menu().key(event.keysym.raw());
             return;
         }
         self.send_key(&event, true);

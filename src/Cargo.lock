@@ -2436,13 +2436,16 @@ name = "jfn-linux-util"
 version = "0.1.0-dev"
 dependencies = [
  "clap",
+ "cosmic-text",
  "drm-fourcc",
  "jfn-input",
+ "jfn-mailbox",
  "jfn-platform-abi",
  "khronos-egl",
  "libloading 0.9.0",
  "nix",
  "parking_lot",
+ "tiny-skia",
  "tracing",
  "xkbcommon 0.9.0",
  "zbus",
@@ -2511,14 +2514,6 @@ name = "jfn-mailbox"
 version = "0.1.0-dev"
 dependencies = [
  "parking_lot",
-]
-
-[[package]]
-name = "jfn-menu"
-version = "0.1.0-dev"
-dependencies = [
- "cosmic-text",
- "tiny-skia",
 ]
 
 [[package]]
@@ -2639,7 +2634,6 @@ dependencies = [
  "jfn-input",
  "jfn-linux-util",
  "jfn-mailbox",
- "jfn-menu",
  "jfn-mpris",
  "jfn-mpv",
  "jfn-platform-abi",
@@ -2706,7 +2700,6 @@ dependencies = [
  "jfn-input",
  "jfn-linux-util",
  "jfn-mailbox",
- "jfn-menu",
  "jfn-mpris",
  "jfn-mpv",
  "jfn-paths",

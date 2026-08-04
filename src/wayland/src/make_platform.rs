@@ -21,8 +21,8 @@ use crate::wl_ops;
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    BootGeometry, DisplayBackend, IdleInhibitLevel, JfnContextMenuRequest, JfnPopupRequest,
-    JfnRect, PaintFrame, Platform, SurfaceHandle, SurfaceSize, WindowDecorations,
+    BootGeometry, DisplayBackend, IdleInhibitLevel, JfnRect, PaintFrame, Platform, SurfaceHandle,
+    SurfaceSize, WindowDecorations,
 };
 
 // =====================================================================
@@ -54,8 +54,7 @@ pub struct WaylandPlatform {
     runtime: &'static WlRuntime,
     mpv_host: crate::mpv_host::WaylandMpvHost,
     window_source: crate::window_source::WaylandWindowSource,
-    dropdown: Box<dyn jfn_platform_abi::DropdownBackend>,
-    context_menu: Box<dyn jfn_platform_abi::ContextMenuBackend>,
+    osr_popup: crate::osr_popup::WlSubsurfacePopup,
     shared_texture: AtomicBool,
     clipboard: AtomicBool,
 }
@@ -67,8 +66,7 @@ impl WaylandPlatform {
             runtime,
             mpv_host: crate::mpv_host::WaylandMpvHost::new(runtime),
             window_source: crate::window_source::WaylandWindowSource::new(runtime),
-            dropdown: crate::dropdown::backend(runtime),
-            context_menu: crate::context_menu::backend(runtime),
+            osr_popup: crate::osr_popup::WlSubsurfacePopup { rt: runtime },
             shared_texture: AtomicBool::new(true),
             clipboard: AtomicBool::new(true),
         }
@@ -161,12 +159,12 @@ impl Platform for WaylandPlatform {
         wl_ops::restack(self.rt(), typed);
     }
 
-    fn dropdown_backend(&self) -> &dyn jfn_platform_abi::DropdownBackend {
-        &*self.dropdown
+    fn menu(&self) -> Option<&'static dyn jfn_platform_abi::MenuHost> {
+        Some(self.rt().menu())
     }
 
-    fn context_menu_backend(&self) -> &dyn jfn_platform_abi::ContextMenuBackend {
-        &*self.context_menu
+    fn osr_popup_surface(&self) -> &dyn jfn_platform_abi::OsrPopupSurface {
+        &self.osr_popup
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {

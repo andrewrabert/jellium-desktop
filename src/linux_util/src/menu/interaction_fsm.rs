@@ -1,5 +1,6 @@
-use crate::MenuItem;
-use crate::render::Layout;
+use jfn_platform_abi::MenuItem;
+
+use crate::menu::render::Layout;
 
 pub const XK_ESCAPE: u32 = 0xff1b;
 pub const XK_RETURN: u32 = 0xff0d;
@@ -90,7 +91,7 @@ pub fn step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::Row;
+    use crate::menu::render::Row;
 
     fn item(id: i32) -> MenuItem {
         MenuItem {

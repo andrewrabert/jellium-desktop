@@ -8,6 +8,8 @@ use parking_lot::Mutex;
 use crate::app_conn::AppConn;
 use crate::clipboard::Clipboard;
 use crate::decoration_probe::DecorationGlobals;
+use jfn_linux_util::menu::SoftwareMenu;
+
 use crate::input::{InputThread, SeatShared};
 use crate::mpv_proxy::ProxyShared;
 use crate::paint_override::WlPaintOverride;
@@ -27,6 +29,7 @@ pub(crate) struct WlRuntime {
     proxy: ProxyShared,
     seat: SeatShared,
     input: OnceLock<InputThread>,
+    menu: OnceLock<SoftwareMenu>,
     clipboard: Clipboard,
     app_conn: AppConn,
     #[cfg(feature = "kde-palette")]
@@ -45,6 +48,7 @@ impl WlRuntime {
             proxy: ProxyShared::new(),
             seat: SeatShared::new(),
             input: OnceLock::new(),
+            menu: OnceLock::new(),
             clipboard: Clipboard::new(),
             app_conn: AppConn::new(),
             #[cfg(feature = "kde-palette")]
@@ -86,6 +90,18 @@ impl WlRuntime {
 
     pub(crate) fn set_input(&self, thread: InputThread) -> Result<(), ()> {
         self.input.set(thread).map_err(|_| ())
+    }
+
+    pub(crate) fn menu(&'static self) -> &'static SoftwareMenu {
+        self.menu.get_or_init(|| {
+            SoftwareMenu::spawn(std::sync::Arc::new(crate::popup::WlPopupSurface {
+                rt: self,
+            }))
+        })
+    }
+
+    pub(crate) fn try_menu(&self) -> Option<&SoftwareMenu> {
+        self.menu.get()
     }
 
     pub(crate) fn clipboard(&self) -> &Clipboard {

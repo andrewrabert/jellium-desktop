@@ -25,7 +25,6 @@ jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-input = { path = "../input" }
 jfn-linux-util = { path = "../linux_util" }
 jfn-mailbox = { path = "../mailbox" }
-jfn-menu = { path = "../menu" }
 jfn-mpris = { path = "../mpris" }
 jfn-mpv = { path = "../mpv" }
 jfn-paths = { path = "../paths" }

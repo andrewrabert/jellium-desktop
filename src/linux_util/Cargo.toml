@@ -15,12 +15,15 @@ parking_lot.workspace = true
 # elsewhere and the workspace builds uniformly on every platform.
 [target.'cfg(target_os = "linux")'.dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
+cosmic-text = "0.19"
 drm-fourcc = "2"
 jfn-input = { path = "../input" }
+jfn-mailbox = { path = "../mailbox" }
 jfn-platform-abi = { path = "../platform_abi" }
 khronos-egl = { version = "6", features = ["dynamic"] }
 libloading = "0.9"
 nix.workspace = true
+tiny-skia = "0.12"
 tracing.workspace = true
 xkbcommon = "0.9"
 zbus.workspace = true

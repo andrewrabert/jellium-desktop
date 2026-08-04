@@ -452,6 +452,7 @@ pub fn init() -> bool {
     }
 
     crate::input_lifecycle::start(toplevel);
+    crate::menu::warm();
 
     eprintln!("[x11] platform initialized (toplevel=0x{toplevel:x})");
     true

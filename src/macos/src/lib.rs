@@ -16,9 +16,7 @@ use objc2_io_kit::{
 };
 
 use jfn_platform_abi::geometry::{Bounds, clamp_to_bounds};
-pub use jfn_platform_abi::{
-    DisplayBackend, JfnPopupRequest, JfnRect, PaintFrame, Platform, WindowDecorations,
-};
+pub use jfn_platform_abi::{DisplayBackend, JfnRect, PaintFrame, Platform, WindowDecorations};
 
 // =====================================================================
 // Backend no-op entry points.
@@ -419,11 +417,10 @@ pub fn macos_open_external_url(url: &str) {
 mod cef_host;
 mod cef_pump;
 mod compositor;
-mod context_menu;
 mod dispatch;
-mod dropdown;
 mod init;
 mod input;
+mod menu;
 mod mpv_host;
 mod ns_menu;
 use compositor::{
@@ -517,12 +514,8 @@ impl Platform for MacosPlatform {
         macos_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
-    fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {
-        &dropdown::NsMenuDropdown
-    }
-
-    fn context_menu_backend(&self) -> &'static dyn jfn_platform_abi::ContextMenuBackend {
-        context_menu::backend()
+    fn menu(&self) -> Option<&'static dyn jfn_platform_abi::MenuHost> {
+        Some(&menu::NsMenuHost)
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {

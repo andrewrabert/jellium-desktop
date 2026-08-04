@@ -23,7 +23,6 @@ jfn-input = { path = "../input" }
 jfn-linux-util = { path = "../linux_util" }
 jfn-mailbox = { path = "../mailbox" }
 jfn-platform-abi = { path = "../platform_abi" }
-jfn-menu = { path = "../menu" }
 jfn-mpris = { path = "../mpris" }
 jfn-mpv = { path = "../mpv" }
 jfn-playback = { path = "../playback" }

@@ -5,9 +5,22 @@ use cef::{
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::platform_ops;
+use crate::platform_ops::{MenuDelivery, MenuItem, MenuRequest};
 
 use super::{Inner, PopupState};
+
+fn options_as_items(options: &[String]) -> Vec<MenuItem> {
+    options
+        .iter()
+        .enumerate()
+        .map(|(i, label)| MenuItem {
+            id: i as i32,
+            label: label.clone(),
+            enabled: true,
+            separator: false,
+        })
+        .collect()
+}
 
 // Windows virtual-key codes CEF expects in KeyEvent::windows_key_code.
 const VK_RETURN: i32 = 0x0D;
@@ -34,7 +47,7 @@ impl Inner {
         if !show {
             let surface = self.surface_handle();
             if !surface.is_none() {
-                self.dropdown.hide(surface);
+                self.hide_dropdown(surface);
             }
             return;
         }
@@ -96,19 +109,34 @@ impl Inner {
             return;
         }
         let inner = Arc::clone(self);
-        let req = platform_ops::JfnPopupRequest {
-            x,
-            y,
-            lw: w,
-            lh: h,
-            options: opts,
-            initial_highlight: selected,
-            on_selected: Some(Box::new(move |idx| {
-                let mut task = DispatchPopupTask::new(inner, idx, selected, selectable.clone());
-                let _ = post_task(ThreadId::UI, Some(&mut task));
-            })),
-        };
-        self.dropdown.show(surface, req);
+        let on_selected: crate::platform_ops::MenuSelectionFn = Box::new(move |idx| {
+            let mut task = DispatchPopupTask::new(inner, idx, selected, selectable.clone());
+            let _ = post_task(ThreadId::UI, Some(&mut task));
+        });
+        match self.dropdown {
+            MenuDelivery::Host(host) => host.open(MenuRequest {
+                items: options_as_items(&opts),
+                x,
+                y,
+                width: w,
+                initial: selected,
+                on_selected,
+            }),
+            MenuDelivery::Composited => {
+                jfn_platform_abi::get()
+                    .osr_popup_surface()
+                    .show(surface, x, y, w, h);
+            }
+            MenuDelivery::Page => {}
+        }
+    }
+
+    fn hide_dropdown(&self, surface: crate::platform_ops::SurfaceHandle) {
+        match self.dropdown {
+            MenuDelivery::Host(host) => host.hide(),
+            MenuDelivery::Composited => jfn_platform_abi::get().osr_popup_surface().hide(surface),
+            MenuDelivery::Page => {}
+        }
     }
 
     pub(super) fn on_deactivated(&self) {
@@ -128,7 +156,7 @@ impl Inner {
         if surface.is_none() {
             return;
         }
-        self.dropdown.hide(surface);
+        self.hide_dropdown(surface);
     }
 
     pub(super) fn popup_rect(&self) -> (i32, i32) {

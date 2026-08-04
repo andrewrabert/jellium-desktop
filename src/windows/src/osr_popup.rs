@@ -1,16 +1,16 @@
 use std::ffi::c_int;
 
-use jfn_platform_abi::{DropdownBackend, JfnPopupRequest, PaintFrame, SurfaceHandle};
+use jfn_platform_abi::{OsrPopupSurface, PaintFrame, SurfaceHandle};
 
 use crate::compositor::{
     win_popup_hide, win_popup_present, win_popup_present_software, win_popup_show,
 };
 
-pub(crate) struct CompositorDropdown;
+pub(crate) struct WinOsrPopup;
 
-impl DropdownBackend for CompositorDropdown {
-    fn show(&self, s: SurfaceHandle, req: JfnPopupRequest) {
-        win_popup_show(s.as_ptr(), req.x, req.y);
+impl OsrPopupSurface for WinOsrPopup {
+    fn show(&self, s: SurfaceHandle, x: c_int, y: c_int, _lw: c_int, _lh: c_int) {
+        win_popup_show(s.as_ptr(), x, y);
     }
 
     fn hide(&self, s: SurfaceHandle) {

@@ -1,7 +1,7 @@
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
 use tiny_skia::{Color as SkColor, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
 
-use crate::MenuItem;
+use jfn_platform_abi::MenuItem;
 
 // Logical (unscaled) metrics; multiplied by the display scale at layout time.
 const FONT_PX: f32 = 13.0;
@@ -58,8 +58,6 @@ impl Layout {
         }
     }
 
-    /// Backends divide physical dimensions by this to recover logical
-    /// (compositor) sizes.
     pub fn scale(&self) -> f32 {
         self.scale
     }
@@ -315,7 +313,6 @@ fn blend_coverage(
             let idx = (py * pw + px) as usize;
             let dst = pixels[idx];
             let inv = 255 - a;
-            // Both src and dst are premultiplied; src alpha == glyph coverage.
             let nr = (cr * a + dst.red() as u32 * inv) / 255;
             let ng = (cg * a + dst.green() as u32 * inv) / 255;
             let nb = (cb * a + dst.blue() as u32 * inv) / 255;
@@ -343,4 +340,15 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Pat
     pb.quad_to(x, y, x + r, y);
     pb.close();
     pb.finish()
+}
+
+/// Writes premultiplied BGRA (wl_shm ARGB8888 little-endian, X11 ARGB32), and
+/// copies `min(dst.len(), pm.width() * pm.height() * 4)` bytes.
+pub fn blit_bgra(pm: &Pixmap, dst: &mut [u8]) {
+    for (out, src) in dst.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
+        out[0] = src[2];
+        out[1] = src[1];
+        out[2] = src[0];
+        out[3] = src[3];
+    }
 }

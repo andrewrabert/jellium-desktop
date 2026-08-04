@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub mod cef_host;
-pub mod context_menu;
-pub mod dropdown;
 pub mod geometry;
 pub mod instance;
 pub mod media_sink;
+pub mod menu;
 pub mod mpv_host;
+pub mod osr_popup;
 #[cfg_attr(unix, path = "process_unix.rs")]
 #[cfg_attr(not(unix), path = "process_other.rs")]
 mod process;
@@ -32,14 +32,6 @@ mod signal;
 pub mod window_source;
 
 pub use cef_host::CefHost;
-pub use context_menu::{
-    ContextMenuBackend, ContextMenuScript, ContextMenuStyle, Delivery, DeliveryKind,
-    JfnContextMenuRequest, JfnMenuItem, JsMenuChannel, JsMenuContextMenu, MENU_DISMISSED,
-    MenuSelectionFn, context_menu_style,
-};
-pub use dropdown::{
-    DropdownBackend, DropdownScript, DropdownStyle, JfnPopupRequest, JsMenuDropdown, dropdown_style,
-};
 pub use geometry::{
     BootGeometry, LogicalSize, PhysicalSize, Scale, SurfaceSize, WindowExtent, WindowGeometry,
     WindowPos,
@@ -47,7 +39,14 @@ pub use geometry::{
 pub use instance::{Instance, InstanceId};
 pub use jfn_gpu_paint::DamageRect as JfnRect;
 pub use media_sink::MediaSink;
+pub use menu::{
+    Generation, JsMenuHost, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem,
+    MenuJsBridge, MenuKind, MenuMetrics, MenuPaint, MenuPlacement, MenuRequest, MenuScript,
+    MenuSelectionFn, MenuStyle, PopupSurface, install_menu_js_bridge, js_menu_host, menu_delivery,
+    menu_scripts, menu_style,
+};
 pub use mpv_host::{DefaultMpvHost, MpvHost};
+pub use osr_popup::{NoOsrPopup, OsrPopupSurface};
 pub use window_source::{
     WindowSnapshot, WindowSource, notify_window_changed, subscribe_window_changed,
 };
@@ -457,9 +456,13 @@ pub trait Platform: Send + Sync {
     fn surface_set_visible(&self, _s: SurfaceHandle, _visible: bool) {}
     fn restack(&self, _ordered: &[SurfaceHandle]) {}
 
-    fn dropdown_backend(&self) -> &dyn DropdownBackend;
+    fn menu(&self) -> Option<&'static dyn MenuHost> {
+        None
+    }
 
-    fn context_menu_backend(&self) -> &dyn ContextMenuBackend;
+    fn osr_popup_surface(&self) -> &dyn OsrPopupSurface {
+        &NoOsrPopup
+    }
 
     /// How this platform hosts mpv's lifecycle (env prep, VO wait,
     /// teardown detach). Default: mpv needs nothing from the platform.

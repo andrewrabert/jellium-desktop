@@ -319,7 +319,6 @@ pub(crate) struct WlState {
     pub use_gpu_paint: bool,
 
     pub scene: crate::scene::Scene,
-    pub menu_io: crate::popup::MenuIo,
 }
 
 // Raw pointers in `stack` are only ever dereferenced under the Mutex
@@ -571,7 +570,6 @@ pub(crate) unsafe fn init(
         gpu: None,
         use_gpu_paint: false,
         scene: crate::scene::Scene::default(),
-        menu_io: crate::popup::MenuIo::default(),
     };
 
     ensure_root_locked(rt, &mut state);

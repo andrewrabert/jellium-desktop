@@ -31,6 +31,7 @@ mod callbacks;
 mod events;
 mod ffi;
 mod lifecycle;
+mod menu_bridge;
 mod paint;
 mod popup;
 mod resize;
@@ -106,8 +107,7 @@ pub(crate) struct Inner {
     // arrives via OnPopupSize, options via the "popupOptions" renderer IPC;
     // try_show_popup fires when popup_visible + size_received + options_received.
     popup: Mutex<PopupState>,
-    dropdown: &'static dyn jfn_platform_abi::DropdownBackend,
-    pub(crate) context_menu: &'static dyn jfn_platform_abi::ContextMenuBackend,
+    dropdown: jfn_platform_abi::MenuDelivery,
 
     // lifecycle / reset state machine (slice 5)
     state: AtomicI32,
@@ -172,7 +172,7 @@ impl Inner {
         let paint_scheduler = PAINT_MODE
             .get_or_init(|| PaintMode::new(false))
             .make_scheduler();
-        Arc::new(Self {
+        let inner = Arc::new(Self {
             name: Mutex::new(String::new()),
             closed: AtomicBool::new(false),
             loaded: AtomicBool::new(false),
@@ -198,8 +198,7 @@ impl Inner {
                 selected_idx: -1,
                 ..PopupState::default()
             }),
-            dropdown: jfn_platform_abi::get().dropdown_backend(),
-            context_menu: jfn_platform_abi::get().context_menu_backend(),
+            dropdown: jfn_platform_abi::menu_delivery(jfn_platform_abi::MenuKind::Dropdown),
             state: AtomicI32::new(STATE_NORMAL),
             pending_url: Mutex::new(String::new()),
             has_browser: AtomicBool::new(false),
@@ -211,7 +210,9 @@ impl Inner {
             context_menu_dispatcher: Mutex::new(None),
             layer_ptr: AtomicPtr::new(std::ptr::null_mut()),
             cursor_handle: OnceLock::new(),
-        })
+        });
+        menu_bridge::ClientMenuJsBridge::install(&inner);
+        inner
     }
 
     fn name_str(&self) -> String {

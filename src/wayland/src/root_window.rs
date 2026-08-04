@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::num::{NonZeroI32, NonZeroU64};
+use std::num::NonZeroI32;
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -48,7 +48,9 @@ use wayland_protocols_plasma::server_decoration_palette::client::{
     org_kde_kwin_server_decoration_palette_manager::OrgKdeKwinServerDecorationPaletteManager,
 };
 
-use jfn_platform_abi::{EffectiveDecorations, WindowDecorations};
+use jfn_platform_abi::{
+    EffectiveDecorations, Generation, MenuPaint, MenuPlacement, WindowDecorations,
+};
 
 use crate::input::SeatShared;
 use crate::runtime::WlRuntime;
@@ -710,43 +712,23 @@ enum WindowCommand {
 /// Menu-popup requests. Create, paint, reposition and destroy must reach the
 /// compositor in the order they were issued — a reposition ahead of the paint
 /// that maps the popup is a protocol error — so they share one queue.
-enum PopupCommand {
+pub(crate) enum PopupCommand {
     Create {
-        generation: NonZeroU64,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
+        generation: Generation,
+        place: MenuPlacement,
         /// The press or key serial the grab cites. Captured on the input
         /// thread at request time; by the time this is applied the seat's last
         /// serial has moved on.
         serial: u32,
     },
     Reposition {
-        generation: NonZeroU64,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
+        generation: Generation,
+        place: MenuPlacement,
     },
-    Paint(PopupPaint),
+    Paint(MenuPaint),
     Destroy {
-        generation: NonZeroU64,
+        generation: Generation,
     },
-}
-
-pub(crate) struct PopupPaint {
-    pub(crate) generation: NonZeroU64,
-    /// BGRA, `pw` x `ph`.
-    pub(crate) pixels: Vec<u8>,
-    pub(crate) pw: i32,
-    pub(crate) ph: i32,
-    /// Scroll offset into the buffer, physical px.
-    pub(crate) scroll: i32,
-    /// Visible height of the crop, physical px.
-    pub(crate) view_ph: i32,
-    pub(crate) lw: i32,
-    pub(crate) lh: i32,
 }
 
 fn apply_command(state: &mut RootState, cmd: WindowCommand) {
@@ -791,19 +773,12 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
         WindowCommand::Popup(cmd) => match cmd {
             PopupCommand::Create {
                 generation,
-                x,
-                y,
-                w,
-                h,
+                place,
                 serial,
-            } => state.create_menu_popup(generation, x, y, w, h, serial),
-            PopupCommand::Reposition {
-                generation,
-                x,
-                y,
-                w,
-                h,
-            } => state.reposition_menu_popup(generation, x, y, w, h),
+            } => state.create_menu_popup(generation, place, serial),
+            PopupCommand::Reposition { generation, place } => {
+                state.reposition_menu_popup(generation, place);
+            }
             PopupCommand::Paint(paint) => state.paint_menu_popup(paint),
             PopupCommand::Destroy { generation } => state.destroy_menu_popup(generation),
         },
@@ -847,21 +822,15 @@ struct MenuPopup {
     popup: Option<Popup>,
     viewport: Option<WpViewport>,
     buffer: Option<crate::wl_state::AttachedBuffer>,
-    generation: Option<NonZeroU64>,
+    generation: Option<Generation>,
 }
 
-fn build_menu_positioner(
-    xdg_shell: &XdgShell,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-) -> Option<XdgPositioner> {
+fn build_menu_positioner(xdg_shell: &XdgShell, place: MenuPlacement) -> Option<XdgPositioner> {
     let p = XdgPositioner::new(xdg_shell)
         .inspect_err(|e| tracing::error!(target: "Main", "menu positioner: {e}"))
         .ok()?;
-    p.set_size(w.max(1), h.max(1));
-    p.set_anchor_rect(x, y, 1, 1);
+    p.set_size(place.lw.max(1), place.lh.max(1));
+    p.set_anchor_rect(place.x, place.y, 1, 1);
     p.set_anchor(Anchor::TopLeft);
     p.set_gravity(Gravity::BottomRight);
     p.set_constraint_adjustment(
@@ -877,15 +846,7 @@ impl RootState {
     /// Create the grab popup, replacing whatever menu still stands. The grab
     /// cites the input thread's last press serial (button or key) — valid here
     /// only because every app connection shares one wl_client.
-    fn create_menu_popup(
-        &mut self,
-        generation: NonZeroU64,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        serial: u32,
-    ) {
+    fn create_menu_popup(&mut self, generation: Generation, place: MenuPlacement, serial: u32) {
         // Each generation drives exactly one create, so `<=` (not `<`) also
         // blocks resurrecting a just-destroyed popup: teardown leaves armed_gen
         // at its peak.
@@ -894,7 +855,7 @@ impl RootState {
         }
         self.armed_gen = generation.get();
         self.tear_down_menu_popup();
-        let Some(positioner) = build_menu_positioner(&self.xdg_shell, x, y, w, h) else {
+        let Some(positioner) = build_menu_positioner(&self.xdg_shell, place) else {
             return;
         };
         let surface = match Surface::new(&self.compositor, &self.qh) {
@@ -943,20 +904,20 @@ impl RootState {
     }
 
     /// Requires the popup to already be mapped.
-    fn reposition_menu_popup(&mut self, generation: NonZeroU64, x: i32, y: i32, w: i32, h: i32) {
+    fn reposition_menu_popup(&mut self, generation: Generation, place: MenuPlacement) {
         if self.menu.generation != Some(generation) {
             return;
         }
         let Some(popup) = self.menu.popup.as_ref() else {
             return;
         };
-        let Some(positioner) = build_menu_positioner(&self.xdg_shell, x, y, w, h) else {
+        let Some(positioner) = build_menu_positioner(&self.xdg_shell, place) else {
             return;
         };
         popup.reposition(&positioner, 0);
     }
 
-    fn paint_menu_popup(&mut self, paint: PopupPaint) {
+    fn paint_menu_popup(&mut self, paint: MenuPaint) {
         if self.menu.generation != Some(paint.generation) {
             return;
         }
@@ -989,7 +950,7 @@ impl RootState {
     /// Tear the popup down, but only if `generation` still owns it — a newer
     /// menu may have taken the role in the gap between a stale teardown being
     /// decided and this call, and must not be torn down by it.
-    fn destroy_menu_popup(&mut self, generation: NonZeroU64) {
+    fn destroy_menu_popup(&mut self, generation: Generation) {
         if self.menu.generation != Some(generation) {
             return;
         }
@@ -1007,7 +968,7 @@ impl RootState {
         self.menu = MenuPopup::default();
     }
 
-    fn menu_generation(&self, popup: &Popup) -> Option<NonZeroU64> {
+    fn menu_generation(&self, popup: &Popup) -> Option<Generation> {
         if self.menu.popup.as_ref()? != popup {
             return None;
         }
@@ -1015,43 +976,8 @@ impl RootState {
     }
 }
 
-pub(crate) fn popup_create(rt: &WlRuntime, generation: NonZeroU64, x: i32, y: i32, w: i32, h: i32) {
-    rt.root().send(WindowCommand::Popup(PopupCommand::Create {
-        generation,
-        x,
-        y,
-        w,
-        h,
-        serial: rt.seat().last_input_serial(),
-    }));
-}
-
-pub(crate) fn popup_reposition(
-    rt: &WlRuntime,
-    generation: NonZeroU64,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-) {
-    rt.root()
-        .send(WindowCommand::Popup(PopupCommand::Reposition {
-            generation,
-            x,
-            y,
-            w,
-            h,
-        }));
-}
-
-pub(crate) fn popup_paint(rt: &WlRuntime, paint: PopupPaint) {
-    rt.root()
-        .send(WindowCommand::Popup(PopupCommand::Paint(paint)));
-}
-
-pub(crate) fn popup_destroy(rt: &WlRuntime, generation: NonZeroU64) {
-    rt.root()
-        .send(WindowCommand::Popup(PopupCommand::Destroy { generation }));
+pub(crate) fn popup(rt: &WlRuntime, cmd: PopupCommand) {
+    rt.root().send(WindowCommand::Popup(cmd));
 }
 
 // High bit marks "set"; the low 24 bits are RGB. Applied on the dispatch thread,
@@ -1588,7 +1514,7 @@ impl PopupHandler for RootState {
         _: PopupConfigure,
     ) {
         if let Some(generation) = self.menu_generation(popup) {
-            crate::popup::on_ready(self.rt, generation);
+            self.rt.menu().on_ready(generation);
         }
     }
 
@@ -1596,10 +1522,9 @@ impl PopupHandler for RootState {
         let Some(generation) = self.menu_generation(popup) else {
             return;
         };
-        crate::popup::on_done(self.rt, generation);
         // SCTK holds its own handle to `popup` for the length of this call, so
-        // the teardown has to happen after it returns.
-        popup_destroy(self.rt, generation);
+        // the teardown the menu emits has to reach the queue, not the popup.
+        self.rt.menu().on_done(generation);
     }
 }
 

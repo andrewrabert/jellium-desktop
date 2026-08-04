@@ -3,7 +3,6 @@
 #![cfg(target_os = "linux")]
 
 pub(crate) mod conn_source;
-pub(crate) mod context_menu;
 pub mod geometry;
 pub(crate) mod input;
 pub(crate) mod input_lifecycle;

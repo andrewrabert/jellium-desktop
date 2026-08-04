@@ -1,23 +1,23 @@
 use std::ffi::c_int;
 
-use jfn_platform_abi::{DropdownBackend, JfnPopupRequest, PaintFrame, SurfaceHandle};
+use jfn_platform_abi::{OsrPopupSurface, PaintFrame, SurfaceHandle};
 
 use crate::runtime::WlRuntime;
 use crate::wl_ops;
 
-pub(super) struct SubsurfaceDropdown {
-    pub(super) rt: &'static WlRuntime,
+pub(crate) struct WlSubsurfacePopup {
+    pub(crate) rt: &'static WlRuntime,
 }
 
-impl DropdownBackend for SubsurfaceDropdown {
-    fn show(&self, s: SurfaceHandle, req: JfnPopupRequest) {
+impl OsrPopupSurface for WlSubsurfacePopup {
+    fn show(&self, s: SurfaceHandle, x: c_int, y: c_int, lw: c_int, lh: c_int) {
         wl_ops::popup_show(
             self.rt,
             s.as_ptr() as *mut crate::wl_state::PlatformSurface,
-            req.x,
-            req.y,
-            req.lw,
-            req.lh,
+            x,
+            y,
+            lw,
+            lh,
         );
     }
 

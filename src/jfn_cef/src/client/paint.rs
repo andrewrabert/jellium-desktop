@@ -65,7 +65,11 @@ impl Inner {
             let Some(frame) = software_frame(buffer, w, h, &[]) else {
                 return;
             };
-            self.dropdown.present(surface, frame, pw, ph);
+            if matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
+                jfn_platform_abi::get()
+                    .osr_popup_surface()
+                    .present(surface, frame, pw, ph);
+            }
             return;
         }
         let Some(p) = platform_ops::ops() else { return };
@@ -88,8 +92,14 @@ impl Inner {
             let Some(tex) = super::accel::acquire(info) else {
                 return;
             };
-            self.dropdown
-                .present(surface, PaintFrame::Accelerated(tex), pw, ph);
+            if matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
+                jfn_platform_abi::get().osr_popup_surface().present(
+                    surface,
+                    PaintFrame::Accelerated(tex),
+                    pw,
+                    ph,
+                );
+            }
             return;
         }
         let Some(p) = platform_ops::ops() else { return };

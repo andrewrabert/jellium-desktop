@@ -15,7 +15,6 @@ members = [
     "macos",
     "macos_sink",
     "mailbox",
-    "menu",
     "mpris",
     "mpv",
     "paths",

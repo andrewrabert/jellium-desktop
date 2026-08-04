@@ -4,8 +4,8 @@
 pub use jfn_gpu_paint::{DmabufFormat, DmabufPlane};
 pub use jfn_gpu_paint::{FrameSize, SharedTexture};
 pub use jfn_platform_abi::{
-    Delivery, DeliveryKind, DisplayBackend, JfnContextMenuRequest, JfnMenuItem, JfnPopupRequest,
-    JfnRect, JsMenuChannel, PaintFrame, PhysicalSize, Platform, SurfaceHandle, SurfaceSize,
+    DisplayBackend, JfnRect, MENU_DISMISSED, MenuDelivery, MenuItem, MenuKind, MenuRequest,
+    MenuSelectionFn, PaintFrame, PhysicalSize, Platform, SurfaceHandle, SurfaceSize,
 };
 
 /// Returns the installed platform backend, or `None` if no backend has

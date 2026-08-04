@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use crate::cef_string::userfree_to_string;
 use crate::client::Inner;
-use crate::platform_ops::{
-    Delivery, DeliveryKind, JfnContextMenuRequest, JfnMenuItem, JsMenuChannel,
-};
+use crate::platform_ops::{MENU_DISMISSED, MenuDelivery, MenuItem, MenuKind, MenuRequest};
 
 const STRIP_ACCEL_KEEP: u8 = b'&';
 
@@ -72,7 +70,7 @@ wrap_context_menu_handler! {
             model: Option<&mut MenuModel>,
             callback: Option<&mut RunContextMenuCallback>,
         ) -> c_int {
-            let (Some(browser), Some(params), Some(model), Some(callback)) =
+            let (Some(_browser), Some(params), Some(model), Some(callback)) =
                 (browser, params, model, callback)
             else {
                 return 0;
@@ -91,7 +89,7 @@ wrap_context_menu_handler! {
             for i in 0..model.count() {
                 let t: sys::cef_menu_item_type_t = model.type_at(i).into();
                 if t == sys::cef_menu_item_type_t::MENUITEMTYPE_SEPARATOR {
-                    items.push(JfnMenuItem {
+                    items.push(MenuItem {
                         id: 0,
                         label: String::new(),
                         enabled: false,
@@ -99,7 +97,7 @@ wrap_context_menu_handler! {
                     });
                 } else {
                     let raw_label = userfree_to_string(&model.label_at(i));
-                    items.push(JfnMenuItem {
+                    items.push(MenuItem {
                         id: model.command_id_at(i),
                         label: strip_accelerator(&raw_label),
                         enabled: model.is_enabled_at(i) != 0,
@@ -108,28 +106,18 @@ wrap_context_menu_handler! {
                 }
             }
 
-            let frame = browser.main_frame();
-            let park_inner = Arc::clone(&self.inner);
-            let on_selected = self.inner.menu_selection_callback(session);
-            let delivery = match self.inner.context_menu.delivery_kind() {
-                DeliveryKind::Native => Delivery::Native(on_selected),
-                DeliveryKind::Js => Delivery::Js(JsMenuChannel {
-                    exec: Box::new(move |js| {
-                        if let Some(frame) = frame {
-                            let code = CefString::from(js.as_str());
-                            frame.execute_java_script(Some(&code), Some(&CefString::from("")), 0);
-                        }
-                    }),
-                    park_selection: Box::new(move |cb| park_inner.park_menu_selection(cb)),
-                    on_selected,
-                }),
-            };
-            self.inner.context_menu.show(JfnContextMenuRequest {
+            let req = MenuRequest {
+                items,
                 x: params.xcoord(),
                 y: params.ycoord(),
-                items,
-                delivery,
-            });
+                width: 0,
+                initial: MENU_DISMISSED,
+                on_selected: self.inner.menu_selection_callback(session),
+            };
+            match jfn_platform_abi::menu_delivery(MenuKind::ContextMenu) {
+                MenuDelivery::Host(host) => host.open(req),
+                MenuDelivery::Composited | MenuDelivery::Page => drop(req),
+            }
             1
         }
     }

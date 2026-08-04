@@ -7,9 +7,7 @@
 
 pub(crate) mod app_conn;
 pub(crate) mod clipboard;
-pub(crate) mod context_menu;
 pub(crate) mod decoration_probe;
-pub(crate) mod dropdown;
 pub(crate) mod input;
 pub(crate) mod input_lifecycle;
 #[cfg(feature = "kde-palette")]
@@ -20,6 +18,7 @@ pub(crate) mod lifecycle;
 pub mod make_platform;
 pub(crate) mod mpv_host;
 pub(crate) mod mpv_proxy;
+pub(crate) mod osr_popup;
 pub mod paint_override;
 pub(crate) mod popup;
 pub(crate) mod root_window;

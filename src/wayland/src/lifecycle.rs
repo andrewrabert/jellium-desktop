@@ -151,6 +151,8 @@ pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
         jfn_platform_abi::get().clear_clipboard_handler();
     }
 
+    jfn_platform_abi::MenuHost::warm(rt.menu());
+
     true
 }
 
@@ -160,6 +162,11 @@ pub(crate) fn cleanup(rt: &'static crate::runtime::WlRuntime) {
     // kde_palette::post_window_cleanup after mpv tears down the surface.
     jfn_linux_util::idle_inhibit::cleanup();
     rt.clipboard().cleanup();
+    // Must precede root_window::cleanup: the menu's teardown ops go through
+    // the root thread's queue.
+    if let Some(menu) = rt.try_menu() {
+        jfn_platform_abi::MenuHost::shutdown(menu);
+    }
     // Stop the app-owned toplevel thread before mpv's VO-teardown roundtrip;
     // otherwise it holds a wl_display read barrier and the roundtrip hangs when
     // no video ever played (a quiet display never wakes its poll).
