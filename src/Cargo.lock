@@ -410,6 +410,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "calloop"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7"
+dependencies = [
+ "bitflags 2.13.1",
+ "polling",
+ "rustix",
+ "slab",
+ "tracing",
+]
+
+[[package]]
+name = "calloop-wayland-source"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "138efcf0940a02ebf0cc8d1eff41a1682a46b431630f4c52450d6265876021fa"
+dependencies = [
+ "calloop",
+ "rustix",
+ "wayland-backend",
+ "wayland-client",
+]
+
+[[package]]
 name = "cargo-lock"
 version = "11.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2505,6 +2530,7 @@ dependencies = [
 name = "jfn-wake-event"
 version = "0.1.0-dev"
 dependencies = [
+ "calloop",
  "nix",
  "windows-sys 0.61.2",
 ]
@@ -2513,6 +2539,8 @@ dependencies = [
 name = "jfn-wayland"
 version = "0.1.0-dev"
 dependencies = [
+ "calloop",
+ "calloop-wayland-source",
  "cef",
  "error_reporter",
  "jfn-gpu-paint",
@@ -2574,6 +2602,7 @@ name = "jfn-x11"
 version = "0.1.0-dev"
 dependencies = [
  "arc-swap",
+ "calloop",
  "cef",
  "cursor-icon",
  "gethostname",
@@ -4335,6 +4364,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

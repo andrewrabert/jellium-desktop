@@ -27,6 +27,8 @@ jfn-mpris = { path = "../mpris" }
 jfn-mpv = { path = "../mpv" }
 jfn-playback = { path = "../playback" }
 jfn-wake-event = { path = "../wake_event" }
+calloop.workspace = true
+calloop-wayland-source.workspace = true
 cef.workspace = true
 error_reporter = "1.0.0"
 libc.workspace = true

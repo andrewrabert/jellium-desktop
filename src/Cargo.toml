@@ -35,6 +35,8 @@ publish = false
 
 [workspace.dependencies]
 arc-swap = "1"
+calloop = "0.14"
+calloop-wayland-source = "0.4"
 cef = { version = "=150.0.0", default-features = false }
 gethostname = "1"
 gix = { version = "0.85", default-features = false, features = ["status", "sha1"] }

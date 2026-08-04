@@ -1,12 +1,11 @@
 //! X11 input thread.
 
-use nix::errno::Errno;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use parking_lot::Mutex;
 use std::ffi::c_int;
-use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use calloop::EventLoop;
+use calloop::channel::{Channel, Event as ChannelEvent, Sender, channel};
 
 use x11rb::connection::Connection as X11rbConnection;
 use x11rb::cursor::Handle as X11rbCursorHandle;
@@ -25,7 +24,9 @@ use jfn_input::{
 };
 use jfn_linux_util::input::jfn_input_dispatch_key_raw;
 use jfn_playback::shutdown::jfn_shutdown_register_waker;
-use jfn_wake_event::WakeEvent;
+use jfn_wake_event::{Drain, WakeEvent, WakeSource};
+
+use crate::xcb_source::XcbSource;
 
 use cursor_icon::CursorIcon;
 use jfn_input::buttons;
@@ -38,53 +39,31 @@ use jfn_platform_abi::event_flags::{
 const XKB_KEY_XF86BACK: u32 = 0x1008ff26;
 const XKB_KEY_XF86FORWARD: u32 = 0x1008ff27;
 
-#[derive(Copy, Clone)]
-enum CursorReq {
-    Set(CursorShape),
+#[derive(Clone)]
+pub(crate) struct CursorChannel {
+    tx: Sender<CursorShape>,
+    latest: Arc<AtomicU32>,
 }
 
-pub struct CursorMailbox {
-    queue: Mutex<Vec<CursorReq>>,
-    latest_type: AtomicU32,
-    shutdown: std::sync::atomic::AtomicBool,
-    wake: Option<WakeEvent>,
-}
+impl CursorChannel {
+    fn new() -> (CursorChannel, Channel<CursorShape>) {
+        let (tx, rx) = channel();
+        let ch = CursorChannel {
+            tx,
+            latest: Arc::new(AtomicU32::new(CursorShape::Pointer.as_raw() as u32)),
+        };
+        (ch, rx)
+    }
 
-impl CursorMailbox {
-    fn new() -> Self {
-        Self {
-            queue: Mutex::new(Vec::new()),
-            latest_type: AtomicU32::new(CursorShape::Pointer.as_raw() as u32),
-            shutdown: std::sync::atomic::AtomicBool::new(false),
-            wake: WakeEvent::new(),
-        }
+    fn set(&self, shape: CursorShape) {
+        self.latest.store(shape.as_raw() as u32, Ordering::Release);
+        let _ = self.tx.send(shape);
     }
-    fn push(&self, req: CursorReq) {
-        match req {
-            CursorReq::Set(t) => self.latest_type.store(t.as_raw() as u32, Ordering::Release),
-        }
-        self.queue.lock().push(req);
-        self.signal_wake();
-    }
-    fn latest_type(&self) -> CursorShape {
-        CursorShape::from_cef(self.latest_type.load(Ordering::Acquire) as i32)
-            .unwrap_or(CursorShape::Pointer)
-    }
-    fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-        self.signal_wake();
-    }
-    fn should_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
-    }
-    fn signal_wake(&self) {
-        if let Some(w) = &self.wake {
-            w.signal();
-        }
-    }
-    fn drain(&self) -> Vec<CursorReq> {
-        let mut q = self.queue.lock();
-        std::mem::take(&mut *q)
+
+    fn resend_latest(&self) {
+        let shape = CursorShape::from_cef(self.latest.load(Ordering::Acquire) as i32)
+            .unwrap_or(CursorShape::Pointer);
+        let _ = self.tx.send(shape);
     }
 }
 
@@ -92,24 +71,29 @@ pub struct Handle {
     join: Option<std::thread::JoinHandle<()>>,
     cursor_join: Option<std::thread::JoinHandle<()>>,
     input_join: Option<std::thread::JoinHandle<()>>,
-    pub mailbox: Arc<CursorMailbox>,
-    input_mailbox: Arc<InputMailbox>,
+    cursor: Option<CursorChannel>,
+    dispatch: Option<Sender<QueuedInputEvent>>,
 }
 
 impl Handle {
     pub fn join(&mut self) {
+        if let Some(ev) = x11_shutdown_waker() {
+            ev.signal();
+        }
+        // The input thread is the producer for both channels, so it must be
+        // gone before either sender drops — otherwise a queued event is lost.
         if let Some(j) = self.join.take()
             && let Err(e) = j.join()
         {
             eprintln!("[x11] input thread panicked: {e:?}");
         }
-        self.mailbox.shutdown();
+        self.cursor = None;
+        self.dispatch = None;
         if let Some(j) = self.cursor_join.take()
             && let Err(e) = j.join()
         {
             eprintln!("[x11] cursor thread panicked: {e:?}");
         }
-        self.input_mailbox.shutdown();
         if let Some(j) = self.input_join.take()
             && let Err(e) = j.join()
         {
@@ -120,12 +104,6 @@ impl Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // Signal the shutdown waker so the input thread exits its `poll`,
-        // then join. Without this, dropping a Handle mid-run leaves the
-        // input thread detached and polling xcb forever.
-        if let Some(ev) = x11_shutdown_waker() {
-            ev.signal();
-        }
         self.join();
     }
 }
@@ -167,47 +145,6 @@ enum QueuedInputEvent {
     },
 }
 
-pub struct InputMailbox {
-    queue: Mutex<Vec<QueuedInputEvent>>,
-    shutdown: std::sync::atomic::AtomicBool,
-    wake: Option<WakeEvent>,
-}
-
-impl InputMailbox {
-    fn new() -> Self {
-        Self {
-            queue: Mutex::new(Vec::new()),
-            shutdown: std::sync::atomic::AtomicBool::new(false),
-            wake: WakeEvent::new(),
-        }
-    }
-
-    fn push(&self, ev: QueuedInputEvent) {
-        self.queue.lock().push(ev);
-        self.signal_wake();
-    }
-
-    fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-        self.signal_wake();
-    }
-
-    fn should_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
-    }
-
-    fn signal_wake(&self) {
-        if let Some(w) = &self.wake {
-            w.signal();
-        }
-    }
-
-    fn drain(&self) -> Vec<QueuedInputEvent> {
-        let mut q = self.queue.lock();
-        std::mem::take(&mut *q)
-    }
-}
-
 struct State {
     conn: Arc<xcb::Connection>,
     window: u32,
@@ -224,8 +161,8 @@ struct State {
     ptr_y: i32,
     mouse_button_modifiers: u32,
 
-    mailbox: Arc<CursorMailbox>,
-    input_mailbox: Arc<InputMailbox>,
+    cursor: CursorChannel,
+    dispatch: Sender<QueuedInputEvent>,
 }
 
 unsafe impl Send for State {}
@@ -368,7 +305,7 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
 
     if sym == XKB_KEY_XF86BACK || sym == XKB_KEY_XF86FORWARD {
         if pressed {
-            st.input_mailbox.push(QueuedInputEvent::HistoryNav {
+            let _ = st.dispatch.send(QueuedInputEvent::HistoryNav {
                 forward: (sym == XKB_KEY_XF86FORWARD) as c_int,
             });
         }
@@ -384,7 +321,7 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
     }
 
     let native = (kc_raw as i32) - 8; // X keycode → linux input code
-    st.input_mailbox.push(QueuedInputEvent::KeyRaw {
+    let _ = st.dispatch.send(QueuedInputEvent::KeyRaw {
         sym,
         native: native as u32,
         modifiers: st.modifiers,
@@ -394,7 +331,7 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
     if pressed {
         let cp = xst.key_get_utf32(kc);
         if cp > 0 {
-            st.input_mailbox.push(QueuedInputEvent::Char {
+            let _ = st.dispatch.send(QueuedInputEvent::Char {
                 cp,
                 modifiers: st.modifiers,
                 native: native as u32,
@@ -429,7 +366,7 @@ fn handle_button(st: &mut State, detail: u8, event_x: i16, event_y: i16, pressed
             7 => (-120, 0),
             _ => (0, 0),
         };
-        st.input_mailbox.push(QueuedInputEvent::Scroll {
+        let _ = st.dispatch.send(QueuedInputEvent::Scroll {
             x,
             y,
             dx,
@@ -441,7 +378,7 @@ fn handle_button(st: &mut State, detail: u8, event_x: i16, event_y: i16, pressed
 
     if button == 8 || button == 9 {
         if pressed {
-            st.input_mailbox.push(QueuedInputEvent::HistoryNav {
+            let _ = st.dispatch.send(QueuedInputEvent::HistoryNav {
                 forward: (button == 9) as c_int,
             });
         }
@@ -470,7 +407,7 @@ fn handle_button(st: &mut State, detail: u8, event_x: i16, event_y: i16, pressed
     if pressed {
         activate_parent(st);
     }
-    st.input_mailbox.push(QueuedInputEvent::MouseButton {
+    let _ = st.dispatch.send(QueuedInputEvent::MouseButton {
         code,
         pressed: pressed as c_int,
         x,
@@ -500,7 +437,7 @@ fn activate_parent(st: &State) {
 fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) {
     st.ptr_x = to_logical(ev.event_x() as i32);
     st.ptr_y = to_logical(ev.event_y() as i32);
-    st.input_mailbox.push(QueuedInputEvent::MouseMove {
+    let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
         x: st.ptr_x,
         y: st.ptr_y,
         modifiers: cef_modifiers(st),
@@ -511,8 +448,8 @@ fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) {
 fn handle_enter(st: &mut State, ev: &xcb::x::EnterNotifyEvent) {
     st.ptr_x = to_logical(ev.event_x() as i32);
     st.ptr_y = to_logical(ev.event_y() as i32);
-    st.mailbox.push(CursorReq::Set(st.mailbox.latest_type()));
-    st.input_mailbox.push(QueuedInputEvent::MouseMove {
+    st.cursor.resend_latest();
+    let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
         x: st.ptr_x,
         y: st.ptr_y,
         modifiers: cef_modifiers(st),
@@ -521,7 +458,7 @@ fn handle_enter(st: &mut State, ev: &xcb::x::EnterNotifyEvent) {
 }
 
 fn handle_leave(st: &State, _ev: &xcb::x::LeaveNotifyEvent) {
-    st.input_mailbox.push(QueuedInputEvent::MouseMove {
+    let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
         x: st.ptr_x,
         y: st.ptr_y,
         modifiers: cef_modifiers(st),
@@ -607,18 +544,9 @@ fn apply_cursor(st: &mut CursorState, shape: CursorShape) {
     let _ = conn.flush();
 }
 
-fn drain_cursor_requests(st: &mut CursorState, mailbox: &CursorMailbox) {
-    let reqs = mailbox.drain();
-    for r in reqs {
-        match r {
-            CursorReq::Set(t) => apply_cursor(st, t),
-        }
-    }
-}
-
 /// Per-process X11 shutdown waker. Allocated on first use and registered
-/// with the shutdown fan-out so the input thread can `poll()` its fd
-/// alongside xcb + the cursor mailbox.
+/// with the shutdown fan-out so the input loop can wait on its fd alongside
+/// xcb. The geometry loop waits on the same fd.
 pub(crate) fn x11_shutdown_waker() -> Option<&'static WakeEvent> {
     use std::sync::OnceLock;
     static EV: OnceLock<Option<&'static WakeEvent>> = OnceLock::new();
@@ -650,41 +578,43 @@ fn input_thread_body(mut st: State) {
     });
     let _ = st.conn.flush();
 
-    let xcb_fd = unsafe { BorrowedFd::borrow_raw(st.conn.as_raw_fd()) };
-    let shutdown_fd = x11_shutdown_waker().map(|ev| unsafe { BorrowedFd::borrow_raw(ev.fd()) });
+    let mut event_loop: EventLoop<'_, State> = match EventLoop::try_new() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("[x11] failed to create input event loop: {e}");
+            return;
+        }
+    };
+    let signal = event_loop.get_signal();
+    let handle = event_loop.handle();
 
-    let mut fds = vec![PollFd::new(xcb_fd, PollFlags::POLLIN)];
-    let shutdown_idx = shutdown_fd.map(|fd| {
-        fds.push(PollFd::new(fd, PollFlags::POLLIN));
-        fds.len() - 1
-    });
+    if let Err(e) =
+        handle.insert_source(XcbSource::new(st.conn.clone()), |ev, (), st: &mut State| {
+            handle_event(st, ev);
+        })
+    {
+        eprintln!("[x11] failed to register xcb event source: {e}");
+        return;
+    }
 
-    loop {
-        match poll(&mut fds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => continue,
-            Err(_) => break,
-            Ok(_) => {}
+    if let Some(ev) = x11_shutdown_waker() {
+        // `Drain::Never`: the geometry loop waits on the same eventfd, and
+        // level-triggered-undrained is what lets both threads see one signal.
+        let res = handle.insert_source(WakeSource::new(ev.fd(), Drain::Never), move |(), (), _| {
+            signal.stop();
+        });
+        if let Err(e) = res {
+            eprintln!("[x11] failed to register shutdown source: {e}");
+            return;
         }
-        let revents = |idx: Option<usize>| {
-            idx.and_then(|i| fds[i].revents())
-                .unwrap_or(PollFlags::empty())
-        };
+    }
 
-        if revents(shutdown_idx).contains(PollFlags::POLLIN) {
-            break;
-        }
-        if revents(Some(0))
-            .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
-        {
-            break;
-        }
-        while let Ok(Some(ev)) = st.conn.poll_for_event() {
-            handle_event(&mut st, ev);
-        }
+    if let Err(e) = event_loop.run(None, &mut st, |_| {}) {
+        eprintln!("[x11] input event loop exited: {e}");
     }
 }
 
-fn cursor_thread_body(screen_num: i32, window: u32, mailbox: Arc<CursorMailbox>) {
+fn cursor_thread_body(screen_num: i32, window: u32, requests: Channel<CursorShape>) {
     let Some(conn) = crate::x11_state::x11rb_conn() else {
         return;
     };
@@ -704,107 +634,89 @@ fn cursor_thread_body(screen_num: i32, window: u32, mailbox: Arc<CursorMailbox>)
         cursor_handle,
     };
 
-    let mut fds: Vec<PollFd> = mailbox
-        .wake
-        .as_ref()
-        .map(|w| {
-            vec![PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(w.fd()) },
-                PollFlags::POLLIN,
-            )]
-        })
-        .unwrap_or_default();
+    let mut event_loop: EventLoop<'_, CursorState> = match EventLoop::try_new() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("[x11] failed to create cursor event loop: {e}");
+            return;
+        }
+    };
+    let signal = event_loop.get_signal();
+    let res = event_loop
+        .handle()
+        .insert_source(requests, move |ev, (), st: &mut CursorState| match ev {
+            ChannelEvent::Msg(shape) => apply_cursor(st, shape),
+            ChannelEvent::Closed => signal.stop(),
+        });
+    if let Err(e) = res {
+        eprintln!("[x11] failed to register cursor request source: {e}");
+        return;
+    }
 
-    loop {
-        match poll(&mut fds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => continue,
-            Err(_) => break,
-            Ok(_) => {}
-        }
-        if !fds
-            .first()
-            .and_then(PollFd::revents)
-            .is_some_and(|r| r.contains(PollFlags::POLLIN))
-        {
-            continue;
-        }
-        if let Some(w) = &mailbox.wake {
-            w.drain();
-        }
-        if mailbox.should_shutdown() {
-            break;
-        }
-        drain_cursor_requests(&mut st, &mailbox);
+    if let Err(e) = event_loop.run(None, &mut st, |_| {}) {
+        eprintln!("[x11] cursor event loop exited: {e}");
     }
 }
 
-fn input_dispatch_thread_body(mailbox: Arc<InputMailbox>) {
-    let mut fds: Vec<PollFd> = mailbox
-        .wake
-        .as_ref()
-        .map(|w| {
-            vec![PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(w.fd()) },
-                PollFlags::POLLIN,
-            )]
-        })
-        .unwrap_or_default();
+fn dispatch_input_event(ev: QueuedInputEvent) {
+    match ev {
+        QueuedInputEvent::KeyRaw {
+            sym,
+            native,
+            modifiers,
+            pressed,
+        } => jfn_input_dispatch_key_raw(sym, native, modifiers, pressed),
+        QueuedInputEvent::Char {
+            cp,
+            modifiers,
+            native,
+        } => jfn_input_dispatch_char(cp, modifiers, native),
+        QueuedInputEvent::HistoryNav { forward } => jfn_input_dispatch_history_nav(forward),
+        QueuedInputEvent::MouseButton {
+            code,
+            pressed,
+            x,
+            y,
+            modifiers,
+        } => jfn_input_dispatch_mouse_button(code, pressed, x, y, modifiers),
+        QueuedInputEvent::MouseMove {
+            x,
+            y,
+            modifiers,
+            leave,
+        } => jfn_input_dispatch_mouse_move(x, y, modifiers, leave),
+        QueuedInputEvent::Scroll {
+            x,
+            y,
+            dx,
+            dy,
+            modifiers,
+        } => jfn_input_dispatch_scroll(x, y, dx, dy, modifiers),
+    }
+}
 
-    loop {
-        match poll(&mut fds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => continue,
-            Err(_) => break,
-            Ok(_) => {}
+fn input_dispatch_thread_body(events: Channel<QueuedInputEvent>) {
+    let mut event_loop: EventLoop<'_, ()> = match EventLoop::try_new() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("[x11] failed to create input dispatch event loop: {e}");
+            return;
         }
-        if !fds
-            .first()
-            .and_then(PollFd::revents)
-            .is_some_and(|r| r.contains(PollFlags::POLLIN))
-        {
-            continue;
-        }
-        if let Some(w) = &mailbox.wake {
-            w.drain();
-        }
-        if mailbox.should_shutdown() {
-            break;
-        }
-        for ev in mailbox.drain() {
-            match ev {
-                QueuedInputEvent::KeyRaw {
-                    sym,
-                    native,
-                    modifiers,
-                    pressed,
-                } => jfn_input_dispatch_key_raw(sym, native, modifiers, pressed),
-                QueuedInputEvent::Char {
-                    cp,
-                    modifiers,
-                    native,
-                } => jfn_input_dispatch_char(cp, modifiers, native),
-                QueuedInputEvent::HistoryNav { forward } => jfn_input_dispatch_history_nav(forward),
-                QueuedInputEvent::MouseButton {
-                    code,
-                    pressed,
-                    x,
-                    y,
-                    modifiers,
-                } => jfn_input_dispatch_mouse_button(code, pressed, x, y, modifiers),
-                QueuedInputEvent::MouseMove {
-                    x,
-                    y,
-                    modifiers,
-                    leave,
-                } => jfn_input_dispatch_mouse_move(x, y, modifiers, leave),
-                QueuedInputEvent::Scroll {
-                    x,
-                    y,
-                    dx,
-                    dy,
-                    modifiers,
-                } => jfn_input_dispatch_scroll(x, y, dx, dy, modifiers),
-            }
-        }
+    };
+    let signal = event_loop.get_signal();
+    let res = event_loop
+        .handle()
+        .insert_source(events, move |ev, (), ()| match ev {
+            ChannelEvent::Msg(ev) => dispatch_input_event(ev),
+            ChannelEvent::Closed => signal.stop(),
+        });
+    if let Err(e) = res {
+        eprintln!("[x11] failed to register input dispatch source: {e}");
+        return;
+    }
+
+    if let Err(e) = event_loop.run(None, &mut (), |()| {}) {
+        eprintln!("[x11] input dispatch event loop exited: {e}");
     }
 }
 
@@ -842,8 +754,8 @@ pub fn start(screen_num: i32, parent: u32) -> Option<Handle> {
         eprintln!("[x11] xcb input connection unavailable");
         return None;
     };
-    let mailbox = Arc::new(CursorMailbox::new());
-    let input_mailbox = Arc::new(InputMailbox::new());
+    let (cursor, cursor_requests) = CursorChannel::new();
+    let (dispatch, dispatch_events) = channel();
     let (root, net_active_window) = crate::x11_state::host()
         .map(|h| (h.root, h.atoms.net_active_window))
         .unwrap_or((0, 0));
@@ -861,14 +773,13 @@ pub fn start(screen_num: i32, parent: u32) -> Option<Handle> {
         ptr_x: 0,
         ptr_y: 0,
         mouse_button_modifiers: 0,
-        mailbox: mailbox.clone(),
-        input_mailbox: input_mailbox.clone(),
+        cursor: cursor.clone(),
+        dispatch: dispatch.clone(),
     };
 
-    let input_thread_mailbox = input_mailbox.clone();
     let input_join = match std::thread::Builder::new()
         .name("jfn-x11-input-dispatch".into())
-        .spawn(move || input_dispatch_thread_body(input_thread_mailbox))
+        .spawn(move || input_dispatch_thread_body(dispatch_events))
     {
         Ok(j) => j,
         Err(e) => {
@@ -877,10 +788,9 @@ pub fn start(screen_num: i32, parent: u32) -> Option<Handle> {
         }
     };
 
-    let cursor_mailbox = mailbox.clone();
     let cursor_join = match std::thread::Builder::new()
         .name("jfn-x11-cursor".into())
-        .spawn(move || cursor_thread_body(screen_num, parent, cursor_mailbox))
+        .spawn(move || cursor_thread_body(screen_num, parent, cursor_requests))
     {
         Ok(j) => j,
         Err(e) => {
@@ -904,8 +814,8 @@ pub fn start(screen_num: i32, parent: u32) -> Option<Handle> {
         join: Some(join),
         cursor_join: Some(cursor_join),
         input_join: Some(input_join),
-        mailbox,
-        input_mailbox,
+        cursor: Some(cursor),
+        dispatch: Some(dispatch),
     })
 }
 
@@ -948,5 +858,7 @@ pub fn grab_overlay_input(window: u32) {
 }
 
 pub fn set_cursor(handle: &Handle, shape: CursorShape) {
-    handle.mailbox.push(CursorReq::Set(shape));
+    if let Some(cursor) = handle.cursor.as_ref() {
+        cursor.set(shape);
+    }
 }

@@ -1,14 +1,13 @@
 use std::ffi::c_void;
 use std::num::{NonZeroI32, NonZeroU64};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
-use nix::errno::Errno;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::thread::{self, JoinHandle};
 
+use calloop::{EventLoop, LoopSignal, ping::PingSource};
+use calloop_wayland_source::WaylandSource;
 use parking_lot::Mutex;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Surface};
@@ -187,7 +186,7 @@ impl RootShared {
 
     fn wake(&self) {
         if let Some(t) = self.thread.get() {
-            t.wake.signal();
+            t.ping.ping();
         }
     }
 
@@ -333,6 +332,7 @@ struct RootState {
     present: Option<Presented>,
     scale_discovery: ScaleDiscovery,
     pre_fs_maximized: bool,
+    stop: Arc<AtomicBool>,
 }
 
 impl RootState {
@@ -1058,13 +1058,13 @@ const BG_SET: u32 = 1 << 24;
 // requests it here, so geometry, overlay and video always land in one
 // uninterruptible root commit; no other thread can commit the root between a
 // geometry change and its children.
-// Teardown handle for the dispatch thread. Without it the thread sits in
-// `poll(-1)` holding a `wl_display` read barrier; when no video ever played the
+// Teardown handle for the dispatch thread. Without it the thread sleeps in
+// calloop holding a `wl_display` read barrier; when no video ever played the
 // display is quiet, so the barrier is never released and mpv's VO-teardown
 // roundtrip hangs forever. `cleanup` signals + joins before that roundtrip.
 struct RootThread {
     stop: Arc<AtomicBool>,
-    wake: Arc<jfn_wake_event::WakeEvent>,
+    ping: calloop::ping::Ping,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 /// Stop and join the dispatch thread, releasing its `wl_display` read barrier.
@@ -1077,8 +1077,6 @@ pub(crate) fn cleanup(rt: &'static WlRuntime) {
     rt.root().wake();
     if let Some(h) = t.handle.lock().take() {
         let _ = h.join();
-        // The WakeEvent's fd is owned by this process-lifetime RootThread and
-        // closes with it; no manual close.
     }
 }
 
@@ -1223,6 +1221,15 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
 
     let _ = rt.root().window.set(window.clone());
 
+    let (ping, stop_source) = match calloop::ping::make_ping() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(target: "Main", "root window: ping: {e}");
+            return;
+        }
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+
     let state = RootState {
         rt,
         registry_state: RegistryState::new(&globals),
@@ -1260,23 +1267,17 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
         present: None,
         scale_discovery: ScaleDiscovery::Idle,
         pre_fs_maximized: false,
+        stop: stop.clone(),
     };
 
-    let Some(wake) = jfn_wake_event::WakeEvent::new().map(Arc::new) else {
-        tracing::error!(target: "Main", "root window: eventfd failed");
-        return;
-    };
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
-    let wake_thread = wake.clone();
     match thread::Builder::new()
         .name("wl-root".into())
-        .spawn(move || root_loop(queue, state, wake_thread, stop_thread))
+        .spawn(move || root_loop(conn, queue, state, stop_source))
     {
         Ok(handle) => {
             let _ = rt.root().thread.set(RootThread {
                 stop,
-                wake,
+                ping,
                 handle: Mutex::new(Some(handle)),
             });
         }
@@ -1289,19 +1290,28 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
 // Apply queued fullscreen / window-control / background-color requests. Runs on
 // the root thread each iteration before it blocks, so a request enqueued before
 // the wake fd could ring is still serviced without waiting for another event.
-fn service_root_requests(state: &mut RootState) {
+fn service_root_requests(state: &mut RootState) -> bool {
+    let mut applied = false;
     match state.rt.root().pending_fs.swap(FS_NONE, Ordering::Acquire) {
-        FS_ON => apply_fullscreen(state, true),
-        FS_OFF => apply_fullscreen(state, false),
+        FS_ON => {
+            apply_fullscreen(state, true);
+            applied = true;
+        }
+        FS_OFF => {
+            apply_fullscreen(state, false);
+            applied = true;
+        }
         FS_TOGGLE => {
             let on = !matches!(state.mode, crate::window_state::WindowMode::Fullscreen);
             apply_fullscreen(state, on);
+            applied = true;
         }
         _ => {}
     }
     // Drain into a local first so the queue lock isn't held while issuing
     // protocol requests.
     let cmds = std::mem::take(&mut *state.rt.root().commands.lock());
+    applied |= !cmds.is_empty();
     for cmd in cmds {
         apply_command(state, cmd);
     }
@@ -1309,6 +1319,7 @@ fn service_root_requests(state: &mut RootState) {
         && bg != state.bg
     {
         state.bg = bg;
+        applied = true;
         // current_size is only set once presented, so the capability is present
         // too; requiring it keeps the buffer attach behind an ack.
         if let (Some(size), Some(present)) = (state.current_size, state.present) {
@@ -1322,112 +1333,109 @@ fn service_root_requests(state: &mut RootState) {
                 .store(true, Ordering::Release);
         }
     }
+    applied
 }
 
-// Coordinates with the other readers on the shared fd via prepare_read + poll
-// (a blocking dispatch here would deadlock them). A wake eventfd lets `cleanup`
-// break the poll so the read barrier is released at shutdown.
-fn root_loop(
-    mut queue: EventQueue<RootState>,
-    mut state: RootState,
-    wake: Arc<jfn_wake_event::WakeEvent>,
-    stop: Arc<AtomicBool>,
-) {
-    let conn = state.conn.clone();
-    let fd = conn.as_fd().as_raw_fd();
-    let wake_fd = wake.fd();
-    loop {
-        if queue.dispatch_pending(&mut state).is_err() {
-            break;
-        }
-        // The batch is drained: a preferred_scale queued behind the configure
-        // has dispatched by now, so only a genuinely absent scale spawns the
-        // fallback probe — and a completed probe re-plans presentation here,
-        // on the thread that owns the surface.
-        if state
-            .rt
-            .root()
-            .scale_fallback_fed
-            .swap(false, Ordering::AcqRel)
-        {
-            state.try_present();
-        }
-        state.service_scale_discovery();
-        // Service queued control work before the blocking poll, not only after a
-        // wake: wake_root_thread is a no-op until ROOT_THREAD is published, so a
-        // request stored during that startup window rings no fd and would
-        // otherwise sleep here until an unrelated compositor event arrives.
-        service_root_requests(&mut state);
-        // Drain here, before the blocking poll: an event handler (configure,
-        // scale) that raised the latch during dispatch must commit now, or the
-        // loop blocks in poll with the compositor still awaiting our commit.
-        // Gate on the present capability so a pre-configure request stays
-        // latched, not lost — swapping the latch only once we can present.
-        if let Some(present) = state.present
-            && state
+impl RootState {
+    /// Everything that must happen before the loop sleeps, repeated until it
+    /// stops making progress: a step's effects (a fed scale raising the present
+    /// latch, a command queued by a popup callback) are themselves work for the
+    /// steps around it, so one pass can leave the state unsettled.
+    fn settle(&mut self) {
+        loop {
+            let mut progressed = false;
+            if self
                 .rt
                 .root()
-                .pending_present
-                .swap(false, Ordering::Acquire)
-        {
-            state.present_transaction(present);
+                .scale_fallback_fed
+                .swap(false, Ordering::AcqRel)
+            {
+                self.try_present();
+                progressed = true;
+            }
+            // The batch is drained: a preferred_scale queued behind the
+            // configure has dispatched by now, so only a genuinely absent scale
+            // spawns the fallback probe.
+            self.service_scale_discovery();
+            // Service queued control work before the sleep, not only after a
+            // wake: the ping is a no-op until RootThread is published, so a
+            // request stored during that startup window rings no fd and would
+            // otherwise sleep here until an unrelated compositor event arrives.
+            progressed |= service_root_requests(self);
+            // Drain the latch before the sleep: an event handler (configure,
+            // scale) that raised it during dispatch must commit now, or the loop
+            // sleeps with the compositor still awaiting our commit. Gate on the
+            // present capability so a pre-configure request stays latched, not
+            // lost — swapping the latch only once we can present.
+            if let Some(present) = self.present
+                && self
+                    .rt
+                    .root()
+                    .pending_present
+                    .swap(false, Ordering::Acquire)
+            {
+                self.present_transaction(present);
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
         }
-        let _ = conn.flush();
+        let _ = self.conn.flush();
+    }
+}
 
-        // A probe completion between the check above and here must not strand
-        // its result until the next compositor event (its wake can be lost if
-        // ROOT_THREAD isn't published yet); re-run the loop instead of polling.
-        if state.rt.root().scale_fallback_fed.load(Ordering::Acquire) {
-            continue;
+// The root queue is driven by calloop: `WaylandSource` owns the prepare_read /
+// poll / read dance, which must coordinate with the other readers on the shared
+// fd (a blocking dispatch here would deadlock them). A stop ping ends the loop
+// so the `wl_display` read barrier is released at shutdown.
+fn root_loop(
+    conn: Connection,
+    queue: EventQueue<RootState>,
+    mut state: RootState,
+    stop_source: PingSource,
+) {
+    let mut event_loop = match EventLoop::<RootState>::try_new() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(target: "Main", "root window: event loop: {e}");
+            return;
         }
-        let guard = match queue.prepare_read() {
-            Some(g) => g,
-            None => continue,
-        };
-        let mut pfds = [
-            PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, PollFlags::POLLIN),
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(wake_fd) },
-                PollFlags::POLLIN,
-            ),
-        ];
-        match poll(&mut pfds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => {
-                drop(guard);
-                continue;
-            }
-            Err(_) => {
-                drop(guard);
-                break;
-            }
-            Ok(_) => {}
+    };
+    let handle = event_loop.handle();
+    let signal: LoopSignal = event_loop.get_signal();
+    if let Err(e) = handle.insert_source(stop_source, move |(), (), state: &mut RootState| {
+        if state.stop.load(Ordering::Relaxed) {
+            signal.stop();
         }
-        let revents = |i: usize| pfds[i].revents().unwrap_or(PollFlags::empty());
-        if revents(0).contains(PollFlags::POLLIN) {
-            if guard.read().is_err() {
-                break;
-            }
+    }) {
+        tracing::error!(target: "Main", "root window: stop source: {e}");
+        return;
+    }
+    let inserted = handle.insert_source(
+        WaylandSource::new(conn, queue),
+        |_, queue, state: &mut RootState| {
+            let dispatched = queue.dispatch_pending(state)?;
             // This thread is the sole reader of the shared display; the read
-            // above distributes events to every queue on it. Pump the CEF
+            // that woke us distributed events to every queue on it. Pump the CEF
             // overlay queue so its `wl_buffer.release` events are processed and
             // retired buffers get destroyed.
             crate::wl_state::pump_events(state.rt);
-        } else {
-            drop(guard);
-        }
-        if revents(0).intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
-            break;
-        }
-        if revents(1).contains(PollFlags::POLLIN) {
-            wake.drain();
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-        }
+            Ok(dispatched)
+        },
+    );
+    if let Err(e) = inserted {
+        tracing::error!(target: "Main", "root window: wayland source: {e}");
+        return;
+    }
+    // `run` calls its callback only after a dispatch, so settle once here or
+    // work queued before the loop started would wait for the first event.
+    state.settle();
+    if let Err(e) = event_loop.run(None, &mut state, RootState::settle) {
+        tracing::error!(target: "Main", "root window: event loop: {e}");
     }
     // Do not drain the bg's release here: this thread shares the wl_display fd
-    // with the other readers via prepare_read/poll, so a blocking roundtrip
-    // would deadlock them.
+    // with the other readers, so a blocking roundtrip would deadlock them.
     state.bg_buffer = None;
 }
 

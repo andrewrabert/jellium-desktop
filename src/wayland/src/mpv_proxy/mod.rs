@@ -20,7 +20,6 @@ use std::sync::{OnceLock, mpsc};
 use std::thread;
 
 use error_reporter::Report;
-use jfn_wake_event::WakeEvent;
 use parking_lot::Mutex;
 use wl_proxy::client::ClientHandler;
 use wl_proxy::protocols::fractional_scale_v1::wp_fractional_scale_manager_v1::{
@@ -68,10 +67,7 @@ pub(crate) struct ProxyShared {
     // `client_id()` on client M. Same wire object => the two ids are equal.
     mpv_video_surface_id: AtomicU32,
     app_client_fd: AtomicI32,
-    /// Owns the S_mpv thread's wake eventfd. Writers signal, and teardown
-    /// clears it, under this lock — so a wake can never write to a descriptor
-    /// that has been closed (and possibly reused) out from under it.
-    mpv_wake: Mutex<Option<WakeEvent>>,
+    mpv_wake: Mutex<Option<calloop::ping::Ping>>,
     proxy: OnceLock<Proxy>,
 }
 
@@ -110,8 +106,8 @@ impl ProxyShared {
     }
 
     fn wake_mpv_thread(&self) {
-        if let Some(wake) = self.mpv_wake.lock().as_ref() {
-            wake.signal();
+        if let Some(ping) = self.mpv_wake.lock().as_ref() {
+            ping.ping();
         }
     }
 

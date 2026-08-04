@@ -6,13 +6,11 @@
 //! to C++ as primitives via JfnInputCallbacks so no CEF-typed structs cross
 //! the FFI boundary.
 
-use nix::errno::Errno;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::sys::time::TimeSpec;
-use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{EventLoop, LoopHandle, LoopSignal, ping::PingSource};
+use calloop_wayland_source::WaylandSource;
 use parking_lot::Mutex;
 use std::ffi::{c_int, c_void};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{self, JoinHandle};
@@ -212,7 +210,12 @@ struct State {
 
     menu_focus: bool,
 
-    repeat_timer: TimerFd,
+    stop: Arc<AtomicBool>,
+    signal: Option<LoopSignal>,
+    loop_handle: Option<LoopHandle<'static, State>>,
+    /// Bumped by every arm/disarm; a timer whose generation is stale drops
+    /// itself instead of firing, so no source is ever removed mid-dispatch.
+    repeat_generation: u64,
     repeat_rate: i32,
     repeat_delay: i32,
     repeat_key: Option<KeyEvent>,
@@ -259,22 +262,38 @@ impl State {
             self.disarm_repeat();
             return;
         }
+        self.disarm_repeat();
         self.repeat_key = Some(key);
-        // A zero start disarms the timer outright regardless of the
-        // interval, so a reported delay/rate of 0 must not reach 0ms.
-        let period_ms = (1000u32 / self.repeat_rate as u32).max(1);
-        let expiration = Expiration::IntervalDelayed(
-            ms_to_timespec(self.repeat_delay.max(1) as u32),
-            ms_to_timespec(period_ms),
+        let generation = self.repeat_generation;
+        // A zero delay would fire the first repeat in the same breath as the
+        // press, so a reported delay/rate of 0 must not reach 0ms.
+        let period = Duration::from_millis(u64::from((1000u32 / self.repeat_rate as u32).max(1)));
+        let delay = Duration::from_millis(self.repeat_delay.max(1) as u64);
+        let Some(handle) = self.loop_handle.clone() else {
+            return;
+        };
+        let inserted = handle.insert_source(
+            Timer::from_duration(delay),
+            move |_, (), state: &mut State| {
+                if state.repeat_generation != generation {
+                    return TimeoutAction::Drop;
+                }
+                state.fire_key_repeat();
+                if state.repeat_generation != generation {
+                    return TimeoutAction::Drop;
+                }
+                TimeoutAction::ToDuration(period)
+            },
         );
-        let _ = self
-            .repeat_timer
-            .set(expiration, TimerSetTimeFlags::empty());
+        if let Err(e) = inserted {
+            tracing::error!(target: "Main", "input: repeat timer: {e}");
+            self.repeat_key = None;
+        }
     }
 
     fn disarm_repeat(&mut self) {
         self.repeat_key = None;
-        let _ = self.repeat_timer.unset();
+        self.repeat_generation = self.repeat_generation.wrapping_add(1);
     }
 
     fn send_key(&self, event: &KeyEvent, pressed: bool) {
@@ -308,10 +327,6 @@ impl State {
         }
         self.send_key(&event, true);
     }
-}
-
-fn ms_to_timespec(ms: u32) -> TimeSpec {
-    TimeSpec::from_duration(Duration::from_millis(u64::from(ms)))
 }
 
 impl ProvidesRegistryState for State {
@@ -893,114 +908,63 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
 
 pub struct InputThread {
     cursor_type: Arc<AtomicU32>,
-    set_cursor_inbox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    wake: Arc<jfn_wake_event::WakeEvent>,
+    ping: calloop::ping::Ping,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-fn worker_loop(
+// The display fd is shared with other readers; a blocking dispatch here would
+// deadlock them, so the queue is driven through `WaylandSource`.
+fn run_input_loop(
     conn: Connection,
-    mut queue: wayland_client::EventQueue<State>,
+    queue: wayland_client::EventQueue<State>,
     mut state: State,
-    wake: Arc<jfn_wake_event::WakeEvent>,
-    stop: Arc<AtomicBool>,
-    cursor_type: Arc<AtomicU32>,
-    set_cursor_inbox: Arc<AtomicBool>,
+    wake: PingSource,
 ) {
-    let display_fd = conn.as_fd().as_raw_fd();
-    let wake_fd = wake.fd();
-    let repeat_fd = state.repeat_timer.as_fd().as_raw_fd();
-    loop {
-        // Apply any pending cursor change before we block.
-        if set_cursor_inbox.swap(false, Ordering::Acquire) {
-            // cursor_type already reflects the desired value (writer updates
-            // it before signalling); this just ensures we re-issue the
-            // Wayland request on the current pointer/serial.
-            state.apply_cursor(&conn);
-            let _ = conn.flush();
+    let mut event_loop = match EventLoop::<State>::try_new() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(target: "Main", "input: event loop: {e}");
+            return;
         }
+    };
+    let handle = event_loop.handle();
+    state.signal = Some(event_loop.get_signal());
+    state.loop_handle = Some(handle.clone());
 
-        let _ = queue.dispatch_pending(&mut state);
-        let _ = conn.flush();
-
-        let read_guard = match queue.prepare_read() {
-            Some(g) => g,
-            None => continue,
-        };
-
-        let mut pfds = [
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(display_fd) },
-                PollFlags::POLLIN,
-            ),
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(wake_fd) },
-                PollFlags::POLLIN,
-            ),
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(repeat_fd) },
-                PollFlags::POLLIN,
-            ),
-        ];
-        match poll(&mut pfds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => {
-                drop(read_guard);
-                continue;
-            }
-            Err(_) => {
-                drop(read_guard);
-                break;
-            }
-            Ok(_) => {}
+    let wake_conn = conn.clone();
+    let stop = state.stop.clone();
+    if let Err(e) = handle.insert_source(wake, move |(), (), state: &mut State| {
+        state.apply_cursor(&wake_conn);
+        let _ = wake_conn.flush();
+        if stop.load(Ordering::Relaxed)
+            && let Some(signal) = &state.signal
+        {
+            signal.stop();
         }
-        let revents = |i: usize| pfds[i].revents().unwrap_or(PollFlags::empty());
-
-        if revents(0).contains(PollFlags::POLLIN) {
-            if read_guard.read().is_err() {
-                break;
-            }
-        } else {
-            drop(read_guard);
-        }
-        if revents(0).intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
-            break;
-        }
-        if revents(1).contains(PollFlags::POLLIN) {
-            wake.drain();
-            // Wake reasons: cursor change request, or cleanup.
-            if stop.load(Ordering::Relaxed) {
-                let _ = queue.dispatch_pending(&mut state);
-                break;
-            }
-            // Cursor change is handled at the top of the next iteration.
-        }
-        // Dispatch before the repeat fd: an unread release event would
-        // otherwise leave state.repeat_key stale for this check.
-        let _ = queue.dispatch_pending(&mut state);
-
-        if revents(2).contains(PollFlags::POLLIN) {
-            // Drain the expiration count so a level-triggered re-fire
-            // doesn't spin the loop, then resend the held key.
-            let mut buf = [0u8; 8];
-            let _ = nix::unistd::read(unsafe { BorrowedFd::borrow_raw(repeat_fd) }, &mut buf);
-            state.fire_key_repeat();
-        }
+    }) {
+        tracing::error!(target: "Main", "input: wake source: {e}");
+        return;
     }
-
-    let _ = cursor_type;
+    if let Err(e) = handle.insert_source(
+        WaylandSource::new(conn, queue),
+        |_, queue, state: &mut State| queue.dispatch_pending(state),
+    ) {
+        tracing::error!(target: "Main", "input: wayland source: {e}");
+        return;
+    }
+    if let Err(e) = event_loop.run(None, &mut state, |_| {}) {
+        tracing::error!(target: "Main", "input: event loop: {e}");
+    }
 }
 
 fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Option<InputThread> {
     if display.is_null() {
         return None;
     }
-    let wake = Arc::new(jfn_wake_event::WakeEvent::new()?);
-    let repeat_timer = TimerFd::new(
-        ClockId::CLOCK_MONOTONIC,
-        TimerFlags::TFD_NONBLOCK | TimerFlags::TFD_CLOEXEC,
-    )
-    .ok()?;
+    let (ping, wake) = calloop::ping::make_ping()
+        .inspect_err(|e| tracing::error!(target: "Main", "input: ping: {e}"))
+        .ok()?;
     let backend = unsafe { Backend::from_foreign_display(display as *mut _) };
     let conn = Connection::from_backend(backend);
     let (globals, queue) = registry_queue_init::<State>(&conn).ok()?;
@@ -1017,7 +981,7 @@ fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Opt
         .ok()?;
 
     let cursor_type = Arc::new(AtomicU32::new(CursorShape::Pointer.as_raw() as u32));
-    let set_cursor_inbox = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     *rt.seat().kb_focus_cb.lock() = cb.kb_focus;
 
     let state = State {
@@ -1047,33 +1011,20 @@ fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Opt
         modifiers: 0,
         cursor_type: cursor_type.clone(),
         menu_focus: false,
-        repeat_timer,
+        stop: stop.clone(),
+        signal: None,
+        loop_handle: None,
+        repeat_generation: 0,
         repeat_rate: 0,
         repeat_delay: 0,
         repeat_key: None,
     };
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let cursor_type_thread = cursor_type.clone();
-    let inbox_thread = set_cursor_inbox.clone();
-    let stop_thread = stop.clone();
-    let wake_thread = wake.clone();
-    let worker = thread::spawn(move || {
-        worker_loop(
-            conn,
-            queue,
-            state,
-            wake_thread,
-            stop_thread,
-            cursor_type_thread,
-            inbox_thread,
-        )
-    });
+    let worker = thread::spawn(move || run_input_loop(conn, queue, state, wake));
     Some(InputThread {
         cursor_type,
-        set_cursor_inbox,
         stop,
-        wake,
+        ping,
         worker: Mutex::new(Some(worker)),
     })
 }
@@ -1088,10 +1039,8 @@ pub fn init(
 
 impl InputThread {
     pub(crate) fn set_cursor(&self, cef_cursor_type: u32) {
-        self.cursor_type.store(cef_cursor_type, Ordering::Relaxed);
-        self.set_cursor_inbox.store(true, Ordering::Release);
-        // Wake the input thread so it picks up the cursor change.
-        self.wake.signal();
+        self.cursor_type.store(cef_cursor_type, Ordering::Release);
+        self.ping.ping();
     }
 
     /// Stop the worker and join it. Idempotent: a second call finds the join
@@ -1099,10 +1048,9 @@ impl InputThread {
     pub(crate) fn shutdown(&self, rt: &'static WlRuntime) {
         *rt.seat().kb_focus_cb.lock() = None;
         self.stop.store(true, Ordering::Relaxed);
-        self.wake.signal();
+        self.ping.ping();
         if let Some(w) = self.worker.lock().take() {
             let _ = w.join();
         }
-        // The WakeEvent closes its fd when the last Arc (worker's + this one) drops.
     }
 }

@@ -16,11 +16,12 @@ pub mod overlay_fsm;
 pub(crate) mod paint;
 pub mod paint_override;
 pub(crate) mod registry;
-pub(crate) mod resize_sync;
 pub(crate) mod scale;
 pub mod shm;
 pub mod surface;
 pub(crate) mod window_source;
+pub(crate) mod x11_source;
 pub(crate) mod x11_state;
+pub(crate) mod xcb_source;
 
 pub use paint_override::{X11PaintOverride, paint_override, set_paint_override};

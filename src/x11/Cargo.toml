@@ -15,6 +15,7 @@ parking_lot.workspace = true
 # elsewhere and the workspace builds uniformly on every platform.
 [target.'cfg(target_os = "linux")'.dependencies]
 arc-swap.workspace = true
+calloop.workspace = true
 cef.workspace = true
 cursor-icon = "1"
 slotmap.workspace = true

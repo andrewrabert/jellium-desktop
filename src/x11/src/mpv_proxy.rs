@@ -43,7 +43,7 @@
 use std::borrow::Cow;
 use std::io::{self, IoSlice, IoSliceMut, Write};
 use std::net::TcpStream;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -51,13 +51,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
+use calloop::generic::Generic;
+use calloop::{EventLoop, Interest, Mode, PostAction};
 use nix::errno::Errno;
-use nix::fcntl::OFlag;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{
     ControlMessage, ControlMessageOwned, MsgFlags, Shutdown, recvmsg, send, sendmsg, shutdown,
 };
-use nix::unistd::{pipe2, write};
 use parking_lot::Mutex;
 use x11rb::connection::Connection as _;
 use x11rb::reexports::x11rb_protocol::errors::ParseError;
@@ -112,7 +111,7 @@ enum DisplayEpoch {
 /// [`restore_real_display`].
 struct ProxyState {
     accept_thread: Option<JoinHandle<()>>,
-    shutdown_w: OwnedFd,
+    stop: calloop::ping::Ping,
     /// Filesystem socket to unlink (dropping the listener does not).
     fs_socket_path: PathBuf,
     xauth_temp: Option<PathBuf>,
@@ -123,7 +122,7 @@ struct ProxyState {
 
 impl Drop for ProxyState {
     fn drop(&mut self) {
-        let _ = write(&self.shutdown_w, &[1u8]);
+        self.stop.ping();
         if let Some(h) = self.accept_thread.take() {
             let _ = h.join();
         }
@@ -234,10 +233,10 @@ pub fn start() -> bool {
         return false;
     };
 
-    let (shutdown_r, shutdown_w) = match pipe2(OFlag::O_CLOEXEC) {
+    let (stop, stop_source) = match calloop::ping::make_ping() {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::error!(target: "Main", "proxy shutdown pipe failed: {e}");
+            tracing::error!(target: "Main", "proxy stop ping failed: {e}");
             let _ = std::fs::remove_file(&bound.fs_path);
             return false;
         }
@@ -254,7 +253,7 @@ pub fn start() -> bool {
     } = bound;
     let accept_thread = thread::Builder::new()
         .name("x11-proxy-accept".into())
-        .spawn(move || run_acceptor(abstract_l, fs_l, shutdown_r, upstream, roots))
+        .spawn(move || run_acceptor(abstract_l, fs_l, stop_source, upstream, roots))
         .ok();
     let Some(accept_thread) = accept_thread else {
         tracing::error!(target: "Main", "proxy accept thread spawn failed");
@@ -275,7 +274,7 @@ pub fn start() -> bool {
     tracing::info!(target: "Main", "x11 proxy listening on {new_display}");
     *guard = Some(ProxyState {
         accept_thread: Some(accept_thread),
-        shutdown_w,
+        stop,
         fs_socket_path: fs_path,
         xauth_temp,
         orig_display,
@@ -366,48 +365,56 @@ fn bind_listeners() -> Option<BoundListeners> {
 fn run_acceptor(
     abstract_l: UnixListener,
     fs_l: UnixListener,
-    shutdown_r: OwnedFd,
+    stop: calloop::ping::PingSource,
     upstream: Vec<UpstreamAddr>,
     roots: Arc<[u32]>,
 ) {
-    let listeners = [&abstract_l, &fs_l];
-    loop {
-        let mut fds = [
-            PollFd::new(abstract_l.as_fd(), PollFlags::POLLIN),
-            PollFd::new(fs_l.as_fd(), PollFlags::POLLIN),
-            PollFd::new(shutdown_r.as_fd(), PollFlags::POLLIN),
-        ];
-        match poll(&mut fds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => continue,
-            Err(_) => break,
-            Ok(_) => {}
+    let mut event_loop: EventLoop<'_, ()> = match EventLoop::try_new() {
+        Ok(el) => el,
+        Err(e) => {
+            tracing::error!(target: "x11-proxy", "acceptor event loop creation failed: {e}");
+            return;
         }
-        if fds[2].revents().is_some_and(|r| !r.is_empty()) {
-            break;
+    };
+    let signal = event_loop.get_signal();
+    let handle = event_loop.handle();
+
+    for listener in [abstract_l, fs_l] {
+        let upstream = upstream.clone();
+        let roots = roots.clone();
+        let res = handle.insert_source(
+            Generic::new(listener, Interest::READ, Mode::Level),
+            move |_readiness, listener, ()| {
+                accept_one(listener, &upstream, &roots);
+                Ok(PostAction::Continue)
+            },
+        );
+        if let Err(e) = res {
+            tracing::error!(target: "x11-proxy", "listener source registration failed: {e}");
+            return;
         }
-        let ready = [
-            fds[0]
-                .revents()
-                .is_some_and(|r| r.contains(PollFlags::POLLIN)),
-            fds[1]
-                .revents()
-                .is_some_and(|r| r.contains(PollFlags::POLLIN)),
-        ];
-        for (listener, ready) in listeners.iter().zip(ready) {
-            if !ready {
-                continue;
-            }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let up = upstream.clone();
-                    let roots = roots.clone();
-                    let _ = thread::Builder::new()
-                        .name("x11-proxy-conn".into())
-                        .spawn(move || handle_conn(stream, up, roots));
-                }
-                Err(e) => tracing::debug!(target: "x11-proxy", "accept failed: {e}"),
-            }
+    }
+
+    if let Err(e) = handle.insert_source(stop, move |(), (), ()| signal.stop()) {
+        tracing::error!(target: "x11-proxy", "stop source registration failed: {e}");
+        return;
+    }
+
+    if let Err(e) = event_loop.run(None, &mut (), |()| {}) {
+        tracing::error!(target: "x11-proxy", "acceptor event loop exited: {e}");
+    }
+}
+
+fn accept_one(listener: &UnixListener, upstream: &[UpstreamAddr], roots: &Arc<[u32]>) {
+    match listener.accept() {
+        Ok((stream, _)) => {
+            let up = upstream.to_vec();
+            let roots = roots.clone();
+            let _ = thread::Builder::new()
+                .name("x11-proxy-conn".into())
+                .spawn(move || handle_conn(stream, up, roots));
         }
+        Err(e) => tracing::debug!(target: "x11-proxy", "accept failed: {e}"),
     }
 }
 

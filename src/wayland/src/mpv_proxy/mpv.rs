@@ -1,16 +1,15 @@
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
+use calloop::generic::Generic;
+use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use error_reporter::Report;
-use jfn_wake_event::WakeEvent;
-use nix::errno::Errno;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use wl_proxy::baseline::Baseline;
 use wl_proxy::client::Client;
 use wl_proxy::object::{ConcreteObject, Object, ObjectCoreApi, ObjectRcUtils};
@@ -169,15 +168,36 @@ fn run_mpv_state(
     let ctx = MpvCtx::new(rt);
     state.set_handler(MpvShimStateH { ctx: ctx.clone() });
 
-    let Some(wake) = WakeEvent::new() else {
-        let _ = tx.send(Err("S_mpv eventfd failed".to_owned()));
-        return;
+    let (wake, wake_source) = match calloop::ping::make_ping() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx.send(Err(format!("S_mpv ping: {e}")));
+            return;
+        }
     };
-    // Cache the raw fd for this thread's own poll/drain; cross-thread wakes go
-    // through the shared wake handle under its lock, never this number.
-    let wake_fd = wake.fd();
+    let mut event_loop = match EventLoop::<MpvLoop>::try_new() {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = tx.send(Err(format!("S_mpv event loop: {e}")));
+            return;
+        }
+    };
+    let handle = event_loop.handle();
+    if let Err(e) = handle.insert_source(wake_source, |(), (), _: &mut MpvLoop| {}) {
+        let _ = tx.send(Err(format!("S_mpv wake source: {e}")));
+        return;
+    }
+    let poll_source = Generic::new(state.poll_fd().clone(), Interest::READ, Mode::Level);
+    let inserted = handle.insert_source(poll_source, |_, _, mpv: &mut MpvLoop| {
+        mpv.dispatch_available();
+        Ok(PostAction::Continue)
+    });
+    if let Err(e) = inserted {
+        let _ = tx.send(Err(format!("S_mpv poll source: {e}")));
+        return;
+    }
+
     *rt.proxy().mpv_wake.lock() = Some(wake);
-    // Clear (and close) the wake handle under the same lock a wake signals under.
     struct WakeGuard(&'static WlRuntime);
     impl Drop for WakeGuard {
         fn drop(&mut self) {
@@ -191,47 +211,48 @@ fn run_mpv_state(
     }
     drop(tx);
 
-    // Block on both the mpv connection and the size-feed wake fd so a resize
-    // reaches mpv without waiting out a poll timeout.
-    let poll_fd = state.poll_fd().as_raw_fd();
-    let mut seen_gen = 0;
-    while state.is_not_destroyed() {
-        // Reconcile before every blocking poll, not only after dispatch: a size
-        // raised before the wake handle was published (line above) delivers no
-        // wake, so servicing it here is the only thing that keeps it from
-        // sleeping out an infinite poll timeout on an otherwise-idle connection.
-        apply_window_size_mpv(&ctx, &mut seen_gen);
-        if let Err(e) = state.before_poll() {
+    let mut mpv = MpvLoop {
+        state,
+        ctx,
+        seen_gen: 0,
+        signal: event_loop.get_signal(),
+    };
+    // `run` calls its callback only after a dispatch, so settle once here or a
+    // size published before the loop started would wait for the first event.
+    mpv.settle();
+    if let Err(e) = event_loop.run(None, &mut mpv, MpvLoop::settle) {
+        eprintln!("proxy: S_mpv event loop: {e}");
+    }
+}
+
+struct MpvLoop {
+    state: Rc<State>,
+    ctx: MpvCtx,
+    seen_gen: u32,
+    signal: LoopSignal,
+}
+
+impl MpvLoop {
+    fn settle(&mut self) {
+        // Reconcile before every sleep, not only after dispatch: a size raised
+        // before the wake was published delivers no ping, so servicing it here is
+        // the only thing that keeps it from sleeping out an otherwise-idle
+        // connection's infinite timeout.
+        apply_window_size_mpv(&self.ctx, &mut self.seen_gen);
+        if let Err(e) = self.state.before_poll() {
             eprintln!("proxy: S_mpv before_poll: {}", Report::new(e));
+            self.signal.stop();
             return;
         }
-        let mut pfds = [
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(poll_fd) },
-                PollFlags::POLLIN,
-            ),
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(wake_fd) },
-                PollFlags::POLLIN,
-            ),
-        ];
-        match poll(&mut pfds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => continue,
-            Err(err) => {
-                eprintln!("proxy: S_mpv poll: {err}");
-                return;
-            }
-            Ok(_) => {}
+        if !self.state.is_not_destroyed() {
+            self.signal.stop();
         }
-        if pfds[1]
-            .revents()
-            .is_some_and(|r| r.contains(PollFlags::POLLIN))
-        {
-            jfn_wake_event::drain_raw_fd(wake_fd);
-        }
-        if let Err(e) = state.dispatch_available() {
+    }
+
+    fn dispatch_available(&mut self) {
+        if let Err(e) = self.state.dispatch_available() {
             eprintln!("proxy: S_mpv dispatch: {}", Report::new(e));
-            return;
+            self.signal.stop();
         }
     }
 }

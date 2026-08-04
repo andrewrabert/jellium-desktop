@@ -7,9 +7,7 @@
 //! managers. Mirrors mpv's clipboard-wayland.c: dedicated wl_display_connect,
 //! dedicated worker thread, no shared globals with the main display.
 
-use nix::errno::Errno;
 use nix::fcntl::OFlag;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use parking_lot::Mutex;
 use std::io::{ErrorKind, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -17,6 +15,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
+use calloop::generic::Generic;
+use calloop::ping::PingSource;
+use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, Readiness};
+use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
@@ -78,7 +80,7 @@ struct PendingCb {
 struct Shared {
     queued: Mutex<Vec<PendingCb>>,
     stop: AtomicBool,
-    wake: jfn_wake_event::WakeEvent,
+    ping: calloop::ping::Ping,
 }
 
 struct State {
@@ -249,155 +251,148 @@ fn start_receive(state: &mut State, conn: &Connection) -> Option<OwnedFd> {
     Some(read_end)
 }
 
-fn worker_loop(
+struct Worker {
     shared: Arc<Shared>,
     conn: Connection,
-    mut queue: wayland_client::EventQueue<State>,
-    mut state: State,
-) {
-    let display_fd = conn.as_fd().as_raw_fd();
-    let wake_fd = shared.wake.fd();
+    state: State,
+    signal: LoopSignal,
+    loop_handle: LoopHandle<'static, Worker>,
+    active: Option<(PendingCb, Vec<u8>)>,
+}
 
-    // (read_fd, callback, buffer) for the in-flight receive — at most one
-    // active at a time, matching the C++ implementation's natural
-    // back-pressure model.
-    let mut active: Option<(OwnedFd, PendingCb, Vec<u8>)> = None;
-
-    while !shared.stop.load(Ordering::Relaxed) {
-        // Drain anything already buffered before preparing a new read.
-        let _ = queue.dispatch_pending(&mut state);
-        let _ = conn.flush();
-
-        let read_guard = match queue.prepare_read() {
-            Some(g) => g,
-            None => continue,
+impl Worker {
+    fn promote_next(&mut self) {
+        if self.active.is_some() {
+            return;
+        }
+        let next = {
+            let mut q = self.shared.queued.lock();
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.remove(0))
+            }
         };
-
-        let mut pfds: Vec<PollFd> = Vec::with_capacity(3);
-        pfds.push(PollFd::new(
-            unsafe { BorrowedFd::borrow_raw(display_fd) },
-            PollFlags::POLLIN,
-        ));
-        pfds.push(PollFd::new(
-            unsafe { BorrowedFd::borrow_raw(wake_fd) },
-            PollFlags::POLLIN,
-        ));
-        if let Some((fd, _, _)) = &active {
-            pfds.push(PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) },
-                PollFlags::POLLIN,
-            ));
+        let Some(cb) = next else {
+            return;
+        };
+        let Some(fd) = start_receive(&mut self.state, &self.conn) else {
+            fire(cb, &[]);
+            self.drain_queued();
+            return;
+        };
+        let inserted = self.loop_handle.insert_source(
+            Generic::new(fd, Interest::READ, Mode::Level),
+            |readiness, fd, worker: &mut Worker| Ok(worker.on_receive_ready(readiness, fd.as_fd())),
+        );
+        if let Err(e) = inserted {
+            tracing::warn!(target: "Main", "clipboard: receive source: {e}");
+            fire(cb, &[]);
+            return;
         }
+        self.active = Some((cb, Vec::new()));
+    }
 
-        match poll(&mut pfds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => {
-                drop(read_guard);
-                continue;
-            }
-            Err(_) => {
-                drop(read_guard);
-                break;
-            }
-            Ok(_) => {}
-        }
-        let revents_at =
-            |pfds: &[PollFd], i: usize| pfds[i].revents().unwrap_or(PollFlags::empty());
-
-        if revents_at(&pfds, 0).contains(PollFlags::POLLIN) {
-            if read_guard.read().is_err() {
-                break;
-            }
-        } else {
-            drop(read_guard);
-        }
-        if revents_at(&pfds, 0)
-            .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
-        {
-            break;
-        }
-
-        if revents_at(&pfds, 1).contains(PollFlags::POLLIN) {
-            shared.wake.drain();
-            let _ = queue.dispatch_pending(&mut state);
-        }
-
-        // Active receive.
-        if let Some((fd, _, buf)) = active.as_mut()
-            && pfds.len() > 2
-        {
-            let revents = revents_at(&pfds, 2);
-            let mut done = false;
-            if revents.contains(PollFlags::POLLIN) {
-                let mut tmp = [0u8; 4096];
-                let mut file = unsafe { std::fs::File::from_raw_fd(fd.as_raw_fd()) };
-                loop {
-                    match file.read(&mut tmp) {
-                        Ok(0) => {
-                            done = true;
-                            break;
-                        }
-                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(_) => {
-                            done = true;
-                            break;
-                        }
+    fn on_receive_ready(&mut self, readiness: Readiness, fd: BorrowedFd<'_>) -> PostAction {
+        let Some((_, buf)) = self.active.as_mut() else {
+            return PostAction::Remove;
+        };
+        let mut done = readiness.error;
+        if readiness.readable {
+            let mut tmp = [0u8; 4096];
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd.as_raw_fd()) };
+            loop {
+                match file.read(&mut tmp) {
+                    Ok(0) => {
+                        done = true;
+                        break;
                     }
-                }
-                // Don't let File drop close the fd — it's owned by OwnedFd above.
-                let _ = file.into_raw_fd();
-            }
-            if revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL) {
-                done = true;
-            }
-            if done && let Some((_, cb, buf)) = active.take() {
-                fire(cb, &buf);
-            }
-        }
-
-        // Promote the next queued request if the active slot is free.
-        if active.is_none() {
-            let next = {
-                let mut q = shared.queued.lock();
-                if q.is_empty() {
-                    None
-                } else {
-                    Some(q.remove(0))
-                }
-            };
-            if let Some(cb) = next {
-                match start_receive(&mut state, &conn) {
-                    Some(fd) => active = Some((fd, cb, Vec::new())),
-                    None => {
-                        fire(cb, &[]);
-                        // Anything else queued has the same problem (no offer,
-                        // no text mime, pipe failure) — drain with empty results.
-                        let drained: Vec<PendingCb> = {
-                            let mut q = shared.queued.lock();
-                            std::mem::take(&mut *q)
-                        };
-                        for cb in drained {
-                            fire(cb, &[]);
-                        }
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        done = true;
+                        break;
                     }
                 }
             }
+            // Don't let File's drop close the fd — the source's OwnedFd owns it.
+            let _ = file.into_raw_fd();
         }
-
-        let _ = queue.dispatch_pending(&mut state);
+        if !done {
+            return PostAction::Continue;
+        }
+        if let Some((cb, buf)) = self.active.take() {
+            fire(cb, &buf);
+        }
+        PostAction::Remove
     }
 
-    if let Some((_, cb, _)) = active.take() {
-        fire(cb, &[]);
+    fn drain_pending(&mut self) {
+        if let Some((cb, _)) = self.active.take() {
+            fire(cb, &[]);
+        }
+        self.drain_queued();
     }
-    let drained: Vec<PendingCb> = {
-        let mut q = shared.queued.lock();
-        std::mem::take(&mut *q)
+
+    fn drain_queued(&mut self) {
+        // Drain into a local first so the queue lock isn't held across the
+        // callbacks, which may re-enter `read_text_async`.
+        let drained: Vec<PendingCb> = std::mem::take(&mut *self.shared.queued.lock());
+        for cb in drained {
+            fire(cb, &[]);
+        }
+    }
+}
+
+fn run_clipboard_loop(
+    shared: Arc<Shared>,
+    conn: Connection,
+    queue: wayland_client::EventQueue<State>,
+    state: State,
+    wake: PingSource,
+) {
+    let mut event_loop: EventLoop<'static, Worker> = match EventLoop::try_new() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(target: "Main", "clipboard: event loop: {e}");
+            return;
+        }
     };
-    for cb in drained {
-        fire(cb, &[]);
+    let handle = event_loop.handle();
+    let mut worker = Worker {
+        shared,
+        conn: conn.clone(),
+        state,
+        signal: event_loop.get_signal(),
+        loop_handle: handle.clone(),
+        active: None,
+    };
+    if let Err(e) = handle.insert_source(wake, |(), (), worker: &mut Worker| {
+        if worker.shared.stop.load(Ordering::Relaxed) {
+            worker.signal.stop();
+        }
+    }) {
+        tracing::error!(target: "Main", "clipboard: wake source: {e}");
+        worker.drain_pending();
+        return;
     }
+    let inserted = handle.insert_source(
+        WaylandSource::new(conn, queue),
+        |_, queue, worker: &mut Worker| queue.dispatch_pending(&mut worker.state),
+    );
+    if let Err(e) = inserted {
+        tracing::error!(target: "Main", "clipboard: wayland source: {e}");
+        worker.drain_pending();
+        return;
+    }
+    // `run` calls its callback only after a dispatch, so promote once here or a
+    // request queued before the loop started would wait for the first event.
+    worker.promote_next();
+    if let Err(e) = event_loop.run(None, &mut worker, Worker::promote_next) {
+        tracing::error!(target: "Main", "clipboard: event loop: {e}");
+    }
+    worker.drain_pending();
 }
 
 fn init_impl() -> Option<JfnClipboardWayland> {
@@ -419,13 +414,14 @@ fn init_impl() -> Option<JfnClipboardWayland> {
     };
     queue.roundtrip(&mut state).ok()?;
 
+    let (ping, wake) = calloop::ping::make_ping().ok()?;
     let shared = Arc::new(Shared {
         queued: Mutex::new(Vec::new()),
         stop: AtomicBool::new(false),
-        wake: jfn_wake_event::WakeEvent::new()?,
+        ping,
     });
     let shared_w = shared.clone();
-    let worker = thread::spawn(move || worker_loop(shared_w, conn, queue, state));
+    let worker = thread::spawn(move || run_clipboard_loop(shared_w, conn, queue, state, wake));
     Some(JfnClipboardWayland {
         shared,
         worker: Some(worker),
@@ -470,7 +466,7 @@ impl Clipboard {
             let mut q = c.shared.queued.lock();
             q.push(PendingCb { cb });
         }
-        c.shared.wake.signal();
+        c.shared.ping.ping();
     }
 
     pub fn cleanup(&self) {
@@ -478,10 +474,11 @@ impl Clipboard {
             return;
         };
         boxed.shared.stop.store(true, Ordering::Relaxed);
-        boxed.shared.wake.signal();
+        boxed.shared.ping.ping();
+        // The worker drains every still-queued callback after its loop returns,
+        // so joining here is what guarantees each one ran exactly once.
         if let Some(w) = boxed.worker.take() {
             let _ = w.join();
         }
-        // The WakeEvent closes its fd when the last Arc<Shared> drops.
     }
 }

@@ -15,8 +15,12 @@ mod imp;
 
 #[cfg(unix)]
 mod fd_wait;
+#[cfg(target_os = "linux")]
+mod source;
 
 pub use imp::WakeEvent;
+#[cfg(target_os = "linux")]
+pub use source::{Drain, WakeSource};
 
 /// Fully drain a level-triggered wake fd (eventfd or pipe read end) that was
 /// signaled while unread, so a following `poll` won't immediately re-fire.

@@ -2,13 +2,8 @@
 //!
 //! It owns every [`StructureSurface`], consumes the [`GeometryCommand`] queue
 //! (create/destroy/visibility/restack), and is the sole sizer of the overlays
-//! and the video host. It blocks in `poll(-1)` with no timer: running
-//! timer-free is safe because every change class emits an event on a window we
-//! watch — `STRUCTURE_NOTIFY | PROPERTY_CHANGE` on the parent and its frame,
-//! `STRUCTURE_NOTIFY` on each overlay (so a WM clamp / our own configure
-//! re-triggers a reconcile), and `PROPERTY_CHANGE` on the root for
-//! RESOURCE_MANAGER (Xft.dpi) updates. It publishes the parent's live geometry
-//! as an immutable [`ParentSnapshot`] so all other readers are lock-free.
+//! and the video host. It publishes the parent's live geometry as an immutable
+//! [`ParentSnapshot`] so all other readers are lock-free.
 //!
 //! Structure (create/size/place/map/restack) runs on the geometry connection;
 //! content (pixel upload) runs on the content connection inside each surface's
@@ -16,14 +11,13 @@
 //! writers.
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::Arc;
 
-use nix::errno::Errno;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use calloop::{EventLoop, LoopSignal};
 use parking_lot::Mutex;
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
+use x11rb::protocol::sync::{ConnectionExt as _, Int64};
 use x11rb::protocol::xfixes::{ConnectionExt as _, SelectionEventMask};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent, ConfigureWindowAux,
@@ -33,14 +27,14 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use jfn_playback::shutdown::jfn_shutdown_initiate;
-use jfn_wake_event::WakeEvent;
+use jfn_wake_event::{Drain, WakeEvent, WakeSource};
 
 use crate::input::x11_shutdown_waker;
 use crate::overlay_fsm::{self, Effect, Geom, OverlayState};
 use crate::registry::{
     GeometryCommand, StructureSurface, SurfaceId, drain_commands, registry, split_capabilities,
 };
-use crate::resize_sync::{self, ResizeSync, SyncCounterAck, SyncState};
+use crate::x11_source::X11Source;
 use crate::x11_state::{HostServices, PaintServices, ParentSnapshot};
 
 pub struct Handle {
@@ -70,11 +64,6 @@ static CONN_HOLD: Mutex<Option<Arc<RustConnection>>> = Mutex::new(None);
 
 pub fn drop_toplevel_connection() {
     *CONN_HOLD.lock() = None;
-}
-
-/// The geometry/top-level connection, for off-thread ack of a resize-sync counter.
-pub(crate) fn toplevel_conn() -> Option<Arc<RustConnection>> {
-    CONN_HOLD.lock().clone()
 }
 
 /// The geometry thread's wake source for command-queue drains and re-mirrors.
@@ -168,12 +157,8 @@ struct GeoWork {
     order: Vec<SurfaceId>,
     /// `_NET_WM_SYNC_REQUEST` counter, or 0 when the protocol was not advertised.
     sync_counter: u32,
-    /// Each overlay's last-known size, the ground truth resize-sync completion is
-    /// read from. Sole writer: the overlay's own `ConfigureNotify` (seeded at
-    /// create). Keyed by [`SurfaceId`]; a destroyed overlay drops out entirely.
-    sizes: HashMap<SurfaceId, (i32, i32)>,
-    /// The outstanding resize-sync obligation, if any.
-    resize_sync: Option<ResizeSync>,
+    sync_pending: Option<(i32, u32)>,
+    sync_armed: bool,
 }
 
 impl GeoWork {
@@ -190,56 +175,30 @@ impl GeoWork {
             fsm: HashMap::new(),
             order: Vec::new(),
             sync_counter: crate::x11_state::host().map_or(0, |h| h.sync_counter),
-            sizes: HashMap::new(),
-            resize_sync: None,
+            sync_pending: None,
+            sync_armed: false,
         }
     }
 
-    /// Latch a resize-sync request, superseding any prior obligation (a newer
-    /// resize replaces the old one). `target` starts `None`: the parent's resize
-    /// `ConfigureNotify` names it, gating the ack against pre-resize geometry.
     fn latch_sync(&mut self, hi: i32, lo: u32) {
         if self.sync_counter == 0 {
             return;
         }
-        self.resize_sync = Some(ResizeSync {
-            signal: Box::new(SyncCounterAck {
-                counter: self.sync_counter,
-                hi,
-                lo,
-            }),
-            target: None,
-        });
+        self.sync_pending = Some((hi, lo));
+        self.sync_armed = false;
     }
 
-    /// An overlay participates in resize-sync completion exactly while it is
-    /// mapped (shown). Hidden/withdrawn overlays are unmapped, so they never gate.
-    fn participating(&self, id: SurfaceId) -> bool {
-        self.fsm.get(&id).is_some_and(|s| s.mapped)
-    }
-
-    /// Ack the outstanding resize once every participating overlay has reached the
-    /// resolved target. Reads owned sizes each call, so a no-op place (no
-    /// `ConfigureNotify`) that already sits at target settles on the spot instead
-    /// of waiting forever.
-    fn drive_resize_sync(&mut self) -> SyncState {
-        let target = self.resize_sync.as_ref().and_then(|rs| rs.target);
-        let settled = target.is_some_and(|t| {
-            resize_sync::all_settled(
-                self.order
-                    .iter()
-                    .map(|id| (self.participating(*id), self.sizes.get(id).copied())),
-                t,
-            )
-        });
-        resize_sync::drive(&mut self.resize_sync, settled)
-    }
-
-    fn id_for_window(&self, window: Window) -> Option<SurfaceId> {
-        self.structures
-            .iter()
-            .find(|(_, s)| s.window() == window)
-            .map(|(id, _)| *id)
+    /// The counter write tells the WM our configures for this resize are done,
+    /// so it must be queued behind them on the same connection.
+    fn commit_resize(&mut self, conn: &RustConnection) {
+        let _ = conn.flush();
+        if !self.sync_armed {
+            return;
+        }
+        if let Some((hi, lo)) = self.sync_pending.take() {
+            let _ = conn.sync_set_counter(self.sync_counter, Int64 { hi, lo });
+            let _ = conn.flush();
+        }
     }
 
     fn publish(&self) {
@@ -415,9 +374,6 @@ fn handle_create(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId) {
     if !work.order.contains(&id) {
         work.order.push(id);
     }
-    // Seed the size fact with the create geometry; its own ConfigureNotify is the
-    // only writer thereafter.
-    work.sizes.insert(id, (work.pw, work.ph));
     if let Some(record) = registry().lock().get(id) {
         record.actor.attach_content(content);
     }
@@ -426,7 +382,6 @@ fn handle_create(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId) {
 fn handle_destroy(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId) {
     work.order.retain(|x| *x != id);
     work.fsm.remove(&id);
-    work.sizes.remove(&id);
     if let Some(structure) = work.structures.remove(&id) {
         structure.unmap(conn);
         structure.destroy(conn);
@@ -684,9 +639,6 @@ fn reconcile(
         jfn_platform_abi::notify_window_changed();
     }
 
-    // Size + place every overlay from the one snapshot. Hold the registry lock
-    // for the loop so present calls serialize behind it; it's brief — X
-    // requests are async, mailbox pokes are cheap.
     let reg = registry();
     let ids: Vec<SurfaceId> = work.order.clone();
     for id in ids {
@@ -728,155 +680,7 @@ fn reconcile(
         }
         work.fsm.insert(id, state);
     }
-    let _ = conn.flush();
-    let _ = work.drive_resize_sync();
-}
-
-fn hide_overlays(conn: &RustConnection, work: &GeoWork) {
-    for structure in work.structures.values() {
-        structure.unmap(conn);
-    }
-    let _ = conn.flush();
-    jfn_playback::lifecycle::jfn_lifecycle_set_visible(false);
-}
-
-enum Trigger {
-    Ignore,
-    External,
-    Overlay,
-    ParentMap,
-    ParentUnmap,
-}
-
-fn geometry_thread_body(
-    conn: Arc<RustConnection>,
-    parent: Window,
-    video_host: Window,
-    root: Window,
-) {
-    let watch_mask = EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE;
-    watch_window(&conn, parent, watch_mask);
-    watch_window(&conn, video_host, EventMask::SUBSTRUCTURE_NOTIFY);
-    let mut frame = find_frame(&conn, parent, root);
-    if frame != parent {
-        watch_window(&conn, frame, watch_mask);
-    }
-    watch_window(&conn, root, EventMask::PROPERTY_CHANGE);
-    watch_compositor(&conn, root);
-    let _ = conn.flush();
-
-    let scale = crate::x11_state::parent_snapshot().scale;
-    let snap = crate::x11_state::parent_snapshot();
-    let mut work = GeoWork::new(scale, &snap);
-
-    let x11_fd = unsafe { BorrowedFd::borrow_raw(conn.stream().as_raw_fd()) };
-    let shutdown_fd = x11_shutdown_waker().map(|ev| unsafe { BorrowedFd::borrow_raw(ev.fd()) });
-    let resync_fd =
-        x11_geometry_resync_waker().map(|ev| unsafe { BorrowedFd::borrow_raw(ev.fd()) });
-
-    let mut fds = vec![PollFd::new(x11_fd, PollFlags::POLLIN)];
-    let shutdown_idx = shutdown_fd.map(|fd| {
-        fds.push(PollFd::new(fd, PollFlags::POLLIN));
-        fds.len() - 1
-    });
-    let resync_idx = resync_fd.map(|fd| {
-        fds.push(PollFd::new(fd, PollFlags::POLLIN));
-        fds.len() - 1
-    });
-
-    let mut parent_mapped = true;
-    let mut embed: Option<Window> = None;
-    reconcile(
-        &conn,
-        &mut work,
-        parent,
-        video_host,
-        embed,
-        root,
-        parent_mapped,
-        true,
-    );
-
-    loop {
-        match poll(&mut fds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => continue,
-            Err(_) => break,
-            Ok(_) => {}
-        }
-        let revents = |idx: Option<usize>| {
-            idx.and_then(|i| fds[i].revents())
-                .unwrap_or(PollFlags::empty())
-        };
-
-        if revents(shutdown_idx).contains(PollFlags::POLLIN) {
-            let _ = conn.unmap_window(parent);
-            let _ = conn.flush();
-            hide_overlays(&conn, &work);
-            break;
-        }
-        if revents(Some(0))
-            .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
-        {
-            hide_overlays(&conn, &work);
-            break;
-        }
-
-        let mut wake = false;
-        let mut reassert = false;
-        let mut activate = false;
-        if revents(resync_idx).contains(PollFlags::POLLIN) {
-            if let Some(ev) = x11_geometry_resync_waker() {
-                ev.drain();
-            }
-            // Drain the structure-command queue; a create/destroy/restack or an
-            // mpv fullscreen toggle can change parent stacking, so always
-            // re-assert overlay stacking after a resync.
-            process_commands(&conn, &mut work);
-            wake = true;
-            reassert = true;
-        }
-
-        while let Ok(Some(ev)) = conn.poll_for_event() {
-            match handle_event(
-                &conn, parent, video_host, root, &mut frame, &mut embed, &mut work, ev,
-            ) {
-                Trigger::Ignore => {}
-                Trigger::External => {
-                    wake = true;
-                    reassert = true;
-                }
-                Trigger::Overlay => wake = true,
-                Trigger::ParentMap => {
-                    parent_mapped = true;
-                    jfn_playback::lifecycle::jfn_lifecycle_set_visible(true);
-                    wake = true;
-                    reassert = true;
-                    activate = true;
-                }
-                Trigger::ParentUnmap => {
-                    parent_mapped = false;
-                    jfn_playback::lifecycle::jfn_lifecycle_set_visible(false);
-                    wake = true;
-                }
-            }
-        }
-
-        if wake {
-            reconcile(
-                &conn,
-                &mut work,
-                parent,
-                video_host,
-                embed,
-                root,
-                parent_mapped,
-                reassert,
-            );
-            if activate {
-                activate_parent(&conn, root, parent);
-            }
-        }
-    }
+    work.commit_resize(conn);
 }
 
 fn is_wm_delete(e: &ClientMessageEvent) -> bool {
@@ -886,8 +690,7 @@ fn is_wm_delete(e: &ClientMessageEvent) -> bool {
     e.type_ == host.atoms.wm_protocols && e.data.as_data32()[0] == host.atoms.wm_delete_window
 }
 
-/// Parse a `_NET_WM_SYNC_REQUEST` client message into its requested counter
-/// value `(hi, lo)`. Data layout: `[protocol, timestamp, lo, hi, _]`.
+/// Data layout: `[protocol, timestamp, lo, hi, _]`.
 fn parse_sync_request(e: &ClientMessageEvent) -> Option<(i32, u32)> {
     let host = crate::x11_state::host()?;
     if host.sync_counter == 0 || host.atoms.net_wm_sync_request == 0 {
@@ -900,134 +703,290 @@ fn parse_sync_request(e: &ClientMessageEvent) -> Option<(i32, u32)> {
     Some((data[3] as i32, data[2]))
 }
 
-/// Re-probe the app-owned display scale after an Xft.dpi change. Returns
-/// `External` when the scale actually changed.
-fn refresh_display_scale(work: &mut GeoWork) -> Trigger {
-    let scale = crate::scale::query_display_scale().unwrap_or(1.0);
-    if (work.scale - scale).abs() > f32::EPSILON {
-        work.scale = scale;
-        work.publish();
-        tracing::info!(target: "Platform", "display scale changed: {scale}");
-        jfn_platform_abi::notify_window_changed();
-        Trigger::External
-    } else {
-        Trigger::Ignore
-    }
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Pending {
+    Idle,
+    Reconcile,
+    Restack,
+    Refocus,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_event(
-    conn: &RustConnection,
+enum Phase {
+    Running(Pending),
+    Stopping,
+}
+
+struct GeoLoop {
+    conn: Arc<RustConnection>,
+    work: GeoWork,
     parent: Window,
     video_host: Window,
     root: Window,
-    frame: &mut Window,
-    embed: &mut Option<Window>,
-    work: &mut GeoWork,
-    ev: Event,
-) -> Trigger {
-    let is_parentish = |w: Window| w == parent || w == *frame;
+    frame: Window,
+    embed: Option<Window>,
+    parent_mapped: bool,
+    phase: Phase,
+    signal: LoopSignal,
+}
+
+impl GeoLoop {
+    fn new(
+        conn: Arc<RustConnection>,
+        parent: Window,
+        video_host: Window,
+        root: Window,
+        signal: LoopSignal,
+    ) -> GeoLoop {
+        let watch_mask = EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE;
+        watch_window(&conn, parent, watch_mask);
+        watch_window(&conn, video_host, EventMask::SUBSTRUCTURE_NOTIFY);
+        let frame = find_frame(&conn, parent, root);
+        if frame != parent {
+            watch_window(&conn, frame, watch_mask);
+        }
+        watch_window(&conn, root, EventMask::PROPERTY_CHANGE);
+        watch_compositor(&conn, root);
+        let _ = conn.flush();
+
+        let snap = crate::x11_state::parent_snapshot();
+        let work = GeoWork::new(snap.scale, &snap);
+
+        GeoLoop {
+            conn,
+            work,
+            parent,
+            video_host,
+            root,
+            frame,
+            embed: None,
+            parent_mapped: true,
+            phase: Phase::Running(Pending::Restack),
+            signal,
+        }
+    }
+
+    fn settle(&mut self) {
+        let Phase::Running(pending) = self.phase else {
+            return;
+        };
+        if pending == Pending::Idle {
+            return;
+        }
+        self.phase = Phase::Running(Pending::Idle);
+        reconcile(
+            &self.conn,
+            &mut self.work,
+            self.parent,
+            self.video_host,
+            self.embed,
+            self.root,
+            self.parent_mapped,
+            pending >= Pending::Restack,
+        );
+        if pending >= Pending::Refocus {
+            activate_parent(&self.conn, self.root, self.parent);
+        }
+    }
+
+    fn on_event(&mut self, ev: Event) {
+        let pending = handle_event(self, ev);
+        self.raise_to(pending);
+    }
+
+    fn raise_to(&mut self, pending: Pending) {
+        if let Phase::Running(cur) = self.phase {
+            self.phase = Phase::Running(cur.max(pending));
+        }
+    }
+
+    fn on_resync(&mut self) {
+        process_commands(&self.conn, &mut self.work);
+        self.raise_to(Pending::Restack);
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.conn.unmap_window(self.parent);
+        let _ = self.conn.flush();
+        self.phase = Phase::Stopping;
+        self.signal.stop();
+    }
+
+    fn refresh_display_scale(&mut self) -> Pending {
+        let scale = crate::scale::query_display_scale().unwrap_or(1.0);
+        if (self.work.scale - scale).abs() > f32::EPSILON {
+            self.work.scale = scale;
+            self.work.publish();
+            tracing::info!(target: "Platform", "display scale changed: {scale}");
+            jfn_platform_abi::notify_window_changed();
+            Pending::Reconcile
+        } else {
+            Pending::Idle
+        }
+    }
+}
+
+impl Drop for GeoLoop {
+    fn drop(&mut self) {
+        for structure in self.work.structures.values() {
+            structure.unmap(&self.conn);
+        }
+        let _ = self.conn.flush();
+        jfn_playback::lifecycle::jfn_lifecycle_set_visible(false);
+    }
+}
+
+fn handle_event(state: &mut GeoLoop, ev: Event) -> Pending {
+    let is_parentish = |w: Window| w == state.parent || w == state.frame;
     match ev {
         Event::CreateNotify(e) => {
-            if e.parent == video_host {
-                *embed = Some(e.window);
-                Trigger::Overlay
+            if e.parent == state.video_host {
+                state.embed = Some(e.window);
+                Pending::Reconcile
             } else {
-                Trigger::Ignore
+                Pending::Idle
             }
         }
         Event::ConfigureNotify(e) => {
             if is_parentish(e.window) {
-                if e.window == parent
-                    && let Some(rs) = work.resize_sync.as_mut()
-                {
-                    // The resize the sync request preceded has landed; its size is
-                    // the target overlays must reach before we ack.
-                    rs.target = Some((e.width as i32, e.height as i32));
+                if e.window == state.parent {
+                    state.work.sync_armed = true;
                 }
-                Trigger::External
+                Pending::Restack
             } else {
-                // Sole writer of the overlay's size fact.
-                if let Some(id) = work.id_for_window(e.window) {
-                    work.sizes.insert(id, (e.width as i32, e.height as i32));
-                }
-                Trigger::Overlay
+                Pending::Reconcile
             }
         }
         Event::CirculateNotify(e) => {
             if is_parentish(e.window) {
-                Trigger::External
+                Pending::Restack
             } else {
-                Trigger::Overlay
+                Pending::Reconcile
             }
         }
         Event::PropertyNotify(e) => {
-            if e.window == parent {
-                Trigger::External
-            } else if e.window == root && e.atom == u32::from(AtomEnum::RESOURCE_MANAGER) {
-                refresh_display_scale(work)
+            if e.window == state.parent {
+                Pending::Restack
+            } else if e.window == state.root && e.atom == u32::from(AtomEnum::RESOURCE_MANAGER) {
+                state.refresh_display_scale()
             } else {
-                Trigger::Ignore
+                Pending::Idle
             }
         }
         Event::ReparentNotify(e) => {
-            if e.window == parent {
-                let new_frame = find_frame(conn, parent, root);
-                if new_frame != parent {
+            if e.window == state.parent {
+                let new_frame = find_frame(&state.conn, state.parent, state.root);
+                if new_frame != state.parent {
                     watch_window(
-                        conn,
+                        &state.conn,
                         new_frame,
                         EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE,
                     );
                 }
-                *frame = new_frame;
-                let _ = conn.flush();
-                return Trigger::External;
+                state.frame = new_frame;
+                let _ = state.conn.flush();
+                Pending::Restack
+            } else {
+                Pending::Idle
             }
-            Trigger::Ignore
         }
         Event::MapNotify(e) => {
-            if e.window == parent {
-                Trigger::ParentMap
+            if e.window == state.parent {
+                state.parent_mapped = true;
+                jfn_playback::lifecycle::jfn_lifecycle_set_visible(true);
+                Pending::Refocus
             } else {
-                Trigger::Ignore
+                Pending::Idle
             }
         }
         Event::UnmapNotify(e) => {
-            if e.window == parent {
-                Trigger::ParentUnmap
-            } else {
-                Trigger::Overlay
+            if e.window == state.parent {
+                state.parent_mapped = false;
+                jfn_playback::lifecycle::jfn_lifecycle_set_visible(false);
             }
+            Pending::Reconcile
         }
         Event::DestroyNotify(e) => {
-            if e.window == parent {
+            if e.window == state.parent {
                 jfn_shutdown_initiate();
             }
-            if Some(e.window) == *embed {
-                *embed = None;
+            if Some(e.window) == state.embed {
+                state.embed = None;
             }
-            Trigger::Ignore
+            Pending::Idle
         }
         Event::ClientMessage(e) => {
-            if e.window == parent && is_wm_delete(&e) {
+            if e.window == state.parent && is_wm_delete(&e) {
                 jfn_shutdown_initiate();
-            } else if e.window == parent
+            } else if e.window == state.parent
                 && let Some((hi, lo)) = parse_sync_request(&e)
             {
-                work.latch_sync(hi, lo);
+                state.work.latch_sync(hi, lo);
             }
-            Trigger::Ignore
+            Pending::Idle
         }
         Event::XfixesSelectionNotify(e) => {
             if e.owner != x11rb::NONE {
                 tracing::debug!(target: "Platform", "{}", crate::lifecycle::COMPOSITOR_DETECTED_MSG);
-                Trigger::External
+                Pending::Restack
             } else {
                 tracing::error!(target: "Platform", "{}", crate::lifecycle::COMPOSITOR_NOT_DETECTED_MSG);
-                Trigger::Ignore
+                Pending::Idle
             }
         }
-        _ => Trigger::Ignore,
+        _ => Pending::Idle,
+    }
+}
+
+fn geometry_thread_body(
+    conn: Arc<RustConnection>,
+    parent: Window,
+    video_host: Window,
+    root: Window,
+) {
+    let mut event_loop: EventLoop<'_, GeoLoop> = match EventLoop::try_new() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("[x11] failed to create geometry event loop: {e}");
+            return;
+        }
+    };
+    let signal = event_loop.get_signal();
+    let mut state = GeoLoop::new(conn.clone(), parent, video_host, root, signal);
+    let handle = event_loop.handle();
+
+    if let Err(e) = handle.insert_source(X11Source::new(conn), |ev, (), state: &mut GeoLoop| {
+        state.on_event(ev);
+    }) {
+        eprintln!("[x11] failed to register x11 event source: {e}");
+        return;
+    }
+
+    if let Some(ev) = x11_shutdown_waker() {
+        // `Drain::Never`: `input.rs` waits on the same eventfd, and
+        // level-triggered-undrained is what lets both threads see one signal.
+        let res = handle.insert_source(
+            WakeSource::new(ev.fd(), Drain::Never),
+            |(), (), state: &mut GeoLoop| state.shutdown(),
+        );
+        if let Err(e) = res {
+            eprintln!("[x11] failed to register shutdown source: {e}");
+            return;
+        }
+    }
+
+    if let Some(ev) = x11_geometry_resync_waker() {
+        let res = handle.insert_source(
+            WakeSource::new(ev.fd(), Drain::BeforeCallback),
+            |(), (), state: &mut GeoLoop| state.on_resync(),
+        );
+        if let Err(e) = res {
+            eprintln!("[x11] failed to register resync source: {e}");
+            return;
+        }
+    }
+
+    state.settle();
+    if let Err(e) = event_loop.run(None, &mut state, GeoLoop::settle) {
+        eprintln!("[x11] geometry event loop exited: {e}");
     }
 }
