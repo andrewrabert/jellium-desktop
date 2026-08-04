@@ -28,7 +28,12 @@ use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use objc2::runtime::AnyObject;
+use objc2::rc::Retained;
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{NSAutoresizingMaskOptions, NSView, NSWindowOrderingMode};
+use objc2_foundation::{NSDictionary, NSMutableDictionary, NSNull, NSRect, NSString};
+use objc2_quartz_core::{CAAction, CAMetalLayer};
 
 use jfn_compositor_core::stack::SurfaceStack;
 use jfn_compositor_core::transition::TransitionGate;
@@ -39,22 +44,6 @@ use jfn_platform_abi::{JfnRect, PhysicalSize};
 
 use crate::dispatch::{is_main_thread, run_on_main_async, run_on_main_sync};
 use crate::init::{jfn_macos_get_input_view, jfn_macos_get_window};
-
-/// Build an NSString from a Rust &str (UTF-8). The returned object is
-/// retained (+1) by NSString init; the caller `release`s when done.
-unsafe fn nsstring_from_str(s: &str) -> *mut AnyObject {
-    unsafe {
-        let bytes = s.as_bytes();
-        let alloc: *mut AnyObject = objc2::msg_send![objc2::class!(NSString), alloc];
-        let init: *mut AnyObject = objc2::msg_send![
-            alloc,
-            initWithBytes: bytes.as_ptr() as *const c_void,
-            length: bytes.len(),
-            encoding: 4u64 // NSUTF8StringEncoding
-        ];
-        init
-    }
-}
 
 // =====================================================================
 // Per-surface state. One per CefLayer (allocated by macos_alloc_surface,
@@ -144,60 +133,58 @@ fn gpu() -> Option<&'static Surfaces> {
 
 unsafe fn create_content_layer(
     content_view: *mut AnyObject,
-    frame: objc2_foundation::NSRect,
+    frame: NSRect,
     scale: f64,
 ) -> (*mut AnyObject, *mut AnyObject) {
     unsafe {
-        // NSView alloc/initWithFrame:
-        let view_cls = objc2::class!(NSView);
-        let view: *mut AnyObject = objc2::msg_send![view_cls, alloc];
-        let view: *mut AnyObject = objc2::msg_send![view, initWithFrame: frame];
-        let _: () = objc2::msg_send![view, setWantsLayer: true];
-        // NSViewWidthSizable | NSViewHeightSizable = 2 | 16 (per AppKit).
-        let _: () = objc2::msg_send![view, setAutoresizingMask: 2u64 | 16u64];
+        // SAFETY: callers run inside a main-queue closure.
+        let mtm = MainThreadMarker::new_unchecked();
 
-        // CAMetalLayer alloc + geometry. Device, pixel format, colorspace,
-        // drawable size and framebuffer-only belong to the painter, which
-        // writes them from its first configure and overwrites anything set
-        // behind it.
-        let layer_cls = objc2::class!(CAMetalLayer);
-        let layer: *mut AnyObject = objc2::msg_send![layer_cls, layer];
-        let _: () = objc2::msg_send![layer, setFrame: frame];
-        let _: () = objc2::msg_send![layer, setContentsScale: scale];
+        let view = NSView::initWithFrame(NSView::alloc(mtm), frame);
+        view.setWantsLayer(true);
+        view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
 
-        // Disable implicit animations on property changes — present
-        // writes contents every frame and CA shouldn't cross-fade them.
-        // Build an NSDictionary { "bounds": NSNull, ... }.
-        let null_cls = objc2::class!(NSNull);
-        let null_obj: *mut AnyObject = objc2::msg_send![null_cls, null];
-        let dict_cls = objc2::class!(NSMutableDictionary);
-        let dict: *mut AnyObject = objc2::msg_send![dict_cls, dictionaryWithCapacity: 5usize];
-        for key in &[
+        // Device, pixel format, colorspace, drawable size and framebuffer-only
+        // belong to the painter, which writes them from its first configure and
+        // overwrites anything set behind it.
+        let layer = CAMetalLayer::layer();
+        layer.setFrame(frame);
+        layer.setContentsScale(scale);
+
+        // Disable implicit animations on property changes — present writes
+        // contents every frame and CA shouldn't cross-fade them.
+        let actions = NSMutableDictionary::<NSString, AnyObject>::dictionaryWithCapacity(5);
+        let null = NSNull::null();
+        for key in [
             "bounds",
             "position",
             "contents",
             "anchorPoint",
             "contentsRect",
         ] {
-            let k = nsstring_from_str(key);
-            let _: () = objc2::msg_send![dict, setObject: null_obj, forKey: k];
-            let _: () = objc2::msg_send![k, release];
+            let key = NSString::from_str(key);
+            actions.setObject_forKey(&null, ProtocolObject::from_ref(&*key));
         }
-        let _: () = objc2::msg_send![layer, setActions: dict];
+        // SAFETY: NSNull is CoreAnimation's documented "no action" value; the
+        // element type is only a Rust-side claim.
+        let actions: Retained<NSDictionary<NSString, ProtocolObject<dyn CAAction>>> =
+            Retained::cast_unchecked(actions);
+        layer.setActions(Some(&actions));
 
-        let _: () = objc2::msg_send![view, setLayer: layer];
+        view.setLayer(Some(&layer));
 
-        // addSubview:positioned:relativeTo: — order applied by
-        // macos_restack later; positionAbove=nil here.
-        // NSWindowAbove == 1.
-        let _: () = objc2::msg_send![
-            content_view,
-            addSubview: view,
-            positioned: 1u64,
-            relativeTo: ptr::null_mut::<AnyObject>(),
-        ];
+        // addSubview:positioned:relativeTo: — order applied by macos_restack
+        // later; positionAbove=nil here.
+        // SAFETY: `content_view` is the window's contentView.
+        let content_view: &NSView = &*content_view.cast::<NSView>();
+        content_view.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Above, None);
 
-        (view, layer)
+        // The view keeps its own retain on the layer; ours is dropped here.
+        let layer_ptr = Retained::as_ptr(&layer).cast_mut().cast::<AnyObject>();
+        (Retained::into_raw(view).cast::<AnyObject>(), layer_ptr)
     }
 }
 

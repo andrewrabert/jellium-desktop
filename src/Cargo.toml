@@ -40,6 +40,7 @@ arc-swap = "1"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
 cef = { version = "=150.0.0", default-features = false }
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 gethostname = "1"
 gix = { version = "0.85", default-features = false, features = ["status", "sha1"] }
 interprocess = { version = "2", features = ["tokio"] }
@@ -47,10 +48,14 @@ libc = "0.2"
 nix = { version = "0.30", features = ["event", "fs", "poll", "signal", "socket", "time", "uio", "user"] }
 objc2 = "0.6"
 parking_lot = "0.12"
+objc2-app-kit = "0.3"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDate", "CFRunLoop", "CFString"] }
 objc2-foundation = "0.3"
-objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
+objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "pwr_mgt"] }
+objc2-io-surface ={ version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
-serde = { version = "1", features = ["derive"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CAMetalLayer"] }
+serde ={ version = "1", features = ["derive"] }
 serde_json = "1"
 slotmap = "1"
 tempfile = "3"

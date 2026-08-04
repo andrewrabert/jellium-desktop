@@ -11,11 +11,12 @@
 
 use parking_lot::Mutex;
 use std::cell::Cell;
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_int, c_void};
 use std::ptr;
 
+use objc2::ffi::{class_addProtocol, imp_implementationWithBlock};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
+use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, Bool, Sel};
 use objc2::{ClassType, DefinedClass, class, define_class, extern_class, msg_send, sel};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSRect};
 
@@ -28,16 +29,6 @@ use jfn_playback::shutdown::{jfn_shutdown_initiate, jfn_shutting_down};
 use jfn_cef::browsers::jfn_browsers_send_external_begin_frame_all;
 use jfn_cef::business_about::jfn_about_open;
 use jfn_mpv::api::jfn_mpv_set_force_window_position;
-
-// libdispatch / NSAutoreleasePool primitives — shared with the rest of the
-// crate but re-declared here to keep this file self-contained.
-unsafe extern "C" {
-    fn objc_getProtocol(name: *const c_char) -> *mut AnyObject;
-    fn class_addProtocol(cls: *const AnyClass, p: *mut AnyObject) -> Bool;
-    fn class_getInstanceMethod(cls: *const AnyClass, sel: Sel) -> *mut c_void;
-    fn method_setImplementation(method: *mut c_void, imp: *const c_void) -> *const c_void;
-    fn imp_implementationWithBlock(block: *const c_void) -> *const c_void;
-}
 
 // Foundation log target for parity with C++ LOG_PLATFORM.
 const LOG_TARGET: &str = "Platform";
@@ -231,17 +222,15 @@ define_class!(
 );
 
 /// Attach the `CefAppProtocol` protocol to the `JellyfinApplication` class
-/// at runtime. The protocol is declared only in CEF's C++ headers; we
-/// look it up by name via `objc_getProtocol` and add it to the class so
+/// at runtime. The protocol is declared only in CEF's C++ headers; we look
+/// it up by name and add it to the class so
 /// `[NSApp conformsToProtocol:@protocol(CefAppProtocol)]` is true.
-fn attach_cef_app_protocol(cls: *const AnyClass) {
-    unsafe {
-        let name = c"CefAppProtocol";
-        let proto = objc_getProtocol(name.as_ptr());
-        if !proto.is_null() {
-            let _ = class_addProtocol(cls, proto);
-        }
-    }
+fn attach_cef_app_protocol(cls: &AnyClass) {
+    let Some(proto) = AnyProtocol::get(c"CefAppProtocol") else {
+        return;
+    };
+    // SAFETY: the class is ours and is not yet registered with AppKit.
+    let _ = unsafe { class_addProtocol(std::ptr::from_ref(cls).cast_mut(), proto) };
 }
 
 // =====================================================================
@@ -656,8 +645,10 @@ pub fn macos_init(_mpv: *mut c_void) -> bool {
         // returns NO (we tear down via jfn_shutdown_initiate, not by
         // letting AppKit close the window).
         let cls: *const AnyClass = msg_send![state.window, class];
-        let method = class_getInstanceMethod(cls, sel!(windowShouldClose:));
-        if !method.is_null() {
+        if let Some(method) = cls
+            .as_ref()
+            .and_then(|c| c.instance_method(sel!(windowShouldClose:)))
+        {
             // Build a block that calls jfn_shutdown_initiate and returns NO.
             // Block layout: { isa, flags, reserved, invoke, descriptor, ... }.
             // We use std::ops::Fn boxed by `block2` if available; lacking
@@ -704,8 +695,10 @@ pub fn macos_init(_mpv: *mut c_void) -> bool {
                 invoke: close_block_invoke,
                 descriptor: &BLOCK_DESC,
             };
-            let imp = imp_implementationWithBlock(&BLOCK as *const _ as *const c_void);
-            method_setImplementation(method, imp);
+            let imp = imp_implementationWithBlock(
+                std::ptr::from_ref(&BLOCK).cast_mut().cast::<AnyObject>(),
+            );
+            let _ = method.set_implementation(imp);
         }
 
         // Clear --force-window-position so subsequent reconfigs don't

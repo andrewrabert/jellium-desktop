@@ -9,20 +9,19 @@
 //! a specific CEF version's `WorkDeduplicator` internals.
 
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::core_foundation::{
-    CFAbsoluteTimeGetCurrent, CFRelease, CFRunLoopAddSource, CFRunLoopAddTimer, CFRunLoopGetMain,
-    CFRunLoopSourceContext, CFRunLoopSourceCreate, CFRunLoopSourceInvalidate,
-    CFRunLoopSourceSignal, CFRunLoopTimerCreate, CFRunLoopTimerInvalidate, CFRunLoopTimerRef,
-    CFRunLoopTimerSetNextFireDate, CFRunLoopWakeUp, kCFRunLoopCommonModes,
+use objc2_core_foundation::{
+    CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext,
+    CFRunLoopTimer, kCFRunLoopCommonModes,
 };
 
 // ----- State ----------------------------------------------------------------
 
-static WORK_SOURCE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static DELAYED_TIMER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static WORK_SOURCE: AtomicPtr<CFRunLoopSource> = AtomicPtr::new(std::ptr::null_mut());
+static DELAYED_TIMER: AtomicPtr<CFRunLoopTimer> = AtomicPtr::new(std::ptr::null_mut());
 static PUMP_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 // True between on_schedule(imm) signalling the source and the source
 // callback actually running. CFRunLoop has no public API to read the
@@ -48,6 +47,20 @@ static DMLW_CALLS: AtomicU64 = AtomicU64::new(0);
 // 10.0ms — anything > 10.0ms means Run was cut short.
 const CEF_MAX_TIME_SLICE_MS: f64 = 10.0;
 
+/// Mark the work source signalled and wake the main run loop.
+fn signal_work_source() {
+    let src = WORK_SOURCE.load(Ordering::Acquire);
+    // SAFETY: the pointer is null or the source `init` stored.
+    let Some(src) = (unsafe { src.as_ref() }) else {
+        return;
+    };
+    WORK_SOURCE_PENDING.store(true, Ordering::Release);
+    src.signal();
+    if let Some(rl) = CFRunLoop::main() {
+        rl.wake_up();
+    }
+}
+
 fn pump_drain(trigger: &str) {
     if PUMP_SHUTDOWN.load(Ordering::Acquire) {
         if jfn_logging::log_enabled(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_DEBUG) {
@@ -69,23 +82,16 @@ fn pump_drain(trigger: &str) {
 
     let wedged = ms > CEF_MAX_TIME_SLICE_MS;
     if wedged && !pending {
-        let src = WORK_SOURCE.load(Ordering::Acquire);
-        if !src.is_null() {
-            WORK_SOURCE_PENDING.store(true, Ordering::Release);
-            unsafe {
-                CFRunLoopSourceSignal(src);
-                CFRunLoopWakeUp(CFRunLoopGetMain());
-            }
-        }
+        signal_work_source();
     }
 }
 
-unsafe extern "C" fn work_source_perform(_info: *mut c_void) {
+unsafe extern "C-unwind" fn work_source_perform(_info: *mut c_void) {
     SOURCE_FIRED.fetch_add(1, Ordering::Relaxed);
     pump_drain("source");
 }
 
-unsafe extern "C" fn delayed_timer_fire(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
+unsafe extern "C-unwind" fn delayed_timer_fire(_timer: *mut CFRunLoopTimer, _info: *mut c_void) {
     TIMER_FIRED.fetch_add(1, Ordering::Relaxed);
     pump_drain("timer");
 }
@@ -99,27 +105,38 @@ pub(crate) fn init() {
         "[PUMP] init: installing CFRunLoopSource + CFRunLoopTimer",
     );
 
+    let Some(main) = CFRunLoop::main() else {
+        jfn_logging::log(
+            jfn_logging::CATEGORY_CEF,
+            jfn_logging::LEVEL_INFO,
+            "[PUMP] init: no main run loop",
+        );
+        return;
+    };
+
     let mut src_ctx = CFRunLoopSourceContext {
         version: 0,
         info: std::ptr::null_mut(),
         retain: None,
         release: None,
-        copy_description: None,
+        copyDescription: None,
         equal: None,
         hash: None,
         schedule: None,
         cancel: None,
         perform: Some(work_source_perform),
     };
-    let source = unsafe { CFRunLoopSourceCreate(std::ptr::null(), 1, &mut src_ctx) };
-    WORK_SOURCE.store(source, Ordering::Release);
-    unsafe {
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    // SAFETY: the context is a valid pointer for the duration of the call,
+    // and CoreFoundation copies it.
+    if let Some(source) = unsafe { CFRunLoopSource::new(None, 1, &mut src_ctx) } {
+        main.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+        WORK_SOURCE.store(CFRetained::into_raw(source).as_ptr(), Ordering::Release);
     }
 
+    // SAFETY: the callout matches the timer signature; the context is null.
     let timer = unsafe {
-        CFRunLoopTimerCreate(
-            std::ptr::null(),
+        CFRunLoopTimer::new(
+            None,
             CFAbsoluteTimeGetCurrent() + 1e10,
             0.0,
             0,
@@ -128,9 +145,9 @@ pub(crate) fn init() {
             std::ptr::null_mut(),
         )
     };
-    DELAYED_TIMER.store(timer, Ordering::Release);
-    unsafe {
-        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+    if let Some(timer) = timer {
+        main.add_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
+        DELAYED_TIMER.store(CFRetained::into_raw(timer).as_ptr(), Ordering::Release);
     }
 }
 
@@ -147,24 +164,13 @@ pub(crate) fn on_schedule(delay_ms: i64) {
     }
     if delay_ms <= 0 {
         SCHED_IMM_CALLS.fetch_add(1, Ordering::Relaxed);
-        let src = WORK_SOURCE.load(Ordering::Acquire);
-        if !src.is_null() {
-            WORK_SOURCE_PENDING.store(true, Ordering::Release);
-            unsafe {
-                CFRunLoopSourceSignal(src);
-                CFRunLoopWakeUp(CFRunLoopGetMain());
-            }
-        }
+        signal_work_source();
     } else {
         SCHED_DELAYED_CALLS.fetch_add(1, Ordering::Relaxed);
         let timer = DELAYED_TIMER.load(Ordering::Acquire);
-        if !timer.is_null() {
-            unsafe {
-                CFRunLoopTimerSetNextFireDate(
-                    timer,
-                    CFAbsoluteTimeGetCurrent() + delay_ms as f64 / 1000.0,
-                );
-            }
+        // SAFETY: the pointer is null or the timer `init` stored.
+        if let Some(timer) = unsafe { timer.as_ref() } {
+            timer.set_next_fire_date(CFAbsoluteTimeGetCurrent() + delay_ms as f64 / 1000.0);
         }
     }
 }
@@ -185,17 +191,15 @@ pub(crate) fn shutdown() {
     PUMP_SHUTDOWN.store(true, Ordering::Release);
 
     let timer = DELAYED_TIMER.swap(std::ptr::null_mut(), Ordering::AcqRel);
-    if !timer.is_null() {
-        unsafe {
-            CFRunLoopTimerInvalidate(timer);
-            CFRelease(timer);
-        }
+    if let Some(timer) = NonNull::new(timer) {
+        // SAFETY: reclaims the +1 `init` stored.
+        let timer = unsafe { CFRetained::from_raw(timer) };
+        timer.invalidate();
     }
     let source = WORK_SOURCE.swap(std::ptr::null_mut(), Ordering::AcqRel);
-    if !source.is_null() {
-        unsafe {
-            CFRunLoopSourceInvalidate(source);
-            CFRelease(source);
-        }
+    if let Some(source) = NonNull::new(source) {
+        // SAFETY: reclaims the +1 `init` stored.
+        let source = unsafe { CFRetained::from_raw(source) };
+        source.invalidate();
     }
 }

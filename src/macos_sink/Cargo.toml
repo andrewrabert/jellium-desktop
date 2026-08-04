@@ -13,10 +13,10 @@ jfn-playback = { path = "../playback" }
 tracing.workspace = true
 objc2.workspace = true
 block2 = "0.6"
+libloading = "0.9"
 objc2-foundation.workspace = true
-objc2-app-kit = "0.3"
+objc2-app-kit.workspace = true
 objc2-media-player = "0.3"
-libc.workspace = true
 
 [lints]
 workspace = true

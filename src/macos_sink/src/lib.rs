@@ -9,9 +9,12 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::{CStr, c_int, c_void};
+use std::ffi::{c_int, c_void};
 use std::sync::OnceLock;
 use std::time::Instant;
+
+use libloading::Library;
+use libloading::os::unix::Library as ProgramImage;
 
 use jfn_playback::sink_core::{
     self, MediaCommand, Phase, PositionThrottle, QueuedSink, map_kind_to_phase,
@@ -197,30 +200,26 @@ fn teardown_remote_command_center() {
     }
 }
 
+/// The program image and everything loaded with it; MediaPlayer's
+/// `extern NSString* const` keys resolve out of it.
+static PROGRAM_IMAGE: OnceLock<ProgramImage> = OnceLock::new();
+
 fn mp_const(name: &str) -> Retained<NSString> {
-    // MediaPlayer property keys (MPMediaItemPropertyTitle etc.) are
-    // exported as `extern NSString* const Name`. objc2-media-player
-    // exposes them as constants; for the few we need we resolve via
-    // dlsym to keep the dependency surface narrow.
     use std::ffi::CString;
     let Ok(cname) = CString::new(name) else {
         return NSString::from_str(name);
     };
-    unsafe {
-        let sym = libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr());
-        if sym.is_null() {
-            // Fallback: construct a Rust NSString. The Media keys are
-            // not interned, so this won't match the framework's lookup,
-            // but tests should never reach this branch on a real macOS.
-            return NSString::from_str(name);
-        }
-        // The symbol is `NSString * const`, i.e. a pointer to a pointer.
-        let pp = sym as *const *const NSString;
-        let p = *pp;
-        match Retained::retain(p as *mut NSString) {
-            Some(s) => s,
-            None => NSString::from_str(name),
-        }
+    let image = PROGRAM_IMAGE.get_or_init(ProgramImage::this);
+    // SAFETY: the symbol is read, not called.
+    let Ok(sym) = (unsafe { image.get::<*const *const NSString>(cname.as_c_str()) }) else {
+        // The Media keys are not interned, so a constructed NSString won't
+        // match the framework's lookup; unreachable on a real macOS.
+        return NSString::from_str(name);
+    };
+    // SAFETY: the symbol is `NSString * const`, i.e. a pointer to a pointer.
+    match unsafe { Retained::retain((**sym).cast_mut()) } {
+        Some(s) => s,
+        None => NSString::from_str(name),
     }
 }
 
@@ -232,37 +231,51 @@ struct MediaRemoteSyms {
     set_visibility: Option<unsafe extern "C" fn(*mut c_void, c_int)>,
     get_local_origin: Option<unsafe extern "C" fn() -> *mut c_void>,
     set_can_be_now_playing: Option<unsafe extern "C" fn(c_int)>,
-    _handle: *mut c_void,
+    _lib: Library,
 }
-unsafe impl Send for MediaRemoteSyms {}
-unsafe impl Sync for MediaRemoteSyms {}
 
 static MEDIA_REMOTE: OnceLock<Option<MediaRemoteSyms>> = OnceLock::new();
 
 fn media_remote() -> Option<&'static MediaRemoteSyms> {
     MEDIA_REMOTE
-        .get_or_init(|| unsafe {
-            let path = c"/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote";
-            let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW);
-            if handle.is_null() {
-                tracing::error!(
-                    target: "Media",
-                    "macOS Media: Failed to load MediaRemote.framework"
-                );
-                return None;
-            }
-            let dl = |name: &CStr| {
-                let p = libc::dlsym(handle, name.as_ptr());
-                if p.is_null() { None } else { Some(p) }
+        .get_or_init(|| {
+            let path = "/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote";
+            // SAFETY: an Apple system framework with no initialiser of ours.
+            let lib = match unsafe { Library::new(path) } {
+                Ok(lib) => lib,
+                Err(e) => {
+                    tracing::error!(
+                        target: "Media",
+                        "macOS Media: Failed to load MediaRemote.framework: {e}"
+                    );
+                    return None;
+                }
             };
+            // SAFETY: each signature matches the private API it names.
+            let set_visibility = unsafe {
+                lib.get::<unsafe extern "C" fn(*mut c_void, c_int)>(
+                    c"MRMediaRemoteSetNowPlayingVisibility",
+                )
+            }
+            .ok()
+            .map(|s| *s);
+            let get_local_origin = unsafe {
+                lib.get::<unsafe extern "C" fn() -> *mut c_void>(c"MRMediaRemoteGetLocalOrigin")
+            }
+            .ok()
+            .map(|s| *s);
+            let set_can_be_now_playing = unsafe {
+                lib.get::<unsafe extern "C" fn(c_int)>(
+                    c"MRMediaRemoteSetCanBeNowPlayingApplication",
+                )
+            }
+            .ok()
+            .map(|s| *s);
             Some(MediaRemoteSyms {
-                set_visibility: dl(c"MRMediaRemoteSetNowPlayingVisibility")
-                    .map(|p| std::mem::transmute(p)),
-                get_local_origin: dl(c"MRMediaRemoteGetLocalOrigin")
-                    .map(|p| std::mem::transmute(p)),
-                set_can_be_now_playing: dl(c"MRMediaRemoteSetCanBeNowPlayingApplication")
-                    .map(|p| std::mem::transmute(p)),
-                _handle: handle,
+                set_visibility,
+                get_local_origin,
+                set_can_be_now_playing,
+                _lib: lib,
             })
         })
         .as_ref()

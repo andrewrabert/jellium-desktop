@@ -19,10 +19,16 @@ jfn-mpv = { path = "../mpv" }
 jfn-platform-abi = { path = "../platform_abi" }
 jfn-playback = { path = "../playback" }
 cef.workspace = true
+dispatch2.workspace = true
 libc.workspace = true
 nix.workspace = true
 objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-core-foundation.workspace = true
 objc2-foundation.workspace = true
+objc2-io-kit.workspace = true
+objc2-metal.workspace = true
+objc2-quartz-core.workspace = true
 tracing.workspace = true
 
 [dependencies]

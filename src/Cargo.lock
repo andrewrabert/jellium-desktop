@@ -2414,6 +2414,7 @@ name = "jfn-macos"
 version = "0.1.0-dev"
 dependencies = [
  "cef",
+ "dispatch2",
  "jfn-cef",
  "jfn-compositor-core",
  "jfn-gpu-paint",
@@ -2426,7 +2427,12 @@ dependencies = [
  "libc",
  "nix",
  "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
  "objc2-foundation",
+ "objc2-io-kit",
+ "objc2-metal",
+ "objc2-quartz-core",
  "parking_lot",
  "tracing",
 ]
@@ -2437,7 +2443,7 @@ version = "0.1.0-dev"
 dependencies = [
  "block2",
  "jfn-playback",
- "libc",
+ "libloading 0.9.0",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -3189,6 +3195,15 @@ dependencies = [
  "block2",
  "libc",
  "objc2",
+ "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-io-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
+dependencies = [
  "objc2-core-foundation",
 ]
 
