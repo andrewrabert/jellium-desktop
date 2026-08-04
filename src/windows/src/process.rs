@@ -1,18 +1,19 @@
 use std::sync::OnceLock;
 
+use windows_sys::Win32::Foundation::TRUE;
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+use windows_sys::core::BOOL;
+
 static SHUTDOWN_CB: OnceLock<fn()> = OnceLock::new();
 
-unsafe extern "system" fn console_ctrl_handler(_t: u32) -> i32 {
+unsafe extern "system" fn console_ctrl_handler(_t: u32) -> BOOL {
     if let Some(cb) = SHUTDOWN_CB.get() {
         cb();
     }
-    1
+    TRUE
 }
 
 pub fn install_shutdown(on_shutdown: fn()) {
     let _ = SHUTDOWN_CB.set(on_shutdown);
-    unsafe extern "system" {
-        fn SetConsoleCtrlHandler(handler: unsafe extern "system" fn(u32) -> i32, add: i32) -> i32;
-    }
-    unsafe { SetConsoleCtrlHandler(console_ctrl_handler, 1) };
+    unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), TRUE) };
 }

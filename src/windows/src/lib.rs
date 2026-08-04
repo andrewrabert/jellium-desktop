@@ -1,10 +1,24 @@
 //! Windows `Platform` backend.
 
 #![cfg(target_os = "windows")]
-#![allow(non_snake_case)]
 
-use std::ffi::{c_int, c_void};
-use std::sync::atomic::Ordering;
+use std::ffi::{OsStr, c_int, c_void};
+use std::os::windows::ffi::OsStrExt;
+
+use cef::rc::Rc;
+use cef::{ImplTask, Task, ThreadId, WrapTask, post_task, wrap_task};
+use windows::Win32::Foundation::{HGLOBAL, HWND};
+use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::Power::{
+    ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, EXECUTION_STATE,
+    SetThreadExecutionState,
+};
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::core::{PCWSTR, w};
 
 pub use jfn_platform_abi::{
     DisplayBackend, JfnPopupRequest, JfnRect, PaintFrame, Platform, WindowDecorations,
@@ -41,95 +55,23 @@ pub fn win_pump() {
 // State-bound bodies ported to native Rust.
 // =====================================================================
 
-unsafe extern "C" {
-    // dwmapi.dll — tints the titlebar to match the app's theme color.
-    fn DwmSetWindowAttribute(
-        hwnd: *mut c_void,
-        attribute: u32,
-        pv_attribute: *const c_void,
-        cb_attribute: u32,
-    ) -> i32;
-}
-
 // =====================================================================
 // CEF task bouncer — posts SetThreadExecutionState(flags) onto TID_UI so
 // the assertion lives on a stable CEF UI thread. Per-thread state is
-// released when that thread calls ES_CONTINUOUS alone. Allocates a small
-// ref-counted cef_task_t whose execute() runs on TID_UI and self-deletes.
+// released when that thread calls ES_CONTINUOUS alone. CEF owns the
+// refcount through the `cef` crate's Task wrapper.
 // =====================================================================
 
-use cef::sys::{cef_base_ref_counted_t, cef_post_task, cef_task_t, cef_thread_id_t::TID_UI};
-use std::sync::atomic::AtomicI32;
-
-#[repr(C)]
-struct ExecutionStateTask {
-    task: cef_task_t,
-    ref_count: AtomicI32,
-    flags: u32,
-}
-
-unsafe extern "C" fn task_add_ref(self_: *mut cef_base_ref_counted_t) {
-    let t = self_ as *mut ExecutionStateTask;
-    unsafe { (*t).ref_count.fetch_add(1, Ordering::SeqCst) };
-}
-
-unsafe extern "C" fn task_release(self_: *mut cef_base_ref_counted_t) -> c_int {
-    let t = self_ as *mut ExecutionStateTask;
-    let prev = unsafe { (*t).ref_count.fetch_sub(1, Ordering::SeqCst) };
-    if prev == 1 {
-        let _ = unsafe { Box::from_raw(t) };
-        return 1;
+wrap_task! {
+    struct ExecutionStateTask {
+        flags: EXECUTION_STATE,
     }
-    0
+    impl Task {
+        fn execute(&self) {
+            unsafe { SetThreadExecutionState(self.flags) };
+        }
+    }
 }
-
-unsafe extern "C" fn task_has_one_ref(self_: *mut cef_base_ref_counted_t) -> c_int {
-    let t = self_ as *mut ExecutionStateTask;
-    (unsafe { (*t).ref_count.load(Ordering::SeqCst) } == 1) as c_int
-}
-
-unsafe extern "C" fn task_has_at_least_one_ref(self_: *mut cef_base_ref_counted_t) -> c_int {
-    let t = self_ as *mut ExecutionStateTask;
-    (unsafe { (*t).ref_count.load(Ordering::SeqCst) } >= 1) as c_int
-}
-
-unsafe extern "C" fn task_execute(self_: *mut cef_task_t) {
-    let t = self_ as *mut ExecutionStateTask;
-    let flags = unsafe { (*t).flags };
-    unsafe { SetThreadExecutionState(flags) };
-}
-
-unsafe extern "C" {
-    fn SetThreadExecutionState(flags: u32) -> u32;
-}
-
-fn post_execution_state(flags: u32) {
-    let boxed = Box::new(ExecutionStateTask {
-        task: cef_task_t {
-            base: cef_base_ref_counted_t {
-                // CEF validates base.size == sizeof(cef_task_t) on Wrap;
-                // ExecutionStateTask is a larger wrapper, not the CEF struct.
-                size: std::mem::size_of::<cef_task_t>(),
-                add_ref: Some(task_add_ref),
-                release: Some(task_release),
-                has_one_ref: Some(task_has_one_ref),
-                has_at_least_one_ref: Some(task_has_at_least_one_ref),
-            },
-            execute: Some(task_execute),
-        },
-        ref_count: AtomicI32::new(1),
-        flags,
-    });
-    let raw = Box::into_raw(boxed);
-    unsafe { cef_post_task(TID_UI, raw as *mut cef_task_t) };
-}
-
-const DWMWA_CAPTION_COLOR: u32 = 35;
-
-// SetThreadExecutionState flags (winbase.h).
-const ES_CONTINUOUS: u32 = 0x8000_0000;
-const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
-const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
 
 /// Tint the DWM titlebar so it matches the current theme color.
 /// rgb is 0x00RRGGBB; DWMWA_CAPTION_COLOR wants 0x00BBGGRR (COLORREF).
@@ -142,14 +84,14 @@ pub fn win_set_theme_color(rgb: u32) {
     let g = (rgb >> 8) & 0xFF;
     let b = rgb & 0xFF;
     let colorref: u32 = r | (g << 8) | (b << 16);
-    unsafe {
+    let _ = unsafe {
         DwmSetWindowAttribute(
-            hwnd,
+            HWND(hwnd),
             DWMWA_CAPTION_COLOR,
-            &colorref as *const u32 as *const c_void,
-            std::mem::size_of::<u32>() as u32,
-        );
-    }
+            std::ptr::from_ref(&colorref).cast(),
+            size_of::<u32>() as u32,
+        )
+    };
 }
 
 /// Map IdleInhibitLevel (None=0, System=1, Display=2) to execution-state
@@ -161,7 +103,8 @@ pub fn win_set_idle_inhibit(level: c_int) {
         1 => flags |= ES_SYSTEM_REQUIRED,
         _ => {}
     }
-    post_execution_state(flags);
+    let mut task = ExecutionStateTask::new(flags);
+    let _ = post_task(ThreadId::UI, Some(&mut task));
 }
 
 // =====================================================================
@@ -184,83 +127,24 @@ pub fn win_in_transition() -> bool {
 // clipboard is synchronous; callback fires inline on the calling thread.
 // =====================================================================
 
-const CF_UNICODETEXT: u32 = 13;
-const CP_UTF8: u32 = 65001;
-const SW_SHOWNORMAL: c_int = 1;
-
-unsafe extern "C" {
-    fn OpenClipboard(hwnd: *mut c_void) -> i32;
-    fn CloseClipboard() -> i32;
-    fn GetClipboardData(format: u32) -> *mut c_void;
-    fn GlobalLock(h: *mut c_void) -> *mut c_void;
-    fn GlobalUnlock(h: *mut c_void) -> i32;
-    fn WideCharToMultiByte(
-        code_page: u32,
-        flags: u32,
-        wide: *const u16,
-        wide_len: c_int,
-        out: *mut u8,
-        out_len: c_int,
-        default_char: *const u8,
-        used_default: *mut i32,
-    ) -> c_int;
-    fn MultiByteToWideChar(
-        code_page: u32,
-        flags: u32,
-        input: *const u8,
-        input_len: c_int,
-        out: *mut u16,
-        out_len: c_int,
-    ) -> c_int;
-    fn ShellExecuteW(
-        hwnd: *mut c_void,
-        verb: *const u16,
-        file: *const u16,
-        params: *const u16,
-        dir: *const u16,
-        show_cmd: c_int,
-    ) -> *mut c_void;
-}
-
 pub fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
-    let mut result: Vec<u8> = Vec::new();
+    let mut text = String::new();
     unsafe {
-        if OpenClipboard(std::ptr::null_mut()) != 0 {
-            let h = GetClipboardData(CF_UNICODETEXT);
-            if !h.is_null() {
-                let wbuf = GlobalLock(h) as *const u16;
-                if !wbuf.is_null() {
-                    let bytes = WideCharToMultiByte(
-                        CP_UTF8,
-                        0,
-                        wbuf,
-                        -1,
-                        std::ptr::null_mut(),
-                        0,
-                        std::ptr::null(),
-                        std::ptr::null_mut(),
-                    );
-                    if bytes > 1 {
-                        // bytes includes the terminating NUL.
-                        result.resize((bytes - 1) as usize, 0);
-                        WideCharToMultiByte(
-                            CP_UTF8,
-                            0,
-                            wbuf,
-                            -1,
-                            result.as_mut_ptr(),
-                            bytes,
-                            std::ptr::null(),
-                            std::ptr::null_mut(),
-                        );
-                    }
-                    GlobalUnlock(h);
+        if OpenClipboard(None).is_ok() {
+            if let Ok(handle) = GetClipboardData(u32::from(CF_UNICODETEXT.0)) {
+                let mem = HGLOBAL(handle.0);
+                let wide = PCWSTR::from_raw(GlobalLock(mem).cast::<u16>());
+                if !wide.is_null() {
+                    text = String::from_utf16_lossy(wide.as_wide());
+                    // GlobalUnlock reports FALSE with no error once the lock
+                    // count reaches zero; the Err is expected.
+                    let _ = GlobalUnlock(mem);
                 }
             }
-            CloseClipboard();
+            let _ = CloseClipboard();
         }
     }
-    on_done(std::str::from_utf8(&result).unwrap_or(""));
+    on_done(&text);
 }
 
 /// Open an external URL via `ShellExecuteW(open)`.
@@ -268,44 +152,20 @@ pub fn win_open_external_url(url: &str) {
     if url.is_empty() {
         return;
     }
-    let bytes = url.as_bytes();
-    let wlen = unsafe {
-        MultiByteToWideChar(
-            CP_UTF8,
-            0,
-            bytes.as_ptr(),
-            bytes.len() as c_int,
-            std::ptr::null_mut(),
-            0,
+    let wurl: Vec<u16> = OsStr::new(url)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let _ = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR::from_raw(wurl.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
         )
     };
-    if wlen <= 0 {
-        return;
-    }
-    let mut wurl: Vec<u16> = vec![0u16; wlen as usize + 1];
-    unsafe {
-        MultiByteToWideChar(
-            CP_UTF8,
-            0,
-            bytes.as_ptr(),
-            bytes.len() as c_int,
-            wurl.as_mut_ptr(),
-            wlen,
-        );
-    }
-    // NUL-terminate (vec initialised to 0, but be explicit).
-    wurl[wlen as usize] = 0;
-    let verb: [u16; 5] = [b'o' as u16, b'p' as u16, b'e' as u16, b'n' as u16, 0];
-    unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            wurl.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        );
-    }
 }
 
 // =====================================================================

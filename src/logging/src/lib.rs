@@ -275,26 +275,22 @@ mod imp {
 mod imp {
     use std::io::{self, Write};
 
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle,
+        STD_ERROR_HANDLE, SetConsoleMode,
+    };
+
     fn enable_vt_mode() {
         // Best-effort: tell conhost to honor ANSI SGR escapes on stderr.
         // Win10+ supports ENABLE_VIRTUAL_TERMINAL_PROCESSING; older builds
         // silently fail and we render with no color.
-        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-        const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4; // (DWORD)-12
-        type Handle = *mut std::ffi::c_void;
-        type Dword = u32;
-        type Bool = i32;
-        unsafe extern "system" {
-            fn GetStdHandle(nStdHandle: Dword) -> Handle;
-            fn GetConsoleMode(hConsoleHandle: Handle, lpMode: *mut Dword) -> Bool;
-            fn SetConsoleMode(hConsoleHandle: Handle, dwMode: Dword) -> Bool;
-        }
         unsafe {
             let h = GetStdHandle(STD_ERROR_HANDLE);
-            if h.is_null() || (h as isize) == -1 {
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
                 return;
             }
-            let mut mode: Dword = 0;
+            let mut mode: CONSOLE_MODE = 0;
             if GetConsoleMode(h, &mut mode) == 0 {
                 return;
             }

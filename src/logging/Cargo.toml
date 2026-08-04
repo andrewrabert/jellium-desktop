@@ -25,5 +25,11 @@ time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
 [lints]
 workspace = true
