@@ -8,11 +8,11 @@
 //! callback.
 
 use async_io::block_on;
-use parking_lot::Mutex;
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use parking_lot::{Mutex, RwLock};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use zbus::blocking::Connection;
@@ -293,29 +293,23 @@ impl Player {
 // ============================================================================
 
 struct Sink {
-    tx: Sender<Msg>,
-    join: Option<JoinHandle<()>>,
+    tx: Sender<PlaybackEvent>,
+    join: JoinHandle<()>,
 }
 
-enum Msg {
-    Event(Box<PlaybackEvent>),
-    Stop,
-}
-
-fn sink_slot() -> &'static Mutex<Option<Sink>> {
-    static SLOT: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
+/// Producer end plus worker handle, live only while the sink runs. `stop`
+/// clears it, which disconnects the worker once the queue drains.
+static SINK: RwLock<Option<Sink>> = RwLock::new(None);
 
 /// Push a PlaybackEvent into the running MPRIS sink. No-op if not started.
 /// Called by the event-sink closure registered in [`start`].
 pub(crate) fn deliver(ev: PlaybackEvent) {
-    if let Some(s) = sink_slot().lock().as_ref() {
-        let _ = s.tx.send(Msg::Event(Box::new(ev)));
+    if let Some(sink) = SINK.read().as_ref() {
+        let _ = sink.tx.send(ev);
     }
 }
 
-fn worker(rx: Receiver<Msg>, service_suffix: String) {
+fn worker(rx: Receiver<PlaybackEvent>, service_suffix: String) {
     let service_name = format!("{}{}", BASE_SERVICE_NAME, service_suffix);
 
     let conn = match Connection::session() {
@@ -361,11 +355,8 @@ fn worker(rx: Receiver<Msg>, service_suffix: String) {
     }
     eprintln!("mpris: registered as {}", service_name);
 
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            Msg::Stop => break,
-            Msg::Event(ev) => handle_event(*ev, &state, &iface, &mut last_props),
-        }
+    while let Ok(ev) = rx.recv() {
+        handle_event(ev, &state, &iface, &mut last_props);
     }
 
     let _ = conn.release_name(service_name.as_str());
@@ -503,12 +494,12 @@ fn emit_properties_changed(
 /// service name (`org.mpris.MediaPlayer2.JelliumDesktop<suffix>`).
 /// No-op if already running.
 pub(crate) fn start(service_suffix: &str) {
-    let mut slot = sink_slot().lock();
+    let mut slot = SINK.write();
     if slot.is_some() {
         return;
     }
     let suffix = service_suffix.to_owned();
-    let (tx, rx) = channel::<Msg>();
+    let (tx, rx) = unbounded::<PlaybackEvent>();
     let join = match thread::Builder::new()
         .name("mpris-sink".into())
         .spawn(move || worker(rx, suffix))
@@ -519,10 +510,7 @@ pub(crate) fn start(service_suffix: &str) {
             return;
         }
     };
-    *slot = Some(Sink {
-        tx,
-        join: Some(join),
-    });
+    *slot = Some(Sink { tx, join });
     drop(slot);
 
     // Once, not a resettable flag: a second start() must not double-register.
@@ -535,14 +523,11 @@ pub(crate) fn start(service_suffix: &str) {
 }
 
 pub(crate) fn stop() {
-    let mut slot = sink_slot().lock();
-    let Some(mut s) = slot.take() else {
+    let Some(sink) = SINK.write().take() else {
         return;
     };
-    let _ = s.tx.send(Msg::Stop);
-    if let Some(h) = s.join.take() {
-        let _ = h.join();
-    }
+    drop(sink.tx);
+    let _ = sink.join.join();
 }
 
 #[cfg(test)]
