@@ -15,8 +15,8 @@ mod mpv;
 use std::ffi::{CStr, CString};
 use std::os::fd::IntoRawFd;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::{OnceLock, mpsc};
 use std::thread;
 
 use error_reporter::Report;
@@ -141,7 +141,7 @@ pub fn start(rt: &'static WlRuntime) -> Option<Proxy> {
     // connects to the real compositor rather than our own socket.
     let upstream = std::env::var("WAYLAND_DISPLAY").ok();
 
-    let (tx_app, rx_app) = mpsc::sync_channel::<Result<AppStartup, String>>(1);
+    let (tx_app, rx_app) = crossbeam_channel::bounded::<Result<AppStartup, String>>(1);
     let app_thread = match thread::Builder::new()
         .name("proxy-app".into())
         .spawn(move || run_app_state(rt, tx_app, upstream))

@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 
 use calloop::{EventLoop, LoopSignal, ping::PingSource};
 use calloop_wayland_source::WaylandSource;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Surface};
@@ -91,7 +92,8 @@ pub(crate) struct RootShared {
     boot: Mutex<BootGeometry>,
     started: AtomicBool,
     scale_fallback_fed: AtomicBool,
-    commands: Mutex<Vec<WindowCommand>>,
+    commands_tx: Sender<WindowCommand>,
+    commands_rx: Receiver<WindowCommand>,
     pending_fs: AtomicU8,
     maximized: AtomicBool,
     pending_bg: AtomicU32,
@@ -119,6 +121,7 @@ struct BootGeometry {
 
 impl RootShared {
     pub(crate) fn new() -> Self {
+        let (commands_tx, commands_rx) = unbounded();
         Self {
             decoration_request: AtomicU8::new(DecorationRequest::Auto as u8),
             effective: EffectiveState(AtomicU8::new(0)),
@@ -129,7 +132,8 @@ impl RootShared {
             }),
             started: AtomicBool::new(false),
             scale_fallback_fed: AtomicBool::new(false),
-            commands: Mutex::new(Vec::new()),
+            commands_tx,
+            commands_rx,
             pending_fs: AtomicU8::new(FS_NONE),
             maximized: AtomicBool::new(false),
             pending_bg: AtomicU32::new(0),
@@ -191,9 +195,10 @@ impl RootShared {
     }
 
     /// Queue a request for the root thread and wake it. Sending and waking are
-    /// one operation so a queued request can't sit unnoticed.
+    /// one operation so a queued request can't sit unnoticed. The receiver is a
+    /// sibling field of the leaked runtime, so the send never fails.
     fn send(&self, cmd: WindowCommand) {
-        self.commands.lock().push(cmd);
+        let _ = self.commands_tx.send(cmd);
         self.wake();
     }
 
@@ -1308,11 +1313,11 @@ fn service_root_requests(state: &mut RootState) -> bool {
         }
         _ => {}
     }
-    // Drain into a local first so the queue lock isn't held while issuing
-    // protocol requests.
-    let cmds = std::mem::take(&mut *state.rt.root().commands.lock());
-    applied |= !cmds.is_empty();
-    for cmd in cmds {
+    // Drained without a lock, so a command queued by an applied command's own
+    // effects is serviced in this same pass.
+    let root: &'static RootShared = state.rt.root();
+    for cmd in root.commands_rx.try_iter() {
+        applied = true;
         apply_command(state, cmd);
     }
     if let Some(bg) = state.rt.root().pending_bg()

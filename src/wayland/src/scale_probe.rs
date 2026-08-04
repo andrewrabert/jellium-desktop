@@ -211,7 +211,7 @@ pub(crate) fn probe_scale_bounded(
     target: ProbeTarget,
     timeout: std::time::Duration,
 ) -> Result<Scale120, ScaleProbeError> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::bounded::<Result<Scale120, ScaleProbeError>>(1);
     std::thread::Builder::new()
         .name("wl-scale-probe".into())
         .spawn(move || {

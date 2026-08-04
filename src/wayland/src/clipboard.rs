@@ -18,6 +18,7 @@ use std::thread::{self, JoinHandle};
 use calloop::generic::Generic;
 use calloop::ping::PingSource;
 use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, Readiness};
+use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents};
 use wl_clipboard_rs::utils::is_primary_selection_supported;
 
@@ -26,7 +27,7 @@ struct PendingCb {
 }
 
 struct Shared {
-    queued: Mutex<Vec<PendingCb>>,
+    tx: Sender<PendingCb>,
     stop: AtomicBool,
     ping: calloop::ping::Ping,
 }
@@ -55,6 +56,7 @@ fn probe_supported() -> bool {
 
 struct Worker {
     shared: Arc<Shared>,
+    queued: Receiver<PendingCb>,
     signal: LoopSignal,
     loop_handle: LoopHandle<'static, Worker>,
     active: Option<(PendingCb, Vec<u8>)>,
@@ -65,15 +67,7 @@ impl Worker {
         if self.active.is_some() {
             return;
         }
-        let next = {
-            let mut q = self.shared.queued.lock();
-            if q.is_empty() {
-                None
-            } else {
-                Some(q.remove(0))
-            }
-        };
-        let Some(cb) = next else {
+        let Ok(cb) = self.queued.try_recv() else {
             return;
         };
         let Some(fd) = start_receive() else {
@@ -136,16 +130,13 @@ impl Worker {
     }
 
     fn drain_queued(&mut self) {
-        // Drain into a local first so the queue lock isn't held across the
-        // callbacks, which may re-enter `read_text_async`.
-        let drained: Vec<PendingCb> = std::mem::take(&mut *self.shared.queued.lock());
-        for cb in drained {
+        for cb in self.queued.try_iter() {
             fire(cb, &[]);
         }
     }
 }
 
-fn run_clipboard_loop(shared: Arc<Shared>, wake: PingSource) {
+fn run_clipboard_loop(shared: Arc<Shared>, queued: Receiver<PendingCb>, wake: PingSource) {
     let mut event_loop: EventLoop<'static, Worker> = match EventLoop::try_new() {
         Ok(l) => l,
         Err(e) => {
@@ -156,6 +147,7 @@ fn run_clipboard_loop(shared: Arc<Shared>, wake: PingSource) {
     let handle = event_loop.handle();
     let mut worker = Worker {
         shared,
+        queued,
         signal: event_loop.get_signal(),
         loop_handle: handle.clone(),
         active: None,
@@ -202,13 +194,14 @@ impl Clipboard {
         let Ok((ping, wake)) = calloop::ping::make_ping() else {
             return;
         };
+        let (tx, rx) = unbounded::<PendingCb>();
         let shared = Arc::new(Shared {
-            queued: Mutex::new(Vec::new()),
+            tx,
             stop: AtomicBool::new(false),
             ping,
         });
         let shared_w = shared.clone();
-        let thread = thread::spawn(move || run_clipboard_loop(shared_w, wake));
+        let thread = thread::spawn(move || run_clipboard_loop(shared_w, rx, wake));
         *g = Some(Handle { shared, thread });
     }
 
@@ -217,17 +210,23 @@ impl Clipboard {
     }
 
     pub fn read_text_async(&self, cb: Box<dyn FnOnce(&str) + Send>) {
-        let g = self.inner.lock();
-        let Some(c) = g.as_ref() else {
-            // No clipboard: deliver an empty read so the caller's promise resolves.
-            cb("");
-            return;
+        // Falls through to an empty read when there is no clipboard worker, or
+        // when its receiver is already gone, so the caller's promise resolves.
+        // Fired with the slot lock released: a callback may re-enter here.
+        let undelivered = {
+            let g = self.inner.lock();
+            match g.as_ref() {
+                Some(c) => match c.shared.tx.send(PendingCb { cb }) {
+                    Ok(()) => {
+                        c.shared.ping.ping();
+                        return;
+                    }
+                    Err(SendError(pending)) => pending,
+                },
+                None => PendingCb { cb },
+            }
         };
-        {
-            let mut q = c.shared.queued.lock();
-            q.push(PendingCb { cb });
-        }
-        c.shared.ping.ping();
+        fire(undelivered, &[]);
     }
 
     pub fn cleanup(&self) {

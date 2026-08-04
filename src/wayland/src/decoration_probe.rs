@@ -51,7 +51,7 @@ fn probe() -> DecorationGlobals {
 /// blocks indefinitely if the compositor stalls, and this runs inline during
 /// startup.
 pub(crate) fn probe_bounded(timeout: Duration) -> DecorationGlobals {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::bounded::<DecorationGlobals>(1);
     let spawned = std::thread::Builder::new()
         .name("wl-deco-probe".into())
         .spawn(move || {

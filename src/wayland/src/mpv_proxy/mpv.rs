@@ -4,11 +4,11 @@ use std::mem::size_of;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
+use crossbeam_channel::{Sender, bounded};
 use error_reporter::Report;
 use wl_proxy::baseline::Baseline;
 use wl_proxy::client::Client;
@@ -45,7 +45,7 @@ impl MpvWorker {
         rt: &'static WlRuntime,
         bridge: OwnedFd,
     ) -> Result<(Self, CString), String> {
-        let (tx, rx) = mpsc::sync_channel::<Result<CString, String>>(1);
+        let (tx, rx) = bounded::<Result<CString, String>>(1);
         let thread = thread::Builder::new()
             .name("proxy-mpv".into())
             .spawn(move || run_mpv_state(rt, tx, bridge))
@@ -135,11 +135,7 @@ impl MpvCtx {
     }
 }
 
-fn run_mpv_state(
-    rt: &'static WlRuntime,
-    tx: mpsc::SyncSender<Result<CString, String>>,
-    bridge: OwnedFd,
-) {
+fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, bridge: OwnedFd) {
     let state = match State::builder(Baseline::ALL_OF_THEM)
         .with_log_prefix("jfn-mpv")
         .with_server_fd(&Rc::new(bridge))

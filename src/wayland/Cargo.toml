@@ -31,6 +31,7 @@ jfn-wake-event = { path = "../wake_event" }
 calloop.workspace = true
 calloop-wayland-source.workspace = true
 cef.workspace = true
+crossbeam-channel.workspace = true
 error_reporter = "1.0.0"
 libloading = "0.9"
 nix.workspace = true

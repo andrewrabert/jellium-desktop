@@ -2633,6 +2633,7 @@ dependencies = [
  "calloop",
  "calloop-wayland-source",
  "cef",
+ "crossbeam-channel",
  "error_reporter",
  "jfn-gpu-paint",
  "jfn-input",

@@ -3,8 +3,8 @@ use std::ffi::CString;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 
+use crossbeam_channel::Sender;
 use error_reporter::Report;
 use wl_proxy::baseline::Baseline;
 use wl_proxy::client::Client;
@@ -158,7 +158,7 @@ impl Drop for AppMpv {
 
 pub(super) fn run_app_state(
     rt: &'static WlRuntime,
-    tx: mpsc::SyncSender<Result<AppStartup, String>>,
+    tx: Sender<Result<AppStartup, String>>,
     upstream: Option<String>,
 ) {
     let mut builder = State::builder(Baseline::ALL_OF_THEM).with_log_prefix("jfn-app");
