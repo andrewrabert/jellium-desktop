@@ -17,6 +17,7 @@ parking_lot.workspace = true
 arc-swap.workspace = true
 calloop.workspace = true
 cef.workspace = true
+crossbeam-channel.workspace = true
 cursor-icon = "1"
 slotmap.workspace = true
 jfn-compositor-core = { path = "../compositor_core" }

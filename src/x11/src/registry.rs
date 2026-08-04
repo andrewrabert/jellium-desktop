@@ -18,8 +18,8 @@
 //! enqueue a [`GeometryCommand`]; the geometry thread is the sole consumer.
 
 use std::sync::OnceLock;
-use std::sync::mpsc::{Receiver, Sender, channel};
 
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use slotmap::{Key, KeyData, SlotMap, new_key_type};
 use x11rb::protocol::xproto::{
@@ -202,21 +202,21 @@ pub(crate) enum GeometryCommand {
     SetOrder { ids: Vec<SurfaceId> },
 }
 
-static QUEUE: OnceLock<Mutex<Sender<GeometryCommand>>> = OnceLock::new();
-static QUEUE_RX: OnceLock<Mutex<Receiver<GeometryCommand>>> = OnceLock::new();
+static QUEUE: OnceLock<Sender<GeometryCommand>> = OnceLock::new();
+static QUEUE_RX: OnceLock<Receiver<GeometryCommand>> = OnceLock::new();
 
 /// Install the command channel. Called once as the geometry thread starts.
 pub(crate) fn install_command_channel() {
-    let (tx, rx) = channel();
-    let _ = QUEUE.set(Mutex::new(tx));
-    let _ = QUEUE_RX.set(Mutex::new(rx));
+    let (tx, rx) = unbounded();
+    let _ = QUEUE.set(tx);
+    let _ = QUEUE_RX.set(rx);
 }
 
 /// Enqueue a command and wake the geometry thread. Dropped silently before the
 /// channel exists (pre-boot) or after teardown.
 pub(crate) fn enqueue(cmd: GeometryCommand) {
     if let Some(tx) = QUEUE.get() {
-        let _ = tx.lock().send(cmd);
+        let _ = tx.send(cmd);
     }
     crate::geometry::request_resync();
 }
@@ -226,7 +226,6 @@ pub(crate) fn drain_commands() -> Vec<GeometryCommand> {
     let Some(rx) = QUEUE_RX.get() else {
         return Vec::new();
     };
-    let rx = rx.lock();
     rx.try_iter().collect()
 }
 

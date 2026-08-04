@@ -2698,6 +2698,7 @@ dependencies = [
  "arc-swap",
  "calloop",
  "cef",
+ "crossbeam-channel",
  "cursor-icon",
  "gethostname",
  "jfn-compositor-core",
