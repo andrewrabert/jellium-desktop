@@ -13,7 +13,8 @@ parking_lot.workspace = true
 jfn-mpv = { path = "../mpv" }
 jfn-platform-abi = { path = "../platform_abi" }
 jfn-wake-event = { path = "../wake_event" }
-serde_json.workspace = true
+jfn-js-json = { path = "../js_json" }
+serde.workspace = true
 
 [lints]
 workspace = true

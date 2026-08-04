@@ -5,6 +5,8 @@ use std::fmt;
 use std::os::raw::c_int;
 use std::sync::LazyLock;
 
+use serde::{Serialize, Serializer};
+
 // Entries (from CEF's cef_version.h): 0-2 CEF major/minor/patch,
 // 3 commit number, 4-7 Chromium major/minor/build/patch.
 unsafe extern "C" {
@@ -64,11 +66,12 @@ impl fmt::Display for CefVersion {
     }
 }
 
-impl From<&CefVersion> for serde_json::Value {
-    fn from(version: &CefVersion) -> Self {
-        match version {
-            CefVersion::Known(_) => Self::String(version.to_string()),
-            CefVersion::Unknown => Self::Null,
+/// `Known` serializes as the [`Display`](fmt::Display) form; `Unknown` as null.
+impl Serialize for CefVersion {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Known(_) => serializer.collect_str(self),
+            Self::Unknown => serializer.serialize_none(),
         }
     }
 }

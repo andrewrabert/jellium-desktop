@@ -2286,6 +2286,7 @@ dependencies = [
  "jfn-gpu-paint",
  "jfn-input",
  "jfn-jellyfin",
+ "jfn-js-json",
  "jfn-logging",
  "jfn-mpv",
  "jfn-paths",
@@ -2293,6 +2294,7 @@ dependencies = [
  "jfn-playback",
  "nix",
  "parking_lot",
+ "serde",
  "serde_json",
  "slotmap",
 ]
@@ -2367,6 +2369,15 @@ dependencies = [
 name = "jfn-jellyfin"
 version = "0.1.0-dev"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jfn-js-json"
+version = "0.1.0-dev"
+dependencies = [
+ "serde",
  "serde_json",
 ]
 
@@ -2487,6 +2498,7 @@ version = "0.1.0-dev"
 dependencies = [
  "cef",
  "jfn-gpu-paint",
+ "jfn-js-json",
  "jfn-paths",
  "nix",
  "parking_lot",
@@ -2500,11 +2512,12 @@ dependencies = [
 name = "jfn-playback"
 version = "0.1.0-dev"
 dependencies = [
+ "jfn-js-json",
  "jfn-mpv",
  "jfn-platform-abi",
  "jfn-wake-event",
  "parking_lot",
- "serde_json",
+ "serde",
 ]
 
 [[package]]
@@ -2531,6 +2544,7 @@ dependencies = [
  "jfn-windows",
  "jfn-x11",
  "parking_lot",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -3829,7 +3843,6 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
- "indexmap",
  "itoa",
  "memchr",
  "serde",

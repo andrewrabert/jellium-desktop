@@ -11,6 +11,10 @@ use cef::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use serde::Serialize;
+
+use crate::version::CefVersion;
+
 // ---- embedded resources ----------------------------------------------------
 
 struct Embedded {
@@ -62,21 +66,25 @@ fn theme_css() -> Vec<u8> {
     format!(":root{{--bg-color:{BG_COLOR_HEX}}}").into_bytes()
 }
 
-fn about_js_payload() -> Vec<u8> {
-    use serde_json::json;
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AboutData<'a> {
+    app: &'a str,
+    cef: &'a CefVersion,
+    config_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_file: Option<String>,
+}
 
+fn about_js_payload() -> Vec<u8> {
     let log_path = jfn_logging::active_path();
-    let mut data = serde_json::Map::new();
-    data.insert("app".into(), json!(crate::APP_VERSION_FULL));
-    data.insert("cef".into(), crate::cef_version().into());
-    data.insert(
-        "configDir".into(),
-        json!(abs_path(&jfn_paths::config_dir().to_string_lossy())),
-    );
-    if !log_path.is_empty() {
-        data.insert("logFile".into(), json!(abs_path(&log_path)));
-    }
-    let json = serde_json::Value::Object(data).to_string();
+    let data = AboutData {
+        app: crate::APP_VERSION_FULL,
+        cef: crate::cef_version(),
+        config_dir: abs_path(&jfn_paths::config_dir().to_string_lossy()),
+        log_file: (!log_path.is_empty()).then(|| abs_path(&log_path)),
+    };
+    let json = jfn_js_json::to_js_json(&data).unwrap_or_else(|| "{}".to_string());
     let prefix = format!("var _aboutData = {json};\n");
 
     let static_body = RESOURCES

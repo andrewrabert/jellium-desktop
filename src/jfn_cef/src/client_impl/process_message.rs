@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::cef_string::userfree_to_string;
 use crate::client::Inner;
 use crate::ipc::BrowserMessage;
+use jfn_platform_abi::MENU_DISMISSED;
 
 pub(super) fn on_process_message_received(
     inner: &Arc<Inner>,
@@ -45,13 +46,13 @@ pub(super) fn on_process_message_received(
         }
         "menuItemSelected" => {
             if let Some(cb) = inner.take_parked_menu_selection() {
-                cb(args.map_or(-1, |a| a.int(0)));
+                cb(args.map_or(MENU_DISMISSED, |a| a.int(0)));
             }
             1
         }
         "menuDismissed" => {
             if let Some(cb) = inner.take_parked_menu_selection() {
-                cb(-1);
+                cb(MENU_DISMISSED);
             }
             1
         }

@@ -19,6 +19,7 @@ kde-palette = ["jfn-wayland/kde-palette"]
 [dependencies]
 tracing.workspace = true
 parking_lot.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 clap = { version = "4", default-features = false, features = ["std", "derive", "error-context", "help", "usage", "suggestions", "env"] }
 jfn-platform-abi = { path = "../platform_abi" }

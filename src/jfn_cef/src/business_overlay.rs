@@ -281,7 +281,7 @@ fn on_complete(state: &Arc<Mutex<ProbeState>>, request: &Urlrequest) {
                     resolved = s;
                 }
             }
-            st.base = extract_base_url(&resolved);
+            st.base = extract_base_url(&resolved).to_string();
             st.phase = Phase::Get;
             let next_url = format!("{}/System/Info/Public", st.base);
             let client = JfnServerProbeClient::new(Arc::clone(state));

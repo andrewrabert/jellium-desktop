@@ -6,10 +6,16 @@ use parking_lot::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde_json::json;
+use serde::Serialize;
 
 use crate::exec_js::call as call_exec_js;
 use crate::types::{PlaybackEvent, PlaybackEventKind};
+
+#[derive(Serialize)]
+struct BufferedRange {
+    start: i64,
+    end: i64,
+}
 
 type SetHzCb = extern "C" fn(f64);
 
@@ -49,8 +55,8 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
             } else {
                 ev.error_message.as_str()
             };
-            let json_str = json!(msg).to_string();
-            call_exec_js(&format!("window._nativeEmit('error',{})", json_str));
+            let text = jfn_js_json::to_js_json(msg).unwrap_or_else(|| "\"\"".to_string());
+            call_exec_js(&format!("window._nativeEmit('error',{text})"));
         }
         PlaybackEventKind::SeekingChanged => {
             if ev.flag {
@@ -91,13 +97,16 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
             }
         }
         PlaybackEventKind::BufferedRangesChanged => {
-            let arr: Vec<_> = snap
+            let ranges: Vec<BufferedRange> = snap
                 .buffered
                 .iter()
-                .map(|r| json!({ "start": r.start_ticks, "end": r.end_ticks }))
+                .map(|r| BufferedRange {
+                    start: r.start_ticks,
+                    end: r.end_ticks,
+                })
                 .collect();
-            let json_str = serde_json::Value::Array(arr).to_string();
-            call_exec_js(&format!("window._nativeUpdateBufferedRanges({})", json_str));
+            let json = jfn_js_json::to_js_json(&ranges).unwrap_or_else(|| "[]".to_string());
+            call_exec_js(&format!("window._nativeUpdateBufferedRanges({json})"));
         }
         PlaybackEventKind::BufferingChanged
         | PlaybackEventKind::MediaTypeChanged

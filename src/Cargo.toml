@@ -9,6 +9,7 @@ members = [
     "jellyfin",
     "jfn_cef",
     "jfn_rust",
+    "js_json",
     "linux_util",
     "logging",
     "macos",

@@ -68,8 +68,8 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            let escaped = serde_json::to_string(&self.text).unwrap_or_else(|_| "\"\"".to_string());
-            let js = format!("document.execCommand('insertText',false,{});", escaped);
+            let text = jfn_js_json::to_js_json(&self.text).unwrap_or_else(|| "\"\"".to_string());
+            let js = format!("document.execCommand('insertText',false,{text});");
             self.inner.exec_js_focused(&js);
         }
     }

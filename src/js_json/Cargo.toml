@@ -1,11 +1,11 @@
 [package]
-name = "jfn-jellyfin"
+name = "jfn-js-json"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [lib]
-name = "jfn_jellyfin"
+name = "jfn_js_json"
 crate-type = ["rlib"]
 
 [dependencies]

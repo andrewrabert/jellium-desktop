@@ -15,7 +15,8 @@
 //! Subtitle normalization at probe time (NormalizeSubtitleCodec):
 //!   <https://github.com/jellyfin/jellyfin/blob/2c62d40f0d13926874eef9118a95be0dcee4e659/MediaBrowser.MediaEncoding/Probing/ProbeResultNormalizer.cs#L632-L652>
 
-use serde_json::{Map, Value, json};
+use serde::Serialize;
+use serde_json::Value;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum MediaKind {
@@ -42,7 +43,12 @@ const SUBTITLE_RENAMES: &[(&str, &str)] = &[
 const CONTAINER_RENAMES: &[(&str, &str)] =
     &[("matroska", "mkv"), ("mpegts", "ts"), ("mpegvideo", "mpeg")];
 
+const MAX_STATIC_BITRATE: i64 = 1_000_000_000;
+const MUSIC_STREAMING_TRANSCODING_BITRATE: i64 = 1_280_000;
+const TIMELINE_OFFSET_SECONDS: i64 = 5;
+
 const TRANSCODE_CONTAINER: &str = "ts";
+const TRANSCODE_CONTAINER_MP4: &str = "mp4";
 const TRANSCODE_PROTOCOL: &str = "hls";
 const TRANSCODE_MAX_AUDIO_CHANNELS: &str = "6";
 
@@ -66,13 +72,75 @@ const TRANSCODE_AUDIO_CODEC_MP4: &[&str] =
     &["opus", "aac", "eac3", "ac3", "flac", "mp3", "dts", "truehd"];
 const TRANSCODE_AUDIO_CODEC_TS: &[&str] = &["aac", "eac3", "ac3", "mp3"];
 
-fn rename_lookup(table: &[(&'static str, &'static str)], key: &str) -> Option<&'static str> {
-    for (k, v) in table {
-        if *k == key {
-            return Some(*v);
-        }
-    }
-    None
+/// Profile lists this client never populates; serializes as `[]`.
+type EmptyList = [(); 0];
+
+const EMPTY_LIST: EmptyList = [];
+
+/// Jellyfin's `DlnaProfileType`.
+#[derive(Copy, Clone, Serialize)]
+enum ProfileType {
+    Video,
+    Audio,
+    Photo,
+}
+
+#[derive(Copy, Clone, Serialize)]
+enum SubtitleDeliveryMethod {
+    Embed,
+    External,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DirectPlayProfile<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container: Option<&'a str>,
+    #[serde(rename = "Type")]
+    profile_type: ProfileType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_codec: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_codec: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct TranscodingProfile<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container: Option<&'a str>,
+    #[serde(rename = "Type")]
+    profile_type: ProfileType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_codec: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_codec: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_audio_channels: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct SubtitleProfile<'a> {
+    format: &'a str,
+    method: SubtitleDeliveryMethod,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeviceProfile<'a> {
+    name: &'a str,
+    max_static_bitrate: i64,
+    music_streaming_transcoding_bitrate: i64,
+    timeline_offset_seconds: i64,
+    direct_play_profiles: Vec<DirectPlayProfile<'a>>,
+    transcoding_profiles: Vec<TranscodingProfile<'a>>,
+    subtitle_profiles: Vec<SubtitleProfile<'a>>,
+    response_profiles: EmptyList,
+    container_profiles: EmptyList,
+    codec_profiles: EmptyList,
 }
 
 // Expand each input through `renames` and return the deduped union of raw +
@@ -91,7 +159,7 @@ fn expand_with_renames(inputs: &[String], renames: &[(&'static str, &'static str
     for input in inputs {
         for piece in input.split(',') {
             push(piece);
-            if let Some(renamed) = rename_lookup(renames, piece) {
+            if let Some((_, renamed)) = renames.iter().find(|(from, _)| *from == piece) {
                 push(renamed);
             }
         }
@@ -99,25 +167,15 @@ fn expand_with_renames(inputs: &[String], renames: &[(&'static str, &'static str
     out
 }
 
-// Filter `items` down to entries present in `allowed`, preserving the order
-// of `items` (Jellyfin treats this as the server's preference order).
-fn filter_in_order(items: &[&str], allowed: &[String]) -> Vec<String> {
-    items
+// Intersect `preferred` with `available`, keeping `preferred`'s order — the
+// server takes the first entry as its output codec — joined as CSV.
+fn preferred_csv(preferred: &[&str], available: &[String]) -> String {
+    preferred
         .iter()
-        .filter(|s| allowed.iter().any(|a| a == *s))
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn join_csv(items: &[String]) -> String {
-    items.join(",")
-}
-
-fn subtitle_profile(format: &str, method: &str) -> Value {
-    let mut m = Map::new();
-    m.insert("Format".to_string(), Value::String(format.to_string()));
-    m.insert("Method".to_string(), Value::String(method.to_string()));
-    Value::Object(m)
+        .filter(|s| available.iter().any(|a| a == *s))
+        .copied()
+        .collect::<Vec<&str>>()
+        .join(",")
 }
 
 /// Build the DeviceProfile JSON.
@@ -142,12 +200,12 @@ pub fn build_device_profile(
     let video_csv = if force_transcode {
         String::new()
     } else {
-        join_csv(&video_codecs)
+        video_codecs.join(",")
     };
     let audio_csv = if force_transcode {
         String::new()
     } else {
-        join_csv(&audio_codecs)
+        audio_codecs.join(",")
     };
 
     let containers = expand_with_renames(demuxers, CONTAINER_RENAMES);
@@ -159,144 +217,138 @@ pub fn build_device_profile(
     // to transcode to formats we don't want as targets (truehd, dts, vp9...)
     // and (b) push the AudioCodec CSV past the server's 40-char query-param
     // validator (^[a-zA-Z0-9\-\._,|]{0,40}$).
-    let transcode_video_csv = join_csv(&filter_in_order(TRANSCODE_VIDEO_CODEC, &video_codecs));
-    let transcode_audio_csv_mp4 =
-        join_csv(&filter_in_order(TRANSCODE_AUDIO_CODEC_MP4, &audio_codecs));
-    let transcode_audio_csv_ts =
-        join_csv(&filter_in_order(TRANSCODE_AUDIO_CODEC_TS, &audio_codecs));
+    let transcode_video_csv = preferred_csv(TRANSCODE_VIDEO_CODEC, &video_codecs);
+    let transcode_audio_csv_mp4 = preferred_csv(TRANSCODE_AUDIO_CODEC_MP4, &audio_codecs);
+    let transcode_audio_csv_ts = preferred_csv(TRANSCODE_AUDIO_CODEC_TS, &audio_codecs);
 
     // DirectPlayProfiles. ContainerHelper.ContainsContainer splits both the
     // profile's Container and the file's MediaSource.Container on comma and
     // does case-insensitive equality, so one entry with every container
     // comma-joined matches identically to N entries with one container each —
     // without repeating the codec CSV per container.
-    let container_csv = join_csv(&containers);
-    let mut direct_play: Vec<Value> = Vec::new();
+    let container_csv = containers.join(",");
+    let mut direct_play: Vec<DirectPlayProfile> = Vec::new();
     if !video_csv.is_empty() || force_transcode {
-        let mut e = Map::new();
-        e.insert(
-            "Container".to_string(),
-            Value::String(container_csv.clone()),
-        );
-        e.insert("Type".to_string(), Value::String("Video".to_string()));
-        e.insert("VideoCodec".to_string(), Value::String(video_csv.clone()));
-        e.insert("AudioCodec".to_string(), Value::String(audio_csv.clone()));
-        direct_play.push(Value::Object(e));
+        direct_play.push(DirectPlayProfile {
+            container: Some(&container_csv),
+            profile_type: ProfileType::Video,
+            video_codec: Some(&video_csv),
+            audio_codec: Some(&audio_csv),
+        });
     }
     if !audio_csv.is_empty() || force_transcode {
-        let mut e = Map::new();
-        e.insert(
-            "Container".to_string(),
-            Value::String(container_csv.clone()),
-        );
-        e.insert("Type".to_string(), Value::String("Audio".to_string()));
-        e.insert("AudioCodec".to_string(), Value::String(audio_csv.clone()));
-        direct_play.push(Value::Object(e));
+        direct_play.push(DirectPlayProfile {
+            container: Some(&container_csv),
+            profile_type: ProfileType::Audio,
+            video_codec: None,
+            audio_codec: Some(&audio_csv),
+        });
     }
-    {
-        let mut e = Map::new();
-        e.insert("Type".to_string(), Value::String("Photo".to_string()));
-        direct_play.push(Value::Object(e));
-    }
+    direct_play.push(DirectPlayProfile {
+        container: None,
+        profile_type: ProfileType::Photo,
+        video_codec: None,
+        audio_codec: None,
+    });
 
     // mpv handles both Embed and External natively, so no need to distinguish.
-    let mut sub_profiles: Vec<Value> = Vec::new();
+    let mut sub_profiles: Vec<SubtitleProfile> = Vec::new();
     for fmt in &subtitle_names {
-        sub_profiles.push(subtitle_profile(fmt, "Embed"));
-        sub_profiles.push(subtitle_profile(fmt, "External"));
+        sub_profiles.push(SubtitleProfile {
+            format: fmt,
+            method: SubtitleDeliveryMethod::Embed,
+        });
+        sub_profiles.push(SubtitleProfile {
+            format: fmt,
+            method: SubtitleDeliveryMethod::External,
+        });
     }
 
     // TranscodingProfiles: describes what server should produce when a
     // transcode is unavoidable. Order of VideoCodec/AudioCodec is the
     // server's preference order.
-    let mut transcoding: Vec<Value> = Vec::new();
-    transcoding.push(json!({ "Type": "Audio" }));
+    let mut transcoding: Vec<TranscodingProfile> = vec![TranscodingProfile {
+        container: None,
+        profile_type: ProfileType::Audio,
+        protocol: None,
+        audio_codec: None,
+        video_codec: None,
+        max_audio_channels: None,
+    }];
     if !force_transcode {
-        let mut fmp4 = Map::new();
-        fmp4.insert("Container".to_string(), Value::String("mp4".to_string()));
-        fmp4.insert("Type".to_string(), Value::String("Video".to_string()));
-        fmp4.insert("Protocol".to_string(), Value::String("hls".to_string()));
-        fmp4.insert(
-            "AudioCodec".to_string(),
-            Value::String(transcode_audio_csv_mp4),
-        );
-        fmp4.insert(
-            "VideoCodec".to_string(),
-            Value::String(transcode_video_csv.clone()),
-        );
-        fmp4.insert(
-            "MaxAudioChannels".to_string(),
-            Value::String(TRANSCODE_MAX_AUDIO_CHANNELS.to_string()),
-        );
-        transcoding.push(Value::Object(fmp4));
+        transcoding.push(TranscodingProfile {
+            container: Some(TRANSCODE_CONTAINER_MP4),
+            profile_type: ProfileType::Video,
+            protocol: Some(TRANSCODE_PROTOCOL),
+            audio_codec: Some(&transcode_audio_csv_mp4),
+            video_codec: Some(&transcode_video_csv),
+            max_audio_channels: Some(TRANSCODE_MAX_AUDIO_CHANNELS),
+        });
     }
-    {
-        let mut v = Map::new();
-        v.insert(
-            "Container".to_string(),
-            Value::String(TRANSCODE_CONTAINER.to_string()),
-        );
-        v.insert("Type".to_string(), Value::String("Video".to_string()));
-        v.insert(
-            "Protocol".to_string(),
-            Value::String(TRANSCODE_PROTOCOL.to_string()),
-        );
-        v.insert(
-            "AudioCodec".to_string(),
-            Value::String(transcode_audio_csv_ts),
-        );
-        v.insert("VideoCodec".to_string(), Value::String(transcode_video_csv));
-        v.insert(
-            "MaxAudioChannels".to_string(),
-            Value::String(TRANSCODE_MAX_AUDIO_CHANNELS.to_string()),
-        );
-        transcoding.push(Value::Object(v));
-    }
-    transcoding.push(json!({ "Container": "jpeg", "Type": "Photo" }));
+    transcoding.push(TranscodingProfile {
+        container: Some(TRANSCODE_CONTAINER),
+        profile_type: ProfileType::Video,
+        protocol: Some(TRANSCODE_PROTOCOL),
+        audio_codec: Some(&transcode_audio_csv_ts),
+        video_codec: Some(&transcode_video_csv),
+        max_audio_channels: Some(TRANSCODE_MAX_AUDIO_CHANNELS),
+    });
+    transcoding.push(TranscodingProfile {
+        container: Some("jpeg"),
+        profile_type: ProfileType::Photo,
+        protocol: None,
+        audio_codec: None,
+        video_codec: None,
+        max_audio_channels: None,
+    });
 
-    let mut profile = Map::new();
-    profile.insert("Name".to_string(), Value::String(device_name.to_string()));
-    profile.insert(
-        "MaxStaticBitrate".to_string(),
-        Value::from(1_000_000_000i64),
-    );
-    profile.insert(
-        "MusicStreamingTranscodingBitrate".to_string(),
-        Value::from(1_280_000i64),
-    );
-    profile.insert("TimelineOffsetSeconds".to_string(), Value::from(5i64));
-    profile.insert("DirectPlayProfiles".to_string(), Value::Array(direct_play));
-    profile.insert("TranscodingProfiles".to_string(), Value::Array(transcoding));
-    profile.insert("SubtitleProfiles".to_string(), Value::Array(sub_profiles));
-    profile.insert("ResponseProfiles".to_string(), Value::Array(Vec::new()));
-    profile.insert("ContainerProfiles".to_string(), Value::Array(Vec::new()));
-    profile.insert("CodecProfiles".to_string(), Value::Array(Vec::new()));
-
-    serde_json::to_string(&Value::Object(profile)).unwrap_or_default()
+    let profile = DeviceProfile {
+        name: device_name,
+        max_static_bitrate: MAX_STATIC_BITRATE,
+        music_streaming_transcoding_bitrate: MUSIC_STREAMING_TRANSCODING_BITRATE,
+        timeline_offset_seconds: TIMELINE_OFFSET_SECONDS,
+        direct_play_profiles: direct_play,
+        transcoding_profiles: transcoding,
+        subtitle_profiles: sub_profiles,
+        response_profiles: EMPTY_LIST,
+        container_profiles: EMPTY_LIST,
+        codec_profiles: EMPTY_LIST,
+    };
+    serde_json::to_string(&profile).unwrap_or_default()
 }
 
 // ---- URL helpers ----
 
+const SCHEME_SEPARATOR: &str = "://";
+const DEFAULT_SCHEME: &str = "http://";
+
+/// Scheme prefixes normalized to lowercase; every other prefix passes through.
+const LOWERCASE_SCHEMES: [&str; 2] = ["http:", "https:"];
+
+const WEB_PATH_SEGMENT: &str = "/web";
+
 /// Trim surrounding whitespace, lowercase `Http:`/`Https:` scheme prefixes,
 /// and prepend `http://` when no scheme is present.
+///
+/// Non-ASCII input never panics: the prefix comparison is `get`-guarded.
 pub fn normalize_input(user_input: &str) -> String {
     let trimmed = user_input.trim();
-    let mut s = String::with_capacity(trimmed.len() + 7);
-    let lower_prefix =
-        |s: &str, p: &str| s.len() >= p.len() && s[..p.len()].eq_ignore_ascii_case(p);
-    if lower_prefix(trimmed, "http:") {
-        s.push_str("http:");
-        s.push_str(&trimmed[5..]);
-    } else if lower_prefix(trimmed, "https:") {
-        s.push_str("https:");
-        s.push_str(&trimmed[6..]);
+    let cased = LOWERCASE_SCHEMES
+        .iter()
+        .find(|scheme| {
+            trimmed
+                .get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        })
+        .map_or_else(
+            || trimmed.to_string(),
+            |scheme| format!("{scheme}{}", &trimmed[scheme.len()..]),
+        );
+    if cased.contains(SCHEME_SEPARATOR) {
+        cased
     } else {
-        s.push_str(trimmed);
+        format!("{DEFAULT_SCHEME}{cased}")
     }
-    if !s.contains("://") {
-        s.insert_str(0, "http://");
-    }
-    s
 }
 
 /// Reduce a URL to its server base:
@@ -304,19 +356,21 @@ pub fn normalize_input(user_input: &str) -> String {
 ///     at the last occurrence;
 ///   - otherwise return the origin (everything up to the first `/` after
 ///     `://`, or the whole string if there's no path).
-pub fn extract_base_url(url: &str) -> String {
+///
+/// The result is a prefix slice of `url`: no percent-encoding, no punycode,
+/// no default-port stripping, no case folding of host or path.
+pub fn extract_base_url(url: &str) -> &str {
     let lower = url.to_ascii_lowercase();
-    if let Some(pos) = lower.rfind("/web") {
-        return url[..pos].to_string();
+    if let Some(pos) = lower.rfind(WEB_PATH_SEGMENT) {
+        return &url[..pos];
     }
-    let host_start = match url.find("://") {
-        Some(i) => i + 3,
-        None => 0,
-    };
-    match url[host_start..].find('/') {
-        Some(rel) => url[..host_start + rel].to_string(),
-        None => url.to_string(),
-    }
+    let host_start = url
+        .find(SCHEME_SEPARATOR)
+        .map_or(0, |i| i + SCHEME_SEPARATOR.len());
+    let end = url[host_start..]
+        .find('/')
+        .map_or(url.len(), |rel| host_start + rel);
+    &url[..end]
 }
 
 /// Validate that a Jellyfin `/System/Info/Public` response body is a JSON
@@ -712,27 +766,51 @@ mod tests {
         ));
     }
 
+    const EMPTY_PROFILE_JSON: &str = r#"{"Name":"dev","MaxStaticBitrate":1000000000,"MusicStreamingTranscodingBitrate":1280000,"TimelineOffsetSeconds":5,"DirectPlayProfiles":[{"Type":"Photo"}],"TranscodingProfiles":[{"Type":"Audio"},{"Container":"mp4","Type":"Video","Protocol":"hls","AudioCodec":"","VideoCodec":"","MaxAudioChannels":"6"},{"Container":"ts","Type":"Video","Protocol":"hls","AudioCodec":"","VideoCodec":"","MaxAudioChannels":"6"},{"Container":"jpeg","Type":"Photo"}],"SubtitleProfiles":[],"ResponseProfiles":[],"ContainerProfiles":[],"CodecProfiles":[]}"#;
+
+    const TYPICAL_PROFILE_JSON: &str = r#"{"Name":"dev","MaxStaticBitrate":1000000000,"MusicStreamingTranscodingBitrate":1280000,"TimelineOffsetSeconds":5,"DirectPlayProfiles":[{"Container":"matroska,mkv,webm,mpegts,ts","Type":"Video","VideoCodec":"h264,hevc","AudioCodec":"aac,opus"},{"Container":"matroska,mkv,webm,mpegts,ts","Type":"Audio","AudioCodec":"aac,opus"},{"Type":"Photo"}],"TranscodingProfiles":[{"Type":"Audio"},{"Container":"mp4","Type":"Video","Protocol":"hls","AudioCodec":"opus,aac","VideoCodec":"h264,hevc","MaxAudioChannels":"6"},{"Container":"ts","Type":"Video","Protocol":"hls","AudioCodec":"aac","VideoCodec":"h264,hevc","MaxAudioChannels":"6"},{"Container":"jpeg","Type":"Photo"}],"SubtitleProfiles":[{"Format":"subrip","Method":"Embed"},{"Format":"subrip","Method":"External"},{"Format":"srt","Method":"Embed"},{"Format":"srt","Method":"External"}],"ResponseProfiles":[],"ContainerProfiles":[],"CodecProfiles":[]}"#;
+
+    const FORCED_TRANSCODE_PROFILE_JSON: &str = r#"{"Name":"dev","MaxStaticBitrate":1000000000,"MusicStreamingTranscodingBitrate":1280000,"TimelineOffsetSeconds":5,"DirectPlayProfiles":[{"Container":"matroska,mkv","Type":"Video","VideoCodec":"","AudioCodec":""},{"Container":"matroska,mkv","Type":"Audio","AudioCodec":""},{"Type":"Photo"}],"TranscodingProfiles":[{"Type":"Audio"},{"Container":"ts","Type":"Video","Protocol":"hls","AudioCodec":"aac","VideoCodec":"h264,hevc","MaxAudioChannels":"6"},{"Container":"jpeg","Type":"Photo"}],"SubtitleProfiles":[{"Format":"subrip","Method":"Embed"},{"Format":"subrip","Method":"External"},{"Format":"srt","Method":"Embed"},{"Format":"srt","Method":"External"}],"ResponseProfiles":[],"ContainerProfiles":[],"CodecProfiles":[]}"#;
+
+    fn byte_exact_decoders() -> Vec<Codec> {
+        vec![
+            codec("h264", MediaKind::Video),
+            codec("hevc", MediaKind::Video),
+            codec("aac", MediaKind::Audio),
+            codec("opus", MediaKind::Audio),
+            codec("subrip", MediaKind::Subtitle),
+        ]
+    }
+
     #[test]
-    fn top_level_keys_in_expected_order() -> TestResult {
-        let s = build_device_profile(&[], &[], "dev", "1.0", false);
-        let v: Value = parse(&s)?;
-        let obj = v.as_object().ok_or("expected object")?;
-        let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    fn empty_capabilities_profile_is_byte_exact() {
         assert_eq!(
-            keys,
-            vec![
-                "Name",
-                "MaxStaticBitrate",
-                "MusicStreamingTranscodingBitrate",
-                "TimelineOffsetSeconds",
-                "DirectPlayProfiles",
-                "TranscodingProfiles",
-                "SubtitleProfiles",
-                "ResponseProfiles",
-                "ContainerProfiles",
-                "CodecProfiles",
-            ]
+            build_device_profile(&[], &[], "dev", "1.0", false),
+            EMPTY_PROFILE_JSON
         );
-        Ok(())
+    }
+
+    #[test]
+    fn typical_capabilities_profile_is_byte_exact() {
+        let demuxers = vec!["matroska,webm".to_string(), "mpegts".to_string()];
+        assert_eq!(
+            build_device_profile(&byte_exact_decoders(), &demuxers, "dev", "1.0", false),
+            TYPICAL_PROFILE_JSON
+        );
+    }
+
+    #[test]
+    fn forced_transcode_profile_is_byte_exact() {
+        let demuxers = vec!["matroska".to_string()];
+        assert_eq!(
+            build_device_profile(&byte_exact_decoders(), &demuxers, "dev", "1.0", true),
+            FORCED_TRANSCODE_PROFILE_JSON
+        );
+    }
+
+    #[test]
+    fn normalize_survives_multibyte_char_across_scheme_prefix() {
+        assert_eq!(normalize_input("htt\u{2028}p"), "http://htt\u{2028}p");
+        assert_eq!(normalize_input("みんな"), "http://みんな");
     }
 }

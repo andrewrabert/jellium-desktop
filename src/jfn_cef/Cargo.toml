@@ -16,11 +16,13 @@ jfn-config = { path = "../config" }
 jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-input = { path = "../input" }
 jfn-jellyfin = { path = "../jellyfin" }
+jfn-js-json = { path = "../js_json" }
 jfn-logging = { path = "../logging" }
 jfn-mpv = { path = "../mpv" }
 jfn-paths = { path = "../paths" }
 jfn-platform-abi = { path = "../platform_abi" }
 jfn-playback = { path = "../playback" }
+serde.workspace = true
 serde_json.workspace = true
 slotmap.workspace = true
 
