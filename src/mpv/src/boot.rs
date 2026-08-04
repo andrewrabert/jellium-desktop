@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::handle::Handle;
 use crate::sys;
@@ -67,8 +67,8 @@ pub struct JfnMpvBoot {
 
 /// Owns the Handle for the rest of the process. `mpv_terminate_destroy`
 /// fires when the slot is taken via [`jfn_mpv_handle_terminate`].
-fn handle_slot() -> &'static Mutex<Option<Handle>> {
-    static SLOT: OnceLock<Mutex<Option<Handle>>> = OnceLock::new();
+fn handle_slot() -> &'static Mutex<Option<Arc<Handle>>> {
+    static SLOT: OnceLock<Mutex<Option<Arc<Handle>>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
@@ -266,7 +266,7 @@ pub unsafe fn jfn_mpv_handle_init(boot: *const JfnMpvBoot) -> *mut sys::mpv_hand
     }
 
     let raw = handle.raw();
-    *handle_slot().lock() = Some(handle);
+    *handle_slot().lock() = Some(Arc::new(handle));
     raw
 }
 
@@ -276,7 +276,16 @@ pub unsafe fn jfn_mpv_handle_init(boot: *const JfnMpvBoot) -> *mut sys::mpv_hand
 /// On macOS the caller must invoke this off the main thread (mpv's VO
 /// uninit does `DispatchQueue.main.sync`).
 pub fn jfn_mpv_handle_terminate() {
-    let _ = handle_slot().lock().take();
+    let taken = handle_slot().lock().take();
+    let Some(handle) = taken else {
+        return;
+    };
+    if Arc::into_inner(handle).is_none() {
+        tracing::warn!(
+            target: "mpv",
+            "mpv handle still referenced at terminate; mpv_terminate_destroy deferred"
+        );
+    }
 }
 
 /// Borrow the live raw `mpv_handle*`. Returns null before
@@ -292,10 +301,9 @@ pub fn current_raw_handle() -> Option<*mut sys::mpv_handle> {
     handle_slot().lock().as_ref().map(|h| h.raw())
 }
 
-/// Wake the live handle's `mpv_wait_event` from any thread. No-op if
-/// the handle is not currently initialized.
-pub fn wakeup_current() {
-    if let Some(raw) = current_raw_handle() {
-        unsafe { sys::mpv_wakeup(raw) };
-    }
+/// Clone the process-global [`Handle`]. `None` before
+/// [`jfn_mpv_handle_init`] succeeds and after
+/// [`jfn_mpv_handle_terminate`].
+pub fn current_handle() -> Option<Arc<Handle>> {
+    handle_slot().lock().as_ref().map(Arc::clone)
 }

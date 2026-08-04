@@ -10,6 +10,7 @@ crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
+crossbeam-channel.workspace = true
 parking_lot.workspace = true
 jfn-color = { path = "../color" }
 thiserror.workspace = true
