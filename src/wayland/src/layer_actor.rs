@@ -1,6 +1,6 @@
 use std::os::fd::AsFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use smithay_client_toolkit::shm::slot::SlotPool;
@@ -9,6 +9,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
 use jfn_gpu_paint::{Frame, FrameSize as PhysicalSize, Pixels, Presented, SharedTexture, Surfaces};
+use jfn_mailbox::Mailbox;
 use jfn_platform_abi::JfnRect;
 
 use crate::layer::{FrameCommit, LayerSurface, Present, PresentError, ViewportState};
@@ -85,7 +86,7 @@ enum ShadowState {
     Valid { size: (i32, i32) },
 }
 
-struct Mailbox {
+struct LayerState {
     pending: Option<PendingFrame>,
     shadow: ShadowState,
     viewport: ViewportState,
@@ -96,7 +97,7 @@ struct Mailbox {
     popup: PopupCommit,
 }
 
-impl Mailbox {
+impl LayerState {
     fn new(viewport: ViewportState, visible: bool) -> Self {
         Self {
             pending: None,
@@ -209,7 +210,7 @@ fn validate_present_dims(width: i32, height: i32) -> Result<(), PresentError> {
 
 pub(crate) struct LayerActor {
     kind: Kind,
-    shared: Arc<(Mutex<Mailbox>, Condvar)>,
+    mailbox: Mailbox<LayerState>,
     gpu_failed: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -226,65 +227,57 @@ impl LayerActor {
             LayerBackend::Gpu(_) => Kind::Gpu,
             LayerBackend::Shm => Kind::Shm,
         };
-        let shared = Arc::new((
-            Mutex::new(Mailbox::new(viewport_state, visible)),
-            Condvar::new(),
-        ));
+        let mailbox = Mailbox::new(LayerState::new(viewport_state, visible));
         let gpu_failed = Arc::new(AtomicBool::new(false));
-        let worker_shared = Arc::clone(&shared);
+        let worker_mailbox = mailbox.clone();
         let worker_failed = Arc::clone(&gpu_failed);
-        let thread = thread::spawn(move || run(backend, deps, layer, worker_shared, worker_failed));
+        let thread =
+            thread::spawn(move || run(backend, deps, layer, worker_mailbox, worker_failed));
         Self {
             kind,
-            shared,
+            mailbox,
             gpu_failed,
             thread: Some(thread),
         }
-    }
-
-    fn with_state(&self, f: impl FnOnce(&mut Mailbox)) {
-        let (lock, cv) = &*self.shared;
-        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        f(&mut state);
-        cv.notify_one();
     }
 
     pub(crate) fn resize(&self, lw: i32, lh: i32, pw: i32, ph: i32) {
         if pw <= 0 || ph <= 0 {
             return;
         }
-        self.with_state(|s| s.resize(ViewportState { lw, lh, pw, ph }));
+        self.mailbox
+            .update(|s| s.resize(ViewportState { lw, lh, pw, ph }));
     }
 
     pub(crate) fn set_visible(&self, visible: bool) {
-        self.with_state(|s| s.set_visible(visible));
+        self.mailbox.update(|s| s.set_visible(visible));
     }
 
     pub(crate) fn request_placeholder(&self, r: u8, g: u8, b: u8) {
-        self.with_state(|s| s.request_placeholder(r, g, b));
+        self.mailbox.update(|s| s.request_placeholder(r, g, b));
     }
 
     /// Hand a synchronized popup subsurface to the worker, which commits the
     /// popup and its parent layer back-to-back so the popup's cached buffer
     /// applies in one ordered flush rather than racing a cross-thread commit.
     pub(crate) fn commit_popup(&self, popup: WlSurface) {
-        self.with_state(|s| s.popup = PopupCommit::Queued(popup));
+        self.mailbox
+            .update(|s| s.popup = PopupCommit::Queued(popup));
     }
 
     /// Block until the worker owes no popup commit. The `shutdown` term is
     /// required: a commit still queued as the worker breaks its loop would
     /// otherwise never be consumed and hang the wait forever.
     pub(crate) fn drain_popup(&self) {
-        let (lock, cv) = &*self.shared;
-        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        while !matches!(state.popup, PopupCommit::Idle) && !state.shutdown {
-            state = cv.wait(state).unwrap_or_else(PoisonError::into_inner);
-        }
+        self.mailbox.wait(
+            |s| matches!(s.popup, PopupCommit::Idle) || s.shutdown,
+            |_| (),
+        );
     }
 
     pub(crate) fn present_dmabuf(&self, frame: SharedTexture) -> Result<Present, PresentError> {
         validate_present_dims(frame.coded().w, frame.coded().h)?;
-        self.with_state(|s| s.present_dmabuf(frame));
+        self.mailbox.update(|s| s.present_dmabuf(frame));
         Ok(Present::Committed)
     }
 
@@ -322,7 +315,7 @@ impl LayerActor {
         dirty: &[JfnRect],
     ) -> Result<Present, PresentError> {
         let dirty = dirty.to_vec();
-        self.with_state(|s| {
+        self.mailbox.update(|s| {
             s.enqueue_gpu(GpuPayload {
                 pixels: pixels[..len].to_vec(),
                 dirty,
@@ -348,22 +341,20 @@ impl LayerActor {
             .filter_map(|rect| copy_dirty_rect(pixels, stride, width, height, rect))
             .collect();
 
-        let (lock, cv) = &*self.shared;
-        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let full_pixels = state
-            .needs_full_copy(width, height)
-            .then(|| pixels[..len].to_vec());
-        if rects.is_empty() && full_pixels.is_none() {
-            return Ok(Present::Skipped);
-        }
-        state.store_shm(rects, full_pixels, width, height);
-        drop(state);
-        cv.notify_one();
-        Ok(Present::Committed)
+        self.mailbox.update(|s| {
+            let full_pixels = s
+                .needs_full_copy(width, height)
+                .then(|| pixels[..len].to_vec());
+            if rects.is_empty() && full_pixels.is_none() {
+                return Ok(Present::Skipped);
+            }
+            s.store_shm(rects, full_pixels, width, height);
+            Ok(Present::Committed)
+        })
     }
 
     pub(crate) fn shutdown(mut self) {
-        self.with_state(|s| {
+        self.mailbox.update(|s| {
             s.shutdown = true;
             s.pending = None;
         });
@@ -523,7 +514,7 @@ fn run(
     backend: LayerBackend,
     deps: LayerDeps,
     layer: LayerSurface,
-    shared: Arc<(Mutex<Mailbox>, Condvar)>,
+    mailbox: Mailbox<LayerState>,
     gpu_failed: Arc<AtomicBool>,
 ) {
     let LayerDeps {
@@ -564,40 +555,38 @@ fn run(
             visible,
             viewport_dirty,
             shutdown,
-        ) = {
-            let (lock, cv) = &*shared;
-            let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            while state.pending.is_none()
-                && !state.shutdown
-                && !state.hide_pending
-                && !state.viewport_dirty
-                && !matches!(state.popup, PopupCommit::Queued(_))
-            {
-                state = cv.wait(state).unwrap_or_else(PoisonError::into_inner);
-            }
-            state.hide_pending = false;
-            let viewport_dirty = state.viewport_dirty;
-            state.viewport_dirty = false;
-            let popup_commit = if let PopupCommit::Queued(popup) =
-                std::mem::replace(&mut state.popup, PopupCommit::InFlight)
-            {
-                Some(popup)
-            } else {
-                state.popup = PopupCommit::Idle;
-                None
-            };
-            let pending = state.pending.take();
-            let pending_is_placeholder = matches!(pending, Some(PendingFrame::Placeholder(..)));
-            (
-                pending,
-                pending_is_placeholder,
-                popup_commit,
-                state.viewport,
-                state.visible,
-                viewport_dirty,
-                state.shutdown,
-            )
-        };
+        ) = mailbox.wait(
+            |s| {
+                s.pending.is_some()
+                    || s.shutdown
+                    || s.hide_pending
+                    || s.viewport_dirty
+                    || matches!(s.popup, PopupCommit::Queued(_))
+            },
+            |s| {
+                s.hide_pending = false;
+                let viewport_dirty = std::mem::take(&mut s.viewport_dirty);
+                let popup_commit = if let PopupCommit::Queued(popup) =
+                    std::mem::replace(&mut s.popup, PopupCommit::InFlight)
+                {
+                    Some(popup)
+                } else {
+                    s.popup = PopupCommit::Idle;
+                    None
+                };
+                let pending = s.pending.take();
+                let pending_is_placeholder = matches!(pending, Some(PendingFrame::Placeholder(..)));
+                (
+                    pending,
+                    pending_is_placeholder,
+                    popup_commit,
+                    s.viewport,
+                    s.visible,
+                    viewport_dirty,
+                    s.shutdown,
+                )
+            },
+        );
 
         if shutdown {
             break;
@@ -618,15 +607,13 @@ fn run(
             && let Some(popup) = popup_commit.as_ref()
         {
             popup.commit();
-            let (lock, cv) = &*shared;
-            let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
             // A `Queued(next)` that arrived mid-commit is a fresh obligation and
             // must survive; only clear our own in-flight commit.
-            if matches!(state.popup, PopupCommit::InFlight) {
-                state.popup = PopupCommit::Idle;
-            }
-            drop(state);
-            cv.notify_one();
+            mailbox.update(|s| {
+                if matches!(s.popup, PopupCommit::InFlight) {
+                    s.popup = PopupCommit::Idle;
+                }
+            });
         }
 
         let action = decision.action;
@@ -1217,7 +1204,7 @@ mod tests {
 
     #[test]
     fn store_shm_merges_dirty_only_same_dims() {
-        let mut mb = Mailbox::new(vp(), true);
+        let mut mb = LayerState::new(vp(), true);
         mb.store_shm(vec![test_rect(1)], None, 100, 100);
         mb.store_shm(vec![test_rect(2)], None, 100, 100);
         let Some(PendingFrame::Shm(p)) = &mb.pending else {
@@ -1228,7 +1215,7 @@ mod tests {
 
     #[test]
     fn store_shm_replaces_on_dim_mismatch() {
-        let mut mb = Mailbox::new(vp(), true);
+        let mut mb = LayerState::new(vp(), true);
         mb.store_shm(vec![test_rect(1)], None, 100, 100);
         mb.store_shm(vec![test_rect(2)], None, 200, 200);
         let Some(PendingFrame::Shm(p)) = &mb.pending else {
@@ -1240,7 +1227,7 @@ mod tests {
 
     #[test]
     fn store_shm_replaces_when_pending_has_full() {
-        let mut mb = Mailbox::new(vp(), true);
+        let mut mb = LayerState::new(vp(), true);
         mb.store_shm(vec![], Some(vec![0u8; 4]), 1, 1);
         mb.store_shm(vec![test_rect(2)], None, 1, 1);
         let Some(PendingFrame::Shm(p)) = &mb.pending else {
@@ -1262,7 +1249,7 @@ mod tests {
 
     #[test]
     fn full_copy_marks_shadow_valid() {
-        let mut mb = Mailbox::new(vp(), true);
+        let mut mb = LayerState::new(vp(), true);
         assert!(matches!(mb.shadow, ShadowState::Stale));
         mb.store_shm(vec![], Some(vec![0u8; 4]), 1, 1);
         assert!(matches!(mb.shadow, ShadowState::Valid { size: (1, 1) }));
@@ -1270,7 +1257,7 @@ mod tests {
 
     #[test]
     fn valid_shadow_at_wrong_size_still_full_copies() {
-        let mut mb = Mailbox::new(vp(), true);
+        let mut mb = LayerState::new(vp(), true);
         mb.store_shm(vec![], Some(vec![0u8; 4 * 100 * 100]), 100, 100);
         mb.pending = None; // worker consumed the full frame
         assert!(!mb.needs_full_copy(100, 100));
@@ -1279,7 +1266,7 @@ mod tests {
 
     #[test]
     fn placeholder_invalidates_shadow_forcing_full_copy() {
-        let mut mb = Mailbox::new(vp(), true);
+        let mut mb = LayerState::new(vp(), true);
         mb.store_shm(vec![], Some(vec![0u8; 4 * 100 * 100]), 100, 100);
         assert!(matches!(mb.shadow, ShadowState::Valid { .. }));
         mb.pending = None; // worker consumed the full frame
@@ -1316,7 +1303,7 @@ mod tests {
 
     #[test]
     fn resize_noop_when_unchanged() {
-        let mut mb = Mailbox::new(vp(), true);
+        let mut mb = LayerState::new(vp(), true);
         mb.shadow = valid_shadow();
         mb.resize(vp());
         assert!(!mb.viewport_dirty);
@@ -1334,7 +1321,7 @@ mod tests {
 
     #[test]
     fn dmabuf_hide_and_resize_invalidate_shadow() {
-        let mut mb = Mailbox::new(vp(), true);
+        let mut mb = LayerState::new(vp(), true);
         mb.shadow = valid_shadow();
         mb.present_dmabuf(dmabuf_frame(64, 64));
         assert!(matches!(mb.shadow, ShadowState::Stale));
@@ -1343,7 +1330,7 @@ mod tests {
         mb.set_visible(false);
         assert!(matches!(mb.shadow, ShadowState::Stale));
 
-        let mut mb = Mailbox::new(vp(), true);
+        let mut mb = LayerState::new(vp(), true);
         mb.shadow = valid_shadow();
         mb.resize(ViewportState {
             lw: 200,
@@ -1399,7 +1386,7 @@ mod tests {
 
     #[test]
     fn first_post_fallback_frame_full_copies() {
-        let mb = Mailbox::new(vp(), true);
+        let mb = LayerState::new(vp(), true);
         assert!(mb.needs_full_copy(100, 100));
     }
 

@@ -19,28 +19,21 @@ use wayland_client::{Connection, QueueHandle};
 
 use crate::scale::Scale120;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ScaleProbeError {
     /// No `WAYLAND_DISPLAY`/`WAYLAND_SOCKET` in the environment.
+    #[error("no Wayland session")]
     NoWaylandSession,
     /// Connecting or round-tripping on the probe connection failed.
+    #[error("probe connection failed")]
     Connection,
     /// No output offered complete, positive geometry to derive a scale from.
+    #[error("no usable output")]
     NoUsableOutput,
     /// The probe thread outlived its deadline (the compositor stalled the
     /// probe connection's round trips).
+    #[error("probe timed out")]
     Timeout,
-}
-
-impl std::fmt::Display for ScaleProbeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoWaylandSession => write!(f, "no Wayland session"),
-            Self::Connection => write!(f, "probe connection failed"),
-            Self::NoUsableOutput => write!(f, "no usable output"),
-            Self::Timeout => write!(f, "probe timed out"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

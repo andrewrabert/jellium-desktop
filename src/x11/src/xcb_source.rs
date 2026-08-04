@@ -31,16 +31,11 @@ impl XcbSource {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct XcbSourceError(xcb::Error);
-
-impl std::fmt::Display for XcbSourceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "xcb connection error: {:?}", self.0)
-    }
-}
-
-impl std::error::Error for XcbSourceError {}
+/// `xcb::Error`'s own `Display` names only the category, so the cause is
+/// formatted with `Debug` here and carried as `source()`.
+#[derive(Debug, thiserror::Error)]
+#[error("xcb connection error: {0:?}")]
+pub(crate) struct XcbSourceError(#[source] xcb::Error);
 
 impl EventSource for XcbSource {
     type Event = xcb::Event;

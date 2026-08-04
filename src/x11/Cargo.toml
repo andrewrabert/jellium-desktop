@@ -23,6 +23,7 @@ jfn-compositor-core = { path = "../compositor_core" }
 jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-input = { path = "../input" }
 jfn-linux-util = { path = "../linux_util" }
+jfn-mailbox = { path = "../mailbox" }
 jfn-menu = { path = "../menu" }
 jfn-mpris = { path = "../mpris" }
 jfn-mpv = { path = "../mpv" }
@@ -34,6 +35,7 @@ gethostname.workspace = true
 libc.workspace = true
 nix.workspace = true
 tempfile.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 xcb = { version = "1.7", features = ["xkb", "as-raw-xcb-connection"] }
 x11rb = { version = "0.14", features = ["cursor", "request-parsing", "resource_manager", "shape", "shm", "sync", "xfixes"] }

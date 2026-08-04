@@ -11,6 +11,7 @@
 
 #![allow(non_snake_case)]
 
+use parking_lot::{Condvar, Mutex};
 use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -73,38 +74,28 @@ pub use signal::SignalGuard;
 // (`[NSApp run]` / stop-NSApp) and never touches this.
 
 struct MainPark {
-    woken: std::sync::Mutex<bool>,
-    cv: std::sync::Condvar,
+    woken: Mutex<bool>,
+    cv: Condvar,
 }
 
 static MAIN_PARK: MainPark = MainPark {
-    woken: std::sync::Mutex::new(false),
-    cv: std::sync::Condvar::new(),
+    woken: Mutex::new(false),
+    cv: Condvar::new(),
 };
 
 /// Block until [`main_park_signal`] is called. Returns immediately if the
 /// signal already fired (latched), so a wake racing ahead of the wait is
 /// not lost.
 pub fn main_park_wait() {
-    let mut woken = MAIN_PARK
-        .woken
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut woken = MAIN_PARK.woken.lock();
     while !*woken {
-        woken = MAIN_PARK
-            .cv
-            .wait(woken)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        MAIN_PARK.cv.wait(&mut woken);
     }
 }
 
 /// Release [`main_park_wait`]. Idempotent and safe from any thread.
 pub fn main_park_signal() {
-    let mut woken = MAIN_PARK
-        .woken
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *woken = true;
+    *MAIN_PARK.woken.lock() = true;
     MAIN_PARK.cv.notify_all();
 }
 

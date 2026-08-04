@@ -29,22 +29,13 @@ impl X11Source {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum X11SourceError {
-    Connection(ConnectionError),
-    Io(std::io::Error),
+    #[error("x11 connection error: {0}")]
+    Connection(#[source] ConnectionError),
+    #[error("x11 socket i/o error: {0}")]
+    Io(#[source] std::io::Error),
 }
-
-impl std::fmt::Display for X11SourceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            X11SourceError::Connection(e) => write!(f, "x11 connection error: {e}"),
-            X11SourceError::Io(e) => write!(f, "x11 socket i/o error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for X11SourceError {}
 
 impl EventSource for X11Source {
     type Event = Event;

@@ -21,6 +21,7 @@ parking_lot.workspace = true
 jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-input = { path = "../input" }
 jfn-linux-util = { path = "../linux_util" }
+jfn-mailbox = { path = "../mailbox" }
 jfn-platform-abi = { path = "../platform_abi" }
 jfn-menu = { path = "../menu" }
 jfn-mpris = { path = "../mpris" }
@@ -37,7 +38,7 @@ nix.workspace = true
 wl-proxy = { version = "0.1.4", features = ["all-protocols"] }
 tracing.workspace = true
 smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["xkbcommon"] }
-thiserror = "2"
+thiserror.workspace = true
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }

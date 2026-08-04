@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 parking_lot.workspace = true
 jfn-color = { path = "../color" }
+thiserror.workspace = true
 tracing.workspace = true
 
 [build-dependencies]

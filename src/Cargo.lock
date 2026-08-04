@@ -2313,6 +2313,7 @@ name = "jfn-config"
 version = "0.1.0-dev"
 dependencies = [
  "gethostname",
+ "jfn-mailbox",
  "jfn-paths",
  "jfn-platform-abi",
  "parking_lot",
@@ -2433,6 +2434,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "jfn-mailbox"
+version = "0.1.0-dev"
+dependencies = [
+ "parking_lot",
+]
+
+[[package]]
 name = "jfn-menu"
 version = "0.1.0-dev"
 dependencies = [
@@ -2459,6 +2467,7 @@ dependencies = [
  "jfn-color",
  "parking_lot",
  "pkg-config",
+ "thiserror",
  "tracing",
 ]
 
@@ -2467,6 +2476,7 @@ name = "jfn-paths"
 version = "0.1.0-dev"
 dependencies = [
  "nix",
+ "parking_lot",
  "tempfile",
 ]
 
@@ -2545,6 +2555,7 @@ dependencies = [
  "jfn-gpu-paint",
  "jfn-input",
  "jfn-linux-util",
+ "jfn-mailbox",
  "jfn-menu",
  "jfn-mpris",
  "jfn-mpv",
@@ -2609,6 +2620,7 @@ dependencies = [
  "jfn-gpu-paint",
  "jfn-input",
  "jfn-linux-util",
+ "jfn-mailbox",
  "jfn-menu",
  "jfn-mpris",
  "jfn-mpv",
@@ -2621,6 +2633,7 @@ dependencies = [
  "parking_lot",
  "slotmap",
  "tempfile",
+ "thiserror",
  "tracing",
  "x11rb",
  "xcb",

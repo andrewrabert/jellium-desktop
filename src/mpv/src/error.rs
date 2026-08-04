@@ -6,7 +6,8 @@ use std::fmt;
 
 /// libmpv error. `code` is the negative integer libmpv returns; the string
 /// payload is the static `mpv_error_string` lookup at construction time.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{}", self.message())]
 pub struct Error {
     pub code: i32,
 }
@@ -35,14 +36,6 @@ impl fmt::Debug for Error {
         write!(f, "mpv::Error({}: {})", self.code, self.message())
     }
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message())
-    }
-}
-
-impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 

@@ -6,8 +6,9 @@
 //! suppresses fields that are at their default (empty strings, sentinel
 //! values, zero geometry) so existing config files round-trip unchanged.
 
+use jfn_mailbox::Mailbox;
 use jfn_platform_abi::WindowDecorations;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -296,19 +297,21 @@ static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 // Single persistent background save worker. save_async() coalesces into
-// Pending::data (only the newest snapshot survives); the worker wakes on the
-// condvar, writes the latest snapshot, then sleeps. Shutdown drains any queued
-// write and joins the thread so nothing is lost at exit.
-struct Pending {
+// SavePending::data (only the newest snapshot survives); the worker wakes,
+// writes the latest snapshot, then sleeps. Shutdown drains any queued write
+// and joins the thread so nothing is lost at exit.
+
+/// Coalescing slot for the background writer: only the newest snapshot
+/// survives, and `stop` both drains the slot and ends the worker.
+struct SavePending {
     data: Option<SettingsData>,
     path: PathBuf,
     stop: bool,
-    started: bool,
 }
 
 struct SaveWorker {
-    pending: Mutex<Pending>,
-    cv: Condvar,
+    mailbox: Mailbox<SavePending>,
+    /// `Some` exactly while the worker thread is running; taken by shutdown.
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -316,29 +319,22 @@ static SAVE_WORKER: OnceLock<SaveWorker> = OnceLock::new();
 
 fn save_worker() -> &'static SaveWorker {
     SAVE_WORKER.get_or_init(|| SaveWorker {
-        pending: Mutex::new(Pending {
+        mailbox: Mailbox::new(SavePending {
             data: None,
             path: PathBuf::new(),
             stop: false,
-            started: false,
         }),
-        cv: Condvar::new(),
         handle: Mutex::new(None),
     })
 }
 
 fn save_worker_loop(w: &'static SaveWorker) {
-    loop {
-        let (data, path) = {
-            let mut p = w.pending.lock();
-            while p.data.is_none() && !p.stop {
-                w.cv.wait(&mut p);
-            }
-            match p.data.take() {
-                Some(d) => (d, p.path.clone()),
-                None => return, // stop with nothing pending — drained
-            }
-        };
+    // A stop with a snapshot still queued writes it, then exits on the next
+    // pass with an empty slot.
+    while let Some((data, path)) = w.mailbox.wait(
+        |p| p.data.is_some() || p.stop,
+        |p| p.data.take().map(|d| (d, p.path.clone())),
+    ) {
         save_data(&path, &data);
     }
 }
@@ -403,29 +399,21 @@ pub fn settings_save_async() {
         (st.path.clone(), st.data.clone())
     };
     let w = save_worker();
-    // Hold `handle` across the spawn so a second caller racing in between
-    // `started = true` and the JoinHandle store can't observe a "started"
-    // worker before the thread actually exists.
-    let mut handle_guard = w.handle.lock();
-    let need_spawn = {
-        let mut p = w.pending.lock();
+    // Hold `handle` across the spawn so a second caller racing in between the
+    // enqueue and the JoinHandle store can't observe a started worker before
+    // the thread actually exists.
+    let mut handle = w.handle.lock();
+    let queued = w.mailbox.update(|p| {
         if p.stop {
-            return;
+            return false;
         }
         p.data = Some(snap);
         p.path = path;
-        if p.started {
-            false
-        } else {
-            p.started = true;
-            true
-        }
-    };
-    if need_spawn {
-        *handle_guard = Some(thread::spawn(|| save_worker_loop(save_worker())));
+        true
+    });
+    if queued && handle.is_none() {
+        *handle = Some(thread::spawn(|| save_worker_loop(save_worker())));
     }
-    drop(handle_guard);
-    w.cv.notify_one();
 }
 
 /// Stop the background save worker after draining any pending write. Safe to
@@ -434,14 +422,9 @@ pub fn settings_shutdown_save_worker() {
     let Some(w) = SAVE_WORKER.get() else {
         return;
     };
-    {
-        let mut p = w.pending.lock();
-        if p.stop {
-            return;
-        }
-        p.stop = true;
+    if !w.mailbox.update(|p| !std::mem::replace(&mut p.stop, true)) {
+        return;
     }
-    w.cv.notify_one();
     let handle = w.handle.lock().take();
     if let Some(h) = handle
         && let Err(e) = h.join()

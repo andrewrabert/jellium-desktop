@@ -11,7 +11,7 @@ crate-type = ["rlib"]
 [dependencies]
 parking_lot.workspace = true
 tracing.workspace = true
-thiserror = "2"
+thiserror.workspace = true
 wgpu = "30"
 pollster = "1.0"
 

@@ -9,12 +9,12 @@
 //! window ([`OverlayActor::attach_content`]); frames that arrive before then
 //! are dropped (the surface has nowhere to land yet).
 
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use jfn_gpu_paint::{
     Frame, FrameSize as PhysicalSize, Pixels, Presented, SharedTexture, WindowTarget,
 };
+use jfn_mailbox::Mailbox;
 use jfn_platform_abi::JfnRect;
 use x11rb::connection::Connection;
 use x11rb::protocol::shm::ConnectionExt as _;
@@ -36,7 +36,7 @@ enum PendingFrame {
     Shared(Box<SharedTexture>),
 }
 
-struct Mailbox {
+struct OverlayState {
     pending: Option<PendingFrame>,
     /// Handed over once the geometry thread has created the window.
     content: Option<ContentSurface>,
@@ -49,40 +49,30 @@ struct Mailbox {
 
 /// X11 content presenter for one overlay. See the module docs.
 pub(crate) struct OverlayActor {
-    shared: Arc<(Mutex<Mailbox>, Condvar)>,
+    mailbox: Mailbox<OverlayState>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl OverlayActor {
     pub(crate) fn new(visible: bool) -> Self {
-        let shared = Arc::new((
-            Mutex::new(Mailbox {
-                pending: None,
-                content: None,
-                target_size: (1, 1),
-                visible,
-                shutdown: false,
-            }),
-            Condvar::new(),
-        ));
-        let worker_shared = Arc::clone(&shared);
+        let mailbox = Mailbox::new(OverlayState {
+            pending: None,
+            content: None,
+            target_size: (1, 1),
+            visible,
+            shutdown: false,
+        });
+        let worker_mailbox = mailbox.clone();
         let thread = thread::Builder::new()
             .name("jfn-x11-overlay".into())
-            .spawn(move || run_worker(worker_shared))
+            .spawn(move || run_worker(worker_mailbox))
             .ok();
-        Self { shared, thread }
-    }
-
-    fn with_state(&self, f: impl FnOnce(&mut Mailbox)) {
-        let (lock, cv) = &*self.shared;
-        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        f(&mut state);
-        cv.notify_one();
+        Self { mailbox, thread }
     }
 
     /// Hand the freshly-created window's content capability to the actor.
     pub(crate) fn attach_content(&self, content: ContentSurface) {
-        self.with_state(|s| s.content = Some(content));
+        self.mailbox.update(|s| s.content = Some(content));
     }
 
     /// Desired swapchain target extent, set by the geometry thread in lockstep
@@ -91,11 +81,12 @@ impl OverlayActor {
         if w <= 0 || h <= 0 {
             return;
         }
-        self.with_state(|s| s.target_size = (w as u32, h as u32));
+        self.mailbox
+            .update(|s| s.target_size = (w as u32, h as u32));
     }
 
     pub(crate) fn set_visible(&self, visible: bool) {
-        self.with_state(|s| {
+        self.mailbox.update(|s| {
             s.visible = visible;
             if !visible {
                 s.pending = None;
@@ -120,7 +111,7 @@ impl OverlayActor {
         if pixels.len() < len {
             return false;
         }
-        self.with_state(|s| {
+        self.mailbox.update(|s| {
             if !s.visible {
                 return;
             }
@@ -136,7 +127,7 @@ impl OverlayActor {
     }
 
     pub(crate) fn present_shared(&self, frame: SharedTexture) -> bool {
-        self.with_state(|s| {
+        self.mailbox.update(|s| {
             if s.visible {
                 s.pending = Some(PendingFrame::Shared(Box::new(frame)));
             }
@@ -154,7 +145,7 @@ impl OverlayActor {
     }
 
     fn signal_shutdown(&self) {
-        self.with_state(|s| {
+        self.mailbox.update(|s| {
             s.shutdown = true;
             s.pending = None;
         });
@@ -194,30 +185,28 @@ fn initial_backend() -> Backend {
     }
 }
 
-fn run_worker(shared: Arc<(Mutex<Mailbox>, Condvar)>) {
+fn run_worker(mailbox: Mailbox<OverlayState>) {
     let mut backend = initial_backend();
     let content_conn = crate::x11_state::x11rb_conn();
 
     loop {
-        let (frame, content_window, content_gc, visible, target_size, shutdown) = {
-            let (lock, cv) = &*shared;
-            let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            while state.pending.is_none() && !state.shutdown {
-                state = cv.wait(state).unwrap_or_else(PoisonError::into_inner);
-            }
-            let (win, gc) = state
-                .content
-                .as_ref()
-                .map_or((None, None), |c| (Some(c.window()), Some(c.gc())));
-            (
-                state.pending.take(),
-                win,
-                gc,
-                state.visible,
-                state.target_size,
-                state.shutdown,
-            )
-        };
+        let (frame, content_window, content_gc, visible, target_size, shutdown) = mailbox.wait(
+            |s| s.pending.is_some() || s.shutdown,
+            |s| {
+                let (win, gc) = s
+                    .content
+                    .as_ref()
+                    .map_or((None, None), |c| (Some(c.window()), Some(c.gc())));
+                (
+                    s.pending.take(),
+                    win,
+                    gc,
+                    s.visible,
+                    s.target_size,
+                    s.shutdown,
+                )
+            },
+        );
 
         if shutdown {
             break;
@@ -243,7 +232,7 @@ fn run_worker(shared: Arc<(Mutex<Mailbox>, Condvar)>) {
         );
     }
 
-    teardown(backend, content_conn.as_deref(), &shared);
+    teardown(backend, content_conn.as_deref(), &mailbox);
 }
 
 fn present_frame(
@@ -462,7 +451,7 @@ fn clip_rect(rect: &JfnRect, width: i32, height: i32) -> Option<(i32, i32, i32, 
 fn teardown(
     backend: Backend,
     content_conn: Option<&RustConnection>,
-    shared: &Arc<(Mutex<Mailbox>, Condvar)>,
+    mailbox: &Mailbox<OverlayState>,
 ) {
     match backend {
         Backend::Gpu(Some(painter)) => drop(painter),
@@ -475,11 +464,11 @@ fn teardown(
     }
     // Free the content GC on the content connection.
     if let Some(conn) = content_conn {
-        let (lock, _) = &**shared;
-        let state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(content) = state.content.as_ref() {
-            content.free_gc(conn);
-        }
+        mailbox.peek(|s| {
+            if let Some(content) = s.content.as_ref() {
+                content.free_gc(conn);
+            }
+        });
         let _ = conn.flush();
     }
 }

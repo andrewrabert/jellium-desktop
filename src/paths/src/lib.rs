@@ -8,29 +8,28 @@
 //! Each directory getter creates the directory (and parents) if missing
 //! before returning.
 
+use parking_lot::{Mutex, MutexGuard};
 use std::env;
 use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 const APP_DIR_NAME: &str = "jellium-desktop";
 const LOG_FILE_NAME: &str = "jellium-desktop.log";
 
-#[derive(Default)]
 struct Overrides {
     config_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
 }
 
-static OVERRIDES: OnceLock<Mutex<Overrides>> = OnceLock::new();
+static OVERRIDES: Mutex<Overrides> = Mutex::new(Overrides {
+    config_dir: None,
+    cache_dir: None,
+});
 
 fn overrides() -> MutexGuard<'static, Overrides> {
-    OVERRIDES
-        .get_or_init(|| Mutex::new(Overrides::default()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    OVERRIDES.lock()
 }
 
 pub fn set_config_dir_override(path: PathBuf) {
