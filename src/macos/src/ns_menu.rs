@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use std::ffi::{c_int, c_void};
+use std::ffi::c_int;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
@@ -9,6 +9,7 @@ use objc2_foundation::{NSObject, NSPoint, NSString};
 
 use jfn_platform_abi::MenuSelectionFn;
 
+use crate::dispatch::post_to_main;
 use crate::init::{jfn_macos_get_input_view, jfn_macos_get_window};
 
 pub(crate) struct MenuEntry {
@@ -58,29 +59,10 @@ define_class!(
     }
 );
 
-unsafe extern "C" {
-    static _dispatch_main_q: c_void;
-    fn dispatch_async_f(
-        queue: *mut c_void,
-        ctx: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
-}
-
-#[inline]
-fn dispatch_get_main_queue() -> *mut c_void {
-    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
-}
-
 /// Owns the spec so it outlives the caller across the async hop to the main queue.
 struct MenuRun {
     cb: Arc<SelectionCb>,
     spec: MenuSpec,
-}
-
-unsafe extern "C" fn run_trampoline(ctx: *mut c_void) {
-    let run: Box<MenuRun> = unsafe { Box::from_raw(ctx as *mut MenuRun) };
-    unsafe { show_menu_on_main(*run) };
 }
 
 unsafe fn show_menu_on_main(run: MenuRun) {
@@ -163,7 +145,5 @@ pub(crate) fn present_on_main(spec: MenuSpec, on_selected: Option<MenuSelectionF
     let cb = Arc::new(SelectionCb {
         fired: Mutex::new(on_selected),
     });
-    let run = Box::new(MenuRun { cb, spec });
-    let ctx = Box::into_raw(run) as *mut c_void;
-    unsafe { dispatch_async_f(dispatch_get_main_queue(), ctx, run_trampoline) };
+    post_to_main(move || unsafe { show_menu_on_main(MenuRun { cb, spec }) });
 }

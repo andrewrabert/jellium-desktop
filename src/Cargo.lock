@@ -2477,7 +2477,6 @@ dependencies = [
  "cef",
  "jfn-gpu-paint",
  "jfn-paths",
- "libc",
  "nix",
  "parking_lot",
  "serde",

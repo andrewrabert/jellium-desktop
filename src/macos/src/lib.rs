@@ -29,51 +29,20 @@ pub fn macos_end_transition() {
 
 // jfn_macos_get_window + jfn_macos_apply_theme_color_on_main are now
 // Rust-side (see src/macos/src/init.rs).
+use crate::core_foundation::{
+    CFRelease, CFRunLoopGetMain, CFRunLoopRunInMode, CFRunLoopWakeUp,
+    CFStringCreateWithCStringNoCopy, CFStringRef, K_CF_STRING_ENCODING_UTF8, kCFAllocatorNull,
+    kCFRunLoopDefaultMode,
+};
+use crate::dispatch::{post_to_main, run_on_main_async, wake_main_queue};
 use crate::init::{jfn_macos_apply_theme_color_on_main, jfn_macos_get_window};
-
-unsafe extern "C" {
-    // dispatch_get_main_queue() is an inline C function that returns
-    // &_dispatch_main_q, so the exported symbol is the queue object itself.
-    static _dispatch_main_q: c_void;
-    fn dispatch_async_f(
-        queue: *mut c_void,
-        ctx: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
-}
-
-#[inline]
-fn dispatch_get_main_queue() -> *mut c_void {
-    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
-}
-
-/// Returns true if the current thread is the AppKit main thread. Avoids
-/// pulling in `objc2-foundation` `MainThreadMarker` infrastructure for a
-/// single check.
-fn is_main_thread() -> bool {
-    unsafe {
-        let cls = objc2::class!(NSThread);
-        let b: bool = objc2::msg_send![cls, isMainThread];
-        b
-    }
-}
-
-unsafe extern "C" fn theme_color_trampoline(ctx: *mut c_void) {
-    let rgb = ctx as usize as u32;
-    jfn_macos_apply_theme_color_on_main(rgb);
-}
 
 /// Tint AppKit fills behind mpv's CAMetalLayer / NSWindow root so the
 /// resize-gap stale-texture window (which CLAUDE.md explicitly accepts
 /// over stretching) matches mpv's own background — no visible flash.
 /// Hops to the main queue when called from another thread.
 pub fn macos_set_theme_color(rgb: u32) {
-    if is_main_thread() {
-        jfn_macos_apply_theme_color_on_main(rgb);
-    } else {
-        let ctx = rgb as usize as *mut c_void;
-        unsafe { dispatch_async_f(dispatch_get_main_queue(), ctx, theme_color_trampoline) };
-    }
+    run_on_main_async(move || jfn_macos_apply_theme_color_on_main(rgb));
 }
 
 // =====================================================================
@@ -90,9 +59,6 @@ type IOReturn = i32;
 const K_IOPM_NULL_ASSERTION_ID: IOPMAssertionID = 0;
 const K_IOPM_ASSERTION_LEVEL_ON: IOPMAssertionLevel = 255;
 
-// CFStringRef is an opaque pointer.
-type CFStringRef = *const c_void;
-
 unsafe extern "C" {
     fn IOPMAssertionCreateWithName(
         assertion_type: CFStringRef,
@@ -102,20 +68,8 @@ unsafe extern "C" {
     ) -> IOReturn;
     fn IOPMAssertionRelease(assertion_id: IOPMAssertionID) -> IOReturn;
 
-    fn CFStringCreateWithCStringNoCopy(
-        alloc: *const c_void,
-        c_str: *const c_char,
-        encoding: u32,
-        contents_deallocator: *const c_void,
-    ) -> CFStringRef;
-
-    // kCFAllocatorNull as contents_deallocator: CF won't free our static byte buffers.
-    static kCFAllocatorNull: *const c_void;
-
-    fn CFRelease(cf: *const c_void);
+    static NSDefaultRunLoopMode: *mut objc2::runtime::AnyObject;
 }
-
-const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 static G_IDLE_ASSERTION: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(K_IOPM_NULL_ASSERTION_ID);
@@ -314,17 +268,6 @@ pub fn macos_toggle_fullscreen() {
 // Message pump / NSApplication run loop / wake.
 // =====================================================================
 
-type CFRunLoopRef = *mut c_void;
-
-unsafe extern "C" {
-    fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source_handled: i32)
-    -> i32;
-    fn CFRunLoopGetMain() -> CFRunLoopRef;
-    fn CFRunLoopWakeUp(rl: CFRunLoopRef);
-    static kCFRunLoopDefaultMode: CFStringRef;
-    static NSDefaultRunLoopMode: *mut objc2::runtime::AnyObject;
-}
-
 /// NSEventMask is NSUInteger; NSEventMaskAny is the bit-or of all event
 /// types. The canonical macro expands to `NSUIntegerMax` (all bits set).
 const NS_EVENT_MASK_ANY: u64 = u64::MAX;
@@ -378,8 +321,6 @@ pub fn macos_run_main_loop() {
     }
 }
 
-unsafe extern "C" fn noop_dispatch(_ctx: *mut c_void) {}
-
 /// Wakeup hook to install with `mpv_set_wakeup_callback`. Bridges mpv's
 /// foreign-thread wakeup notification into a dispatch on the main queue,
 /// which causes `CFRunLoopRunInMode(default, _, returnAfterSourceHandled=1)`
@@ -392,13 +333,7 @@ unsafe extern "C" fn noop_dispatch(_ctx: *mut c_void) {}
 /// Called by mpv from an arbitrary thread; `_data` is unused, so any value
 /// (including null) is fine.
 pub unsafe extern "C" fn macos_mpv_wakeup_cb(_data: *mut c_void) {
-    unsafe {
-        dispatch_async_f(
-            dispatch_get_main_queue(),
-            std::ptr::null_mut(),
-            noop_dispatch,
-        )
-    };
+    wake_main_queue();
 }
 
 /// Pump pending NSEvents (non-blocking), then block on `CFRunLoopRunInMode`
@@ -413,7 +348,12 @@ pub fn macos_pump_block(seconds: f64) {
     }
 }
 
-unsafe extern "C" fn wake_trampoline(_ctx: *mut c_void) {
+/// `-stop:` the shared application plus a sentinel applicationDefined NSEvent
+/// so the run loop wakes and exits on its next iteration.
+///
+/// # Safety
+/// Must run on the AppKit main thread.
+unsafe fn stop_app_with_sentinel() {
     unsafe {
         let pool: *mut objc2::runtime::AnyObject =
             objc2::msg_send![objc2::class!(NSAutoreleasePool), new];
@@ -445,22 +385,15 @@ unsafe extern "C" fn wake_trampoline(_ctx: *mut c_void) {
     }
 }
 
-/// Stop the NSApplication run loop from any thread. Hops to main via
-/// `dispatch_async_f` and from there calls `-stop:` plus a sentinel
-/// NSEvent so the loop wakes and exits on its next iteration. The
-/// trampoline carries no state — wake is fire-and-forget.
+/// Stop the NSApplication run loop from any thread. Posts the stop to the
+/// main queue — never inline, so the calling frame unwinds first — and wakes
+/// the run loop. Fire-and-forget.
 pub fn macos_wake_main_loop() {
-    unsafe {
-        dispatch_async_f(
-            dispatch_get_main_queue(),
-            std::ptr::null_mut(),
-            wake_trampoline,
-        );
-        // Belt-and-suspenders: also wake the main CFRunLoop directly in
-        // case the main thread is currently in CFRunLoopRunInMode rather
-        // than [NSApp run]. Harmless when [NSApp run] is active.
-        CFRunLoopWakeUp(CFRunLoopGetMain());
-    }
+    post_to_main(|| unsafe { stop_app_with_sentinel() });
+    // Belt-and-suspenders: also wake the main CFRunLoop directly in case the
+    // main thread is currently in CFRunLoopRunInMode rather than [NSApp run].
+    // Harmless when [NSApp run] is active.
+    unsafe { CFRunLoopWakeUp(CFRunLoopGetMain()) };
 }
 
 /// Run `f` on a side thread while the main thread pumps CFRunLoop until
@@ -582,6 +515,8 @@ mod cef_host;
 mod cef_pump;
 mod compositor;
 mod context_menu;
+mod core_foundation;
+mod dispatch;
 mod dropdown;
 mod init;
 mod input;

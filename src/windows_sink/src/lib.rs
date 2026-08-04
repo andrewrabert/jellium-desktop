@@ -13,7 +13,9 @@
 
 use std::time::Instant;
 
-use jfn_playback::sink_core::{self, MediaCommand, Phase, QueuedSink, map_kind_to_phase};
+use jfn_playback::sink_core::{
+    self, MediaCommand, Phase, PositionThrottle, QueuedSink, map_kind_to_phase,
+};
 use jfn_playback::{MediaMetadata, MediaType as PbMediaType, PlaybackEvent, PlaybackEventKind};
 use windows::Foundation::TimeSpan;
 use windows::Media::{
@@ -64,8 +66,7 @@ struct WinState {
     metadata: MediaMetadata,
     phase: Option<Phase>,
     position_us: i64,
-    last_position_update: Option<Instant>,
-    pending_update: bool,
+    throttle: PositionThrottle,
 }
 
 struct WindowsSink {
@@ -281,30 +282,23 @@ fn deliver(state: &mut WinState, smtc: &mut Option<Smtc>, ev: &PlaybackEvent) {
                     return;
                 }
             }
-            state.pending_update = true;
+            state.throttle.force_next();
         }
         PlaybackEventKind::PositionChanged => {
             state.position_us = ev.snapshot.position_us;
-            let now = Instant::now();
-            let elapsed = state
-                .last_position_update
-                .map(|t| now.duration_since(t).as_millis() as i64)
-                .unwrap_or(i64::MAX);
-            if state.pending_update || elapsed >= 1000 {
-                if let Some(s) = smtc.as_mut() {
-                    update_timeline(state, s);
-                }
-                state.last_position_update = Some(now);
-                state.pending_update = false;
+            if state.throttle.due(Instant::now(), false)
+                && let Some(s) = smtc.as_mut()
+            {
+                update_timeline(state, s);
             }
         }
         PlaybackEventKind::Seeked => {
             state.position_us = ev.snapshot.position_us;
-            if let Some(s) = smtc.as_mut() {
+            if state.throttle.due(Instant::now(), true)
+                && let Some(s) = smtc.as_mut()
+            {
                 update_timeline(state, s);
             }
-            state.last_position_update = Some(Instant::now());
-            state.pending_update = false;
         }
         _ => {}
     }

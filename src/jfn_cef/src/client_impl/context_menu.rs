@@ -3,7 +3,7 @@ use cef::*;
 use std::os::raw::{c_int, c_void};
 use std::sync::Arc;
 
-use crate::app::userfree_to_string;
+use crate::cef_string::userfree_to_string;
 use crate::client::Inner;
 use crate::platform_ops::{
     Delivery, DeliveryKind, JfnContextMenuRequest, JfnMenuItem, JsMenuChannel,

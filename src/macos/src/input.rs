@@ -70,19 +70,7 @@ use jfn_input::{
     jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll_precise,
 };
 
-unsafe extern "C" {
-    static _dispatch_main_q: c_void;
-    fn dispatch_async_f(
-        queue: *mut c_void,
-        ctx: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
-}
-
-#[inline]
-fn dispatch_get_main_queue() -> *mut c_void {
-    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
-}
+use crate::dispatch::post_to_main;
 
 // =====================================================================
 // Modifier / key translation
@@ -259,20 +247,10 @@ unsafe fn apply_cursor_state() {
     }
 }
 
-unsafe extern "C" fn cursor_trampoline(_ctx: *mut c_void) {
-    unsafe { apply_cursor_state() };
-}
-
 /// Platform::set_cursor — safe to call from any thread.
 pub fn jfn_input_macos_set_cursor(t: c_int) {
     G_PENDING_CURSOR.store(t, Ordering::SeqCst);
-    unsafe {
-        dispatch_async_f(
-            dispatch_get_main_queue(),
-            std::ptr::null_mut(),
-            cursor_trampoline,
-        );
-    }
+    post_to_main(|| unsafe { apply_cursor_state() });
 }
 
 // =====================================================================
@@ -281,10 +259,6 @@ pub fn jfn_input_macos_set_cursor(t: c_int) {
 // =====================================================================
 
 static SCROLL: Mutex<ScrollAccum> = Mutex::new(ScrollAccum::new());
-
-unsafe extern "C" fn scroll_flush_trampoline(_ctx: *mut c_void) {
-    flush_scroll_accumulator();
-}
 
 fn flush_scroll_accumulator() {
     let flush = SCROLL.lock().flush();
@@ -451,13 +425,7 @@ define_class!(
                 delta_y,
             );
             if sched {
-                unsafe {
-                    dispatch_async_f(
-                        dispatch_get_main_queue(),
-                        std::ptr::null_mut(),
-                        scroll_flush_trampoline,
-                    );
-                }
+                post_to_main(flush_scroll_accumulator);
             }
         }
 

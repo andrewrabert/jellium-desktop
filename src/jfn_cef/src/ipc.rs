@@ -36,7 +36,7 @@ impl BrowserMessage {
 }
 
 pub(crate) fn list_string(args: &ListValue, idx: usize) -> String {
-    crate::app::userfree_to_string(&args.string(idx))
+    crate::cef_string::userfree_to_string(&args.string(idx))
 }
 
 pub(crate) fn list_opt_string(args: &ListValue, idx: usize) -> Option<String> {

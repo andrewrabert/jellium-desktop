@@ -47,6 +47,46 @@ pub fn seek_to_ms(ms: i64) {
     crate::exec_js::call(&format!("if(window._nativeSeek) window._nativeSeek({ms});"));
 }
 
+/// Rate-limits now-playing timeline pushes.
+#[derive(Default)]
+pub struct PositionThrottle {
+    last: Option<std::time::Instant>,
+    forced: bool,
+}
+
+impl PositionThrottle {
+    /// Minimum wall-clock gap between two unforced pushes.
+    pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last: None,
+            forced: false,
+        }
+    }
+
+    /// Make the next [`due`](Self::due) call report true whatever the elapsed
+    /// time.
+    pub const fn force_next(&mut self) {
+        self.forced = true;
+    }
+
+    /// True when a push is due at `now`. A `force` argument or a pending
+    /// [`force_next`](Self::force_next) bypasses the elapsed check, as does the
+    /// first call after construction. A true result records the push.
+    pub fn due(&mut self, now: std::time::Instant, force: bool) -> bool {
+        let forced = force || self.forced;
+        let elapsed_ok = self.last.is_none_or(|last| now - last >= Self::INTERVAL);
+        if !forced && !elapsed_ok {
+            return false;
+        }
+        self.forced = false;
+        self.last = Some(now);
+        true
+    }
+}
+
 // =====================================================================
 // Consumer-thread harness — used only by the macOS / Windows sinks; the
 // Linux MPRIS sink runs its own zbus thread.

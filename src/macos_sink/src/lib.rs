@@ -11,9 +11,11 @@
 
 use std::ffi::{CStr, c_int, c_void};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use jfn_playback::sink_core::{self, MediaCommand, Phase, QueuedSink, map_kind_to_phase};
+use jfn_playback::sink_core::{
+    self, MediaCommand, Phase, PositionThrottle, QueuedSink, map_kind_to_phase,
+};
 use jfn_playback::{MediaMetadata, MediaType as PbMediaType, PlaybackEvent, PlaybackEventKind};
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -55,7 +57,7 @@ struct MacosSink {
     metadata: MediaMetadata,
     position_us: i64,
     rate: f64,
-    last_position_update: Option<Instant>,
+    throttle: PositionThrottle,
 }
 
 impl QueuedSink for MacosSink {
@@ -402,30 +404,16 @@ fn deliver(state: &mut MacosSink, ev: &PlaybackEvent) {
                 center.setNowPlayingInfo(Some(&info));
             }
         },
-        PlaybackEventKind::Seeked => unsafe {
-            state.position_us = ev.snapshot.position_us;
-            let center = MPNowPlayingInfoCenter::defaultCenter();
-            if let Some(existing) = center.nowPlayingInfo() {
-                let info = NSMutableDictionary::dictionaryWithDictionary(&existing);
-                let key = mp_const("MPNowPlayingInfoPropertyElapsedPlaybackTime");
-                info.setObject_forKey(
-                    &*NSNumber::new_f64(state.position_us as f64 / 1_000_000.0) as &AnyObject,
-                    ns_key(&key),
-                );
-                center.setNowPlayingInfo(Some(&info));
-            }
-        },
+        PlaybackEventKind::Seeked => {
+            update_timeline_throttled(state, ev.snapshot.position_us, true);
+        }
         _ => {}
     }
 }
 
 fn update_timeline_throttled(state: &mut MacosSink, position_us: i64, force: bool) {
     state.position_us = position_us;
-    let now = Instant::now();
-    if !force
-        && let Some(last) = state.last_position_update
-        && now.duration_since(last) < Duration::from_secs(1)
-    {
+    if !state.throttle.due(Instant::now(), force) {
         return;
     }
     unsafe {
@@ -441,7 +429,6 @@ fn update_timeline_throttled(state: &mut MacosSink, position_us: i64, force: boo
         );
         center.setNowPlayingInfo(Some(&info));
     }
-    state.last_position_update = Some(now);
 }
 
 fn update_now_playing_info(state: &mut MacosSink) {

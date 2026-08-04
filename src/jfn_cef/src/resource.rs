@@ -122,7 +122,7 @@ wrap_scheme_handler_factory! {
         ) -> Option<ResourceHandler> {
             let request = request?;
             let url_uf = request.url();
-            let url = crate::app::userfree_to_string(&url_uf);
+            let url = crate::cef_string::userfree_to_string(&url_uf);
 
             // Strip scheme prefix and query/fragment.
             let after_scheme = url

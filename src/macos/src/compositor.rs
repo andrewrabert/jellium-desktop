@@ -37,39 +37,8 @@ use jfn_gpu_paint::{
 };
 use jfn_platform_abi::{JfnRect, PhysicalSize};
 
+use crate::dispatch::{is_main_thread, run_on_main_async, run_on_main_sync};
 use crate::init::{jfn_macos_get_input_view, jfn_macos_get_window};
-
-unsafe extern "C" {
-    static _dispatch_main_q: c_void;
-    fn dispatch_async_f(
-        queue: *mut c_void,
-        ctx: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
-
-    // dispatch_sync_f — bounce onto the main queue and block until the
-    // work item returns. Used by macos_alloc_surface / macos_free_surface
-    // / macos_restack which need their AppKit mutations done before
-    // returning to the caller.
-    fn dispatch_sync_f(
-        queue: *mut c_void,
-        ctx: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
-}
-
-#[inline]
-fn dispatch_get_main_queue() -> *mut c_void {
-    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
-}
-
-fn is_main_thread() -> bool {
-    unsafe {
-        let cls = objc2::class!(NSThread);
-        let b: bool = objc2::msg_send![cls, isMainThread];
-        b
-    }
-}
 
 /// Build an NSString from a Rust &str (UTF-8). The returned object is
 /// retained (+1) by NSString init; the caller `release`s when done.
@@ -166,59 +135,6 @@ static GPU: OnceLock<Option<Surfaces>> = OnceLock::new();
 
 fn gpu() -> Option<&'static Surfaces> {
     GPU.get_or_init(|| Surfaces::init(None, None)).as_ref()
-}
-
-/// Run a closure on the AppKit main thread. Used for layer-tree mutations
-/// (subview attach, frame writes, etc.). Sync — caller blocks until the
-/// closure returns. Safe to call from the main thread (runs inline).
-///
-/// The closure runs strictly on the main thread; raw pointers it
-/// captures don't actually cross threads (sync blocks until the work
-/// item returns). We therefore drop the `Send` bound and shuttle the
-/// closure pointer through `usize` to satisfy dispatch_sync_f's C ABI.
-fn run_on_main_sync<F>(f: F)
-where
-    F: FnOnce(),
-{
-    if is_main_thread() {
-        f();
-        return;
-    }
-    let boxed: Box<dyn FnOnce()> = Box::new(f);
-    let dbl_box: Box<Box<dyn FnOnce()>> = Box::new(boxed);
-    let ptr_ctx = Box::into_raw(dbl_box) as *mut c_void;
-    unsafe extern "C" fn trampoline(ctx: *mut c_void) {
-        unsafe {
-            let dbl_box: Box<Box<dyn FnOnce()>> = Box::from_raw(ctx as *mut _);
-            let inner = *dbl_box;
-            inner();
-        }
-    }
-    unsafe { dispatch_sync_f(dispatch_get_main_queue(), ptr_ctx, trampoline) };
-}
-
-/// Async version — fire-and-forget; the closure runs later on the main
-/// queue. Used by macos_surface_set_visible / macos_surface_resize where
-/// the caller does not need ordering. Closure must be `'static`.
-fn run_on_main_async<F>(f: F)
-where
-    F: FnOnce() + 'static,
-{
-    if is_main_thread() {
-        f();
-        return;
-    }
-    let boxed: Box<dyn FnOnce()> = Box::new(f);
-    let dbl_box: Box<Box<dyn FnOnce()>> = Box::new(boxed);
-    let ptr_ctx = Box::into_raw(dbl_box) as *mut c_void;
-    unsafe extern "C" fn trampoline(ctx: *mut c_void) {
-        unsafe {
-            let dbl_box: Box<Box<dyn FnOnce()>> = Box::from_raw(ctx as *mut _);
-            let inner = *dbl_box;
-            inner();
-        }
-    }
-    unsafe { dispatch_async_f(dispatch_get_main_queue(), ptr_ctx, trampoline) };
 }
 
 // =====================================================================

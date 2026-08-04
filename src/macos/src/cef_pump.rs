@@ -12,80 +12,12 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Instant;
 
-// ----- CoreFoundation FFI ---------------------------------------------------
-
-#[allow(non_camel_case_types)]
-type CFIndex = isize;
-#[allow(non_camel_case_types)]
-type CFAbsoluteTime = f64;
-#[allow(non_camel_case_types)]
-type CFTimeInterval = f64;
-#[allow(non_camel_case_types)]
-type CFOptionFlags = usize;
-#[allow(non_camel_case_types)]
-type CFHashCode = usize;
-#[allow(non_camel_case_types)]
-type Boolean = u8;
-
-type CFAllocatorRef = *const c_void;
-type CFRunLoopRef = *mut c_void;
-type CFRunLoopSourceRef = *mut c_void;
-type CFRunLoopTimerRef = *mut c_void;
-type CFStringRef = *const c_void;
-type CFTypeRef = *const c_void;
-
-#[repr(C)]
-struct CFRunLoopSourceContext {
-    version: CFIndex,
-    info: *mut c_void,
-    retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
-    release: Option<unsafe extern "C" fn(*const c_void)>,
-    copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
-    equal: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> Boolean>,
-    hash: Option<unsafe extern "C" fn(*const c_void) -> CFHashCode>,
-    schedule: Option<unsafe extern "C" fn(*mut c_void, CFRunLoopRef, CFStringRef)>,
-    cancel: Option<unsafe extern "C" fn(*mut c_void, CFRunLoopRef, CFStringRef)>,
-    perform: Option<unsafe extern "C" fn(*mut c_void)>,
-}
-
-#[repr(C)]
-struct CFRunLoopTimerContext {
-    version: CFIndex,
-    info: *mut c_void,
-    retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
-    release: Option<unsafe extern "C" fn(*const c_void)>,
-    copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    static kCFRunLoopCommonModes: CFStringRef;
-
-    fn CFRunLoopGetMain() -> CFRunLoopRef;
-    fn CFRunLoopWakeUp(rl: CFRunLoopRef);
-    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
-    fn CFRunLoopAddTimer(rl: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: CFStringRef);
-    fn CFRunLoopSourceCreate(
-        allocator: CFAllocatorRef,
-        order: CFIndex,
-        context: *mut CFRunLoopSourceContext,
-    ) -> CFRunLoopSourceRef;
-    fn CFRunLoopSourceSignal(source: CFRunLoopSourceRef);
-    fn CFRunLoopSourceInvalidate(source: CFRunLoopSourceRef);
-    fn CFRunLoopTimerCreate(
-        allocator: CFAllocatorRef,
-        fire_date: CFAbsoluteTime,
-        interval: CFTimeInterval,
-        flags: CFOptionFlags,
-        order: CFIndex,
-        callout: Option<unsafe extern "C" fn(CFRunLoopTimerRef, *mut c_void)>,
-        context: *mut CFRunLoopTimerContext,
-    ) -> CFRunLoopTimerRef;
-    fn CFRunLoopTimerSetNextFireDate(timer: CFRunLoopTimerRef, fire_date: CFAbsoluteTime);
-    fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
-    fn CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime;
-    fn CFRelease(cf: CFTypeRef);
-}
+use crate::core_foundation::{
+    CFAbsoluteTimeGetCurrent, CFRelease, CFRunLoopAddSource, CFRunLoopAddTimer, CFRunLoopGetMain,
+    CFRunLoopSourceContext, CFRunLoopSourceCreate, CFRunLoopSourceInvalidate,
+    CFRunLoopSourceSignal, CFRunLoopTimerCreate, CFRunLoopTimerInvalidate, CFRunLoopTimerRef,
+    CFRunLoopTimerSetNextFireDate, CFRunLoopWakeUp, kCFRunLoopCommonModes,
+};
 
 // ----- State ----------------------------------------------------------------
 

@@ -8,9 +8,11 @@
 //! cross-process payload, so we don't hold a long-lived reference.
 
 use cef::{
-    CefString, CefStringUserfreeUtf16, DictionaryValue, ImplDictionaryValue, ImplListValue,
-    dictionary_value_create, list_value_create, sys,
+    CefString, DictionaryValue, ImplDictionaryValue, ImplListValue, dictionary_value_create,
+    list_value_create,
 };
+
+use crate::cef_string::userfree_to_string;
 use jfn_platform_abi::{
     ContextMenuBackend, ContextMenuScript, DropdownBackend, DropdownScript, WindowDecorations,
 };
@@ -438,19 +440,6 @@ fn write_string_list<'a>(
     }
     dict.set_list(Some(&CefString::from(key)), Some(&mut list));
     Some(())
-}
-
-fn userfree_to_string(s: &CefStringUserfreeUtf16) -> String {
-    let raw: Option<&sys::_cef_string_utf16_t> = s.into();
-    raw.map(|r| {
-        if r.str_.is_null() || r.length == 0 {
-            String::new()
-        } else {
-            let slice = unsafe { std::slice::from_raw_parts(r.str_, r.length) };
-            String::from_utf16_lossy(slice)
-        }
-    })
-    .unwrap_or_default()
 }
 
 /// Set the cached Jellyfin device-profile JSON. Called once at startup
