@@ -3,7 +3,7 @@
 //! macOS delivers high-frequency wheel/trackpad deltas; firing a CEF scroll
 //! event per `scrollWheel:` floods the renderer. This batches deltas and
 //! drains an integer chunk per runloop flush, carrying the fractional
-//! remainder. It's a pure state machine — the platform keeps the `Mutex`
+//! remainder. It's a pure state machine — the platform keeps the state
 //! and the main-queue scheduling, and just feeds events in and pushes the
 //! drained chunk out. The fixed-point drain math is subtle, so it lives
 //! here where it can be unit-tested on any host.

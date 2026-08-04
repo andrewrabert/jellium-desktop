@@ -2,11 +2,11 @@
 //! events and forwards them to the active browser via
 //! [`jfn_platform_abi::browser_bridge`].
 
+use crossbeam_utils::atomic::AtomicCell;
 use jfn_platform_abi::event_flags::EVENTFLAG_PRECISION_SCROLLING_DELTA;
 use jfn_platform_abi::{BrowserBridge, browser_bridge};
 use jfn_playback::hotkey::jfn_hotkey_classify_keydown;
 use jfn_playback::shutdown::jfn_shutdown_initiate;
-use parking_lot::Mutex;
 use std::os::raw::c_int;
 
 pub mod buttons;
@@ -30,7 +30,9 @@ struct LastMousePos {
     modifiers: u32,
 }
 
-static LAST_POS: Mutex<LastMousePos> = Mutex::new(LastMousePos {
+// 16 bytes: AtomicCell synchronizes this through its seqlock, not an atomic
+// integer, so loads may retry against a concurrent motion event.
+static LAST_POS: AtomicCell<LastMousePos> = AtomicCell::new(LastMousePos {
     valid: false,
     x: 0,
     y: 0,
@@ -58,7 +60,7 @@ pub fn jfn_input_last_mouse_pos(
     out_y: &mut i32,
     out_modifiers: &mut u32,
 ) -> c_int {
-    let p = *LAST_POS.lock();
+    let p = LAST_POS.load();
     *out_x = p.x;
     *out_y = p.y;
     *out_modifiers = p.modifiers;
@@ -66,16 +68,17 @@ pub fn jfn_input_last_mouse_pos(
 }
 
 pub fn jfn_input_dispatch_mouse_move(x: i32, y: i32, mods: u32, leave: c_int) {
-    {
-        let mut p = LAST_POS.lock();
-        if leave != 0 {
-            p.valid = false;
-        } else {
-            p.valid = true;
-            p.x = x;
-            p.y = y;
-            p.modifiers = mods;
-        }
+    if leave != 0 {
+        let mut p = LAST_POS.load();
+        p.valid = false;
+        LAST_POS.store(p);
+    } else {
+        LAST_POS.store(LastMousePos {
+            valid: true,
+            x,
+            y,
+            modifiers: mods,
+        });
     }
     with_bridge(|b| b.send_mouse_move(x, y, mods, leave != 0));
 }
