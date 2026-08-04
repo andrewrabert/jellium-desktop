@@ -9,7 +9,6 @@
 //! before returning.
 
 use parking_lot::{Mutex, MutexGuard};
-use std::env;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -48,8 +47,9 @@ fn cache_override() -> Option<PathBuf> {
     overrides().cache_dir.clone()
 }
 
+#[cfg(not(windows))]
 fn env_or(var: &str, fallback: &str) -> String {
-    match env::var(var) {
+    match std::env::var(var) {
         Ok(v) if !v.is_empty() => v,
         _ => fallback.to_string(),
     }
@@ -111,7 +111,7 @@ pub fn mpv_home() -> PathBuf {
 
 #[cfg(unix)]
 pub fn runtime_dir() -> io::Result<PathBuf> {
-    if let Ok(dir) = env::var("XDG_RUNTIME_DIR")
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
         && !dir.is_empty()
     {
         return Ok(ensure(PathBuf::from(dir)));

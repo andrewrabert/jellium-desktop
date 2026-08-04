@@ -8,7 +8,7 @@
 
 use std::ffi::c_void;
 
-use jfn_linux_util::egl_dyn as egl;
+use jfn_linux_util::egl;
 
 // =====================================================================
 // FFI declarations consumed during init/cleanup.
@@ -31,38 +31,32 @@ fn paint_name(mode: crate::paint_override::WlPaintOverride) -> &'static str {
 
 struct ProbeDisplay<'a> {
     egl: &'a egl::Egl,
-    display: egl::EGLDisplay,
+    display: egl::Display,
 }
 
 impl ProbeDisplay<'_> {
     fn init(egl: &egl::Egl, native: egl::NativeDisplayType) -> Option<ProbeDisplay<'_>> {
-        let display = unsafe { (egl.get_display)(native) };
-        if display.is_null() {
-            return None;
-        }
-        let mut major = 0;
-        let mut minor = 0;
-        if unsafe { (egl.initialize)(display, &mut major, &mut minor) } != egl::TRUE {
-            return None;
-        }
+        // SAFETY: `native` is mpv's live `wl_display`.
+        let display = unsafe { egl.get_display(native) }?;
+        egl.initialize(display).ok()?;
         Some(ProbeDisplay { egl, display })
     }
 }
 
 impl Drop for ProbeDisplay<'_> {
     fn drop(&mut self) {
-        unsafe { (self.egl.terminate)(self.display) };
+        let _ = self.egl.terminate(self.display);
     }
 }
 
 fn dmabuf_available(native_display: *mut c_void) -> bool {
-    let Ok(egl) = egl::Egl::load_default() else {
+    let Ok(egl) = egl::load() else {
         return false;
     };
-    let Some(display) = ProbeDisplay::init(&egl, native_display.cast()) else {
+    let Some(probe) = ProbeDisplay::init(&egl, native_display.cast()) else {
         return false;
     };
-    unsafe { jfn_wl_dmabuf_probe(c"wayland".as_ptr(), display.display) }
+    unsafe { jfn_wl_dmabuf_probe(c"wayland".as_ptr(), probe.display.as_ptr()) }
 }
 
 // =====================================================================

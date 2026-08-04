@@ -426,14 +426,14 @@ pub fn init() -> bool {
         return false;
     }
 
-    // Verify the MIT-SHM extension is present.
+    // Verify MIT-SHM 1.2 (fd passing) is present.
     let shm_ok = x11rb_conn
         .shm_query_version()
         .ok()
         .and_then(|cookie| cookie.reply().ok())
-        .is_some();
+        .is_some_and(|v| (v.major_version, v.minor_version) >= (1, 2));
     if !shm_ok {
-        tracing::error!("MIT-SHM extension not available");
+        tracing::error!("MIT-SHM 1.2 not available");
         return false;
     }
 

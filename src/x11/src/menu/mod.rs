@@ -15,8 +15,8 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::rust_connection::RustConnection;
 
+use crate::conn_source::X11Source;
 use crate::shm::{shm_alloc, shm_free};
-use crate::x11_source::X11Source;
 use crate::x11_state::ShmBuffer;
 use jfn_menu::interaction_fsm::{self, MenuEffect, MenuEvent, MenuState};
 use jfn_menu::render::{self, Fonts, Layout};
@@ -459,14 +459,15 @@ fn redraw(
     // tiny-skia is premultiplied RGBA; the ARGB32 X visual wants premultiplied
     // BGRA, so swap R and B as we copy into the SHM segment.
     let src = pm.data();
-    let dst = unsafe { std::slice::from_raw_parts_mut(buf.data, (w * h * 4) as usize) };
-    let mut i = 0;
-    while i + 3 < src.len() && i + 3 < dst.len() {
-        dst[i] = src[i + 2];
-        dst[i + 1] = src[i + 1];
-        dst[i + 2] = src[i];
-        dst[i + 3] = src[i + 3];
-        i += 4;
+    for (dst, src) in buf
+        .pixels_mut()
+        .chunks_exact_mut(4)
+        .zip(src.chunks_exact(4))
+    {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = src[3];
     }
     let _ = conn.shm_put_image(
         win,
@@ -482,7 +483,7 @@ fn redraw(
         32,
         u8::from(ImageFormat::Z_PIXMAP),
         false,
-        buf.seg,
+        buf.seg(),
         0,
     );
     let _ = conn.flush();

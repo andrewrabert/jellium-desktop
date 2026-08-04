@@ -29,12 +29,12 @@ use x11rb::wrapper::ConnectionExt as _;
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 use jfn_wake_event::{Drain, WakeEvent, WakeSource};
 
+use crate::conn_source::X11Source;
 use crate::input::x11_shutdown_waker;
 use crate::overlay_fsm::{self, Effect, Geom, OverlayState};
 use crate::registry::{
     GeometryCommand, StructureSurface, SurfaceId, drain_commands, registry, split_capabilities,
 };
-use crate::x11_source::X11Source;
 use crate::x11_state::{HostServices, PaintServices, ParentSnapshot};
 
 pub struct Handle {

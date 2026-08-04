@@ -2,6 +2,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub(crate) mod conn_source;
 pub(crate) mod context_menu;
 pub mod geometry;
 pub(crate) mod input;
@@ -20,8 +21,6 @@ pub(crate) mod scale;
 pub mod shm;
 pub mod surface;
 pub(crate) mod window_source;
-pub(crate) mod x11_source;
 pub(crate) mod x11_state;
-pub(crate) mod xcb_source;
 
 pub use paint_override::{X11PaintOverride, paint_override, set_paint_override};

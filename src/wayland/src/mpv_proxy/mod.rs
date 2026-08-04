@@ -82,9 +82,13 @@ impl ProxyShared {
         }
     }
 
-    pub(crate) fn app_client_fd(&self) -> Option<std::os::fd::RawFd> {
-        let fd = self.app_client_fd.load(Ordering::Acquire);
-        (fd >= 0).then_some(fd)
+    /// Takes the published fd and leaves the slot empty; a second call is
+    /// `None`.
+    pub(crate) fn take_app_client_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        let fd = self.app_client_fd.swap(-1, Ordering::AcqRel);
+        // SAFETY: the swap hands this fd to exactly one caller, and nothing
+        // else in the process holds it after publication.
+        (fd >= 0).then(|| unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
     }
 
     fn window_size(&self) -> Option<WindowSize> {

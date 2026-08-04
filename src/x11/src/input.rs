@@ -26,7 +26,7 @@ use jfn_linux_util::input::jfn_input_dispatch_key_raw;
 use jfn_playback::shutdown::jfn_shutdown_register_waker;
 use jfn_wake_event::{Drain, WakeEvent, WakeSource};
 
-use crate::xcb_source::XcbSource;
+use crate::conn_source::XcbSource;
 
 use cursor_icon::CursorIcon;
 use jfn_input::buttons;

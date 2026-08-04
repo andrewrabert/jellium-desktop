@@ -1,59 +1,51 @@
 //! xkb keysym → Windows VK code.
 
-// Letters: XKB_KEY_a..z = 0x61..0x7A, A..Z = 0x41..0x5A.
-const XKB_KEY_A: u32 = 0x0041;
-const XKB_KEY_Z: u32 = 0x005A;
-const XKB_KEY_LC_A: u32 = 0x0061;
-const XKB_KEY_LC_Z: u32 = 0x007A;
-const XKB_KEY_0: u32 = 0x0030;
-const XKB_KEY_9: u32 = 0x0039;
-const XKB_KEY_F1: u32 = 0xFFBE;
-const XKB_KEY_F12: u32 = 0xFFC9;
+use xkbcommon::xkb::keysyms as ks;
 
 pub fn keysym_to_vkey(sym: u32) -> i32 {
-    if (XKB_KEY_LC_A..=XKB_KEY_LC_Z).contains(&sym) {
-        return (b'A' as u32 + (sym - XKB_KEY_LC_A)) as i32;
+    if (ks::KEY_a..=ks::KEY_z).contains(&sym) {
+        return (b'A' as u32 + (sym - ks::KEY_a)) as i32;
     }
-    if (XKB_KEY_A..=XKB_KEY_Z).contains(&sym) {
+    if (ks::KEY_A..=ks::KEY_Z).contains(&sym) {
         return sym as i32;
     }
-    if (XKB_KEY_0..=XKB_KEY_9).contains(&sym) {
+    if (ks::KEY_0..=ks::KEY_9).contains(&sym) {
         return sym as i32;
     }
-    if (XKB_KEY_F1..=XKB_KEY_F12).contains(&sym) {
-        return 0x70 + (sym - XKB_KEY_F1) as i32;
+    if (ks::KEY_F1..=ks::KEY_F12).contains(&sym) {
+        return 0x70 + (sym - ks::KEY_F1) as i32;
     }
 
     match sym {
-        0xFF0D => 0x0D,          // Return
-        0xFF1B => 0x1B,          // Escape
-        0xFF09 | 0xFE20 => 0x09, // Tab / ISO_Left_Tab
-        0xFF08 => 0x08,          // BackSpace
-        0x0020 => 0x20,          // space
-        0xFF51 => 0x25,          // Left
-        0xFF52 => 0x26,          // Up
-        0xFF53 => 0x27,          // Right
-        0xFF54 => 0x28,          // Down
-        0xFF50 => 0x24,          // Home
-        0xFF57 => 0x23,          // End
-        0xFF55 => 0x21,          // Page_Up
-        0xFF56 => 0x22,          // Page_Down
-        0xFFFF => 0x2E,          // Delete
-        0xFF63 => 0x2D,          // Insert
+        ks::KEY_Return => 0x0D,
+        ks::KEY_Escape => 0x1B,
+        ks::KEY_Tab | ks::KEY_ISO_Left_Tab => 0x09,
+        ks::KEY_BackSpace => 0x08,
+        ks::KEY_space => 0x20,
+        ks::KEY_Left => 0x25,
+        ks::KEY_Up => 0x26,
+        ks::KEY_Right => 0x27,
+        ks::KEY_Down => 0x28,
+        ks::KEY_Home => 0x24,
+        ks::KEY_End => 0x23,
+        ks::KEY_Page_Up => 0x21,
+        ks::KEY_Page_Down => 0x22,
+        ks::KEY_Delete => 0x2E,
+        ks::KEY_Insert => 0x2D,
         // OEM punctuation. Required so Chromium can derive event.key (e.g.
         // '>' from Shift+Period) for DOM keydown handlers; without a VK
         // here, jellyfin-web shortcuts like '<' / '>' never match.
-        0x003B | 0x003A => 0xBA, // semicolon / colon
-        0x003D | 0x002B => 0xBB, // equal / plus
-        0x002C | 0x003C => 0xBC, // comma / less
-        0x002D | 0x005F => 0xBD, // minus / underscore
-        0x002E | 0x003E => 0xBE, // period / greater
-        0x002F | 0x003F => 0xBF, // slash / question
-        0x0060 | 0x007E => 0xC0, // grave / asciitilde
-        0x005B | 0x007B => 0xDB, // bracketleft / braceleft
-        0x005C | 0x007C => 0xDC, // backslash / bar
-        0x005D | 0x007D => 0xDD, // bracketright / braceright
-        0x0027 | 0x0022 => 0xDE, // apostrophe / quotedbl
+        ks::KEY_semicolon | ks::KEY_colon => 0xBA,
+        ks::KEY_equal | ks::KEY_plus => 0xBB,
+        ks::KEY_comma | ks::KEY_less => 0xBC,
+        ks::KEY_minus | ks::KEY_underscore => 0xBD,
+        ks::KEY_period | ks::KEY_greater => 0xBE,
+        ks::KEY_slash | ks::KEY_question => 0xBF,
+        ks::KEY_grave | ks::KEY_asciitilde => 0xC0,
+        ks::KEY_bracketleft | ks::KEY_braceleft => 0xDB,
+        ks::KEY_backslash | ks::KEY_bar => 0xDC,
+        ks::KEY_bracketright | ks::KEY_braceright => 0xDD,
+        ks::KEY_apostrophe | ks::KEY_quotedbl => 0xDE,
         _ => 0,
     }
 }

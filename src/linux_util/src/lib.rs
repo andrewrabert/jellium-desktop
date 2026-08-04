@@ -7,7 +7,7 @@
 
 pub mod cli;
 pub mod dmabuf_probe;
-pub mod egl_dyn;
+pub mod egl;
 pub mod idle_inhibit;
 pub mod input;
 mod keysym;

@@ -20,32 +20,58 @@ use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 use jfn_compositor_core::transition::TransitionGate;
+use memmap2::MmapMut;
 use x11rb::protocol::shm;
 use x11rb::rust_connection::RustConnection;
 
-/// Owns one SHM segment + the mapped memory. Two per surface so the
-/// renderer can double-buffer.
+/// Owns one MIT-SHM segment plus its mapping. Two per surface so the renderer
+/// can double-buffer.
 pub struct ShmBuffer {
-    pub seg: shm::Seg,
-    pub shmid: i32,
-    pub data: *mut u8,
-    pub w: i32,
-    pub h: i32,
-    pub size: usize,
+    seg: shm::Seg,
+    map: Option<MmapMut>,
+    w: i32,
+    h: i32,
 }
-
-unsafe impl Send for ShmBuffer {}
 
 impl ShmBuffer {
     pub fn empty() -> Self {
         Self {
             seg: 0,
-            shmid: -1,
-            data: std::ptr::null_mut(),
+            map: None,
             w: 0,
             h: 0,
-            size: 0,
         }
+    }
+
+    /// The segment registered with the server, or 0 while unmapped.
+    pub fn seg(&self) -> shm::Seg {
+        self.seg
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        self.map.is_some()
+    }
+
+    pub fn dims(&self) -> (i32, i32) {
+        (self.w, self.h)
+    }
+
+    /// The live mapping, or an empty slice while unmapped.
+    pub fn pixels_mut(&mut self) -> &mut [u8] {
+        self.map.as_mut().map_or(&mut [], |m| &mut m[..])
+    }
+
+    /// Replaces the mapping; the caller detaches the previous segment first.
+    pub fn set(&mut self, seg: shm::Seg, map: MmapMut, w: i32, h: i32) {
+        self.seg = seg;
+        self.map = Some(map);
+        self.w = w;
+        self.h = h;
+    }
+
+    /// Unmaps and returns the buffer to its empty state.
+    pub fn clear(&mut self) {
+        *self = Self::empty();
     }
 }
 

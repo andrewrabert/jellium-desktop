@@ -15,5 +15,9 @@ tempfile.workspace = true
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
+# macOS keeps its own derivation, so `dirs` is gated off it.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+dirs = "6"
+
 [lints]
 workspace = true

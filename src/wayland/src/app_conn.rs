@@ -1,15 +1,9 @@
-use std::ffi::{c_int, c_void};
+use std::ffi::c_void;
+use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
 
 use parking_lot::Mutex;
-
-type ConnectToFdFn = unsafe extern "C" fn(c_int) -> *mut c_void;
-
-// The resolved fn takes ownership of `fd` — libwayland closes it even on failure.
-fn wl_display_connect_to_fd() -> Option<ConnectToFdFn> {
-    let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"wl_display_connect_to_fd".as_ptr()) };
-    (!addr.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, ConnectToFdFn>(addr) })
-}
+use wayland_backend::client::Backend;
 
 /// The app-side `wl_display`. Sharing the raw pointer across threads is sound:
 /// libwayland's display is internally synchronized and the app already drives it
@@ -26,12 +20,18 @@ impl AppDisplay {
     }
 }
 
-/// `Unattempted` retries on the next call; `Failed` does not. Only a `fd < 0`
-/// (proxy hasn't published the client fd yet) stays `Unattempted` — once
-/// `connect` runs it has consumed the fd, so its result is terminal either way.
+/// `Unattempted` retries on the next call; `Failed` does not. Only a missing
+/// fd (proxy hasn't published the client fd yet) stays `Unattempted` — once
+/// `Backend::connect` runs it has consumed the fd, so its result is terminal
+/// either way.
 enum DisplayState {
     Unattempted,
-    Connected(AppDisplay),
+    /// The backend owns the connection for the process lifetime; dropping it
+    /// would disconnect the display CEF and mpv hold pointers to.
+    Connected {
+        display: AppDisplay,
+        _backend: Backend,
+    },
     Failed,
 }
 
@@ -50,26 +50,32 @@ impl AppConn {
 pub(crate) fn app_display(rt: &crate::runtime::WlRuntime) -> Option<AppDisplay> {
     let mut state = rt.app_conn().display.lock();
     match &*state {
-        DisplayState::Connected(a) => return Some(*a),
+        DisplayState::Connected { display, .. } => return Some(*display),
         DisplayState::Failed => return None,
         DisplayState::Unattempted => {}
     }
-    let Some(fd) = rt.proxy().app_client_fd() else {
+    let Some(fd) = rt.proxy().take_app_client_fd() else {
         tracing::error!(target: "Main", "app_display: no app client fd available");
         return None;
     };
-    let Some(connect) = wl_display_connect_to_fd() else {
-        tracing::error!(target: "Main", "app_display: wl_display_connect_to_fd unavailable");
+    let backend = match Backend::connect(UnixStream::from(fd)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            tracing::error!(target: "Main", "app_display: {e}");
+            *state = DisplayState::Failed;
+            return None;
+        }
+    };
+    let Some(d) = NonNull::new(backend.display_ptr().cast::<c_void>()) else {
+        tracing::error!(target: "Main", "app_display: null wl_display");
         *state = DisplayState::Failed;
         return None;
     };
-    let Some(d) = NonNull::new(unsafe { connect(fd) }) else {
-        tracing::error!(target: "Main", "app_display: wl_display_connect_to_fd failed");
-        *state = DisplayState::Failed;
-        return None;
-    };
-    tracing::info!(target: "Main", "app_display: connected on fd={fd} -> {:p}", d.as_ptr());
+    tracing::info!(target: "Main", "app_display: connected -> {:p}", d.as_ptr());
     let display = AppDisplay(d);
-    *state = DisplayState::Connected(display);
+    *state = DisplayState::Connected {
+        display,
+        _backend: backend,
+    };
     Some(display)
 }

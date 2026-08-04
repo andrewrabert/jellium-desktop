@@ -382,7 +382,9 @@ fn present_shm(
         eprintln!("[x11] overlay actor shm allocation failed");
         return;
     }
+    let seg = buf.seg();
     let dst_stride = (width as usize) * 4;
+    let dst = buf.pixels_mut();
     for rect in &dirty {
         let Some((rx, ry, rw, rh)) = clip_rect(rect, width, height) else {
             continue;
@@ -391,15 +393,13 @@ fn present_shm(
             let src_off = ((ry + row) as usize) * stride + (rx as usize) * 4;
             let dst_off = ((ry + row) as usize) * dst_stride + (rx as usize) * 4;
             let row_bytes = (rw as usize) * 4;
-            let (Some(src), true) = (
+            let (Some(src), Some(dst_row)) = (
                 pixels.get(src_off..src_off + row_bytes),
-                dst_off + row_bytes <= buf.size,
+                dst.get_mut(dst_off..dst_off + row_bytes),
             ) else {
                 continue;
             };
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), buf.data.add(dst_off), row_bytes);
-            }
+            dst_row.copy_from_slice(src);
         }
         let _ = conn.shm_put_image(
             window,
@@ -415,7 +415,7 @@ fn present_shm(
             depth,
             u8::from(xproto::ImageFormat::Z_PIXMAP),
             false,
-            buf.seg,
+            seg,
             0,
         );
     }
