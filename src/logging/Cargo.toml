@@ -9,9 +9,9 @@ name = "jfn_logging"
 crate-type = ["rlib"]
 
 [dependencies]
+memchr = "2"
 parking_lot.workspace = true
 tracing.workspace = true
-tracing-core = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "std",
     "fmt",
@@ -21,6 +21,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 tracing-appender = "0.2"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 jfn-wake-event = { path = "../wake_event" }

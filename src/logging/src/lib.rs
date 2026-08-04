@@ -12,26 +12,23 @@
 mod redact;
 
 use parking_lot::Mutex;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use time::macros::format_description;
 
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
-use tracing_core::{
-    Callsite, Interest, Metadata, field::FieldSet, identify_callsite, metadata::Kind,
-};
-use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
+use tracing_subscriber::{EnvFilter, Registry, filter::LevelFilter, fmt, layer::SubscriberExt};
 
-const CATEGORY_NAMES: &[&str] = &["Main", "mpv", "CEF", "Media", "Platform", "JS", "Resource"];
+const CATEGORY_COUNT: u8 = 7;
+const LEVEL_COUNT: u8 = 5;
 
-// Public category/level constants. Indices into CATEGORY_NAMES, and the u8
-// values accepted by `log` / `log_enabled` / `jfn_log` / `jfn_log_enabled`.
+// Public category/level constants, and the u8 values accepted by `log` /
+// `log_enabled`.
 pub const CATEGORY_CEF: u8 = 2;
 pub const CATEGORY_JS: u8 = 5;
 pub const CATEGORY_RESOURCE: u8 = 6;
@@ -81,67 +78,56 @@ const MAX_BACKUPS: usize = 3;
 struct RotatingFile {
     path: PathBuf,
     file: File,
+    max_bytes: u64,
+    max_backups: usize,
     bytes_written: u64,
 }
 
 impl RotatingFile {
-    fn open(path: PathBuf) -> io::Result<Self> {
+    fn open(path: PathBuf, max_bytes: u64, max_backups: usize) -> io::Result<Self> {
         // Start each run with a fresh file; prior run's contents shift into
         // the backup chain.
-        rotate_backups(&path)?;
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        shift_backups(&path, max_backups);
+        let file = File::create(&path)?;
         Ok(Self {
             path,
             file,
+            max_bytes,
+            max_backups,
             bytes_written: 0,
         })
     }
 
-    fn maybe_rotate(&mut self, incoming: usize) -> io::Result<()> {
-        if self.bytes_written + incoming as u64 <= MAX_FILE_BYTES {
-            return Ok(());
-        }
+    fn rotate(&mut self) -> io::Result<()> {
         self.file.flush()?;
-        rotate_backups(&self.path)?;
-        self.file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.path)?;
+        shift_backups(&self.path, self.max_backups);
+        self.file = File::create(&self.path)?;
         self.bytes_written = 0;
         Ok(())
     }
 }
 
-fn rotate_backups(path: &PathBuf) -> io::Result<()> {
-    let oldest = backup_path(path, MAX_BACKUPS);
-    let _ = std::fs::remove_file(&oldest);
-    for i in (1..MAX_BACKUPS).rev() {
-        let src = backup_path(path, i);
-        let dst = backup_path(path, i + 1);
-        if src.exists() {
-            std::fs::rename(&src, &dst)?;
-        }
+fn shift_backups(path: &Path, max_backups: usize) {
+    let _ = std::fs::remove_file(backup_path(path, max_backups));
+    for i in (1..max_backups).rev() {
+        let _ = std::fs::rename(backup_path(path, i), backup_path(path, i + 1));
     }
-    if path.exists() {
-        std::fs::rename(path, backup_path(path, 1))?;
-    }
-    Ok(())
+    let _ = std::fs::rename(path, backup_path(path, 1));
 }
 
 fn backup_path(path: &Path, n: usize) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(format!(".{}", n));
-    PathBuf::from(s)
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{n}"));
+    PathBuf::from(name)
 }
 
 impl Write for RotatingFile {
+    // Rotates before writing when the buffer would cross `max_bytes`, so a
+    // record never spans two files.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.maybe_rotate(buf.len())?;
+        if self.bytes_written.saturating_add(buf.len() as u64) > self.max_bytes {
+            self.rotate()?;
+        }
         let n = self.file.write(buf)?;
         self.bytes_written += n as u64;
         Ok(n)
@@ -351,117 +337,64 @@ const CONSOLE_TRACE_FMT: &[FormatItem<'static>] =
     format_description!("[hour]:[minute]:[second].[subsecond digits:3]");
 
 // =====================================================================
-// Per-(category, level) enablement table — primed once at init from the
-// EnvFilter. Lets call sites skip formatting when filtered out, matching
-// the gating tracing's own Interest cache provides for pure-Rust callers.
-// =====================================================================
-
-const N_LEVELS: usize = 5;
-const ENABLED_LEN: usize = 7 * N_LEVELS; // CATEGORY_NAMES.len() == 7
-
-static ENABLED: [AtomicBool; ENABLED_LEN] = [const { AtomicBool::new(false) }; ENABLED_LEN];
-
-#[inline]
-fn enabled_slot(category: u8, level: u8) -> usize {
-    (category as usize) * N_LEVELS + (level as usize)
-}
-
-struct ProbeCallsite;
-impl Callsite for ProbeCallsite {
-    fn set_interest(&self, _: Interest) {}
-    fn metadata(&self) -> &Metadata<'_> {
-        // Never invoked: we only feed synthesized Metadata to
-        // Dispatch::enabled, which doesn't consult the callsite's own
-        // metadata() — only the metadata we pass in.
-        unreachable!("ProbeCallsite::metadata should not be called")
-    }
-}
-static PROBE_CS: ProbeCallsite = ProbeCallsite;
-
-fn probe_meta(target: &'static str, level: tracing::Level) -> Metadata<'static> {
-    static EMPTY: &[&str] = &[];
-    Metadata::new(
-        "jfn_log_probe",
-        target,
-        level,
-        None,
-        None,
-        None,
-        FieldSet::new(EMPTY, identify_callsite!(&PROBE_CS)),
-        Kind::EVENT,
-    )
-}
-
-fn compute_enabled_table() -> [bool; ENABLED_LEN] {
-    use tracing::Level as L;
-    let levels = [
-        (0u8, L::TRACE),
-        (1, L::DEBUG),
-        (2, L::INFO),
-        (3, L::WARN),
-        (4, L::ERROR),
-    ];
-    let mut table = [false; ENABLED_LEN];
-    for (cat_idx, cat_name) in CATEGORY_NAMES.iter().enumerate() {
-        for (lvl_u8, tlvl) in levels {
-            let md = probe_meta(cat_name, tlvl);
-            let on = tracing::dispatcher::get_default(|d| d.enabled(&md));
-            table[enabled_slot(cat_idx as u8, lvl_u8)] = on;
-        }
-    }
-    table
-}
-
-fn prime_enabled_table() {
-    for (i, on) in compute_enabled_table().iter().enumerate() {
-        ENABLED[i].store(*on, Ordering::Relaxed);
-    }
-}
-
-/// True if the directive string contains a trace-level component
-/// anywhere — used to decide whether to prepend HH:MM:SS.mmm on console
-/// lines (preserving the previous crate's trace-mode timestamps).
-fn directive_contains_trace(filter: &str) -> bool {
-    filter.split(',').any(|tok| {
-        tok.trim().eq_ignore_ascii_case("trace")
-            || tok.trim().to_ascii_lowercase().ends_with("=trace")
-    })
-}
-
-// =====================================================================
 // Emit
 // =====================================================================
 
+// The one place a category number maps to a target string; `$mac` is
+// re-invoked with the target literal prepended to its arguments.
+macro_rules! with_category_target {
+    ($category:expr, $mac:ident $(, $arg:expr)*) => {
+        match $category {
+            0 => $mac!("Main" $(, $arg)*),
+            1 => $mac!("mpv" $(, $arg)*),
+            2 => $mac!("CEF" $(, $arg)*),
+            3 => $mac!("Media" $(, $arg)*),
+            4 => $mac!("Platform" $(, $arg)*),
+            5 => $mac!("JS" $(, $arg)*),
+            6 => $mac!("Resource" $(, $arg)*),
+            _ => $mac!("Unknown" $(, $arg)*),
+        }
+    };
+}
+
 // `tracing::event!` requires a literal `target` (it builds a `static`
-// Callsite at the call site). Since `jfn_log`'s category is a runtime u8,
-// we materialize all 8×5 callsites by matching on (category, level)
-// before dispatch. Each `event!` arm gets its own callsite + Interest
-// cache, matching what pure-Rust callers would see.
-macro_rules! emit_with_target {
-    ($lvl:expr, $tgt:expr, $msg:expr) => {{
+// Callsite at the call site), so the level match keeps `target` a literal
+// and materializes one static callsite per (category, level).
+macro_rules! emit_at {
+    ($tgt:expr, $lvl:expr, $msg:expr) => {{
         use tracing::Level as L;
         match $lvl {
             Level::Trace => tracing::event!(target: $tgt, L::TRACE, "{}", $msg),
             Level::Debug => tracing::event!(target: $tgt, L::DEBUG, "{}", $msg),
-            Level::Info  => tracing::event!(target: $tgt, L::INFO,  "{}", $msg),
-            Level::Warn  => tracing::event!(target: $tgt, L::WARN,  "{}", $msg),
+            Level::Info => tracing::event!(target: $tgt, L::INFO, "{}", $msg),
+            Level::Warn => tracing::event!(target: $tgt, L::WARN, "{}", $msg),
             Level::Error => tracing::event!(target: $tgt, L::ERROR, "{}", $msg),
+        }
+    }};
+}
+
+macro_rules! enabled_at {
+    ($tgt:expr, $lvl:expr) => {{
+        use tracing::Level as L;
+        match $lvl {
+            Level::Trace => tracing::event_enabled!(target: $tgt, L::TRACE),
+            Level::Debug => tracing::event_enabled!(target: $tgt, L::DEBUG),
+            Level::Info => tracing::event_enabled!(target: $tgt, L::INFO),
+            Level::Warn => tracing::event_enabled!(target: $tgt, L::WARN),
+            Level::Error => tracing::event_enabled!(target: $tgt, L::ERROR),
         }
     }};
 }
 
 fn emit(category: u8, level: Level, msg: &str) {
     let msg = msg.trim_end_matches(['\r', '\n']);
-    match category {
-        0 => emit_with_target!(level, "Main", msg),
-        1 => emit_with_target!(level, "mpv", msg),
-        2 => emit_with_target!(level, "CEF", msg),
-        3 => emit_with_target!(level, "Media", msg),
-        4 => emit_with_target!(level, "Platform", msg),
-        5 => emit_with_target!(level, "JS", msg),
-        6 => emit_with_target!(level, "Resource", msg),
-        _ => emit_with_target!(level, "Unknown", msg),
-    }
+    with_category_target!(category, emit_at, level, msg);
+}
+
+/// True if the filter admits any TRACE-level callsite — used to decide
+/// whether to prepend HH:MM:SS.mmm on console lines.
+fn filter_is_trace(filter: &EnvFilter) -> bool {
+    filter.max_level_hint() == Some(LevelFilter::TRACE)
 }
 
 pub fn jfn_log_init(path: &str, filter: &str) {
@@ -492,7 +425,7 @@ pub fn jfn_log_init(path: &str, filter: &str) {
         .finish(console_writer);
 
     let (file_nb, file_guard) = if !path_str.is_empty() {
-        match RotatingFile::open(PathBuf::from(&path_str)) {
+        match RotatingFile::open(PathBuf::from(&path_str), MAX_FILE_BYTES, MAX_BACKUPS) {
             Ok(rf) => {
                 let (nb, g) = NonBlockingBuilder::default().lossy(true).finish(rf);
                 (Some(nb), Some(g))
@@ -508,7 +441,7 @@ pub fn jfn_log_init(path: &str, filter: &str) {
         Err(_) => EnvFilter::new("info"),
     };
 
-    let trace_mode = directive_contains_trace(&filter_str);
+    let trace_mode = filter_is_trace(&env_filter);
 
     let console_layer = fmt::layer()
         .event_format(ConsoleFormat { trace_mode, color })
@@ -532,8 +465,6 @@ pub fn jfn_log_init(path: &str, filter: &str) {
     // the STATE.is_some() early-return above, but possible across crate
     // boundaries in tests), proceed without panicking.
     let _ = tracing::dispatcher::set_global_default(dispatch);
-
-    prime_enabled_table();
 
     let stderr_capture = imp::StderrCapture::start();
 
@@ -561,10 +492,11 @@ pub fn jfn_log_shutdown() {
 }
 
 pub fn log_enabled(category: u8, level: u8) -> bool {
-    if (category as usize) >= CATEGORY_NAMES.len() || (level as usize) >= N_LEVELS {
+    if category >= CATEGORY_COUNT || level >= LEVEL_COUNT {
         return false;
     }
-    ENABLED[enabled_slot(category, level)].load(Ordering::Relaxed)
+    let level = Level::from_u8(level);
+    with_category_target!(category, enabled_at, level)
 }
 
 pub fn log(category: u8, level: u8, msg: &str) {
@@ -815,55 +747,109 @@ mod tests {
         }
     }
 
-    #[test]
-    fn directive_trace_detection() {
-        assert!(directive_contains_trace("trace"));
-        assert!(directive_contains_trace("info,mpv=trace"));
-        assert!(directive_contains_trace("debug,CEF=trace,mpv=warn"));
-        assert!(!directive_contains_trace("info"));
-        assert!(!directive_contains_trace("debug,mpv=warn"));
-        assert!(!directive_contains_trace("warn,CEF=off"));
-    }
-
-    fn probe_with_filter(directive: &str, cat_idx: usize, lvl: u8) -> bool {
-        let filter = EnvFilter::new(directive);
-        let subscriber = Registry::default().with(filter);
-        let dispatch = tracing::Dispatch::new(subscriber);
-        let table = tracing::dispatcher::with_default(&dispatch, compute_enabled_table);
-        table[enabled_slot(cat_idx as u8, lvl)]
+    fn enabled_under(directive: &str, category: u8, level: u8) -> bool {
+        let dispatch = tracing::Dispatch::new(Registry::default().with(EnvFilter::new(directive)));
+        tracing::dispatcher::with_default(&dispatch, || log_enabled(category, level))
     }
 
     #[test]
-    fn enabled_table_respects_global_filter() {
-        // "warn" → Info+ disabled, Warn/Error enabled for any category.
-        assert!(!probe_with_filter(
-            "warn", 0, /* Main */
-            2  /* Info */
-        ));
-        assert!(probe_with_filter("warn", 0, 3 /* Warn */));
-        assert!(probe_with_filter("warn", 0, 4 /* Error */));
+    fn log_enabled_respects_global_filter() {
+        // "warn" → Info disabled, Warn/Error enabled for any category.
+        assert!(!enabled_under("warn", 0 /* Main */, 2 /* Info */));
+        assert!(enabled_under("warn", 0, 3 /* Warn */));
+        assert!(enabled_under("warn", 0, 4 /* Error */));
     }
 
     #[test]
-    fn enabled_table_respects_target_override() {
+    fn log_enabled_respects_target_override() {
         // Global warn, but mpv=trace → mpv Trace enabled, Main Trace not.
-        assert!(probe_with_filter(
+        assert!(enabled_under(
             "warn,mpv=trace",
             1, /* mpv */
             0  /* Trace */
         ));
-        assert!(!probe_with_filter("warn,mpv=trace", 0 /* Main */, 0));
+        assert!(!enabled_under("warn,mpv=trace", 0 /* Main */, 0));
     }
 
     #[test]
-    fn enabled_table_respects_off_directive() {
+    fn log_enabled_respects_off_directive() {
         // Global info, CEF=off → CEF Error disabled, Main Error enabled.
-        assert!(!probe_with_filter(
+        assert!(!enabled_under(
             "info,CEF=off",
             2, /* CEF */
             4  /* Error */
         ));
-        assert!(probe_with_filter("info,CEF=off", 0 /* Main */, 4));
+        assert!(enabled_under("info,CEF=off", 0 /* Main */, 4));
+    }
+
+    #[test]
+    fn log_enabled_rejects_out_of_range_category_and_level() {
+        assert!(!enabled_under("trace", CATEGORY_COUNT, 4));
+        assert!(!enabled_under("trace", 0, LEVEL_COUNT));
+    }
+
+    #[test]
+    fn filter_is_trace_detects_bare_and_target_directives() {
+        for directive in [
+            "trace",
+            "info,mpv=trace",
+            "debug,CEF=trace,mpv=warn",
+            "mpv=5",
+            "CEF[{field}]=trace",
+        ] {
+            assert!(
+                filter_is_trace(&EnvFilter::new(directive)),
+                "expected trace mode for {directive:?}"
+            );
+        }
+        for directive in ["info", "debug,mpv=warn", "warn,CEF=off"] {
+            assert!(
+                !filter_is_trace(&EnvFilter::new(directive)),
+                "unexpected trace mode for {directive:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_shifts_previous_run_into_backup_one() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("run.log");
+        std::fs::write(&path, b"previous run\n")?;
+        let mut rf = RotatingFile::open(path.clone(), 1024, 3)?;
+        rf.write_all(b"current run\n")?;
+        rf.flush()?;
+        assert_eq!(std::fs::read(&path)?, b"current run\n");
+        assert_eq!(std::fs::read(backup_path(&path, 1))?, b"previous run\n");
+        Ok(())
+    }
+
+    #[test]
+    fn write_past_limit_rotates_without_splitting_a_record() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("run.log");
+        let mut rf = RotatingFile::open(path.clone(), 8, 3)?;
+        rf.write_all(b"aaaaa\n")?;
+        rf.write_all(b"bbbbb\n")?;
+        rf.flush()?;
+        assert_eq!(std::fs::read(&path)?, b"bbbbb\n");
+        assert_eq!(std::fs::read(backup_path(&path, 1))?, b"aaaaa\n");
+        Ok(())
+    }
+
+    #[test]
+    fn backups_beyond_max_are_dropped() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("run.log");
+        let mut rf = RotatingFile::open(path.clone(), 8, 2)?;
+        for record in [&b"1111\n"[..], b"2222\n", b"3333\n", b"4444\n"] {
+            rf.write_all(record)?;
+        }
+        rf.flush()?;
+        assert_eq!(std::fs::read(&path)?, b"4444\n");
+        assert_eq!(std::fs::read(backup_path(&path, 1))?, b"3333\n");
+        assert_eq!(std::fs::read(backup_path(&path, 2))?, b"2222\n");
+        assert!(!backup_path(&path, 3).exists());
+        Ok(())
     }
 
     fn capture_console(color: bool) -> String {
