@@ -49,6 +49,7 @@ parking_lot = "0.12"
 objc2-foundation = "0.3"
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 slotmap = "1"
 tempfile = "3"

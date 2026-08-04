@@ -13,7 +13,8 @@ jfn-mailbox = { path = "../mailbox" }
 jfn-paths = { path = "../paths" }
 jfn-platform-abi = { path = "../platform_abi" }
 parking_lot.workspace = true
-serde_json = { workspace = true, features = ["preserve_order"] }
+serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 gethostname.workspace = true

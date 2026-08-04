@@ -2317,6 +2317,7 @@ dependencies = [
  "jfn-paths",
  "jfn-platform-abi",
  "parking_lot",
+ "serde",
  "serde_json",
 ]
 
