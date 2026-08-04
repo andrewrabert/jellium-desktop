@@ -14,6 +14,12 @@
 use parking_lot::Mutex;
 use std::ffi::c_char;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Bound on the TID_UI close-and-collect round trip. A TID_UI that is
+/// already dead never runs the posted task, and shutdown must still reach
+/// `wake_main_loop`.
+const CLOSE_COLLECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 use jfn_platform_abi::cursor::CursorShape;
 
@@ -385,15 +391,16 @@ pub fn jfn_browsers_push_csd_state_all() {
 /// race window, and no UAF when a layer's `before_close_callback`
 /// self-removes its `JfnCefLayer` Box mid-drain (the about layer does).
 pub fn jfn_browsers_close_all_blocking() {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Arc<Inner>>>(1);
+    let (tx, rx) = crossbeam_channel::bounded::<Vec<Arc<Inner>>>(1);
     crate::client::jfn_cef_post_close_and_collect(tx);
-    let inners = match rx.recv() {
-        Ok(inners) => inners,
-        Err(e) => {
-            eprintln!("[cef] close-all wait set never arrived: {e}");
-            return;
-        }
-    };
+    let inners = rx.recv_timeout(CLOSE_COLLECT_TIMEOUT).unwrap_or_else(|e| {
+        jfn_logging::log(
+            jfn_logging::CATEGORY_CEF,
+            jfn_logging::LEVEL_WARN,
+            &format!("close-all wait set never arrived: {e}"),
+        );
+        Vec::new()
+    });
     for i in inners {
         i.wait_for_close();
     }

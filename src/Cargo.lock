@@ -2328,6 +2328,8 @@ name = "jfn-cef"
 version = "0.1.0-dev"
 dependencies = [
  "cef",
+ "crossbeam-channel",
+ "crossbeam-utils",
  "gix",
  "jfn-color",
  "jfn-config",

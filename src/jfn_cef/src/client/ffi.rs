@@ -212,7 +212,9 @@ pub(crate) unsafe fn jfn_cef_layer_send_mouse_wheel(
 }
 
 pub(crate) unsafe fn jfn_cef_layer_set_surface(h: *const JfnCefLayer, s: *mut c_void) {
-    *unsafe { arc(h) }.surface.lock() = jfn_platform_abi::SurfaceHandle::from_ptr(s);
+    unsafe { arc(h) }
+        .surface
+        .store(jfn_platform_abi::SurfaceHandle::from_ptr(s));
 }
 
 pub(crate) unsafe fn jfn_cef_layer_get_surface(h: *const JfnCefLayer) -> *mut c_void {

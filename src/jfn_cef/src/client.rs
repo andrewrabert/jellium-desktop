@@ -12,6 +12,7 @@
 //! eventually run sees `None` and exits.
 
 use cef::{Browser, RunContextMenuCallback};
+use crossbeam_utils::atomic::AtomicCell;
 use parking_lot::{Condvar, Mutex};
 use std::os::raw::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
@@ -39,6 +40,10 @@ pub use ffi::{jfn_cef_layer_create, jfn_cef_layer_wait_for_load};
 pub(crate) use tasks::{
     jfn_cef_post_close_and_collect, jfn_cef_post_csd_state_all, jfn_cef_post_set_hidden_all,
 };
+
+// A word-sized handle must never fall back to AtomicCell's global-lock
+// path: it is read on every paint.
+const _: () = assert!(AtomicCell::<platform_ops::SurfaceHandle>::is_lock_free());
 
 const STATE_NORMAL: i32 = 0;
 const STATE_PENDING_RESET: i32 = 1;
@@ -78,7 +83,7 @@ pub(crate) struct Inner {
     injection_kind: Mutex<String>,
     // Opaque per-layer surface handle (PlatformSurface*); passed back to the
     // C++ platform vtable for surface_resize / present / popup.
-    surface: Mutex<platform_ops::SurfaceHandle>,
+    surface: AtomicCell<platform_ops::SurfaceHandle>,
 
     // logical/physical dims (slice 3)
     width: AtomicI32,
@@ -156,8 +161,9 @@ struct PopupState {
     options_received: bool,
 }
 
-// SAFETY: surface is a C++ pointer treated as opaque; only handed back to
-// the platform vtable on TID_UI.
+// SAFETY: `Inner` is not auto-Send/Sync only because of the CEF ref-counted
+// handles it stores (`Browser`, `RunContextMenuCallback`); those live behind
+// `Inner`'s own mutexes and CEF ref-counts them atomically.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
@@ -178,7 +184,7 @@ impl Inner {
             pending_menu_callback: Mutex::new(None),
             pending_menu_on_selected: Mutex::new(None),
             injection_kind: Mutex::new(String::new()),
-            surface: Mutex::new(platform_ops::SurfaceHandle::NONE),
+            surface: AtomicCell::new(platform_ops::SurfaceHandle::NONE),
             width: AtomicI32::new(0),
             height: AtomicI32::new(0),
             physical_w: AtomicI32::new(0),
@@ -233,7 +239,7 @@ impl Inner {
     }
 
     fn surface_handle(&self) -> platform_ops::SurfaceHandle {
-        *self.surface.lock()
+        self.surface.load()
     }
 }
 

@@ -11,6 +11,8 @@ crate-type = ["rlib"]
 [dependencies]
 parking_lot.workspace = true
 cef = { workspace = true }
+crossbeam-channel.workspace = true
+crossbeam-utils.workspace = true
 jfn-color = { path = "../color" }
 jfn-config = { path = "../config" }
 jfn-gpu-paint = { path = "../gpu_paint" }

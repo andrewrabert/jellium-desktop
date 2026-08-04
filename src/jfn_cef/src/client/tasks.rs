@@ -1,8 +1,7 @@
 use cef::rc::Rc;
 use cef::{ImplTask, Task, ThreadId, WrapTask, post_delayed_task, post_task, wrap_task};
-use parking_lot::Mutex;
+use crossbeam_channel::Sender;
 use std::sync::Arc;
-use std::sync::mpsc::SyncSender;
 
 use super::Inner;
 use jfn_playback::shutdown::jfn_shutting_down;
@@ -80,24 +79,19 @@ pub(super) fn post_paste_js(inner: Arc<Inner>, text: String) {
     let _ = post_task(ThreadId::UI, Some(&mut task));
 }
 
-type CloseCollectTx = Arc<Mutex<Option<SyncSender<Vec<Arc<Inner>>>>>>;
-
 wrap_task! {
     struct CloseAndCollectTask {
-        tx: CloseCollectTx,
+        tx: Sender<Vec<Arc<Inner>>>,
     }
     impl Task {
         fn execute(&self) {
-            let inners = crate::browsers::jfn_browsers_close_and_snapshot();
-            if let Some(tx) = self.tx.lock().take() {
-                let _ = tx.send(inners);
-            }
+            let _ = self.tx.send(crate::browsers::jfn_browsers_close_and_snapshot());
         }
     }
 }
 
-pub(crate) fn jfn_cef_post_close_and_collect(tx: SyncSender<Vec<Arc<Inner>>>) {
-    let mut task = CloseAndCollectTask::new(Arc::new(Mutex::new(Some(tx))));
+pub(crate) fn jfn_cef_post_close_and_collect(tx: Sender<Vec<Arc<Inner>>>) {
+    let mut task = CloseAndCollectTask::new(tx);
     assert!(
         post_task(ThreadId::UI, Some(&mut task)) != 0,
         "TID_UI post during shutdown — CEF UI thread invariant broken"
