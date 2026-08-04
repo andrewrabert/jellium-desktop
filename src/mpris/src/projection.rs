@@ -7,9 +7,9 @@
 //!   - Rate locked to 0 while seeking|buffering|Starting
 //!
 //! Pass-through fields (volume, can_go_next, can_go_previous, metadata
-//! itself) are NOT computed here — they live in the sink's Content and
-//! copy straight into the view. The diff over those is trivial bool /
-//! double / struct equality and is handled by the caller.
+//! itself) are NOT computed here — they live in the sink's Content and are
+//! answered verbatim by the sink's property getters. Change detection runs
+//! over the emitted property values, not over these fields.
 
 use jfn_playback::PlaybackPhase;
 
