@@ -9,6 +9,8 @@ name = "jfn_playback"
 crate-type = ["rlib"]
 
 [dependencies]
+crossbeam-channel.workspace = true
+crossbeam-utils.workspace = true
 parking_lot.workspace = true
 jfn-mpv = { path = "../mpv" }
 jfn-platform-abi = { path = "../platform_abi" }

@@ -48,10 +48,7 @@ pub fn jfn_playback_init() {
         if guard.is_some() {
             return;
         }
-        let Some(mut c) = PlaybackCoordinator::new() else {
-            eprintln!("[playback] failed to create coordinator (wake eventfd)");
-            return;
-        };
+        let mut c = PlaybackCoordinator::new();
         register_builtin_sinks(&c);
         c.start();
         *guard = Some(c);

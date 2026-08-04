@@ -40,6 +40,8 @@ arc-swap = "1"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
 cef = { version = "=150.0.0", default-features = false }
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
 dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 gethostname = "1"
 gix = { version = "0.85", default-features = false, features = ["status", "sha1"] }

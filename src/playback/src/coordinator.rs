@@ -3,13 +3,10 @@
 //! them in batches, runs transitions, publishes the canonical snapshot,
 //! and hands events to registered sinks via the FFI vtable.
 
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-
-use jfn_wake_event::WakeEvent;
 
 use crate::ffi::{ActionSink, EventSink};
 use crate::state_machine::PlaybackStateMachine;
@@ -48,9 +45,9 @@ pub enum Input {
 }
 
 struct Shared {
-    queue: Mutex<VecDeque<Input>>,
-    wake: WakeEvent,
-    running: AtomicBool,
+    /// Producer end, cleared by `stop` so the worker's `recv` disconnects
+    /// even while handles remain alive.
+    tx: Mutex<Option<Sender<Input>>>,
     snapshot: Mutex<PlaybackSnapshot>,
     event_sinks: Mutex<Vec<EventSink>>,
     action_sinks: Mutex<Vec<ActionSink>>,
@@ -60,6 +57,9 @@ struct Shared {
 
 pub struct PlaybackCoordinator {
     shared: Arc<Shared>,
+    /// Handed to the worker by `start`; `None` afterwards, which makes a
+    /// second `start` a no-op.
+    rx: Option<Receiver<Input>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -68,11 +68,9 @@ pub struct CoordinatorHandle(Arc<Shared>);
 
 impl CoordinatorHandle {
     pub fn enqueue(&self, in_: Input) {
-        {
-            let mut q = self.0.queue.lock();
-            q.push_back(in_);
+        if let Some(tx) = self.0.tx.lock().as_ref() {
+            let _ = tx.send(in_);
         }
-        self.0.wake.signal();
     }
 
     pub fn snapshot(&self) -> PlaybackSnapshot {
@@ -81,36 +79,33 @@ impl CoordinatorHandle {
 }
 
 impl PlaybackCoordinator {
-    /// Returns `None` if the wake eventfd can't be created (fd exhaustion).
-    pub fn new() -> Option<Self> {
-        Some(Self {
+    #[must_use]
+    pub fn new() -> Self {
+        let (tx, rx) = unbounded();
+        Self {
             shared: Arc::new(Shared {
-                queue: Mutex::new(VecDeque::new()),
-                wake: WakeEvent::new()?,
-                running: AtomicBool::new(false),
+                tx: Mutex::new(Some(tx)),
                 snapshot: Mutex::new(PlaybackSnapshot::fresh()),
                 event_sinks: Mutex::new(Vec::new()),
                 action_sinks: Mutex::new(Vec::new()),
                 builtin_event_sinks: Mutex::new(Vec::new()),
                 builtin_action_sinks: Mutex::new(Vec::new()),
             }),
+            rx: Some(rx),
             join: None,
-        })
+        }
     }
 
     pub fn start(&mut self) {
-        if self.shared.running.swap(true, Ordering::SeqCst) {
+        let Some(rx) = self.rx.take() else {
             return;
-        }
+        };
         let shared = Arc::clone(&self.shared);
-        self.join = Some(thread::spawn(move || worker(shared)));
+        self.join = Some(thread::spawn(move || worker(rx, shared)));
     }
 
     pub fn stop(&mut self) {
-        if !self.shared.running.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        self.shared.wake.signal();
+        drop(self.shared.tx.lock().take());
         if let Some(h) = self.join.take()
             && let Err(e) = h.join()
         {
@@ -147,29 +142,24 @@ impl PlaybackCoordinator {
     }
 }
 
+impl Default for PlaybackCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for PlaybackCoordinator {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-fn worker(shared: Arc<Shared>) {
+fn worker(rx: Receiver<Input>, shared: Arc<Shared>) {
     let mut sm = PlaybackStateMachine::new();
-    while shared.running.load(Ordering::Relaxed) {
-        let work: VecDeque<Input> = {
-            let mut q = shared.queue.lock();
-            std::mem::take(&mut *q)
-        };
-
-        if work.is_empty() {
-            shared.wake.wait();
-            shared.wake.drain();
-            continue;
-        }
-
+    while let Ok(first) = rx.recv() {
         let mut events: Vec<PlaybackEvent> = Vec::new();
         let mut actions: Vec<PlaybackAction> = Vec::new();
-        for input in work {
+        for input in std::iter::once(first).chain(rx.try_iter()) {
             apply(&mut sm, input, &mut events);
             actions.extend(sm.consume_actions());
         }
@@ -274,7 +264,7 @@ mod tests {
 
     #[test]
     fn snapshot_starts_fresh() {
-        let coord = PlaybackCoordinator::new().unwrap();
+        let coord = PlaybackCoordinator::new();
         let s = coord.snapshot();
         assert_eq!(s.presence, PlayerPresence::None);
         assert_eq!(s.phase, PlaybackPhase::Stopped);
@@ -283,7 +273,7 @@ mod tests {
 
     #[test]
     fn worker_updates_snapshot_after_input() {
-        let mut coord = PlaybackCoordinator::new().unwrap();
+        let mut coord = PlaybackCoordinator::new();
         coord.start();
         // Register a sink BEFORE enqueuing so the first dispatched batch
         // signals the channel. Sinks fire on the worker thread after the

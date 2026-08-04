@@ -2573,6 +2573,8 @@ dependencies = [
 name = "jfn-playback"
 version = "0.1.0-dev"
 dependencies = [
+ "crossbeam-channel",
+ "crossbeam-utils",
  "jfn-js-json",
  "jfn-mpv",
  "jfn-platform-abi",

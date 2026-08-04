@@ -2,7 +2,7 @@
 //!
 //! A long-lived worker that routes app-level control work off the platform
 //! main loop and off CEF's UI thread. Mirrors the playback coordinator's
-//! queue + `WakeEvent` drain idiom (`jfn_playback::coordinator`), but lives in
+//! queue + drain idiom (`jfn_playback::coordinator`), but lives in
 //! the binary crate because it drives `jfn_cef` + `platform_abi` — layers
 //! *above* `playback`, so it can't fold into the coordinator without a
 //! dependency cycle.

@@ -93,11 +93,9 @@ impl PositionThrottle {
 // =====================================================================
 
 mod harness {
-    use parking_lot::{Condvar, Mutex};
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, OnceLock};
-    use std::time::Duration;
+    use crossbeam_channel::{Receiver, Sender, bounded};
+    use parking_lot::Mutex;
+    use std::sync::Once;
 
     use crate::types::{PlaybackEvent, PlaybackEventKind};
 
@@ -134,43 +132,28 @@ mod harness {
         fn init(&mut self);
         /// Called for every queued event, in order.
         fn deliver(&mut self, ev: &PlaybackEvent);
-        /// Called once on the consumer thread after `running` clears.
+        /// Called once on the consumer thread after the queue disconnects.
         fn teardown(&mut self);
     }
 
-    struct Inner {
-        queue: Mutex<VecDeque<PlaybackEvent>>,
-        cv: Condvar,
-        running: AtomicBool,
-    }
-
-    static SINK: OnceLock<Arc<Inner>> = OnceLock::new();
-
+    /// Pending-event ceiling. Producers drop events past it rather than
+    /// block the coordinator worker.
     const EVENT_QUEUE_CAP: usize = 256;
 
-    fn inner() -> Arc<Inner> {
-        SINK.get_or_init(|| {
-            Arc::new(Inner {
-                queue: Mutex::new(VecDeque::new()),
-                cv: Condvar::new(),
-                running: AtomicBool::new(false),
-            })
-        })
-        .clone()
-    }
+    /// Producer end, live only while a sink runs. `stop` clears it, which
+    /// disconnects the consumer once the queue drains.
+    static EVENT_TX: Mutex<Option<Sender<PlaybackEvent>>> = Mutex::new(None);
+
+    /// The coordinator sink registration is process-wide and survives
+    /// stop/run cycles, so it happens at most once.
+    static REGISTER_SINK: Once = Once::new();
 
     // Coordinator-side hook: jfn-playback invokes this for every event.
     // Cloning is cheap relative to the OS transport round-trips that follow.
     fn on_event(ev: &PlaybackEvent) {
-        let inner = inner();
-        {
-            let mut q = inner.queue.lock();
-            if q.len() >= EVENT_QUEUE_CAP {
-                return;
-            }
-            q.push_back(ev.clone());
+        if let Some(tx) = EVENT_TX.lock().as_ref() {
+            let _ = tx.try_send(ev.clone());
         }
-        inner.cv.notify_one();
     }
 
     /// Start the process-wide media sink. `build` constructs the platform
@@ -181,50 +164,40 @@ mod harness {
         S: QueuedSink,
         F: FnOnce() -> S + Send + 'static,
     {
-        let inner = inner();
-        if inner.running.swap(true, Ordering::AcqRel) {
-            return;
+        let (tx, rx) = bounded(EVENT_QUEUE_CAP);
+        {
+            let mut slot = EVENT_TX.lock();
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(tx);
         }
 
-        crate::ffi::register_event_sink(Box::new(on_event));
+        REGISTER_SINK.call_once(|| crate::ffi::register_event_sink(Box::new(on_event)));
 
-        let thread_inner = inner.clone();
         if let Err(e) = std::thread::Builder::new()
             .name(thread_name.to_owned())
-            .spawn(move || consumer_thread(thread_inner, build))
+            .spawn(move || consumer_thread(rx, build))
         {
-            inner.running.store(false, Ordering::Release);
+            drop(EVENT_TX.lock().take());
             eprintln!("[playback] failed to spawn media-sink thread: {e}");
         }
     }
 
-    /// Signal the consumer thread to exit at its next wake. No-op if not
-    /// running.
+    /// Drop the producer end. The consumer delivers whatever is already
+    /// queued, tears down, and exits. No-op if not running.
     pub fn stop() {
-        let inner = match SINK.get() {
-            Some(i) => i.clone(),
-            None => return,
-        };
-        if !inner.running.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        inner.cv.notify_all();
+        drop(EVENT_TX.lock().take());
     }
 
-    fn consumer_thread<S: QueuedSink>(inner: Arc<Inner>, build: impl FnOnce() -> S) {
+    fn consumer_thread<S: QueuedSink>(rx: Receiver<PlaybackEvent>, build: impl FnOnce() -> S) {
         let mut sink = build();
         sink.init();
 
-        while inner.running.load(Ordering::Acquire) {
-            let drained: Vec<PlaybackEvent> = {
-                let mut q = inner.queue.lock();
-                while q.is_empty() && inner.running.load(Ordering::Acquire) {
-                    inner.cv.wait_for(&mut q, Duration::from_millis(100));
-                }
-                q.drain(..).collect()
-            };
-            for ev in &drained {
-                sink.deliver(ev);
+        while let Ok(ev) = rx.recv() {
+            sink.deliver(&ev);
+            for ev in rx.try_iter() {
+                sink.deliver(&ev);
             }
         }
 
