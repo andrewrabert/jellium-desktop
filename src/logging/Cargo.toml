@@ -23,6 +23,7 @@ tracing-appender = "0.2"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 
 [target.'cfg(unix)'.dependencies]
+jfn-wake-event = { path = "../wake_event" }
 nix.workspace = true
 
 [target.'cfg(windows)'.dependencies]

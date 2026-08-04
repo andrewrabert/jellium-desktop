@@ -163,7 +163,10 @@ mod imp {
     use nix::unistd::{dup, dup2_stderr, isatty, pipe, read, write};
     use std::io::{self, Write};
     use std::os::fd::{AsFd, OwnedFd};
+    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
+
+    use jfn_wake_event::WakeEvent;
 
     // Holds a dup of the original stderr taken before StderrCapture's
     // dup2 redirect; writing via io::stderr() here would feed each log
@@ -192,7 +195,7 @@ mod imp {
 
     pub(super) struct StderrCapture {
         original_fd: Option<OwnedFd>,
-        signal_write: Option<OwnedFd>,
+        wake: Arc<WakeEvent>,
         join: Option<JoinHandle<()>>,
     }
 
@@ -200,48 +203,45 @@ mod imp {
         pub(super) fn start() -> Option<Self> {
             let original = dup(io::stderr()).ok()?;
             let (pipe_read, pipe_write) = pipe().ok()?;
-            let (signal_read, signal_write) = pipe().ok()?;
+            let wake = Arc::new(WakeEvent::new()?);
 
             dup2_stderr(&pipe_write).ok()?;
             drop(pipe_write);
 
-            let join = thread::spawn(move || capture_loop(&pipe_read, &signal_read));
+            let thread_wake = Arc::clone(&wake);
+            let join = thread::spawn(move || capture_loop(&pipe_read, &thread_wake));
 
             Some(StderrCapture {
                 original_fd: Some(original),
-                signal_write: Some(signal_write),
+                wake,
                 join: Some(join),
             })
         }
 
         pub(super) fn stop(&mut self) {
             // Order: restore STDERR FIRST (so any concurrent writer drains to
-            // the real fd from now on), THEN wake the capture thread via the
-            // signal pipe, THEN join, THEN close the signal write end. Joining
-            // before closing signal_write avoids a window where the capture
-            // thread races a close on its read end.
+            // the real fd from now on), THEN wake the capture thread, THEN
+            // join. The wake outlives the join: it is dropped with the
+            // StderrCapture, after the thread is gone.
             if let Some(original) = self.original_fd.take() {
                 let _ = dup2_stderr(&original);
             }
-            if let Some(w) = &self.signal_write {
-                let _ = write(w, b"x");
-            }
+            self.wake.signal();
             if let Some(h) = self.join.take()
                 && let Err(e) = h.join()
             {
                 eprintln!("[logging] stderr capture thread panicked: {e:?}");
             }
-            self.signal_write = None;
         }
     }
 
-    fn capture_loop(pipe_read: &OwnedFd, signal_read: &OwnedFd) {
+    fn capture_loop(pipe_read: &OwnedFd, wake: &WakeEvent) {
         let mut buf = [0u8; 4096];
         let mut partial = Vec::<u8>::new();
         loop {
             let mut pfds = [
                 PollFd::new(pipe_read.as_fd(), PollFlags::POLLIN),
-                PollFd::new(signal_read.as_fd(), PollFlags::POLLIN),
+                PollFd::new(wake.as_fd(), PollFlags::POLLIN),
             ];
             if poll(&mut pfds, PollTimeout::NONE).is_err() {
                 break;

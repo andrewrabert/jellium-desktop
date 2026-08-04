@@ -2400,6 +2400,7 @@ dependencies = [
 name = "jfn-logging"
 version = "0.1.0-dev"
 dependencies = [
+ "jfn-wake-event",
  "nix",
  "parking_lot",
  "time",
@@ -2615,6 +2616,7 @@ dependencies = [
  "tracing",
  "windows",
  "windows-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

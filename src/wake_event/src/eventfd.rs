@@ -1,5 +1,5 @@
 use std::ffi::c_int;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use nix::sys::eventfd::{EfdFlags, EventFd};
 
@@ -30,5 +30,11 @@ impl WakeEvent {
     /// before the call returns immediately.
     pub fn wait(&self) {
         crate::fd_wait::wait(self.fd.as_raw_fd());
+    }
+}
+
+impl AsFd for WakeEvent {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
