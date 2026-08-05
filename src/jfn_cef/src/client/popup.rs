@@ -5,7 +5,7 @@ use cef::{
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::platform_ops::{MenuDelivery, MenuItem, MenuRequest};
+use crate::platform_ops::{MenuDelivery, MenuItem, MenuRequest, MenuSelection};
 
 use super::{Inner, PopupState};
 
@@ -109,7 +109,7 @@ impl Inner {
             return;
         }
         let inner = Arc::clone(self);
-        let on_selected: crate::platform_ops::MenuSelectionFn = Box::new(move |idx| {
+        let on_selected = MenuSelection::new(move |idx| {
             let mut task = DispatchPopupTask::new(inner, idx, selected, selectable.clone());
             let _ = post_task(ThreadId::UI, Some(&mut task));
         });
@@ -171,6 +171,11 @@ impl Inner {
     // arrow-key to the chosen row + Enter to commit, or Escape to cancel.
     fn dispatch_popup_selection(&self, idx: i32, current: i32, selectable: &[i32]) {
         if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        // Blink already closed the popup: a replayed Escape or arrow would land
+        // on the page instead.
+        if !self.popup.lock().visible {
             return;
         }
         let Some(host) = self.host() else {

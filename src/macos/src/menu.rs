@@ -2,7 +2,7 @@
 //! opaque black on macOS, so its popup runs invisibly and a native NSMenu is
 //! presented in its place.
 
-use jfn_platform_abi::{MENU_DISMISSED, MenuHost, MenuRequest};
+use jfn_platform_abi::{MENU_DISMISSED, MenuHost, MenuRequest, menu_has_selectable};
 
 use crate::ns_menu::{MenuEntry, MenuSpec, present_on_main};
 
@@ -10,8 +10,8 @@ pub(crate) struct NsMenuHost;
 
 impl MenuHost for NsMenuHost {
     fn open(&self, req: MenuRequest) {
-        if req.items.is_empty() {
-            (req.on_selected)(MENU_DISMISSED);
+        if !menu_has_selectable(&req.items) {
+            req.on_selected.resolve(MENU_DISMISSED);
             return;
         }
         let entries = req

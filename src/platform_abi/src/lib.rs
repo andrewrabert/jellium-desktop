@@ -41,8 +41,8 @@ pub use jfn_gpu_paint::DamageRect as JfnRect;
 pub use media_sink::MediaSink;
 pub use menu::{
     Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem, MenuKind, MenuMetrics,
-    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelectionFn, PopupSurface,
-    menu_delivery, menu_scripts,
+    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface, menu_delivery,
+    menu_has_selectable, menu_initial_row, menu_scripts,
 };
 pub use mpv_host::{DefaultMpvHost, MpvHost};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};

@@ -7,17 +7,15 @@ use std::os::raw::{c_int, c_void};
 use std::sync::Arc;
 
 use crate::ipc::BrowserMessage;
+use crate::platform_ops::MenuSelection;
 use crate::sink_routing::Handle;
 
 use super::Inner;
 
 impl Inner {
-    pub(crate) fn menu_selection_callback(
-        self: &Arc<Self>,
-        session: Handle,
-    ) -> Box<dyn FnOnce(c_int) + Send> {
+    pub(crate) fn menu_selection_callback(self: &Arc<Self>, session: Handle) -> MenuSelection {
         let inner = Arc::clone(self);
-        Box::new(move |id| {
+        MenuSelection::new(move |id| {
             let mut task = DispatchMenuResultTask::new(inner, session, id);
             let _ = post_task(ThreadId::UI, Some(&mut task));
         })

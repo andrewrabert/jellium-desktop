@@ -710,8 +710,7 @@ enum WindowCommand {
 }
 
 /// Menu-popup requests. Create, paint, reposition and destroy must reach the
-/// compositor in the order they were issued — a reposition ahead of the paint
-/// that maps the popup is a protocol error — so they share one queue.
+/// compositor in the order they were issued, so they share one queue.
 pub(crate) enum PopupCommand {
     Create {
         generation: Generation,
@@ -815,14 +814,157 @@ fn apply_fullscreen(state: &mut RootState, on: bool) {
     let _ = state.conn.flush();
 }
 
-/// SCTK's `Popup` destroys the menu `wl_surface` when it drops, so the
-/// viewport and buffer naming that surface live and die with it.
-#[derive(Default)]
-struct MenuPopup {
-    popup: Option<Popup>,
+/// Placement bookkeeping for one menu popup, free of protocol objects: it owns
+/// what the compositor has been given and what it may still be sent, so "never
+/// reposition an unmapped popup" is decided here and nowhere else.
+mod popup_place {
+    use super::MenuPlacement;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Placed {
+        sent: MenuPlacement,
+        held: Option<MenuPlacement>,
+    }
+
+    impl Placed {
+        pub(super) fn created(sent: MenuPlacement) -> Placed {
+            Placed { sent, held: None }
+        }
+
+        /// What an unmapped popup wants next. A want equal to `sent` clears the
+        /// hold, so a placement already on the wire is never re-sent.
+        pub(super) fn hold(&mut self, want: MenuPlacement) {
+            self.held = (want != self.sent).then_some(want);
+        }
+
+        /// The placement the mapping commit must be followed with, consumed as
+        /// it is read. `None` when the create-time placement still stands.
+        pub(super) fn on_map(&mut self) -> Option<MenuPlacement> {
+            let place = self.held.take()?;
+            self.sent = place;
+            Some(place)
+        }
+
+        /// The placement to put on the wire now; `None` when the compositor
+        /// already holds it.
+        pub(super) fn send(&mut self, want: MenuPlacement) -> Option<MenuPlacement> {
+            (want != self.sent).then(|| {
+                self.sent = want;
+                want
+            })
+        }
+    }
+}
+use popup_place::Placed;
+
+/// One live menu popup and everything that names its `wl_surface`.
+struct LivePopup {
+    generation: Generation,
+    popup: Popup,
     viewport: Option<WpViewport>,
-    buffer: Option<crate::wl_state::AttachedBuffer>,
-    generation: Option<Generation>,
+    place: Placed,
+}
+
+impl LivePopup {
+    /// Crop, attach, damage and commit the menu buffer; the first one maps the
+    /// popup.
+    fn attach(&self, buffer: &crate::wl_state::AttachedBuffer, paint: &MenuPaint) {
+        let surface = self.popup.wl_surface();
+        if let Some(vp) = self.viewport.as_ref() {
+            vp.set_source(
+                0.0,
+                f64::from(paint.scroll),
+                f64::from(paint.pw),
+                f64::from(paint.view_ph),
+            );
+            vp.set_destination(paint.lw, paint.lh);
+        }
+        buffer.attach_to(surface);
+        surface.damage_buffer(0, 0, paint.pw, paint.ph);
+        surface.commit();
+    }
+
+    /// `xdg_popup.reposition`; every caller stands in a mapped state.
+    fn reposition(&self, xdg_shell: &XdgShell, place: MenuPlacement) {
+        let Some(positioner) = build_menu_positioner(xdg_shell, place) else {
+            return;
+        };
+        self.popup.reposition(&positioner, 0);
+    }
+}
+
+// The viewport names the `wl_surface` that dropping the popup destroys, so it
+// goes first.
+impl Drop for LivePopup {
+    fn drop(&mut self) {
+        if let Some(vp) = self.viewport.take() {
+            vp.destroy();
+        }
+    }
+}
+
+/// The menu popup's mapping state: `Unmapped` has no path to
+/// [`LivePopup::reposition`], so a placement requested there is held until the
+/// commit that maps the popup applies it.
+#[derive(Default)]
+enum MenuPopup {
+    #[default]
+    None,
+    Unmapped {
+        live: LivePopup,
+    },
+    Mapped {
+        live: LivePopup,
+        buffer: crate::wl_state::AttachedBuffer,
+    },
+}
+
+impl MenuPopup {
+    fn generation(&self) -> Option<Generation> {
+        Some(self.live()?.generation)
+    }
+
+    fn live(&self) -> Option<&LivePopup> {
+        match self {
+            Self::None => None,
+            Self::Unmapped { live } | Self::Mapped { live, .. } => Some(live),
+        }
+    }
+
+    fn reposition(&mut self, xdg_shell: &XdgShell, want: MenuPlacement) {
+        match self {
+            Self::None => {}
+            Self::Unmapped { live } => live.place.hold(want),
+            Self::Mapped { live, .. } => {
+                if let Some(place) = live.place.send(want) {
+                    live.reposition(xdg_shell, place);
+                }
+            }
+        }
+    }
+
+    /// Commits `buffer`, mapping an unmapped popup and then sending whatever
+    /// placement was held since the create.
+    fn paint(
+        &mut self,
+        xdg_shell: &XdgShell,
+        buffer: crate::wl_state::AttachedBuffer,
+        paint: &MenuPaint,
+    ) {
+        let (mut live, retired) = match std::mem::take(self) {
+            Self::None => return,
+            Self::Unmapped { live } => (live, None),
+            Self::Mapped { live, buffer } => (live, Some(buffer)),
+        };
+        live.attach(&buffer, paint);
+        // Retired only once the replacement is committed, so the surface is
+        // never left naming a destroyed buffer.
+        drop(retired);
+        if let Some(place) = live.place.on_map() {
+            live.reposition(xdg_shell, place);
+        }
+        *self = Self::Mapped { live, buffer };
+    }
 }
 
 fn build_menu_positioner(xdg_shell: &XdgShell, place: MenuPlacement) -> Option<XdgPositioner> {
@@ -854,7 +996,7 @@ impl RootState {
             return;
         }
         self.armed_gen = generation.get();
-        self.tear_down_menu_popup();
+        self.menu = MenuPopup::None;
         let Some(positioner) = build_menu_positioner(&self.xdg_shell, place) else {
             return;
         };
@@ -895,84 +1037,53 @@ impl RootState {
             .root()
             .menu_surface_id
             .store(popup.wl_surface().id().protocol_id(), Ordering::Release);
-        self.menu = MenuPopup {
-            popup: Some(popup),
-            viewport,
-            buffer: None,
-            generation: Some(generation),
+        self.menu = MenuPopup::Unmapped {
+            live: LivePopup {
+                generation,
+                popup,
+                viewport,
+                place: Placed::created(place),
+            },
         };
     }
 
-    /// Requires the popup to already be mapped.
     fn reposition_menu_popup(&mut self, generation: Generation, place: MenuPlacement) {
-        if self.menu.generation != Some(generation) {
+        if self.menu.generation() != Some(generation) {
             return;
         }
-        let Some(popup) = self.menu.popup.as_ref() else {
-            return;
-        };
-        let Some(positioner) = build_menu_positioner(&self.xdg_shell, place) else {
-            return;
-        };
-        popup.reposition(&positioner, 0);
+        self.menu.reposition(&self.xdg_shell, place);
     }
 
     fn paint_menu_popup(&mut self, paint: MenuPaint) {
-        if self.menu.generation != Some(paint.generation) {
+        if self.menu.generation() != Some(paint.generation) {
             return;
         }
-        let buf = self
+        let Some(buffer) = self
             .menu_pool
             .as_mut()
             .and_then(|pool| {
                 crate::wl_state::draw_from_pixels(pool, &paint.pixels, paint.pw, paint.ph)
             })
-            .map(crate::wl_state::AttachedBuffer::Shm);
-        let (Some(buf), Some(popup)) = (buf, self.menu.popup.as_ref()) else {
+            .map(crate::wl_state::AttachedBuffer::Shm)
+        else {
             return;
         };
-        let surface = popup.wl_surface();
-        if let Some(vp) = self.menu.viewport.as_ref() {
-            vp.set_source(
-                0.0,
-                f64::from(paint.scroll),
-                f64::from(paint.pw),
-                f64::from(paint.view_ph),
-            );
-            vp.set_destination(paint.lw, paint.lh);
-        }
-        buf.attach_to(surface);
-        surface.damage_buffer(0, 0, paint.pw, paint.ph);
-        surface.commit();
-        drop(self.menu.buffer.replace(buf));
+        self.menu.paint(&self.xdg_shell, buffer, &paint);
     }
 
     /// Tear the popup down, but only if `generation` still owns it — a newer
     /// menu may have taken the role in the gap between a stale teardown being
     /// decided and this call, and must not be torn down by it.
     fn destroy_menu_popup(&mut self, generation: Generation) {
-        if self.menu.generation != Some(generation) {
+        if self.menu.generation() != Some(generation) {
             return;
         }
-        self.tear_down_menu_popup();
-    }
-
-    /// Unqualified teardown, safe only behind the `armed_gen` guard; every
-    /// other caller goes through `destroy_menu_popup`.
-    fn tear_down_menu_popup(&mut self) {
-        // The viewport names the wl_surface that dropping the popup destroys,
-        // so it goes first.
-        if let Some(vp) = self.menu.viewport.take() {
-            vp.destroy();
-        }
-        self.menu = MenuPopup::default();
+        self.menu = MenuPopup::None;
     }
 
     fn menu_generation(&self, popup: &Popup) -> Option<Generation> {
-        if self.menu.popup.as_ref()? != popup {
-            return None;
-        }
-        self.menu.generation
+        let live = self.menu.live()?;
+        (&live.popup == popup).then_some(live.generation)
     }
 }
 
@@ -1177,7 +1288,7 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
         xdg_shell,
         viewporter,
         menu_pool: new_slot_pool(&shm, "menu"),
-        menu: MenuPopup::default(),
+        menu: MenuPopup::None,
         armed_gen: 0,
         viewport,
         bg_buffer: None,
@@ -1828,10 +1939,57 @@ mod model_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::popup_place::Placed;
     use super::presentation::{Inputs, ScaleDiscovery, Step, plan};
     use super::resolve_logical_size;
     use crate::window_state::{WindowMode, WindowSize};
+    use jfn_platform_abi::MenuPlacement;
     use std::num::NonZeroI32;
+
+    fn place(x: i32) -> MenuPlacement {
+        MenuPlacement {
+            x,
+            y: 0,
+            lw: 10,
+            lh: 10,
+            pw: 10,
+            ph: 10,
+        }
+    }
+
+    #[test]
+    fn an_unmapped_popup_holds_a_placement_until_the_map() {
+        let mut p = Placed::created(place(0));
+        p.hold(place(1));
+        p.hold(place(2));
+        assert_eq!(p.on_map(), Some(place(2)));
+    }
+
+    #[test]
+    fn a_held_placement_equal_to_the_create_never_reaches_the_wire() {
+        let mut p = Placed::created(place(0));
+        p.hold(place(1));
+        p.hold(place(0));
+        assert_eq!(p.on_map(), None);
+    }
+
+    #[test]
+    fn a_mapped_popup_sends_only_a_changed_placement() {
+        let mut p = Placed::created(place(0));
+        assert_eq!(p.send(place(0)), None);
+        assert_eq!(p.send(place(1)), Some(place(1)));
+        assert_eq!(p.send(place(1)), None);
+    }
+
+    #[test]
+    fn a_consumed_hold_is_not_replayed_by_a_later_map() {
+        let mut p = Placed::created(place(0));
+        p.hold(place(1));
+        assert_eq!(p.on_map(), Some(place(1)));
+        assert_eq!(p.on_map(), None);
+        // The consumed hold is now what the compositor holds.
+        assert_eq!(p.send(place(1)), None);
+    }
 
     #[test]
     fn discovery_request_is_idempotent_and_never_downgrades() {

@@ -1,10 +1,10 @@
-use std::ffi::c_int;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use calloop::channel::{Channel, Sender};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, LoopHandle, LoopSignal};
+use parking_lot::Mutex;
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::shm::ConnectionExt as ShmConnectionExt;
@@ -14,7 +14,7 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::rust_connection::RustConnection;
 
-use jfn_linux_util::menu::SoftwareMenu;
+use jfn_linux_util::menu::{MenuPoint, SoftwareMenu};
 use jfn_platform_abi::{
     Generation, MenuClose, MenuHost, MenuMetrics, MenuPaint, MenuPlacement, PopupSurface,
 };
@@ -33,18 +33,46 @@ pub fn warm() {
 }
 
 pub fn host() -> &'static SoftwareMenu {
-    MENU.get_or_init(|| SoftwareMenu::spawn(Arc::new(X11PopupSurface { tx: spawn_popup() })))
+    MENU.get_or_init(|| {
+        let surface = Arc::new(X11PopupSurface {
+            tx: Mutex::new(None),
+        });
+        spawn_popup(&surface);
+        SoftwareMenu::spawn(surface)
+    })
 }
 
 struct X11PopupSurface {
-    tx: Option<Sender<Op>>,
+    tx: Mutex<Option<Sender<Op>>>,
 }
 
 impl X11PopupSurface {
-    fn send(&self, op: Op) {
-        let Some(tx) = self.tx.as_ref() else { return };
-        if tx.send(op).is_err() {
-            tracing::error!(target: "x11::menu", "popup thread gone; menu op dropped");
+    /// False when the op could not be queued for the popup thread.
+    fn send(&self, op: Op) -> bool {
+        let slot = self.tx.lock();
+        let Some(tx) = slot.as_ref() else {
+            return false;
+        };
+        tx.send(op).is_ok()
+    }
+
+    /// Stops accepting ops, then dismisses every menu left in the queue. `rx` is
+    /// `None` once the event loop owns the channel and it cannot be reclaimed.
+    fn close(&self, rx: Option<Channel<Op>>) {
+        let doomed: Vec<Generation> = {
+            let mut slot = self.tx.lock();
+            *slot = None;
+            rx.into_iter()
+                .flat_map(|rx| {
+                    std::iter::from_fn(move || rx.try_recv().ok()).filter_map(|op| match op {
+                        Op::Create { generation, .. } => Some(generation),
+                        _ => None,
+                    })
+                })
+                .collect()
+        };
+        for generation in doomed {
+            host().on_done(generation);
         }
     }
 }
@@ -59,7 +87,10 @@ impl PopupSurface for X11PopupSurface {
     }
 
     fn create(&self, generation: Generation, place: MenuPlacement, _serial: u32) {
-        self.send(Op::Create { generation, place });
+        if !self.send(Op::Create { generation, place }) {
+            tracing::error!(target: "x11::menu", "popup thread gone; dismissing menu");
+            host().on_done(generation);
+        }
     }
 
     fn reposition(&self, generation: Generation, place: MenuPlacement) {
@@ -90,36 +121,46 @@ enum Op {
     },
 }
 
-fn spawn_popup() -> Option<Sender<Op>> {
+/// Installs the sender and starts the popup thread; on spawn failure the slot
+/// is left empty and menus dismiss on arrival.
+fn spawn_popup(surface: &Arc<X11PopupSurface>) {
     let (tx, rx) = calloop::channel::channel::<Op>();
-    std::thread::Builder::new()
+    let thread_surface = Arc::clone(surface);
+    match std::thread::Builder::new()
         .name("jfn-x11-menu".into())
-        .spawn(move || popup_thread(rx))
-        .ok()?;
-    Some(tx)
+        .spawn(move || popup_thread(&thread_surface, rx))
+    {
+        Ok(_) => *surface.tx.lock() = Some(tx),
+        Err(e) => {
+            tracing::error!(target: "x11::menu", "popup thread spawn failed: {e}; menus disabled");
+        }
+    }
 }
 
-fn popup_thread(rx: Channel<Op>) {
+fn popup_thread(surface: &Arc<X11PopupSurface>, rx: Channel<Op>) {
     let Ok((conn, _screen)) = x11rb::connect(None) else {
         tracing::error!(target: "x11::menu", "popup: X11 connect failed; menus disabled");
-        drain(rx);
+        surface.close(Some(rx));
         return;
     };
     let conn = Arc::new(conn);
     let Ok(mut event_loop) = EventLoop::<'static, PopupLoop>::try_new() else {
         tracing::error!(target: "x11::menu", "popup: calloop init failed; menus disabled");
-        drain(rx);
+        surface.close(Some(rx));
         return;
     };
     let handle = event_loop.handle();
-    let inserted = handle
-        .insert_source(rx, |event, _, st| st.on_channel(event))
-        .is_ok()
-        && handle
-            .insert_source(X11Source::new(conn.clone()), |ev, (), st| st.on_event(ev))
-            .is_ok();
-    if !inserted {
+    if handle
+        .insert_source(X11Source::new(conn.clone()), |ev, (), st| st.on_event(ev))
+        .is_err()
+    {
         tracing::error!(target: "x11::menu", "popup: event source setup failed; menus disabled");
+        surface.close(Some(rx));
+        return;
+    }
+    if let Err(e) = handle.insert_source(rx, |event, _, st| st.on_channel(event)) {
+        tracing::error!(target: "x11::menu", "popup: event source setup failed; menus disabled");
+        surface.close(Some(e.inserted));
         return;
     }
     let mut state = PopupLoop {
@@ -134,10 +175,7 @@ fn popup_thread(rx: Channel<Op>) {
         tracing::error!(target: "x11::menu", "popup: loop error: {e}");
     }
     state.tear_down();
-}
-
-fn drain(rx: Channel<Op>) {
-    while rx.recv().is_ok() {}
+    surface.close(None);
 }
 
 enum Phase {
@@ -393,14 +431,16 @@ impl PopupLoop {
         if !matches!(self.phase, Phase::Open(_)) {
             return;
         }
-        let scale = crate::x11_state::parent_snapshot().scale;
-        let scale = if scale > 0.0 { scale } else { 1.0 };
-        // X11 event coordinates are physical; the menu takes logical ones.
-        let logical = |v: i16| (v as f32 / scale).round() as c_int;
         match ev {
             Event::Expose(_) => host().expose(),
-            Event::MotionNotify(e) => host().motion(logical(e.event_x), logical(e.event_y)),
-            Event::ButtonPress(e) => host().press(logical(e.event_x), logical(e.event_y)),
+            Event::MotionNotify(e) => host().motion(MenuPoint::Physical {
+                x: f32::from(e.event_x),
+                y: f32::from(e.event_y),
+            }),
+            Event::ButtonPress(e) => host().press(MenuPoint::Physical {
+                x: f32::from(e.event_x),
+                y: f32::from(e.event_y),
+            }),
             Event::KeyPress(e) => host().key(self.keymap.lookup(e.detail)),
             _ => {}
         }

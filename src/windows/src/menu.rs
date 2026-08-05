@@ -8,7 +8,9 @@ use std::ffi::{OsStr, c_int};
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use jfn_platform_abi::{MENU_DISMISSED, MenuHost, MenuItem, MenuRequest, MenuSelectionFn};
+use jfn_platform_abi::{
+    MENU_DISMISSED, MenuHost, MenuItem, MenuRequest, MenuSelection, menu_has_selectable,
+};
 use parking_lot::Mutex;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -33,7 +35,7 @@ struct Pending {
     /// Anchor in logical (view) coordinates.
     x: c_int,
     y: c_int,
-    on_selected: MenuSelectionFn,
+    on_selected: MenuSelection,
 }
 
 // The request awaiting its turn on the input thread.
@@ -42,7 +44,7 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 // Set while `TrackPopupMenuEx` sits on the input thread's stack.
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
-// Set by `hide`; makes the tracked menu drop its callback unfired. Cleared
+// Set by `hide`; makes the tracked menu resolve with MENU_DISMISSED. Cleared
 // when tracking begins.
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
@@ -50,8 +52,8 @@ pub(crate) struct WinMenuHost;
 
 impl MenuHost for WinMenuHost {
     fn open(&self, req: MenuRequest) {
-        let (Some(hwnd), false) = (input_hwnd(), req.items.is_empty()) else {
-            (req.on_selected)(MENU_DISMISSED);
+        let (Some(hwnd), true) = (input_hwnd(), menu_has_selectable(&req.items)) else {
+            req.on_selected.resolve(MENU_DISMISSED);
             return;
         };
         let displaced = PENDING.lock().replace(Pending {
@@ -61,20 +63,24 @@ impl MenuHost for WinMenuHost {
             on_selected: req.on_selected,
         });
         if let Some(prev) = displaced {
-            (prev.on_selected)(MENU_DISMISSED);
+            prev.on_selected.resolve(MENU_DISMISSED);
         }
         let _ = unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_TRACK, WPARAM(0), LPARAM(0)) };
     }
 
     fn hide(&self) {
         CANCELLED.store(true, Ordering::Release);
-        drop(PENDING.lock().take());
+        let pending = PENDING.lock().take();
+        if let Some(pending) = pending {
+            pending.on_selected.resolve(MENU_DISMISSED);
+        }
         post_end();
     }
 
     fn shutdown(&self) {
-        if let Some(pending) = PENDING.lock().take() {
-            (pending.on_selected)(MENU_DISMISSED);
+        let pending = PENDING.lock().take();
+        if let Some(pending) = pending {
+            pending.on_selected.resolve(MENU_DISMISSED);
         }
         post_end();
     }
@@ -113,7 +119,7 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) {
         return;
     };
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
-        (pending.on_selected)(MENU_DISMISSED);
+        pending.on_selected.resolve(MENU_DISMISSED);
         return;
     };
 
@@ -168,8 +174,11 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) {
     let _ = unsafe { DestroyMenu(menu) };
 
     if CANCELLED.swap(false, Ordering::AcqRel) {
+        pending.on_selected.resolve(MENU_DISMISSED);
         return;
     }
     let picked = picked.0;
-    (pending.on_selected)(if picked == 0 { MENU_DISMISSED } else { picked });
+    pending
+        .on_selected
+        .resolve(if picked == 0 { MENU_DISMISSED } else { picked });
 }

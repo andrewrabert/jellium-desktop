@@ -7,7 +7,7 @@ use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_foundation::{NSObject, NSPoint, NSString};
 
-use jfn_platform_abi::MenuSelectionFn;
+use jfn_platform_abi::MenuSelection;
 
 use crate::dispatch::post_to_main;
 use crate::init::{jfn_macos_get_input_view, jfn_macos_get_window};
@@ -29,13 +29,14 @@ pub(crate) struct MenuSpec {
 }
 
 struct SelectionCb {
-    fired: Mutex<Option<MenuSelectionFn>>,
+    fired: Mutex<Option<MenuSelection>>,
 }
 
 impl SelectionCb {
     fn fire(&self, id: c_int) {
-        if let Some(cb) = self.fired.lock().take() {
-            cb(id);
+        let cb = self.fired.lock().take();
+        if let Some(cb) = cb {
+            cb.resolve(id);
         }
     }
 }
@@ -141,7 +142,7 @@ unsafe fn show_menu_on_main(run: MenuRun) {
     drop(target);
 }
 
-pub(crate) fn present_on_main(spec: MenuSpec, on_selected: Option<MenuSelectionFn>) {
+pub(crate) fn present_on_main(spec: MenuSpec, on_selected: Option<MenuSelection>) {
     let cb = Arc::new(SelectionCb {
         fired: Mutex::new(on_selected),
     });

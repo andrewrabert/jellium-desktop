@@ -79,6 +79,12 @@ wrap_context_menu_handler! {
                 callback.cancel();
                 return 1;
             }
+            let MenuDelivery::Host(host) =
+                jfn_platform_abi::menu_delivery(MenuKind::ContextMenu)
+            else {
+                callback.cancel();
+                return 1;
+            };
             let Some(session) = crate::browsers::jfn_browsers_menu_open() else {
                 callback.cancel();
                 return 1;
@@ -106,18 +112,14 @@ wrap_context_menu_handler! {
                 }
             }
 
-            let req = MenuRequest {
+            host.open(MenuRequest {
                 items,
                 x: params.xcoord(),
                 y: params.ycoord(),
                 width: 0,
                 initial: MENU_DISMISSED,
                 on_selected: self.inner.menu_selection_callback(session),
-            };
-            match jfn_platform_abi::menu_delivery(MenuKind::ContextMenu) {
-                MenuDelivery::Host(host) => host.open(req),
-                MenuDelivery::Composited | MenuDelivery::Page => drop(req),
-            }
+            });
             1
         }
     }

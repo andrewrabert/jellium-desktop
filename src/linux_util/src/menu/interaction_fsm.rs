@@ -35,15 +35,19 @@ pub enum MenuEffect {
     Close(i32),
 }
 
+/// Without a layout only `Dismiss`, Escape and Tab have an effect.
 pub fn step(
     s: &mut MenuState,
     ev: &MenuEvent,
-    layout: &Layout,
+    layout: Option<&Layout>,
     items: &[MenuItem],
 ) -> Vec<MenuEffect> {
     match *ev {
         MenuEvent::Dismiss => vec![MenuEffect::Close(-1)],
         MenuEvent::Motion { x, y } => {
+            let Some(layout) = layout else {
+                return vec![];
+            };
             let hit = layout.row_at(x, y).map_or(-1, |i| i as i32);
             if hit != s.active {
                 s.active = hit;
@@ -53,26 +57,29 @@ pub fn step(
             }
         }
         MenuEvent::Press { x, y } => {
+            let Some(layout) = layout else {
+                return vec![];
+            };
             if !layout.contains(x, y) {
                 return vec![MenuEffect::Close(-1)];
             }
             // In-bounds press on a separator/disabled row or the padding band is
             // ignored, not a dismiss.
-            match layout.row_at(x, y) {
-                Some(idx) => vec![MenuEffect::Close(items[idx].id)],
+            match layout.row_at(x, y).and_then(|idx| items.get(idx)) {
+                Some(item) => vec![MenuEffect::Close(item.id)],
                 None => vec![],
             }
         }
         MenuEvent::Key(keysym) => match keysym {
             XK_ESCAPE | XK_TAB => vec![MenuEffect::Close(-1)],
-            XK_RETURN | XK_KP_ENTER | XK_SPACE => {
-                if s.active >= 0 {
-                    vec![MenuEffect::Close(items[s.active as usize].id)]
-                } else {
-                    vec![]
-                }
-            }
+            XK_RETURN | XK_KP_ENTER | XK_SPACE => match selectable(items, s.active) {
+                Some(id) => vec![MenuEffect::Close(id)],
+                None => vec![],
+            },
             XK_DOWN | XK_UP => {
+                let Some(layout) = layout else {
+                    return vec![];
+                };
                 let next = layout.step(s.active, keysym == XK_DOWN);
                 if next != s.active {
                     s.active = next;
@@ -84,6 +91,16 @@ pub fn step(
             _ => vec![],
         },
     }
+}
+
+/// The id of `active` when it names an item that exists, is enabled and is not
+/// a separator.
+fn selectable(items: &[MenuItem], active: i32) -> Option<i32> {
+    usize::try_from(active)
+        .ok()
+        .and_then(|i| items.get(i))
+        .filter(|i| i.enabled && !i.separator)
+        .map(|i| i.id)
 }
 
 #[cfg(test)]
@@ -150,7 +167,7 @@ mod tests {
     fn run(active: i32, ev: MenuEvent) -> (i32, Vec<MenuEffect>) {
         let (items, layout) = fixture();
         let mut s = MenuState { active };
-        let e = step(&mut s, &ev, &layout, &items);
+        let e = step(&mut s, &ev, Some(&layout), &items);
         (s.active, e)
     }
 
@@ -224,7 +241,12 @@ mod tests {
         }];
         let layout = Layout::for_test(100, 18, rows, vec![]);
         let mut s = MenuState { active: -1 };
-        let e = step(&mut s, &MenuEvent::Press { x: 50, y: 5 }, &layout, &items);
+        let e = step(
+            &mut s,
+            &MenuEvent::Press { x: 50, y: 5 },
+            Some(&layout),
+            &items,
+        );
         assert_eq!(e, vec![]);
     }
 
@@ -285,7 +307,7 @@ mod tests {
         }];
         let layout = Layout::for_test(100, 18, rows, vec![0]);
         let mut s = MenuState { active: 0 };
-        let e = step(&mut s, &MenuEvent::Key(XK_DOWN), &layout, &items);
+        let e = step(&mut s, &MenuEvent::Key(XK_DOWN), Some(&layout), &items);
         assert_eq!(s.active, 0);
         assert_eq!(e, vec![]);
     }
@@ -293,5 +315,56 @@ mod tests {
     #[test]
     fn key_unknown_noop() {
         assert_eq!(run(1, MenuEvent::Key(0xffff)).1, vec![]);
+    }
+
+    fn bare(active: i32, ev: MenuEvent) -> (i32, Vec<MenuEffect>) {
+        let (items, _) = fixture();
+        let mut s = MenuState { active };
+        let e = step(&mut s, &ev, None, &items);
+        (s.active, e)
+    }
+
+    #[test]
+    fn escape_and_dismiss_close_without_a_layout() {
+        assert_eq!(bare(0, MenuEvent::Dismiss).1, vec![MenuEffect::Close(-1)]);
+        assert_eq!(
+            bare(0, MenuEvent::Key(XK_ESCAPE)).1,
+            vec![MenuEffect::Close(-1)]
+        );
+        assert_eq!(
+            bare(0, MenuEvent::Key(XK_TAB)).1,
+            vec![MenuEffect::Close(-1)]
+        );
+    }
+
+    #[test]
+    fn pointer_and_arrow_events_without_a_layout_are_ignored() {
+        for ev in [
+            MenuEvent::Motion { x: 50, y: 5 },
+            MenuEvent::Press { x: 50, y: 5 },
+            MenuEvent::Key(XK_DOWN),
+            MenuEvent::Key(XK_UP),
+        ] {
+            let (active, e) = bare(0, ev);
+            assert_eq!(active, 0);
+            assert_eq!(e, vec![]);
+        }
+    }
+
+    #[test]
+    fn enter_on_a_row_past_the_item_list_is_ignored() {
+        assert_eq!(run(9, MenuEvent::Key(XK_RETURN)).1, vec![]);
+        assert_eq!(bare(9, MenuEvent::Key(XK_RETURN)).1, vec![]);
+    }
+
+    #[test]
+    fn enter_on_a_disabled_row_is_ignored() {
+        let items = vec![disabled(10), sep()];
+        let layout = Layout::for_test(100, 18, vec![], vec![]);
+        for active in [0, 1] {
+            let mut s = MenuState { active };
+            let e = step(&mut s, &MenuEvent::Key(XK_RETURN), Some(&layout), &items);
+            assert_eq!(e, vec![]);
+        }
     }
 }

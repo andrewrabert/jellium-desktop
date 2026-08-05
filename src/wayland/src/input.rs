@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use jfn_linux_util::menu::MenuPoint;
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -486,7 +487,10 @@ impl State {
                 self.ptr_x = surface_x;
                 self.ptr_y = surface_y;
                 if self.menu_focus {
-                    self.rt.menu().motion(surface_x as i32, surface_y as i32);
+                    self.rt.menu().motion(MenuPoint::Logical {
+                        x: surface_x as f32,
+                        y: surface_y as f32,
+                    });
                     return;
                 }
                 self.main_ptr_x = surface_x;
@@ -524,7 +528,10 @@ impl State {
                 }
                 if self.rt.menu().is_active() {
                     if self.menu_focus {
-                        self.rt.menu().motion(surface_x as i32, surface_y as i32);
+                        self.rt.menu().motion(MenuPoint::Logical {
+                            x: surface_x as f32,
+                            y: surface_y as f32,
+                        });
                     }
                     return;
                 }
@@ -557,7 +564,10 @@ impl State {
                             self.popup_swallowed_buttons |= flag;
                         }
                         if self.menu_focus {
-                            self.rt.menu().press(self.ptr_x as i32, self.ptr_y as i32);
+                            self.rt.menu().press(MenuPoint::Logical {
+                                x: self.ptr_x as f32,
+                                y: self.ptr_y as f32,
+                            });
                         } else {
                             // Click on our own window outside the menu: the popup grab
                             // won't dismiss same-client clicks, so do it ourselves.
