@@ -12,12 +12,9 @@ use std::os::raw::c_int;
 pub mod buttons;
 pub mod scroll;
 
-// CEF event-type constants (from include/internal/cef_types.h).
 const KEYEVENT_RAWKEYDOWN: c_int = 0;
 const KEYEVENT_KEYUP: c_int = 2;
 const KEYEVENT_CHAR: c_int = 3;
-// CEF mouse-button-type constants (MBT_*) — the click target, distinct from
-// the evdev button-code currency in [`buttons`].
 const MBT_LEFT: c_int = 0;
 const MBT_MIDDLE: c_int = 1;
 const MBT_RIGHT: c_int = 2;
@@ -30,8 +27,6 @@ struct LastMousePos {
     modifiers: u32,
 }
 
-// 16 bytes: AtomicCell synchronizes this through its seqlock, not an atomic
-// integer, so loads may retry against a concurrent motion event.
 static LAST_POS: AtomicCell<LastMousePos> = AtomicCell::new(LastMousePos {
     valid: false,
     x: 0,

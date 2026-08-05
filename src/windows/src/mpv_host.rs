@@ -2,7 +2,7 @@
 
 use jfn_platform_abi::{MpvHost, WindowDecorations};
 
-pub struct WindowsMpvHost;
+pub(crate) struct WindowsMpvHost;
 
 impl MpvHost for WindowsMpvHost {
     fn prepare(&self, _configured: Option<WindowDecorations>) {

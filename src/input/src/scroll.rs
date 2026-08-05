@@ -116,8 +116,6 @@ impl ScrollAccum {
         } else {
             dx = (self.ax * DRAIN).round() as i32;
             dy = (self.ay * DRAIN).round() as i32;
-            // Drain at least one unit once a full line has accumulated, so a
-            // slow scroll still moves instead of stalling under the round.
             if dx == 0 && self.ax.abs() >= 1.0 {
                 dx = if self.ax > 0.0 { 1 } else { -1 };
             }
@@ -126,7 +124,6 @@ impl ScrollAccum {
             }
             self.ax -= dx as f32;
             self.ay -= dy as f32;
-            // Snap a tiny residual to zero so it doesn't linger as pending.
             if self.ax.abs() < 0.5 {
                 self.ax = 0.0;
             }
@@ -161,33 +158,26 @@ mod tests {
         assert_eq!((f.dx, f.dy), (3, -5));
         assert_eq!((f.x, f.y), (10, 20));
         assert!(f.precise);
-        // Nothing left pending.
         assert_eq!(s.flush(), None);
     }
 
     #[test]
     fn precise_carries_fractional_remainder() {
         let mut s = ScrollAccum::new();
-        // 0.6 rounds to 1, leaving -0.4; 0.4 rounds to 0, leaving 0.4.
         s.accumulate(0, 0, 0, true, 0.4, 0.6);
         let f = s.flush().unwrap();
         assert_eq!((f.dx, f.dy), (0, 1));
-        // Remainder still pending (ax = 0.4).
         let again = s.flush();
-        // 0.4 alone still rounds to 0 → nothing emitted, but flush was
-        // descheduled.
         assert_eq!(again, None);
     }
 
     #[test]
     fn nonprecise_scales_and_drains() {
         let mut s = ScrollAccum::new();
-        // One line down → ay = 40. First drain: round(40 * 0.45) = 18.
         s.accumulate(5, 6, 0, false, 0.0, 1.0);
         let f = s.flush().unwrap();
         assert_eq!(f.dy, 18);
         assert_eq!(f.dx, 0);
-        // Remainder (22) is still pending for the next scheduled flush.
         let f2 = s.flush().unwrap();
         assert_eq!(f2.dy, (22.0_f32 * DRAIN).round() as i32);
     }
@@ -195,22 +185,19 @@ mod tests {
     #[test]
     fn nonprecise_nudges_at_least_one_unit() {
         let mut s = ScrollAccum::new();
-        // Tiny line delta: ay ends just above 1.0 so round(ay*0.45)=0 but the
-        // nudge forces a single unit.
-        s.accumulate(0, 0, 0, false, 0.0, 0.026); // ay ≈ 1.04
+        s.accumulate(0, 0, 0, false, 0.0, 0.026);
         let f = s.flush().unwrap();
         assert_eq!(f.dy, 1);
-        // Residual snapped to zero → no longer pending.
         assert_eq!(s.flush(), None);
     }
 
     #[test]
     fn schedule_signal_fires_once_per_burst() {
         let mut s = ScrollAccum::new();
-        assert!(s.accumulate(0, 0, 0, true, 1.0, 1.0)); // first → schedule
-        assert!(!s.accumulate(0, 0, 0, true, 1.0, 1.0)); // already scheduled
-        let _ = s.flush(); // clears the latch
-        assert!(s.accumulate(0, 0, 0, true, 1.0, 1.0)); // schedules again
+        assert!(s.accumulate(0, 0, 0, true, 1.0, 1.0));
+        assert!(!s.accumulate(0, 0, 0, true, 1.0, 1.0));
+        let _ = s.flush();
+        assert!(s.accumulate(0, 0, 0, true, 1.0, 1.0));
     }
 
     #[test]

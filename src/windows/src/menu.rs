@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 use crate::input::input_hwnd;
-use crate::platform::{jfn_win_get_hwnd, win_get_scale};
+use crate::platform::win_get_scale;
 
 /// Asks the input thread to track the parked request.
 pub(crate) const WM_JFN_MENU_TRACK: u32 = WM_APP + 0x100;
@@ -158,9 +158,8 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) {
         let _ = ClientToScreen(hwnd, &mut pt);
     }
 
-    let toplevel = jfn_win_get_hwnd();
-    if !toplevel.is_null() {
-        let _ = unsafe { SetForegroundWindow(HWND(toplevel)) };
+    if let Some(toplevel) = crate::platform::win_hwnd() {
+        let _ = unsafe { SetForegroundWindow(toplevel) };
     }
 
     CANCELLED.store(false, Ordering::Release);

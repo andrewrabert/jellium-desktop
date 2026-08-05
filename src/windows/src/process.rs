@@ -13,7 +13,7 @@ unsafe extern "system" fn console_ctrl_handler(_t: u32) -> BOOL {
     TRUE
 }
 
-pub fn install_shutdown(on_shutdown: fn()) {
+pub(crate) fn install_shutdown(on_shutdown: fn()) {
     let _ = SHUTDOWN_CB.set(on_shutdown);
     unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), TRUE) };
 }

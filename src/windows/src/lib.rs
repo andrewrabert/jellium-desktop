@@ -7,7 +7,7 @@ use std::os::windows::ffi::OsStrExt;
 
 use cef::rc::Rc;
 use cef::{ImplTask, Task, ThreadId, WrapTask, post_task, wrap_task};
-use windows::Win32::Foundation::{HGLOBAL, HWND};
+use windows::Win32::Foundation::HGLOBAL;
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
@@ -20,33 +20,24 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
 
-pub use jfn_platform_abi::{DisplayBackend, JfnRect, PaintFrame, Platform, WindowDecorations};
+use jfn_platform_abi::{DisplayBackend, PaintFrame, Platform, WindowDecorations};
 
-mod compositor;
 mod input;
 mod menu;
 mod mpv_host;
 mod osr_popup;
 mod platform;
 mod process;
-pub use compositor::{
-    jfn_win_begin_transition_locked, jfn_win_cleanup_compositor, jfn_win_init_compositor,
-    jfn_win_update_surface_size, jfn_win_wndproc_begin_transition_locked,
-    jfn_win_wndproc_end_transition_locked, win_alloc_surface, win_end_transition, win_free_surface,
-    win_restack, win_set_expected_size, win_surface_present, win_surface_present_software,
-    win_surface_resize, win_surface_set_visible,
-};
-pub use input::{
-    jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
-    jfn_input_windows_set_cursor, jfn_input_windows_stop_input_thread,
-};
-pub use platform::{
-    jfn_win_get_hwnd, win_clamp_window_geometry, win_cleanup, win_early_init,
-    win_get_display_scale, win_get_scale, win_init, win_query_window_position, win_set_fullscreen,
-    win_toggle_fullscreen,
+mod render;
+mod window;
+
+use crate::input::jfn_input_windows_set_cursor;
+use crate::platform::{
+    win_clamp_window_geometry, win_cleanup, win_early_init, win_get_display_scale, win_get_scale,
+    win_init, win_query_window_position, win_set_fullscreen, win_toggle_fullscreen,
 };
 
-pub fn win_pump() {
+fn win_pump() {
     // Input handled by dedicated input-thread message loop.
 }
 
@@ -74,18 +65,17 @@ wrap_task! {
 
 /// Tint the DWM titlebar so it matches the current theme color.
 /// rgb is 0x00RRGGBB; DWMWA_CAPTION_COLOR wants 0x00BBGGRR (COLORREF).
-pub fn win_set_theme_color(rgb: u32) {
-    let hwnd = jfn_win_get_hwnd();
-    if hwnd.is_null() {
+fn win_set_theme_color(rgb: u32) {
+    let Some(hwnd) = crate::platform::win_hwnd() else {
         return;
-    }
+    };
     let r = (rgb >> 16) & 0xFF;
     let g = (rgb >> 8) & 0xFF;
     let b = rgb & 0xFF;
     let colorref: u32 = r | (g << 8) | (b << 16);
     let _ = unsafe {
         DwmSetWindowAttribute(
-            HWND(hwnd),
+            hwnd,
             DWMWA_CAPTION_COLOR,
             std::ptr::from_ref(&colorref).cast(),
             size_of::<u32>() as u32,
@@ -95,7 +85,7 @@ pub fn win_set_theme_color(rgb: u32) {
 
 /// Map IdleInhibitLevel (None=0, System=1, Display=2) to execution-state
 /// flags and post the call onto TID_UI so it lives on a stable thread.
-pub fn win_set_idle_inhibit(level: c_int) {
+fn win_set_idle_inhibit(level: c_int) {
     let mut flags = ES_CONTINUOUS;
     match level {
         2 => flags |= ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED,
@@ -107,26 +97,12 @@ pub fn win_set_idle_inhibit(level: c_int) {
 }
 
 // =====================================================================
-// Fullscreen-transition gating lives in a jfn-compositor-core
-// TransitionGate held inside the compositor's STATE lock (see
-// compositor::gate_in_transition); these are thin entry points.
-// =====================================================================
-
-pub fn win_begin_transition() {
-    jfn_win_begin_transition_locked();
-}
-
-pub fn win_in_transition() -> bool {
-    crate::compositor::gate_in_transition()
-}
-
-// =====================================================================
 // Clipboard (Win32 CF_UNICODETEXT) — read only; writes go through CEF's
 // own frame->Copy() path which works correctly on Windows. Win32
 // clipboard is synchronous; callback fires inline on the calling thread.
 // =====================================================================
 
-pub fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
+fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
     let mut text = String::new();
     unsafe {
         if OpenClipboard(None).is_ok() {
@@ -147,7 +123,7 @@ pub fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
 }
 
 /// Open an external URL via `ShellExecuteW(open)`.
-pub fn win_open_external_url(url: &str) {
+fn win_open_external_url(url: &str) {
     if url.is_empty() {
         return;
     }
@@ -172,7 +148,7 @@ pub fn win_open_external_url(url: &str) {
 // =====================================================================
 
 use jfn_platform_abi::{
-    IdleInhibitLevel, MenuDelivery, MenuKind, SurfaceHandle, SurfaceSize, WindowGeometry, WindowPos,
+    IdleInhibitLevel, MenuDelivery, MenuKind, SurfaceHandle, WindowGeometry, WindowPos,
 };
 
 /// SMTC-backed [`jfn_platform_abi::MediaSink`].
@@ -212,44 +188,23 @@ impl Platform for WindowsPlatform {
     }
 
     fn alloc_surface(&self) -> SurfaceHandle {
-        SurfaceHandle::from_ptr(win_alloc_surface())
+        render::alloc()
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
-        win_free_surface(s.as_ptr());
+        render::free(s);
     }
 
     fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
-        match frame {
-            PaintFrame::Accelerated(tex) => win_surface_present(s.as_ptr(), &tex),
-            // Only reachable with --disable-gpu-compositing: the painter draws
-            // both frame kinds, so there is nothing to gain by refusing one.
-            PaintFrame::Software {
-                size,
-                pixels,
-                dirty,
-            } => win_surface_present_software(s.as_ptr(), pixels, size, dirty),
-        }
-    }
-
-    fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
-        win_surface_resize(
-            s.as_ptr(),
-            size.logical_w,
-            size.logical_h,
-            size.physical_w,
-            size.physical_h,
-        );
+        render::present(s, render::Part::Content, frame)
     }
 
     fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        win_surface_set_visible(s.as_ptr(), visible);
+        render::set_visible(s, visible);
     }
 
     fn restack(&self, ordered: &[SurfaceHandle]) {
-        // `SurfaceHandle` is `#[repr(transparent)]` over `*mut c_void`, so the
-        // slice pointer reinterprets directly.
-        win_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
+        render::restack(ordered);
     }
 
     fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery {
@@ -292,22 +247,6 @@ impl Platform for WindowsPlatform {
         win_toggle_fullscreen();
     }
 
-    fn begin_transition(&self) {
-        win_begin_transition();
-    }
-
-    fn end_transition(&self) {
-        win_end_transition();
-    }
-
-    fn in_transition(&self) -> bool {
-        win_in_transition()
-    }
-
-    fn set_expected_size(&self, w: c_int, h: c_int) {
-        win_set_expected_size(w, h);
-    }
-
     fn get_scale(&self) -> f32 {
         win_get_scale()
     }
@@ -317,7 +256,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn window_source(&self) -> &'static dyn jfn_platform_abi::WindowSource {
-        &jfn_playback::window_source::MPV_WINDOW_SOURCE
+        &crate::window::WIN_WINDOW_SOURCE
     }
 
     fn query_window_position(&self) -> Option<WindowPos> {
