@@ -5,7 +5,6 @@ use std::thread::{self, JoinHandle};
 
 use smithay_client_toolkit::shm::slot::SlotPool;
 use wayland_client::QueueHandle;
-use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
 use jfn_gpu_paint::{Frame, FrameSize as PhysicalSize, Pixels, Presented, SharedTexture, Surfaces};
@@ -70,15 +69,6 @@ enum PendingFrame {
     Placeholder(u8, u8, u8),
 }
 
-/// `InFlight` covers the window after the worker takes the queued surface but
-/// before it has committed the proxy; `drain_popup` must wait on it too, or a
-/// destroy races that pending `.commit()`.
-enum PopupCommit {
-    Idle,
-    Queued(WlSurface),
-    InFlight,
-}
-
 /// Every event that invalidates the shadow (dmabuf, placeholder, hide, resize)
 /// must reset it to `Stale`, or a later dirty-only frame patches stale pixels.
 enum ShadowState {
@@ -94,7 +84,6 @@ struct LayerState {
     hide_pending: bool,
     viewport_dirty: bool,
     shutdown: bool,
-    popup: PopupCommit,
 }
 
 impl LayerState {
@@ -107,7 +96,6 @@ impl LayerState {
             hide_pending: false,
             viewport_dirty: false,
             shutdown: false,
-            popup: PopupCommit::Idle,
         }
     }
 
@@ -257,24 +245,6 @@ impl LayerActor {
         self.mailbox.update(|s| s.request_placeholder(r, g, b));
     }
 
-    /// Hand a synchronized popup subsurface to the worker, which commits the
-    /// popup and its parent layer back-to-back so the popup's cached buffer
-    /// applies in one ordered flush rather than racing a cross-thread commit.
-    pub(crate) fn commit_popup(&self, popup: WlSurface) {
-        self.mailbox
-            .update(|s| s.popup = PopupCommit::Queued(popup));
-    }
-
-    /// Block until the worker owes no popup commit. The `shutdown` term is
-    /// required: a commit still queued as the worker breaks its loop would
-    /// otherwise never be consumed and hang the wait forever.
-    pub(crate) fn drain_popup(&self) {
-        self.mailbox.wait(
-            |s| matches!(s.popup, PopupCommit::Idle) || s.shutdown,
-            |_| (),
-        );
-    }
-
     pub(crate) fn present_dmabuf(&self, frame: SharedTexture) -> Result<Present, PresentError> {
         validate_present_dims(frame.coded().w, frame.coded().h)?;
         self.mailbox.update(|s| s.present_dmabuf(frame));
@@ -373,14 +343,8 @@ impl LayerActor {
 pub(crate) enum Action<F> {
     Hide,
     Present(F),
-    BareCommit,
     ReapplyViewport,
     Nop,
-}
-
-pub(crate) struct Decision<F> {
-    pub commit_popup: bool,
-    pub action: Action<F>,
 }
 
 fn next_content<F>(prev: bool, action: &Action<F>, committed: bool, is_placeholder: bool) -> bool {
@@ -391,14 +355,14 @@ fn next_content<F>(prev: bool, action: &Action<F>, committed: bool, is_placehold
     }
 }
 
-/// Decide the popup commit and frame op from a mailbox snapshot. Driven by the
-/// final desired `visible` state: a frame arriving in the same wake as a
+/// The frame op for one worker iteration, from one mailbox snapshot. Driven by
+/// the final desired `visible` state: a frame arriving in the same wake as a
 /// coalesced hide+show is presented, not dropped.
 ///
 /// # Examples
 /// ```ignore
-/// let d = decide(Some(7u32), false, true, false, false, false);
-/// assert_eq!(d.action, Action::Present(7));
+/// let action = decide(Some(7u32), false, true, false, false);
+/// assert_eq!(action, Action::Present(7));
 /// ```
 pub(crate) fn decide<F>(
     pending: Option<F>,
@@ -406,9 +370,8 @@ pub(crate) fn decide<F>(
     visible: bool,
     has_content: bool,
     viewport_dirty: bool,
-    popup_pending: bool,
-) -> Decision<F> {
-    let action = if !visible {
+) -> Action<F> {
+    if !visible {
         Action::Hide
     } else if let Some(frame) = pending {
         if pending_is_placeholder && has_content {
@@ -416,36 +379,10 @@ pub(crate) fn decide<F>(
         } else {
             Action::Present(frame)
         }
+    } else if viewport_dirty {
+        Action::ReapplyViewport
     } else {
-        match reconcile(viewport_dirty, popup_pending) {
-            Reconcile::ReapplyViewport => Action::ReapplyViewport,
-            Reconcile::BareCommit => Action::BareCommit,
-            Reconcile::None => Action::Nop,
-        }
-    };
-    Decision {
-        commit_popup: popup_pending,
-        action,
-    }
-}
-
-/// The fallback commit a still-visible layer owes when its frame op did not
-/// commit. Viewport is checked first because reapplying it also commits, which
-/// folds any co-pending popup — returning `BareCommit` there would drop it.
-#[derive(Debug, PartialEq, Eq)]
-enum Reconcile {
-    ReapplyViewport,
-    BareCommit,
-    None,
-}
-
-fn reconcile(viewport_dirty: bool, popup_pending: bool) -> Reconcile {
-    if viewport_dirty {
-        Reconcile::ReapplyViewport
-    } else if popup_pending {
-        Reconcile::BareCommit
-    } else {
-        Reconcile::None
+        Action::Nop
     }
 }
 
@@ -547,76 +484,38 @@ fn run(
     let mut has_content = false;
 
     loop {
-        let (
-            pending,
-            pending_is_placeholder,
-            popup_commit,
-            viewport,
-            visible,
-            viewport_dirty,
-            shutdown,
-        ) = mailbox.wait(
-            |s| {
-                s.pending.is_some()
-                    || s.shutdown
-                    || s.hide_pending
-                    || s.viewport_dirty
-                    || matches!(s.popup, PopupCommit::Queued(_))
-            },
-            |s| {
-                s.hide_pending = false;
-                let viewport_dirty = std::mem::take(&mut s.viewport_dirty);
-                let popup_commit = if let PopupCommit::Queued(popup) =
-                    std::mem::replace(&mut s.popup, PopupCommit::InFlight)
-                {
-                    Some(popup)
-                } else {
-                    s.popup = PopupCommit::Idle;
-                    None
-                };
-                let pending = s.pending.take();
-                let pending_is_placeholder = matches!(pending, Some(PendingFrame::Placeholder(..)));
-                (
-                    pending,
-                    pending_is_placeholder,
-                    popup_commit,
-                    s.viewport,
-                    s.visible,
-                    viewport_dirty,
-                    s.shutdown,
-                )
-            },
-        );
+        let (pending, pending_is_placeholder, viewport, visible, viewport_dirty, shutdown) =
+            mailbox.wait(
+                |s| s.pending.is_some() || s.shutdown || s.hide_pending || s.viewport_dirty,
+                |s| {
+                    s.hide_pending = false;
+                    let viewport_dirty = std::mem::take(&mut s.viewport_dirty);
+                    let pending = s.pending.take();
+                    let pending_is_placeholder =
+                        matches!(pending, Some(PendingFrame::Placeholder(..)));
+                    (
+                        pending,
+                        pending_is_placeholder,
+                        s.viewport,
+                        s.visible,
+                        viewport_dirty,
+                        s.shutdown,
+                    )
+                },
+            );
 
         if shutdown {
             break;
         }
 
-        let decision = decide(
+        let action = decide(
             pending,
             pending_is_placeholder,
             visible,
             has_content,
             viewport_dirty,
-            popup_commit.is_some(),
         );
 
-        // Commit the popup before the layer commit that follows (the frame op or
-        // the reconcile below), which folds the popup's cached state.
-        if decision.commit_popup
-            && let Some(popup) = popup_commit.as_ref()
-        {
-            popup.commit();
-            // A `Queued(next)` that arrived mid-commit is a fresh obligation and
-            // must survive; only clear our own in-flight commit.
-            mailbox.update(|s| {
-                if matches!(s.popup, PopupCommit::InFlight) {
-                    s.popup = PopupCommit::Idle;
-                }
-            });
-        }
-
-        let action = decision.action;
         let mut present_committed = false;
         let mut layer_committed = match &action {
             Action::Hide => runner.hide(&layer),
@@ -639,10 +538,6 @@ fn run(
                 layer.commit();
                 true
             }
-            Action::BareCommit => {
-                layer.commit();
-                true
-            }
             Action::Nop => false,
         };
         has_content = next_content(
@@ -654,24 +549,15 @@ fn run(
 
         // The `visible` gate keeps this fallback commit off a hidden GPU/WSI
         // surface, whose buffers the compositor's swapchain owns.
-        if visible && !layer_committed {
-            match reconcile(viewport_dirty, popup_commit.is_some()) {
-                Reconcile::ReapplyViewport => {
-                    // Zero source args leave the latched source untouched; only
-                    // the destination is rescaled to the new logical size.
-                    layer.set_viewport(0, 0, viewport.lw, viewport.lh);
-                    layer.commit();
-                    layer_committed = true;
-                }
-                Reconcile::BareCommit => {
-                    layer.commit();
-                    layer_committed = true;
-                }
-                Reconcile::None => {}
-            }
+        if visible && !layer_committed && viewport_dirty {
+            // Zero source args leave the latched source untouched; only the
+            // destination is rescaled to the new logical size.
+            layer.set_viewport(0, 0, viewport.lw, viewport.lh);
+            layer.commit();
+            layer_committed = true;
         }
 
-        if layer_committed || popup_commit.is_some() {
+        if layer_committed {
             layer.flush();
             rt.root().request_present();
         }
@@ -1117,26 +1003,28 @@ mod tests {
 
     #[test]
     fn coalesced_hide_then_show_frame_presents() {
-        let d = decide(Some(7u32), false, true, false, false, false);
-        assert_eq!(d.action, Action::Present(7));
+        assert_eq!(
+            decide(Some(7u32), false, true, false, false),
+            Action::Present(7)
+        );
     }
 
     #[test]
     fn hide_alone_hides() {
-        let d = decide(None::<u32>, false, false, true, false, false);
-        assert_eq!(d.action, Action::Hide);
+        assert_eq!(decide(None::<u32>, false, false, true, false), Action::Hide);
     }
 
     #[test]
     fn placeholder_honored_again_after_hide() {
-        let d = decide(Some(0u32), true, true, false, false, false);
-        assert_eq!(d.action, Action::Present(0));
+        assert_eq!(
+            decide(Some(0u32), true, true, false, false),
+            Action::Present(0)
+        );
     }
 
     #[test]
     fn placeholder_skipped_when_content_present() {
-        let d = decide(Some(0u32), true, true, true, false, false);
-        assert_eq!(d.action, Action::Nop);
+        assert_eq!(decide(Some(0u32), true, true, true, false), Action::Nop);
     }
 
     #[test]
@@ -1150,8 +1038,7 @@ mod tests {
         // A skipped/failed present (not committed) leaves the prior value.
         assert!(next_content(true, &Action::Present(()), false, false));
         assert!(!next_content(false, &Action::Present(()), false, false));
-        // Bare/viewport/nop leave the prior value.
-        assert!(next_content(true, &Action::<()>::BareCommit, true, false));
+        // Viewport/nop leave the prior value.
         assert!(!next_content(
             false,
             &Action::<()>::ReapplyViewport,
@@ -1162,44 +1049,11 @@ mod tests {
     }
 
     #[test]
-    fn present_and_popup_decided_from_one_snapshot() {
-        let d = decide(Some(7u32), false, true, false, false, true);
-        assert!(d.commit_popup);
-        assert_eq!(d.action, Action::Present(7));
-    }
-
-    #[test]
-    fn popup_only_snapshot_bare_commits() {
-        let d = decide(None::<u32>, false, true, false, false, true);
-        assert!(d.commit_popup);
-        assert_eq!(d.action, Action::BareCommit);
-    }
-
-    #[test]
     fn viewport_dirty_snapshot_reapplies_viewport() {
-        let d = decide(None::<u32>, false, true, false, true, true);
-        assert_eq!(d.action, Action::ReapplyViewport);
-    }
-
-    #[test]
-    fn popup_survives_a_skipped_or_failed_present() {
         assert_eq!(
-            decide(Some(9u32), false, true, false, false, true).action,
-            Action::Present(9)
+            decide(None::<u32>, false, true, false, true),
+            Action::ReapplyViewport
         );
-        assert_eq!(reconcile(false, true), Reconcile::BareCommit);
-    }
-
-    #[test]
-    fn reconcile_bare_commits_for_popup() {
-        assert_eq!(reconcile(false, true), Reconcile::BareCommit);
-        assert_eq!(reconcile(false, false), Reconcile::None);
-    }
-
-    #[test]
-    fn reconcile_reapplies_viewport() {
-        assert_eq!(reconcile(true, false), Reconcile::ReapplyViewport);
-        assert_eq!(reconcile(true, true), Reconcile::ReapplyViewport);
     }
 
     #[test]

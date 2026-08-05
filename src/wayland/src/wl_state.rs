@@ -7,8 +7,7 @@
 //!     (foreign-display backend, never closes the fd)
 //!   * Bindings for `wl_compositor`, `wl_subcompositor`, `wl_shm`,
 //!     `zwp_linux_dmabuf_v1`, `wp_viewporter`
-//!   * The list of per-layer `PlatformSurface`s and their popup
-//!     children
+//!   * The list of per-layer `PlatformSurface`s
 //!   * The fullscreen-transition state machine (begin/end + tolerance
 //!     gate for the paint path)
 //!
@@ -255,13 +254,6 @@ pub(crate) struct PlatformSurface {
     pub subsurface: Option<SyncSubsurface>,
     pub visible: bool,
     pub null_attached: bool,
-
-    pub popup_surface: Option<WlSurface>,
-    pub popup_subsurface: Option<SyncSubsurface>,
-    pub popup_viewport: Option<WpViewport>,
-    pub popup_buffer: Option<AttachedBuffer>,
-    pub popup_visible: bool,
-
     pub layer_actor: Option<LayerActor>,
 }
 
@@ -272,11 +264,6 @@ impl PlatformSurface {
             subsurface: None,
             visible: true,
             null_attached: false,
-            popup_surface: None,
-            popup_subsurface: None,
-            popup_viewport: None,
-            popup_buffer: None,
-            popup_visible: false,
             layer_actor: None,
         }
     }
@@ -297,7 +284,6 @@ pub(crate) struct WlState {
     pub compositor: WlCompositor,
     pub subcompositor: WlSubcompositor,
     pub shm: ShmGlobal,
-    pub shm_pool: Option<SlotPool>,
     pub dmabuf: Option<ZwpLinuxDmabufV1>,
     pub viewporter: Option<WpViewporter>,
 
@@ -550,7 +536,6 @@ pub(crate) unsafe fn init(
         .bind(&qh, 1..=1, ())
         .map_err(bind_error("wl_subcompositor"))?;
     let shm = ShmGlobal::new(globals.bind(&qh, 1..=1, ()).map_err(bind_error("wl_shm"))?);
-    let shm_pool = new_slot_pool(&shm, "cef overlay");
     let dmabuf: Option<ZwpLinuxDmabufV1> = globals.bind(&qh, 1..=4, ()).ok();
     let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
 
@@ -561,7 +546,6 @@ pub(crate) unsafe fn init(
         compositor,
         subcompositor,
         shm,
-        shm_pool,
         dmabuf,
         viewporter,
         root_surface: None,

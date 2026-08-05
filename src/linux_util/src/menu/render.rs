@@ -48,6 +48,7 @@ pub struct Layout {
 }
 
 impl Layout {
+    #[cfg(test)]
     pub fn for_test(width: i32, height: i32, rows: Vec<Row>, selectable: Vec<usize>) -> Self {
         Self {
             width,
@@ -56,10 +57,6 @@ impl Layout {
             selectable,
             scale: 1.0,
         }
-    }
-
-    pub fn scale(&self) -> f32 {
-        self.scale
     }
 
     pub fn contains(&self, x: i32, y: i32) -> bool {

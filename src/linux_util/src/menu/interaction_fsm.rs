@@ -23,7 +23,6 @@ impl Default for MenuState {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuEvent {
-    Expose,
     Motion { x: i32, y: i32 },
     Press { x: i32, y: i32 },
     Key(u32),
@@ -43,7 +42,6 @@ pub fn step(
     items: &[MenuItem],
 ) -> Vec<MenuEffect> {
     match *ev {
-        MenuEvent::Expose => vec![MenuEffect::Redraw],
         MenuEvent::Dismiss => vec![MenuEffect::Close(-1)],
         MenuEvent::Motion { x, y } => {
             let hit = layout.row_at(x, y).map_or(-1, |i| i as i32);
@@ -154,13 +152,6 @@ mod tests {
         let mut s = MenuState { active };
         let e = step(&mut s, &ev, &layout, &items);
         (s.active, e)
-    }
-
-    #[test]
-    fn expose_always_redraws() {
-        let (active, e) = run(2, MenuEvent::Expose);
-        assert_eq!(active, 2);
-        assert_eq!(e, vec![MenuEffect::Redraw]);
     }
 
     #[test]

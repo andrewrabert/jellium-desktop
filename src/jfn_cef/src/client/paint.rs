@@ -61,15 +61,16 @@ impl Inner {
             return;
         }
         if is_popup {
+            if !matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
+                return;
+            }
             let (pw, ph) = self.popup_rect();
             let Some(frame) = software_frame(buffer, w, h, &[]) else {
                 return;
             };
-            if matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
-                jfn_platform_abi::get()
-                    .osr_popup_surface()
-                    .present(surface, frame, pw, ph);
-            }
+            jfn_platform_abi::get()
+                .osr_popup_surface()
+                .present(surface, frame, pw, ph);
             return;
         }
         let Some(p) = platform_ops::ops() else { return };
@@ -88,18 +89,21 @@ impl Inner {
             return;
         }
         if is_popup {
+            if !matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
+                return;
+            }
             let (pw, ph) = self.popup_rect();
+            // Acquire last: this dups a fd per plane, and every gate above drops
+            // frames.
             let Some(tex) = super::accel::acquire(info) else {
                 return;
             };
-            if matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
-                jfn_platform_abi::get().osr_popup_surface().present(
-                    surface,
-                    PaintFrame::Accelerated(tex),
-                    pw,
-                    ph,
-                );
-            }
+            jfn_platform_abi::get().osr_popup_surface().present(
+                surface,
+                PaintFrame::Accelerated(tex),
+                pw,
+                ph,
+            );
             return;
         }
         let Some(p) = platform_ops::ops() else { return };

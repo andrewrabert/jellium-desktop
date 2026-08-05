@@ -54,7 +54,6 @@ pub struct WaylandPlatform {
     runtime: &'static WlRuntime,
     mpv_host: crate::mpv_host::WaylandMpvHost,
     window_source: crate::window_source::WaylandWindowSource,
-    osr_popup: crate::osr_popup::WlSubsurfacePopup,
     shared_texture: AtomicBool,
     clipboard: AtomicBool,
 }
@@ -66,7 +65,6 @@ impl WaylandPlatform {
             runtime,
             mpv_host: crate::mpv_host::WaylandMpvHost::new(runtime),
             window_source: crate::window_source::WaylandWindowSource::new(runtime),
-            osr_popup: crate::osr_popup::WlSubsurfacePopup { rt: runtime },
             shared_texture: AtomicBool::new(true),
             clipboard: AtomicBool::new(true),
         }
@@ -159,12 +157,8 @@ impl Platform for WaylandPlatform {
         wl_ops::restack(self.rt(), typed);
     }
 
-    fn menu(&self) -> Option<&'static dyn jfn_platform_abi::MenuHost> {
-        Some(self.rt().menu())
-    }
-
-    fn osr_popup_surface(&self) -> &dyn jfn_platform_abi::OsrPopupSurface {
-        &self.osr_popup
+    fn menu_delivery(&self, _kind: jfn_platform_abi::MenuKind) -> jfn_platform_abi::MenuDelivery {
+        jfn_platform_abi::MenuDelivery::Host(self.rt().menu())
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {

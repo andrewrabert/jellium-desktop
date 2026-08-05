@@ -41,8 +41,8 @@ pub use jfn_gpu_paint::DamageRect as JfnRect;
 pub use media_sink::MediaSink;
 pub use menu::{
     Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem, MenuKind, MenuMetrics,
-    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelectionFn, MenuStyle, PopupSurface,
-    menu_delivery, menu_scripts, menu_style,
+    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelectionFn, PopupSurface,
+    menu_delivery, menu_scripts,
 };
 pub use mpv_host::{DefaultMpvHost, MpvHost};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};
@@ -455,9 +455,9 @@ pub trait Platform: Send + Sync {
     fn surface_set_visible(&self, _s: SurfaceHandle, _visible: bool) {}
     fn restack(&self, _ordered: &[SurfaceHandle]) {}
 
-    fn menu(&self) -> Option<&'static dyn MenuHost> {
-        None
-    }
+    /// How this backend delivers `kind`; `Host` names the backend's own menu
+    /// host.
+    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery;
 
     fn osr_popup_surface(&self) -> &dyn OsrPopupSurface {
         &NoOsrPopup

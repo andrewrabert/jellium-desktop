@@ -1,8 +1,6 @@
 use std::ffi::c_int;
 use std::num::NonZeroU64;
 
-use crate::DisplayBackend;
-
 /// Identifies one popup across its whole life; a surface drops anything
 /// naming a generation it no longer owns.
 pub type Generation = NonZeroU64;
@@ -40,34 +38,13 @@ pub enum MenuKind {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum MenuStyle {
-    Platform,
-    Page,
-    Composited,
-}
-
-pub fn menu_style(kind: MenuKind, backend: DisplayBackend) -> MenuStyle {
-    match (kind, backend) {
-        (MenuKind::ContextMenu, _) => MenuStyle::Platform,
-        (MenuKind::Dropdown, DisplayBackend::Wayland | DisplayBackend::MacOS) => {
-            MenuStyle::Platform
-        }
-        (MenuKind::Dropdown, DisplayBackend::X11) => MenuStyle::Page,
-        (MenuKind::Dropdown, DisplayBackend::Windows) => MenuStyle::Composited,
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MenuScript {
     SelectMenu,
 }
 
 pub fn menu_scripts(kind: MenuKind) -> &'static [MenuScript] {
-    let Some(p) = crate::try_get() else {
-        return &[];
-    };
-    match (menu_style(kind, p.display()), kind) {
-        (MenuStyle::Page, MenuKind::Dropdown) => &[MenuScript::SelectMenu],
+    match (menu_delivery(kind), kind) {
+        (MenuDelivery::Page, MenuKind::Dropdown) => &[MenuScript::SelectMenu],
         _ => &[],
     }
 }
@@ -80,17 +57,7 @@ pub enum MenuDelivery {
 }
 
 pub fn menu_delivery(kind: MenuKind) -> MenuDelivery {
-    let Some(p) = crate::try_get() else {
-        return MenuDelivery::Page;
-    };
-    match menu_style(kind, p.display()) {
-        MenuStyle::Platform => match p.menu() {
-            Some(host) => MenuDelivery::Host(host),
-            None => MenuDelivery::Page,
-        },
-        MenuStyle::Composited => MenuDelivery::Composited,
-        MenuStyle::Page => MenuDelivery::Page,
-    }
+    crate::get().menu_delivery(kind)
 }
 
 pub trait MenuHost: Send + Sync {
@@ -164,44 +131,4 @@ pub trait PopupSurface: Send + Sync {
     fn present(&self, paint: MenuPaint);
 
     fn destroy(&self, generation: Generation, reason: MenuClose);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn context_menu_is_platform_drawn_on_every_backend() {
-        for backend in [
-            DisplayBackend::Wayland,
-            DisplayBackend::X11,
-            DisplayBackend::Windows,
-            DisplayBackend::MacOS,
-        ] {
-            assert_eq!(
-                menu_style(MenuKind::ContextMenu, backend),
-                MenuStyle::Platform
-            );
-        }
-    }
-
-    #[test]
-    fn dropdown_style_is_per_backend() {
-        assert_eq!(
-            menu_style(MenuKind::Dropdown, DisplayBackend::Wayland),
-            MenuStyle::Platform
-        );
-        assert_eq!(
-            menu_style(MenuKind::Dropdown, DisplayBackend::X11),
-            MenuStyle::Page
-        );
-        assert_eq!(
-            menu_style(MenuKind::Dropdown, DisplayBackend::Windows),
-            MenuStyle::Composited
-        );
-        assert_eq!(
-            menu_style(MenuKind::Dropdown, DisplayBackend::MacOS),
-            MenuStyle::Platform
-        );
-    }
 }

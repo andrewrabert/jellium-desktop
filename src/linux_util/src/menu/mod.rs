@@ -1,6 +1,5 @@
 pub mod engine;
-pub mod interaction_fsm;
-pub mod render;
+pub(crate) mod interaction_fsm;
+pub(crate) mod render;
 
 pub use engine::SoftwareMenu;
-pub use render::{Fonts, Layout, blit_bgra, layout, paint};

@@ -81,8 +81,13 @@ impl Platform for X11Platform {
         surface::restack(&ids);
     }
 
-    fn menu(&self) -> Option<&'static dyn jfn_platform_abi::MenuHost> {
-        Some(crate::menu::host())
+    fn menu_delivery(&self, kind: jfn_platform_abi::MenuKind) -> jfn_platform_abi::MenuDelivery {
+        match kind {
+            jfn_platform_abi::MenuKind::ContextMenu => {
+                jfn_platform_abi::MenuDelivery::Host(crate::menu::host())
+            }
+            jfn_platform_abi::MenuKind::Dropdown => jfn_platform_abi::MenuDelivery::Page,
+        }
     }
 
     fn media_session(&self) -> &dyn jfn_platform_abi::MediaSink {

@@ -433,7 +433,9 @@ use compositor::{
 // Backend impl
 // =====================================================================
 
-use jfn_platform_abi::{IdleInhibitLevel, SurfaceHandle, SurfaceSize, WindowGeometry, WindowPos};
+use jfn_platform_abi::{
+    IdleInhibitLevel, MenuDelivery, MenuKind, SurfaceHandle, SurfaceSize, WindowGeometry, WindowPos,
+};
 
 /// MPNowPlaying-backed [`jfn_platform_abi::MediaSink`].
 struct NowPlayingSink;
@@ -514,8 +516,8 @@ impl Platform for MacosPlatform {
         macos_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
-    fn menu(&self) -> Option<&'static dyn jfn_platform_abi::MenuHost> {
-        Some(&menu::NsMenuHost)
+    fn menu_delivery(&self, _kind: MenuKind) -> MenuDelivery {
+        MenuDelivery::Host(&menu::NsMenuHost)
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {

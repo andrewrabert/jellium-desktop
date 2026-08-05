@@ -7,17 +7,13 @@
 
 use jfn_gpu_paint::SharedTexture;
 use jfn_platform_abi::JfnRect;
-use std::os::fd::AsFd;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
 use crate::layer::{LayerSurface, Present, PresentError, SurfaceRef, ViewportState};
 use crate::layer_actor::{LayerActor, LayerBackend};
 use crate::runtime::WlRuntime;
-use crate::wl_state::{
-    AttachedBuffer, PlatformSurface, WlState, create_dmabuf_buffer, draw_from_pixels,
-    size_in_tolerance,
-};
+use crate::wl_state::{PlatformSurface, WlState, size_in_tolerance};
 
 fn core(rt: &WlRuntime) -> Option<parking_lot::MutexGuard<'_, WlState>> {
     rt.try_core().map(parking_lot::Mutex::lock)
@@ -115,7 +111,6 @@ pub(crate) fn free_surface(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
         // SAFETY: stack drop above guarantees no aliases via stack;
         // caller (C++) guarantees no concurrent use of `ptr`.
         let s = unsafe { surface_mut(ptr) };
-        popup_destroy_locked(s);
         if let Some(sub) = s.subsurface.take() {
             sub.destroy();
         }
@@ -175,91 +170,6 @@ pub(crate) fn surface_set_visible(
     }
     s.null_attached = !visible;
     rt.root().request_present();
-}
-
-// =====================================================================
-// Popup
-// =====================================================================
-
-pub(crate) fn popup_show(
-    rt: &'static WlRuntime,
-    ptr: *mut PlatformSurface,
-    x: i32,
-    y: i32,
-    lw: i32,
-    lh: i32,
-) {
-    if ptr.is_null() {
-        return;
-    }
-    let Some(st) = core(rt) else { return };
-    let s = unsafe { surface_mut(ptr) };
-    popup_create_locked(s, &st);
-    s.popup_visible = true;
-    let Some(sub) = s.popup_subsurface.as_ref() else {
-        return;
-    };
-    sub.set_position(x, y);
-    if let Some(vp) = s.popup_viewport.as_ref()
-        && lw > 0
-        && lh > 0
-    {
-        vp.set_destination(lw, lh);
-    }
-    st.flush();
-}
-
-pub(crate) fn popup_hide(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
-    if ptr.is_null() {
-        return;
-    }
-    let Some(st) = core(rt) else { return };
-    let s = unsafe { surface_mut(ptr) };
-    s.popup_visible = false;
-    // Drain any popup commit the worker still owes before destroying the popup
-    // surface: committing the popup proxy after it is destroyed aborts the client.
-    // Holding the `wl_state` lock blocks any new popup enqueue, so once drained
-    // nothing more can be owed.
-    if let Some(actor) = s.layer_actor.as_ref() {
-        actor.drain_popup();
-    }
-    popup_destroy_locked(s);
-    st.flush();
-}
-
-fn popup_create_locked(s: &mut PlatformSurface, st: &WlState) {
-    let Some(parent) = s.surface.as_ref() else {
-        return;
-    };
-    if s.popup_surface.is_some() {
-        return;
-    }
-    let surf = st.compositor.create_surface(&st.qh, ());
-    let sub =
-        crate::wl_state::SyncSubsurface::create(&st.subcompositor, &surf, parent.as_arg(), &st.qh);
-    if let Some(empty) = st.empty_region() {
-        surf.set_input_region(Some(empty.wl_region()));
-    }
-    let vp = st
-        .viewporter
-        .as_ref()
-        .map(|v| v.get_viewport(&surf, &st.qh, ()));
-    s.popup_surface = Some(surf);
-    s.popup_subsurface = Some(sub);
-    s.popup_viewport = vp;
-}
-
-fn popup_destroy_locked(s: &mut PlatformSurface) {
-    if let Some(v) = s.popup_viewport.take() {
-        v.destroy();
-    }
-    drop(s.popup_buffer.take());
-    if let Some(sub) = s.popup_subsurface.take() {
-        sub.destroy();
-    }
-    if let Some(surf) = s.popup_surface.take() {
-        surf.destroy();
-    }
 }
 
 // =====================================================================
@@ -376,117 +286,6 @@ pub(crate) fn surface_present_software(
     actor.set_visible(s.visible);
     actor.resize(lw, lh, pw, ph);
     actor.present_software(pixels, w, h, dirty)
-}
-
-pub(crate) fn popup_present(
-    rt: &'static WlRuntime,
-    ptr: *mut PlatformSurface,
-    frame: &SharedTexture,
-    lw: i32,
-    lh: i32,
-) {
-    if ptr.is_null() || lw <= 0 || lh <= 0 {
-        return;
-    }
-    let Some(st) = core(rt) else { return };
-    let s = unsafe { surface_mut(ptr) };
-    if s.popup_surface.is_none() || !s.popup_visible {
-        return;
-    }
-    let w = frame.coded().w;
-    let h = frame.coded().h;
-    let (vw, vh) = (frame.visible().w, frame.visible().h);
-    let Some(plane) = frame.planes().first() else {
-        return;
-    };
-    let Some(dmabuf) = st.dmabuf.as_ref() else {
-        return;
-    };
-    let Some(buf) = create_dmabuf_buffer(
-        rt.buffers(),
-        dmabuf,
-        &st.qh,
-        crate::wl_state::DmabufPlane {
-            fd: plane.fd.as_fd(),
-            stride: plane.stride,
-            modifier: frame.modifier(),
-            w,
-            h,
-        },
-    ) else {
-        return;
-    };
-    let buf = AttachedBuffer::Dmabuf(buf);
-    drop(s.popup_buffer.take());
-    if let Some(vp) = s.popup_viewport.as_ref() {
-        vp.set_source(0.0, 0.0, vw as f64, vh as f64);
-        vp.set_destination(lw, lh);
-    }
-    let Some(popup) = s.popup_surface.as_ref() else {
-        return;
-    };
-    buf.attach_to(popup);
-    popup.damage_buffer(0, 0, vw, vh);
-    commit_popup_via_actor(rt, s, popup, &st);
-    s.popup_buffer = Some(buf);
-}
-
-pub(crate) fn popup_present_software(
-    rt: &'static WlRuntime,
-    ptr: *mut PlatformSurface,
-    pixels: &[u8],
-    pw: i32,
-    ph: i32,
-    lw: i32,
-    lh: i32,
-) {
-    if ptr.is_null() || lw <= 0 || lh <= 0 {
-        return;
-    }
-    let Some(mut st) = core(rt) else { return };
-    let s = unsafe { surface_mut(ptr) };
-    if s.popup_surface.is_none() || !s.popup_visible {
-        return;
-    }
-    // Retire the outgoing buffer first: its slot can only be reused for this
-    // frame once nothing owns it but the compositor.
-    drop(s.popup_buffer.take());
-    let Some(pool) = st.shm_pool.as_mut() else {
-        return;
-    };
-    let Some(buf) = draw_from_pixels(pool, pixels, pw, ph) else {
-        return;
-    };
-    let buf = AttachedBuffer::Shm(buf);
-    if let Some(vp) = s.popup_viewport.as_ref() {
-        vp.set_source(0.0, 0.0, pw as f64, ph as f64);
-        vp.set_destination(lw, lh);
-    }
-    let Some(popup) = s.popup_surface.as_ref() else {
-        return;
-    };
-    buf.attach_to(popup);
-    popup.damage_buffer(0, 0, pw, ph);
-    commit_popup_via_actor(rt, s, popup, &st);
-    s.popup_buffer = Some(buf);
-}
-
-/// Route the popup commit through the actor so it lands ordered after the
-/// layer's own commits; commit inline only when the surface has no actor.
-fn commit_popup_via_actor(
-    rt: &'static WlRuntime,
-    s: &PlatformSurface,
-    popup: &WlSurface,
-    st: &WlState,
-) {
-    match s.layer_actor.as_ref() {
-        Some(actor) => actor.commit_popup(popup.clone()),
-        None => {
-            popup.commit();
-            st.flush();
-            rt.root().request_present();
-        }
-    }
 }
 
 pub(crate) fn on_configure(rt: &'static WlRuntime, fullscreen: bool) {

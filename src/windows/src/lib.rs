@@ -171,7 +171,9 @@ pub fn win_open_external_url(url: &str) {
 // Backend impl
 // =====================================================================
 
-use jfn_platform_abi::{IdleInhibitLevel, SurfaceHandle, SurfaceSize, WindowGeometry, WindowPos};
+use jfn_platform_abi::{
+    IdleInhibitLevel, MenuDelivery, MenuKind, SurfaceHandle, SurfaceSize, WindowGeometry, WindowPos,
+};
 
 /// SMTC-backed [`jfn_platform_abi::MediaSink`].
 struct SmtcSink;
@@ -250,8 +252,11 @@ impl Platform for WindowsPlatform {
         win_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
-    fn menu(&self) -> Option<&'static dyn jfn_platform_abi::MenuHost> {
-        Some(&menu::WinMenuHost)
+    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery {
+        match kind {
+            MenuKind::ContextMenu => MenuDelivery::Host(&menu::WinMenuHost),
+            MenuKind::Dropdown => MenuDelivery::Composited,
+        }
     }
 
     fn osr_popup_surface(&self) -> &dyn jfn_platform_abi::OsrPopupSurface {

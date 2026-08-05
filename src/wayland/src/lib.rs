@@ -18,7 +18,6 @@ pub(crate) mod lifecycle;
 pub mod make_platform;
 pub(crate) mod mpv_host;
 pub(crate) mod mpv_proxy;
-pub(crate) mod osr_popup;
 pub mod paint_override;
 pub(crate) mod popup;
 pub(crate) mod root_window;
