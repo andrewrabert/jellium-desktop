@@ -9,7 +9,6 @@ name = "jfn_windows_sink"
 crate-type = ["rlib"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
-jfn-mpv = { path = "../mpv" }
 jfn-playback = { path = "../playback" }
 tracing.workspace = true
 windows = { workspace = true, features = [

@@ -34,7 +34,7 @@ mod window;
 use crate::input::jfn_input_windows_set_cursor;
 use crate::platform::{
     win_clamp_window_geometry, win_cleanup, win_early_init, win_get_display_scale, win_get_scale,
-    win_init, win_query_window_position, win_set_fullscreen, win_toggle_fullscreen,
+    win_init, win_set_fullscreen, win_toggle_fullscreen,
 };
 
 fn win_pump() {}
@@ -131,7 +131,11 @@ struct SmtcSink;
 
 impl jfn_platform_abi::MediaSink for SmtcSink {
     fn start(&self, _instance: &jfn_platform_abi::Instance) {
-        jfn_windows_sink::jfn_windows_sink_start();
+        let Some(hwnd) = crate::platform::win_hwnd() else {
+            tracing::error!(target: "Media", "[SMTC] mpv window unresolved; SMTC not started");
+            return;
+        };
+        jfn_windows_sink::jfn_windows_sink_start_for(hwnd.0 as isize);
     }
 
     fn stop(&self) {
@@ -235,12 +239,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn query_window_position(&self) -> Option<WindowPos> {
-        let (mut x, mut y) = (0, 0);
-        if win_query_window_position(&mut x, &mut y) {
-            Some(WindowPos { x, y })
-        } else {
-            None
-        }
+        crate::window::snapshot()?.position
     }
 
     fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry {

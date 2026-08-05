@@ -3,8 +3,8 @@
 //!
 //! All `g_win` state (HWND, the minimize edge, the maximize-restore flag, the
 //! WndProc hook handle, the input thread JoinHandle) lives in this module
-//! behind a `Mutex<WinState>`. Scale and window mode are not stored: they come
-//! from Win32, through `crate::window`.
+//! behind a `Mutex<WinState>`. Scale, position, and window mode are not stored
+//! here: they come from Win32, through `crate::window`'s sample.
 
 #![allow(non_snake_case)]
 
@@ -13,21 +13,17 @@ use std::ffi::{c_int, c_void};
 use std::thread::JoinHandle;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
-};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CWPRETSTRUCT, CallNextHookEx, GWL_STYLE, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, HHOOK, IsZoomed, SIZE_MINIMIZED, SPI_GETWORKAREA,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowsHookExW, SystemParametersInfoW,
-    UnhookWindowsHookEx, WH_CALLWNDPROCRET, WM_CLOSE, WM_DPICHANGED, WM_SIZE, WM_STYLECHANGED,
-    WS_CAPTION, WS_THICKFRAME,
+    CWPRETSTRUCT, CallNextHookEx, GWL_STYLE, GetWindowLongPtrW, GetWindowThreadProcessId, HHOOK,
+    IsZoomed, SIZE_MINIMIZED, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetWindowsHookExW, SystemParametersInfoW, UnhookWindowsHookEx, WH_CALLWNDPROCRET, WM_CLOSE,
+    WM_DPICHANGED, WM_MOVE, WM_SIZE, WM_STYLECHANGED, WS_CAPTION, WS_THICKFRAME,
 };
 
 use jfn_mpv::api::{
-    jfn_mpv_get_property_int, jfn_mpv_set_fullscreen, jfn_mpv_set_window_maximized,
-    jfn_mpv_set_window_minimized, jfn_mpv_toggle_fullscreen,
+    jfn_mpv_set_fullscreen, jfn_mpv_set_window_maximized, jfn_mpv_set_window_minimized,
+    jfn_mpv_toggle_fullscreen,
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_platform_abi::geometry::{Bounds, WindowGeometry, clamp_to_bounds};
@@ -70,23 +66,22 @@ pub(crate) fn win_hwnd() -> Option<HWND> {
     (raw != 0).then(|| hwnd_from_raw(raw))
 }
 
-/// The stored HWND, resolved from mpv's `window-id` on first use. The boot
-/// wait polls the window snapshot before `win_init` runs, so resolution
-/// cannot wait for init. `None` until mpv has a window.
+/// The stored HWND, taken from mpv's observed `window-id` on first use. The
+/// boot wait pulls the window snapshot before `win_init` runs, so resolution
+/// cannot wait for init. `None` until mpv's VO has a window.
+///
+/// Reads a cached atomic — no mpv property read, so no thread that pulls the
+/// snapshot can serialize against the mpv core or mpv's VO GUI thread.
 pub(crate) fn win_ensure_hwnd() -> Option<HWND> {
     if let Some(hwnd) = win_hwnd() {
         return Some(hwnd);
     }
-    if jfn_mpv_handle_get().is_null() {
+    let raw = jfn_playback::ingest_driver::jfn_playback_window_id()? as usize;
+    if raw == 0 {
         return None;
     }
-    let mut wid: i64 = 0;
-    let rc = unsafe { jfn_mpv_get_property_int(c"window-id".as_ptr(), &mut wid) };
-    if rc < 0 || wid == 0 {
-        return None;
-    }
-    STATE.lock().mpv_hwnd_raw = wid as usize;
-    Some(hwnd_from_raw(wid as usize))
+    STATE.lock().mpv_hwnd_raw = raw;
+    Some(hwnd_from_raw(raw))
 }
 
 /// True when mpv's window has neither `WS_CAPTION` nor `WS_THICKFRAME`.
@@ -187,6 +182,9 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                         jfn_playback::lifecycle::jfn_lifecycle_set_visible(true);
                     }
                 }
+                WM_MOVE => {
+                    crate::window::sample();
+                }
                 WM_DPICHANGED | WM_STYLECHANGED => {
                     crate::window::publish_deferred();
                 }
@@ -204,7 +202,7 @@ pub(crate) fn win_early_init() {}
 
 pub(crate) fn win_init(_mpv: *mut c_void) -> bool {
     let Some(hwnd) = win_ensure_hwnd() else {
-        tracing::error!("Failed to get window-id from mpv");
+        tracing::error!("mpv window handle unresolved; no observed window-id");
         return false;
     };
     let hwnd_raw = hwnd.0 as usize;
@@ -256,31 +254,6 @@ pub(crate) fn win_cleanup() {
     crate::render::cleanup();
     crate::window::clear();
     STATE.lock().mpv_hwnd_raw = 0;
-}
-
-/// Query window position relative to the monitor's working area (excludes
-/// taskbar), in physical pixels. Matches mpv's `--geometry +X+Y`
-/// coordinate system on Windows (`vo_calc_window_geometry` uses the
-/// working area).
-pub(crate) fn win_query_window_position(x: &mut c_int, y: &mut c_int) -> bool {
-    let Some(hwnd) = win_hwnd() else {
-        return false;
-    };
-    let mut wr = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut wr) }.is_err() {
-        return false;
-    }
-    let mon: HMONITOR = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    let mut mi = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    if !unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
-        return false;
-    }
-    *x = wr.left - mi.rcWork.left;
-    *y = wr.top - mi.rcWork.top;
-    true
 }
 
 /// Resolve saved geometry against the primary monitor's working area so the

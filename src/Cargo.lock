@@ -2675,7 +2675,6 @@ dependencies = [
 name = "jfn-windows-sink"
 version = "0.1.0-dev"
 dependencies = [
- "jfn-mpv",
  "jfn-playback",
  "tracing",
  "windows",

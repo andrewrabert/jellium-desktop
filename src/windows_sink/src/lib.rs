@@ -5,8 +5,8 @@
 //! callbacks dispatch via [`sink_core::execute`] / [`sink_core::seek_to_ms`].
 //!
 //! Public entry points:
-//!   * `jfn_windows_sink_start()` / `jfn_windows_sink_start_for(hwnd)` —
-//!     start the sink (SMTC binds to the mpv window via GetForWindow).
+//!   * `jfn_windows_sink_start_for(hwnd)` — start the sink (SMTC binds to the
+//!     mpv window via GetForWindow).
 //!   * `jfn_windows_sink_stop()` — signal the thread to exit at next wake.
 
 #![cfg(target_os = "windows")]
@@ -35,18 +35,6 @@ use windows::core::HSTRING;
 /// to bind SMTC via ISystemMediaTransportControlsInterop::GetForWindow.
 pub fn jfn_windows_sink_start_for(hwnd_raw: isize) {
     sink_core::run_sink("windows-sink", move || WindowsSink::new(hwnd_raw));
-}
-
-/// Convenience entry: queries mpv for the window-id and starts the sink.
-pub fn jfn_windows_sink_start() {
-    let mut wid: i64 = 0;
-    let name = c"window-id";
-    let rc = unsafe { jfn_mpv::api::jfn_mpv_get_property_int(name.as_ptr(), &mut wid) };
-    if rc < 0 || wid == 0 {
-        tracing::error!(target: "Media", "[SMTC] mpv window-id lookup failed");
-        return;
-    }
-    jfn_windows_sink_start_for(wid as isize);
 }
 
 pub fn jfn_windows_sink_stop() {

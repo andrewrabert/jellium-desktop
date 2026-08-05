@@ -1,9 +1,11 @@
-//! The mpv window's client rect and DPI, and the [`WindowSource`] that
-//! publishes them.
+//! The mpv window's client rect, DPI, position, and mode, and the
+//! [`WindowSource`] that publishes them.
 //!
-//! One `GetClientRect` + `GetDpiForWindow` sample is the whole window
-//! geometry: CEF's render size, the persisted geometry, and the scale the
-//! context menu and the OSR popup are placed with all read it.
+//! One sample pass is the whole window state: CEF's render size, the
+//! persisted geometry and position, the scale the context menu and the OSR
+//! popup are placed with, and the mode playback reconciles against all read
+//! the stored snapshot. No pull issues an mpv call, and a pull with a stored
+//! snapshot issues no Win32 query either.
 
 use std::thread::JoinHandle;
 
@@ -13,14 +15,17 @@ use jfn_platform_abi::{
 };
 use parking_lot::{Condvar, Mutex};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow,
+};
 use windows::Win32::UI::HiDpi::{
     GetAwarenessFromDpiAwarenessContext, GetDpiForWindow, GetThreadDpiAwarenessContext,
     GetWindowDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsZoomed};
 
-static METRICS: Mutex<Option<WindowExtent>> = Mutex::new(None);
+static SNAPSHOT: Mutex<Option<WindowSnapshot>> = Mutex::new(None);
 
 struct NotifyState {
     dirty: bool,
@@ -74,12 +79,12 @@ pub(crate) fn stop_notifier() {
     let _ = handle.join();
 }
 
-/// Re-read the client rect and the window DPI and store them as the window's
-/// metrics. Returns the client size just stored; `None` when there is no
-/// window or its client rect is empty, which leaves the stored metrics
-/// untouched.
+/// Re-read mpv's window in one pass — client rect, DPI, position, maximized,
+/// fullscreen — and store it as the window's snapshot. Returns the client
+/// size just stored; `None` when there is no window or its client rect is
+/// empty, which leaves the stored snapshot untouched.
 pub(crate) fn sample() -> Option<PhysicalSize> {
-    let hwnd = crate::platform::win_hwnd()?;
+    let hwnd = crate::platform::win_ensure_hwnd()?;
     let mut rc = RECT::default();
     unsafe { GetClientRect(hwnd, &mut rc) }.ok()?;
     let client = PhysicalSize {
@@ -92,11 +97,38 @@ pub(crate) fn sample() -> Option<PhysicalSize> {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
     let extent = WindowExtent::new(client, Scale(scale));
-    let previous = METRICS.lock().replace(extent);
-    if previous != Some(extent) {
+    let fullscreen = crate::platform::win_is_fullscreen();
+    let snap = WindowSnapshot {
+        extent: Some(extent),
+        position: window_position(hwnd),
+        maximized: !fullscreen && unsafe { IsZoomed(hwnd) }.as_bool(),
+        fullscreen,
+    };
+    let previous = SNAPSHOT.lock().replace(snap);
+    if previous.and_then(|p| p.extent) != Some(extent) {
         log_sample(hwnd, extent);
     }
     Some(client)
+}
+
+/// Window position relative to the monitor's working area (excludes the
+/// taskbar), in physical pixels. Matches mpv's `--geometry +X+Y` coordinate
+/// system on Windows (`vo_calc_window_geometry` uses the working area).
+fn window_position(hwnd: HWND) -> Option<WindowPos> {
+    let mut wr = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut wr) }.ok()?;
+    let mon: HMONITOR = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
+        return None;
+    }
+    Some(WindowPos {
+        x: wr.left - mi.rcWork.left,
+        y: wr.top - mi.rcWork.top,
+    })
 }
 
 /// The client size, the client origin in screen coordinates, the window rect,
@@ -140,18 +172,19 @@ pub(crate) fn publish_deferred() -> Option<PhysicalSize> {
     Some(client)
 }
 
-/// Client size and scale as of the last sample.
-///
-/// Before the first sample exists — the boot wait polls the snapshot before
-/// `win_init` runs — this seeds itself: it resolves mpv's HWND and samples
-/// directly, without waking anyone, since returning the extent *is* the pull.
-pub(crate) fn client_extent() -> Option<WindowExtent> {
-    if let Some(extent) = *METRICS.lock() {
-        return Some(extent);
+/// The stored snapshot, seeded by one [`sample`] when nothing is stored yet —
+/// the boot wait pulls it before `win_init` runs.
+pub(crate) fn snapshot() -> Option<WindowSnapshot> {
+    if let Some(snap) = *SNAPSHOT.lock() {
+        return Some(snap);
     }
-    crate::platform::win_ensure_hwnd()?;
     sample()?;
-    *METRICS.lock()
+    *SNAPSHOT.lock()
+}
+
+/// Client size and scale as of the last sample.
+pub(crate) fn client_extent() -> Option<WindowExtent> {
+    snapshot()?.extent
 }
 
 /// Window DPI scale as of the last sample.
@@ -159,9 +192,9 @@ pub(crate) fn client_scale() -> Option<Scale> {
     client_extent().map(|e| e.scale())
 }
 
-/// Forget the stored metrics.
+/// Forget the stored snapshot.
 pub(crate) fn clear() {
-    *METRICS.lock() = None;
+    *SNAPSHOT.lock() = None;
 }
 
 pub(crate) struct WinWindowSource;
@@ -170,17 +203,11 @@ pub(crate) static WIN_WINDOW_SOURCE: WinWindowSource = WinWindowSource;
 
 impl WindowSource for WinWindowSource {
     fn snapshot(&self) -> WindowSnapshot {
-        let fullscreen = crate::platform::win_is_fullscreen();
-        let maximized = !fullscreen
-            && crate::platform::win_hwnd().is_some_and(|hwnd| unsafe { IsZoomed(hwnd) }.as_bool());
-        let (mut x, mut y) = (0, 0);
-        let position = crate::platform::win_query_window_position(&mut x, &mut y)
-            .then_some(WindowPos { x, y });
-        WindowSnapshot {
-            extent: client_extent(),
-            position,
-            maximized,
-            fullscreen,
-        }
+        crate::window::snapshot().unwrap_or(WindowSnapshot {
+            extent: None,
+            position: None,
+            maximized: false,
+            fullscreen: false,
+        })
     }
 }

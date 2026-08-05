@@ -9,7 +9,7 @@
 //! lives in [`IngestState`] so multiple
 //! ingest calls observe the same change-suppression behavior.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use crossbeam_utils::atomic::AtomicCell;
 use jfn_mpv::{Event, ObserveId, PropertyValue};
@@ -34,6 +34,7 @@ pub mod observe_id {
     pub const PAUSED_FOR_CACHE: u64 = 13;
     pub const CORE_IDLE: u64 = 14;
     pub const VIDEO_FRAME_INFO: u64 = 15;
+    pub const WINDOW_ID: u64 = 16;
 }
 
 const MAX_BUFFERED_RANGES: usize = 8;
@@ -85,6 +86,8 @@ pub struct IngestState {
     extent: AtomicCell<Option<WindowExtent>>,
     display_scale: AtomicCell<f64>,
     display_hz: AtomicCell<f64>,
+    /// mpv's native window handle; `0` until the VO has a window.
+    window_id: AtomicI64,
 }
 
 impl IngestState {
@@ -109,6 +112,12 @@ impl IngestState {
     }
     pub fn set_display_hz(&self, hz: f64) {
         self.display_hz.store(hz);
+    }
+    /// mpv's native window handle as last reported by `window-id`; `None`
+    /// until mpv's VO has a window.
+    pub fn window_id(&self) -> Option<i64> {
+        let id = self.window_id.load(Ordering::Relaxed);
+        (id != 0).then_some(id)
     }
 }
 
@@ -212,6 +221,12 @@ fn digest_property<C: IngestCtx>(
             value,
             PropertyValue::None
         )))],
+        WINDOW_ID => {
+            if let Some(id) = as_int(value) {
+                state.window_id.store(id, Ordering::Relaxed);
+            }
+            Vec::new()
+        }
         WINDOW_MAX => {
             if let Some(f) = as_flag(value) {
                 state.window_maximized.store(f, Ordering::Relaxed);
@@ -317,6 +332,14 @@ fn digest_cache_state(value: &PropertyValue) -> Vec<IngestOut> {
 fn as_flag(v: &PropertyValue) -> Option<bool> {
     if let PropertyValue::Flag(f) = v {
         Some(*f)
+    } else {
+        None
+    }
+}
+
+fn as_int(v: &PropertyValue) -> Option<i64> {
+    if let PropertyValue::Int(i) = v {
+        Some(*i)
     } else {
         None
     }

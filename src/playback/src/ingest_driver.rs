@@ -67,6 +67,13 @@ pub fn jfn_playback_window_extent() -> Option<jfn_platform_abi::WindowExtent> {
     state().window_extent()
 }
 
+/// mpv's native window handle (`window-id`) as last observed. `None` before
+/// mpv's VO has created its window, and on backends where mpv embeds into a
+/// host window.
+pub fn jfn_playback_window_id() -> Option<i64> {
+    state().window_id()
+}
+
 /// Returns flag bits — see [`INGEST_FLAG_SHUTDOWN`].
 pub fn jfn_playback_ingest_mpv_event_owned(
     event: &Event,
@@ -165,8 +172,11 @@ pub fn jfn_playback_observe_mpv_properties(backend: u8) -> bool {
 
     // Order matches the legacy C++ observe_properties(): display-hidpi-scale
     // is registered before osd-dimensions so mpv's FIFO initial-value
-    // delivery seeds the scale before osd-dimensions consumes it.
+    // delivery seeds the scale before osd-dimensions consumes it. window-id
+    // precedes both so the platform's window handle resolves before the first
+    // digest asks the platform for scale.
     let pairs: &[(u64, &std::ffi::CStr, mpv_format)] = &[
+        (WINDOW_ID, c"window-id", mpv_format::MPV_FORMAT_INT64),
         (
             DISPLAY_SCALE,
             c"display-hidpi-scale",
@@ -201,7 +211,7 @@ pub fn jfn_playback_observe_mpv_properties(backend: u8) -> bool {
 
     for &(id, name, fmt) in pairs {
         if matches!(backend, BACKEND_WAYLAND | BACKEND_X11)
-            && matches!(id, OSD_DIMS | FULLSCREEN | WINDOW_MAX)
+            && matches!(id, OSD_DIMS | FULLSCREEN | WINDOW_MAX | WINDOW_ID)
         {
             continue;
         }
