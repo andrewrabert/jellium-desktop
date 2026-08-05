@@ -24,6 +24,7 @@ pub use jfn_platform_abi::{DisplayBackend, JfnRect, PaintFrame, Platform, Window
 
 mod compositor;
 mod input;
+mod menu;
 mod mpv_host;
 mod osr_popup;
 mod platform;
@@ -247,6 +248,10 @@ impl Platform for WindowsPlatform {
         // `SurfaceHandle` is `#[repr(transparent)]` over `*mut c_void`, so the
         // slice pointer reinterprets directly.
         win_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
+    }
+
+    fn menu(&self) -> Option<&'static dyn jfn_platform_abi::MenuHost> {
+        Some(&menu::WinMenuHost)
     }
 
     fn osr_popup_surface(&self) -> &dyn jfn_platform_abi::OsrPopupSurface {

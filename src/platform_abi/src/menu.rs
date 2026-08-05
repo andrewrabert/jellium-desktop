@@ -1,9 +1,5 @@
 use std::ffi::c_int;
 use std::num::NonZeroU64;
-use std::sync::Arc;
-
-use parking_lot::RwLock;
-use serde::Serialize;
 
 use crate::DisplayBackend;
 
@@ -46,14 +42,12 @@ pub enum MenuKind {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MenuStyle {
     Platform,
-    Js,
     Page,
     Composited,
 }
 
 pub fn menu_style(kind: MenuKind, backend: DisplayBackend) -> MenuStyle {
     match (kind, backend) {
-        (MenuKind::ContextMenu, DisplayBackend::Windows) => MenuStyle::Js,
         (MenuKind::ContextMenu, _) => MenuStyle::Platform,
         (MenuKind::Dropdown, DisplayBackend::Wayland | DisplayBackend::MacOS) => {
             MenuStyle::Platform
@@ -65,7 +59,6 @@ pub fn menu_style(kind: MenuKind, backend: DisplayBackend) -> MenuStyle {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MenuScript {
-    ContextMenu,
     SelectMenu,
 }
 
@@ -73,12 +66,9 @@ pub fn menu_scripts(kind: MenuKind) -> &'static [MenuScript] {
     let Some(p) = crate::try_get() else {
         return &[];
     };
-    match menu_style(kind, p.display()) {
-        MenuStyle::Platform | MenuStyle::Composited => &[],
-        MenuStyle::Js | MenuStyle::Page => match kind {
-            MenuKind::ContextMenu => &[MenuScript::ContextMenu],
-            MenuKind::Dropdown => &[MenuScript::SelectMenu],
-        },
+    match (menu_style(kind, p.display()), kind) {
+        (MenuStyle::Page, MenuKind::Dropdown) => &[MenuScript::SelectMenu],
+        _ => &[],
     }
 }
 
@@ -98,7 +88,6 @@ pub fn menu_delivery(kind: MenuKind) -> MenuDelivery {
             Some(host) => MenuDelivery::Host(host),
             None => MenuDelivery::Page,
         },
-        MenuStyle::Js => MenuDelivery::Host(js_menu_host()),
         MenuStyle::Composited => MenuDelivery::Composited,
         MenuStyle::Page => MenuDelivery::Page,
     }
@@ -115,39 +104,6 @@ pub trait MenuHost: Send + Sync {
 
     /// Fires any pending selection callback with [`MENU_DISMISSED`].
     fn shutdown(&self) {}
-}
-
-pub trait MenuJsBridge: Send + Sync {
-    /// Park `on_selected` until the page reports a pick, then evaluate
-    /// `script` in the page.
-    fn open(&self, script: String, on_selected: MenuSelectionFn);
-}
-
-static MENU_JS_BRIDGE: RwLock<Option<Arc<dyn MenuJsBridge>>> = RwLock::new(None);
-
-/// Replaces any previously installed bridge.
-pub fn install_menu_js_bridge(bridge: Arc<dyn MenuJsBridge>) {
-    *MENU_JS_BRIDGE.write() = Some(bridge);
-}
-
-pub struct JsMenuHost;
-
-impl MenuHost for JsMenuHost {
-    fn open(&self, req: MenuRequest) {
-        let bridge = MENU_JS_BRIDGE.read().clone();
-        let (Some(bridge), Some(items)) = (bridge, items_js_json(&req.items)) else {
-            (req.on_selected)(MENU_DISMISSED);
-            return;
-        };
-        bridge.open(
-            format!("window._showContextMenu({items},{},{})", req.x, req.y),
-            req.on_selected,
-        );
-    }
-}
-
-pub fn js_menu_host() -> &'static JsMenuHost {
-    &JsMenuHost
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -210,100 +166,23 @@ pub trait PopupSurface: Send + Sync {
     fn destroy(&self, generation: Generation, reason: MenuClose);
 }
 
-#[derive(Serialize)]
-#[serde(untagged)]
-enum JsMenuEntry<'a> {
-    Separator {
-        sep: bool,
-    },
-    Item {
-        id: c_int,
-        label: &'a str,
-        enabled: bool,
-    },
-}
-
-impl<'a> JsMenuEntry<'a> {
-    fn from_item(item: &'a MenuItem) -> JsMenuEntry<'a> {
-        if item.separator {
-            JsMenuEntry::Separator { sep: true }
-        } else {
-            JsMenuEntry::Item {
-                id: item.id,
-                label: &item.label,
-                enabled: item.enabled,
-            }
-        }
-    }
-}
-
-fn items_js_json(items: &[MenuItem]) -> Option<String> {
-    let entries: Vec<JsMenuEntry> = items.iter().map(JsMenuEntry::from_item).collect();
-    jfn_js_json::to_js_json(&entries)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn item(id: c_int, label: &str) -> MenuItem {
-        MenuItem {
-            id,
-            label: label.to_string(),
-            enabled: true,
-            separator: false,
+    #[test]
+    fn context_menu_is_platform_drawn_on_every_backend() {
+        for backend in [
+            DisplayBackend::Wayland,
+            DisplayBackend::X11,
+            DisplayBackend::Windows,
+            DisplayBackend::MacOS,
+        ] {
+            assert_eq!(
+                menu_style(MenuKind::ContextMenu, backend),
+                MenuStyle::Platform
+            );
         }
-    }
-
-    fn separator() -> MenuItem {
-        MenuItem {
-            id: 0,
-            label: String::new(),
-            enabled: false,
-            separator: true,
-        }
-    }
-
-    #[test]
-    fn separator_and_item_entries_serialize_in_order() {
-        let items = vec![item(1, "Copy"), separator(), item(2, "Paste")];
-        assert_eq!(
-            items_js_json(&items).as_deref(),
-            Some(
-                r#"[{"id":1,"label":"Copy","enabled":true},{"sep":true},{"id":2,"label":"Paste","enabled":true}]"#
-            )
-        );
-    }
-
-    #[test]
-    fn label_line_separators_are_escaped() {
-        let items = vec![item(1, "a\u{2028}b\u{2029}c")];
-        let json = items_js_json(&items).unwrap_or_default();
-        assert!(json.contains("\\u2028"), "{json}");
-        assert!(json.contains("\\u2029"), "{json}");
-        assert!(!json.contains('\u{2028}'), "{json}");
-        assert!(!json.contains('\u{2029}'), "{json}");
-    }
-
-    #[test]
-    fn label_quotes_and_control_chars_are_escaped() {
-        let items = vec![item(1, "a\"b\\c\nd\te\u{1}")];
-        assert_eq!(
-            items_js_json(&items).as_deref(),
-            Some(r#"[{"id":1,"label":"a\"b\\c\nd\te\u0001","enabled":true}]"#)
-        );
-    }
-
-    #[test]
-    fn context_menu_is_platform_drawn_off_windows() {
-        assert_eq!(
-            menu_style(MenuKind::ContextMenu, DisplayBackend::Wayland),
-            MenuStyle::Platform
-        );
-        assert_eq!(
-            menu_style(MenuKind::ContextMenu, DisplayBackend::Windows),
-            MenuStyle::Js
-        );
     }
 
     #[test]

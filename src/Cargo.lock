@@ -2558,7 +2558,6 @@ version = "0.1.0-dev"
 dependencies = [
  "cef",
  "jfn-gpu-paint",
- "jfn-js-json",
  "jfn-paths",
  "nix",
  "parking_lot",

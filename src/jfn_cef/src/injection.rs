@@ -62,8 +62,6 @@ pub(crate) enum NativeFunction {
     WindowStartMove,
     WindowStartResize,
     CsdReady,
-    MenuItemSelected,
-    MenuDismissed,
 }
 
 impl NativeFunction {
@@ -112,8 +110,6 @@ impl NativeFunction {
             "windowStartMove" => Self::WindowStartMove,
             "windowStartResize" => Self::WindowStartResize,
             "csdReady" => Self::CsdReady,
-            "menuItemSelected" => Self::MenuItemSelected,
-            "menuDismissed" => Self::MenuDismissed,
             _ => return None,
         })
     }
@@ -163,8 +159,6 @@ impl NativeFunction {
             Self::WindowStartMove => "windowStartMove",
             Self::WindowStartResize => "windowStartResize",
             Self::CsdReady => "csdReady",
-            Self::MenuItemSelected => "menuItemSelected",
-            Self::MenuDismissed => "menuDismissed",
         }
     }
 }
@@ -178,7 +172,6 @@ pub(crate) enum InjectedScript {
     InputPlugin,
     ClientSettings,
     Csd,
-    ContextMenu,
     SelectMenu,
 }
 
@@ -192,7 +185,6 @@ impl InjectedScript {
             "input-plugin.js" => Self::InputPlugin,
             "client-settings.js" => Self::ClientSettings,
             "csd.js" => Self::Csd,
-            "context-menu.js" => Self::ContextMenu,
             "select-menu.js" => Self::SelectMenu,
             _ => return None,
         })
@@ -207,14 +199,12 @@ impl InjectedScript {
             Self::InputPlugin => "input-plugin.js",
             Self::ClientSettings => "client-settings.js",
             Self::Csd => "csd.js",
-            Self::ContextMenu => "context-menu.js",
             Self::SelectMenu => "select-menu.js",
         }
     }
 
     fn from_menu(script: MenuScript) -> InjectedScript {
         match script {
-            MenuScript::ContextMenu => Self::ContextMenu,
             MenuScript::SelectMenu => Self::SelectMenu,
         }
     }
@@ -455,7 +445,6 @@ pub unsafe fn jfn_cef_set_device_profile_json(json_utf8: *const c_char, len: usi
 fn build_extra_info(
     functions: &[NativeFunction],
     scripts: &[InjectedScript],
-    add_ctx_menu: bool,
     add_window: bool,
     shared_textures_enabled: bool,
 ) -> ExtraInfo {
@@ -463,24 +452,10 @@ fn build_extra_info(
     if add_window {
         functions.extend_from_slice(WINDOW_FUNCTIONS);
     }
-    if add_ctx_menu {
-        functions.extend_from_slice(&[
-            NativeFunction::MenuItemSelected,
-            NativeFunction::MenuDismissed,
-        ]);
-    }
 
     let mut scripts = scripts.to_vec();
     if add_window {
         scripts.push(InjectedScript::Csd);
-    }
-    if add_ctx_menu {
-        scripts.extend(
-            jfn_platform_abi::menu_scripts(MenuKind::ContextMenu)
-                .iter()
-                .copied()
-                .map(InjectedScript::from_menu),
-        );
     }
 
     ExtraInfo {
@@ -493,20 +468,11 @@ fn build_extra_info(
     }
 }
 
-pub(crate) fn build_for_kind(
-    kind: &str,
-    add_ctx_menu: bool,
-    shared_textures_enabled: bool,
-) -> Option<ExtraInfo> {
+pub(crate) fn build_for_kind(kind: &str, shared_textures_enabled: bool) -> Option<ExtraInfo> {
     match kind {
         "web" => {
-            let mut extra_info = build_extra_info(
-                WEB_FUNCTIONS,
-                WEB_SCRIPTS,
-                add_ctx_menu,
-                true,
-                shared_textures_enabled,
-            );
+            let mut extra_info =
+                build_extra_info(WEB_FUNCTIONS, WEB_SCRIPTS, true, shared_textures_enabled);
             if let Some(json) = DEVICE_PROFILE_JSON.get()
                 && !json.is_empty()
             {
@@ -530,14 +496,12 @@ pub(crate) fn build_for_kind(
         "overlay" => Some(build_extra_info(
             OVERLAY_FUNCTIONS,
             &[],
-            add_ctx_menu,
             true,
             shared_textures_enabled,
         )),
         "about" => Some(build_extra_info(
             ABOUT_FUNCTIONS,
             &[],
-            add_ctx_menu,
             true,
             shared_textures_enabled,
         )),

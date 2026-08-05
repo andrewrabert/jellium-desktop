@@ -50,14 +50,6 @@ impl Inner {
         self.invoke_context_menu_dispatcher(id);
     }
 
-    pub(crate) fn park_menu_selection(&self, cb: Box<dyn FnOnce(c_int) + Send>) {
-        *self.pending_menu_on_selected.lock() = Some(cb);
-    }
-
-    pub(crate) fn take_parked_menu_selection(&self) -> Option<Box<dyn FnOnce(c_int) + Send>> {
-        self.pending_menu_on_selected.lock().take()
-    }
-
     fn take_pending_menu_callback(&self) -> Option<RunContextMenuCallback> {
         self.pending_menu_callback.lock().take()
     }

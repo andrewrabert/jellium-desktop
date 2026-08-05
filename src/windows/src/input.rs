@@ -65,6 +65,8 @@ use jfn_input::{
 };
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 
+use crate::menu::{WM_JFN_MENU_END, WM_JFN_MENU_TRACK};
+
 // =====================================================================
 // Shared state. `set_cursor` is invoked from the CEF UI thread; the
 // input thread reads `cursor_type` from WM_SETCURSOR. `input_hwnd_raw`
@@ -83,6 +85,13 @@ static STATE: Mutex<State> = Mutex::new(State {
     thread_id: 0,
     cursor_type: CursorShape::Pointer.as_raw(),
 });
+
+/// The input child window, or `None` before the input thread creates it and
+/// after it tears it down.
+pub(crate) fn input_hwnd() -> Option<HWND> {
+    let raw = STATE.lock().input_hwnd_raw;
+    (raw != 0).then(|| HWND(raw as *mut _))
+}
 
 // =====================================================================
 // Win32 macro helpers — windows-rs doesn't ship the *_LPARAM / *_WPARAM
@@ -411,6 +420,11 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 lp.0 as u32,
                 if msg == WM_SYSCHAR { 1 } else { 0 },
             );
+            return LRESULT(0);
+        }
+
+        WM_JFN_MENU_TRACK | WM_JFN_MENU_END => {
+            crate::menu::on_input_message(hwnd, msg);
             return LRESULT(0);
         }
 

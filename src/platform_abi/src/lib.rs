@@ -40,10 +40,9 @@ pub use instance::{Instance, InstanceId};
 pub use jfn_gpu_paint::DamageRect as JfnRect;
 pub use media_sink::MediaSink;
 pub use menu::{
-    Generation, JsMenuHost, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem,
-    MenuJsBridge, MenuKind, MenuMetrics, MenuPaint, MenuPlacement, MenuRequest, MenuScript,
-    MenuSelectionFn, MenuStyle, PopupSurface, install_menu_js_bridge, js_menu_host, menu_delivery,
-    menu_scripts, menu_style,
+    Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem, MenuKind, MenuMetrics,
+    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelectionFn, MenuStyle, PopupSurface,
+    menu_delivery, menu_scripts, menu_style,
 };
 pub use mpv_host::{DefaultMpvHost, MpvHost};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};

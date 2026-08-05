@@ -31,7 +31,6 @@ mod callbacks;
 mod events;
 mod ffi;
 mod lifecycle;
-mod menu_bridge;
 mod paint;
 mod popup;
 mod resize;
@@ -76,9 +75,6 @@ pub(crate) struct Inner {
     browser: Mutex<Option<Browser>>,
     // Pending RunContextMenuCallback — held while a context menu is open.
     pending_menu_callback: Mutex<Option<RunContextMenuCallback>>,
-    // Selection callback parked by the JS-rendered context-menu backend;
-    // fired by the menuItemSelected / menuDismissed IPC (-1 = dismissed).
-    pending_menu_on_selected: Mutex<Option<jfn_platform_abi::MenuSelectionFn>>,
     // Injection-profile kind ("web" / "overlay" / "about") — looked up at
     // browser-create time to build the extra_info DictionaryValue.
     injection_kind: Mutex<String>,
@@ -172,7 +168,7 @@ impl Inner {
         let paint_scheduler = PAINT_MODE
             .get_or_init(|| PaintMode::new(false))
             .make_scheduler();
-        let inner = Arc::new(Self {
+        Arc::new(Self {
             name: Mutex::new(String::new()),
             closed: AtomicBool::new(false),
             loaded: AtomicBool::new(false),
@@ -182,7 +178,6 @@ impl Inner {
             load_cv: Condvar::new(),
             browser: Mutex::new(None),
             pending_menu_callback: Mutex::new(None),
-            pending_menu_on_selected: Mutex::new(None),
             injection_kind: Mutex::new(String::new()),
             surface: AtomicCell::new(platform_ops::SurfaceHandle::NONE),
             width: AtomicI32::new(0),
@@ -210,9 +205,7 @@ impl Inner {
             context_menu_dispatcher: Mutex::new(None),
             layer_ptr: AtomicPtr::new(std::ptr::null_mut()),
             cursor_handle: OnceLock::new(),
-        });
-        menu_bridge::ClientMenuJsBridge::install(&inner);
-        inner
+        })
     }
 
     fn name_str(&self) -> String {
