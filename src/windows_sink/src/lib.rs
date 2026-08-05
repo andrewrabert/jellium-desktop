@@ -31,10 +31,6 @@ use windows::Win32::Security::Cryptography::{CRYPT_STRING_BASE64, CryptStringToB
 use windows::Win32::System::WinRT::{ISystemMediaTransportControlsInterop, RoGetActivationFactory};
 use windows::core::HSTRING;
 
-// =====================================================================
-// Public start/stop entry points.
-// =====================================================================
-
 /// Start the sink. `hwnd_raw` is the HWND of the mpv window — required
 /// to bind SMTC via ISystemMediaTransportControlsInterop::GetForWindow.
 pub fn jfn_windows_sink_start_for(hwnd_raw: isize) {
@@ -56,10 +52,6 @@ pub fn jfn_windows_sink_start() {
 pub fn jfn_windows_sink_stop() {
     sink_core::stop();
 }
-
-// =====================================================================
-// Sink state — lives on the consumer thread for the sink's lifetime.
-// =====================================================================
 
 #[derive(Default)]
 struct WinState {
@@ -101,10 +93,6 @@ impl QueuedSink for WindowsSink {
     }
 }
 
-// =====================================================================
-// SMTC bindings.
-// =====================================================================
-
 struct Smtc {
     smtc: SystemMediaTransportControls,
     updater: windows::Media::SystemMediaTransportControlsDisplayUpdater,
@@ -115,8 +103,6 @@ struct Smtc {
 
 fn init_smtc(hwnd_raw: isize) -> Option<Smtc> {
     unsafe {
-        // RPC_E_CHANGED_MODE is fine — another thread may already have
-        // initialised the apartment.
         let _ = windows::Win32::System::Com::CoInitializeEx(
             None,
             windows::Win32::System::Com::COINIT_MULTITHREADED,
@@ -178,7 +164,6 @@ fn init_smtc(hwnd_raw: isize) -> Option<Smtc> {
                     if let Some(args) = args.as_ref()
                         && let Ok(span) = args.RequestedPlaybackPosition()
                     {
-                        // TimeSpan.Duration is 100-ns ticks.
                         let pos_us = span.Duration / 10;
                         sink_core::seek_to_ms(pos_us / 1000);
                     }
@@ -225,8 +210,6 @@ fn deliver(state: &mut WinState, smtc: &mut Option<Smtc>, ev: &PlaybackEvent) {
             if !ev.metadata.id.is_empty() && ev.metadata.id == state.metadata.id {
                 return;
             }
-            // Display refresh happens on the next phase transition
-            // (Started/Paused), which reads this cached metadata.
             state.metadata = ev.metadata.clone();
         }
         PlaybackEventKind::ArtworkChanged => {
@@ -380,7 +363,6 @@ fn make_thumbnail_stream(bytes: &[u8]) -> Option<RandomAccessStreamReference> {
     let stream = InMemoryRandomAccessStream::new().ok()?;
     let writer = DataWriter::CreateDataWriter(&stream).ok()?;
     writer.WriteBytes(bytes).ok()?;
-    // Safe to .get() because we're on the MTA sink thread.
     let _ = writer.StoreAsync().ok()?.join().ok()?;
     let _ = writer.DetachStream();
     stream.Seek(0).ok()?;

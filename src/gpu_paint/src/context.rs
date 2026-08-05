@@ -21,6 +21,9 @@ pub struct Surfaces {
     pub(crate) queue: wgpu::Queue,
     pub(crate) bind_layout: wgpu::BindGroupLayout,
     pub(crate) sampler: wgpu::Sampler,
+    /// `device.limits().max_texture_dimension_2d`, read once — `limits()`
+    /// clones the whole limits struct and sits on per-frame paths.
+    pub(crate) max_texture_dim: u32,
     /// Sample and write through, for producers that already premultiplied.
     pipeline: wgpu::RenderPipeline,
     /// Premultiply in the shader, for producers that hand over straight alpha.
@@ -116,54 +119,14 @@ impl Surfaces {
             info.backend,
         );
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("jfn_gpu_paint overlay"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/overlay.wgsl").into()),
-        });
+        let Pipelines {
+            bind_layout,
+            sampler,
+            pipeline,
+            pipeline_premultiplied,
+        } = build_pipelines(&device);
 
-        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("jfn_gpu_paint bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-            ],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("jfn_gpu_paint pl"),
-            bind_group_layouts: &[Some(&bind_layout)],
-            immediate_size: 0,
-        });
-
-        let pipeline = build_pipeline(&device, &pipeline_layout, &shader, "fs_main");
-        let pipeline_premultiplied =
-            build_pipeline(&device, &pipeline_layout, &shader, "fs_main_premultiplied");
-
-        // Nearest, no anisotropy — 1:1 sampling, never stretch.
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("jfn_gpu_paint sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        let max_texture_dim = device.limits().max_texture_dimension_2d;
 
         Ok(Self {
             instance,
@@ -172,6 +135,7 @@ impl Surfaces {
             queue,
             bind_layout,
             sampler,
+            max_texture_dim,
             pipeline,
             pipeline_premultiplied,
             submit_gate: parking_lot::RwLock::new(()),
@@ -198,6 +162,72 @@ impl Surfaces {
 /// enumeration so the frame that does open the device pays nothing for it.
 pub fn any_adapter() -> bool {
     !enumerated().adapters.is_empty()
+}
+
+/// The device-wide draw state every surface shares.
+struct Pipelines {
+    bind_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    pipeline: wgpu::RenderPipeline,
+    pipeline_premultiplied: wgpu::RenderPipeline,
+}
+
+fn build_pipelines(device: &wgpu::Device) -> Pipelines {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("jfn_gpu_paint overlay"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/overlay.wgsl").into()),
+    });
+
+    let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("jfn_gpu_paint bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                count: None,
+            },
+        ],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("jfn_gpu_paint pl"),
+        bind_group_layouts: &[Some(&bind_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = build_pipeline(device, &pipeline_layout, &shader, "fs_main");
+    let pipeline_premultiplied =
+        build_pipeline(device, &pipeline_layout, &shader, "fs_main_premultiplied");
+
+    // Nearest, no anisotropy — 1:1 sampling, never stretch.
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("jfn_gpu_paint sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+
+    Pipelines {
+        bind_layout,
+        sampler,
+        pipeline,
+        pipeline_premultiplied,
+    }
 }
 
 fn build_pipeline(

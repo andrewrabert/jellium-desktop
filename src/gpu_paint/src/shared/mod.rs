@@ -36,6 +36,9 @@ pub(crate) struct Imported {
     /// The raw image handle [`acquire_barrier`] needs, where the platform has
     /// a queue-family transfer to do. `None` where it does not.
     pub(crate) acquire: Option<u64>,
+    /// `texture` is the importer's cached wrapper from an earlier frame, so
+    /// anything the painter built over it (its bind group) is reusable too.
+    pub(crate) reused: bool,
 }
 
 /// A device opened for painting, plus whether it is capable of importing at

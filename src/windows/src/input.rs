@@ -42,12 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-// Not re-exported by windows-rs 0.62's WindowsAndMessaging metadata.
 const WM_MOUSELEAVE: u32 = 0x02A3;
-
-// =====================================================================
-// CEF cursor-type ordinals + event flags (mirrors cef_types.h)
-// =====================================================================
 
 use jfn_input::buttons::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use jfn_platform_abi::cursor::CursorShape;
@@ -67,13 +62,6 @@ use jfn_playback::shutdown::jfn_shutdown_initiate;
 
 use crate::menu::{WM_JFN_MENU_END, WM_JFN_MENU_TRACK};
 
-// =====================================================================
-// Shared state. `set_cursor` is invoked from the CEF UI thread; the
-// input thread reads `cursor_type` from WM_SETCURSOR. `input_hwnd_raw`
-// and `thread_id` are written once during run_input_thread startup and
-// read by the cross-thread set_cursor / stop / resize helpers.
-// =====================================================================
-
 struct State {
     input_hwnd_raw: usize,
     thread_id: u32,
@@ -92,11 +80,6 @@ pub(crate) fn input_hwnd() -> Option<HWND> {
     let raw = STATE.lock().input_hwnd_raw;
     (raw != 0).then(|| HWND(raw as *mut _))
 }
-
-// =====================================================================
-// Win32 macro helpers — windows-rs doesn't ship the *_LPARAM / *_WPARAM
-// macros from Windows headers, so reimplement the ones we need inline.
-// =====================================================================
 
 #[inline]
 fn loword_u32(v: u32) -> u16 {
@@ -126,10 +109,6 @@ fn get_xbutton_wparam(wp: WPARAM) -> u16 {
 fn get_appcommand_lparam(lp: LPARAM) -> u16 {
     (hiword_i16(lp.0 as u32) as u16) & 0x7FFF
 }
-
-// =====================================================================
-// Modifier helpers.
-// =====================================================================
 
 #[inline]
 fn is_key_down(vk: u16) -> bool {
@@ -247,10 +226,6 @@ fn keyboard_modifiers(wp: WPARAM, lp: LPARAM) -> u32 {
     m
 }
 
-// =====================================================================
-// Cursor mapping.
-// =====================================================================
-
 fn cef_cursor_to_win(shape: CursorShape) -> PCWSTR {
     use CursorShape::*;
     match shape {
@@ -270,10 +245,6 @@ fn cef_cursor_to_win(shape: CursorShape) -> PCWSTR {
     }
 }
 
-// =====================================================================
-// Mouse button helpers.
-// =====================================================================
-
 fn msg_to_button_code(msg: u32) -> u32 {
     match msg {
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => BTN_LEFT,
@@ -287,10 +258,6 @@ fn msg_to_button_code(msg: u32) -> u32 {
 fn is_button_down(msg: u32) -> bool {
     matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN)
 }
-
-// =====================================================================
-// WndProc.
-// =====================================================================
 
 unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -343,7 +310,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let fwd = if btn == XBUTTON2 { 1 } else { 0 };
                 jfn_input_dispatch_history_nav(fwd);
             }
-            return LRESULT(1); // TRUE per MSDN
+            return LRESULT(1);
         }
 
         WM_APPCOMMAND => {
@@ -356,7 +323,6 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 jfn_input_dispatch_history_nav(1);
                 return LRESULT(1);
             }
-            // bubble unhandled commands to parent via DefWindowProc.
         }
 
         WM_MOUSEWHEEL => {
@@ -391,7 +357,6 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 jfn_shutdown_initiate();
                 return LRESULT(0);
             }
-            // Browser nav keystrokes (some IR drivers).
             if vk == VK_BROWSER_BACK.0 || vk == VK_BROWSER_FORWARD.0 {
                 if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
                     let fwd = if vk == VK_BROWSER_FORWARD.0 { 1 } else { 0 };
@@ -442,12 +407,6 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-// =====================================================================
-// Thread entry — registers the class, creates the child window, runs
-// the message loop, then cleans up. Called from std::thread::spawn in
-// platform.rs::win_init.
-// =====================================================================
-
 const CLASS_NAME: PCWSTR = w!("JellyfinCefInput");
 
 pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
@@ -469,7 +428,6 @@ pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void
         cbWndExtra: 0,
         hInstance: hinst.into(),
         hIcon: HICON::default(),
-        // No class cursor — WM_SETCURSOR drives it.
         hCursor: HCURSOR::default(),
         hbrBackground: Default::default(),
         lpszMenuName: PCWSTR::null(),
@@ -508,12 +466,10 @@ pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void
     };
     STATE.lock().input_hwnd_raw = input_hwnd.0 as usize;
 
-    // Share input queue with mpv so SetFocus across windows works.
     let mpv_tid = unsafe { GetWindowThreadProcessId(mpv, None) };
     let _ = unsafe { AttachThreadInput(tid, mpv_tid, true) };
     let _ = unsafe { SetFocus(Some(input_hwnd)) };
 
-    // Standard GetMessage/Dispatch loop.
     let mut m = MSG::default();
     while unsafe { GetMessageW(&mut m, None, 0, 0).0 } > 0 {
         unsafe {
@@ -561,6 +517,5 @@ pub(crate) fn jfn_input_windows_set_cursor(t: c_int) {
         return;
     }
     let hwnd = HWND(hwnd_raw as *mut _);
-    // wparam = hwnd, lparam = MAKELPARAM(HTCLIENT=1, 0)
     let _ = unsafe { PostMessageW(Some(hwnd), WM_SETCURSOR, WPARAM(hwnd_raw), LPARAM(1)) };
 }

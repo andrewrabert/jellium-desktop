@@ -91,6 +91,7 @@ impl Importer {
             return Ok(Imported {
                 texture: cached.texture.clone(),
                 acquire: None,
+                reused: true,
             });
         }
 
@@ -156,6 +157,7 @@ impl Importer {
         Ok(Imported {
             texture,
             acquire: None,
+            reused: false,
         })
     }
 }

@@ -13,18 +13,15 @@ use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 /// surface parents into.
 pub(crate) struct Devices {
     device: IDCompositionDevice,
-    // Held only to keep the composition target (and the root bound to it)
-    // alive; never read after construction.
-    #[allow(dead_code)]
-    target: IDCompositionTarget,
+    // Keep-alive, never read: dropping the target unbinds the visual tree
+    // from the HWND.
+    _target: IDCompositionTarget,
     root: IDCompositionVisual,
 }
 
 impl Devices {
     pub(crate) fn create(hwnd: HWND) -> windows_core::Result<Devices> {
         unsafe {
-            // NULL rendering device: this module builds a visual tree and
-            // nothing else; the swapchains under it belong to wgpu.
             let device: IDCompositionDevice = DCompositionCreateDevice(None::<&IDXGIDevice>)?;
             let target = device.CreateTargetForHwnd(hwnd, false)?;
             let root = device.CreateVisual()?;
@@ -32,7 +29,7 @@ impl Devices {
             device.Commit()?;
             Ok(Devices {
                 device,
-                target,
+                _target: target,
                 root,
             })
         }
@@ -48,9 +45,13 @@ impl Devices {
 
     /// Publishes every tree change since the last call, including the
     /// `SetContent` wgpu issues from inside `configure`.
+    ///
+    /// A failed commit is loud even though it cannot be handled here: it
+    /// usually means the composition device was lost, after which no tree
+    /// change ever reaches the screen again.
     pub(crate) fn commit(&self) {
-        unsafe {
-            let _ = self.device.Commit();
+        if let Err(e) = unsafe { self.device.Commit() } {
+            tracing::error!(target: "platform", "DirectComposition Commit failed: {e:?}");
         }
     }
 }

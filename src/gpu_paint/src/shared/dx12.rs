@@ -147,6 +147,7 @@ impl Importer {
         Ok(Imported {
             texture,
             acquire: None,
+            reused: false,
         })
     }
 }

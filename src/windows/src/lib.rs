@@ -37,20 +37,7 @@ use crate::platform::{
     win_init, win_query_window_position, win_set_fullscreen, win_toggle_fullscreen,
 };
 
-fn win_pump() {
-    // Input handled by dedicated input-thread message loop.
-}
-
-// =====================================================================
-// State-bound bodies ported to native Rust.
-// =====================================================================
-
-// =====================================================================
-// CEF task bouncer — posts SetThreadExecutionState(flags) onto TID_UI so
-// the assertion lives on a stable CEF UI thread. Per-thread state is
-// released when that thread calls ES_CONTINUOUS alone. CEF owns the
-// refcount through the `cef` crate's Task wrapper.
-// =====================================================================
+fn win_pump() {}
 
 wrap_task! {
     struct ExecutionStateTask {
@@ -96,12 +83,6 @@ fn win_set_idle_inhibit(level: c_int) {
     let _ = post_task(ThreadId::UI, Some(&mut task));
 }
 
-// =====================================================================
-// Clipboard (Win32 CF_UNICODETEXT) — read only; writes go through CEF's
-// own frame->Copy() path which works correctly on Windows. Win32
-// clipboard is synchronous; callback fires inline on the calling thread.
-// =====================================================================
-
 fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
     let mut text = String::new();
     unsafe {
@@ -111,8 +92,6 @@ fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
                 let wide = PCWSTR::from_raw(GlobalLock(mem).cast::<u16>());
                 if !wide.is_null() {
                     text = String::from_utf16_lossy(wide.as_wide());
-                    // GlobalUnlock reports FALSE with no error once the lock
-                    // count reaches zero; the Err is expected.
                     let _ = GlobalUnlock(mem);
                 }
             }
@@ -142,10 +121,6 @@ fn win_open_external_url(url: &str) {
         )
     };
 }
-
-// =====================================================================
-// Backend impl
-// =====================================================================
 
 use jfn_platform_abi::{
     IdleInhibitLevel, MenuDelivery, MenuKind, SurfaceHandle, WindowGeometry, WindowPos,
@@ -300,7 +275,6 @@ impl Platform for WindowsPlatform {
     }
 
     fn open_path(&self, path: &std::path::Path) {
-        // explorer.exe wants native backslash-separated paths.
         let native: String = path
             .to_string_lossy()
             .chars()

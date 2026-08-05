@@ -124,8 +124,13 @@ impl Registry {
     }
 }
 
-// The one unsafe impl in the renderer: COM interfaces are agile for the
-// apartment they were created in, and every call on them is made under STATE.
+// SAFETY: `Registry` holds DirectComposition interface pointers, which COM
+// marks apartment-bound. DComp objects are in fact free-threaded (documented
+// "DirectComposition and multithreading": any thread may call them, the
+// device serializing internally), so moving them across threads is sound; the
+// mutual exclusion this module additionally relies on comes from `STATE`'s
+// Mutex plus the threading contract in the module doc — every entry point
+// takes the lock exactly once, and no window-message thread enters.
 unsafe impl Send for Registry {}
 
 static STATE: Mutex<Registry> = Mutex::new(Registry::new());
@@ -158,12 +163,15 @@ pub(crate) fn init(hwnd: HWND) -> bool {
 /// hook is unhooked and the input thread is joined.
 pub(crate) fn cleanup() {
     let mut st = STATE.lock();
-    let root = st.devices.as_ref().map(|d| d.root().clone());
-    for mut entry in std::mem::take(&mut st.surfaces) {
-        if let Some(root) = root.as_ref() {
-            entry.unparent(root);
+    let Registry {
+        devices, surfaces, ..
+    } = &mut *st;
+    if let Some(devices) = devices.as_ref() {
+        for entry in surfaces.iter_mut() {
+            entry.unparent(devices.root());
         }
     }
+    surfaces.clear();
     st.commit();
     st.devices = None;
 }
@@ -208,12 +216,15 @@ pub(crate) fn free(h: SurfaceHandle) {
 /// surface stays parented.
 pub(crate) fn restack(ordered: &[SurfaceHandle]) {
     let mut st = STATE.lock();
-    let Some(root) = st.devices.as_ref().map(|d| d.root().clone()) else {
+    let Registry {
+        devices, surfaces, ..
+    } = &mut *st;
+    let Some(root) = devices.as_ref().map(Devices::root) else {
         return;
     };
     let rank = |e: &Entry| ordered.iter().position(|h| h.id() == e.id.0);
 
-    let (mut named, mut unnamed): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut st.surfaces)
+    let (mut named, mut unnamed): (Vec<Entry>, Vec<Entry>) = std::mem::take(surfaces)
         .into_iter()
         .partition(|e| rank(e).is_some());
     named.sort_by_key(|e| rank(e).unwrap_or(usize::MAX));
@@ -237,7 +248,7 @@ pub(crate) fn restack(ordered: &[SurfaceHandle]) {
         }
     }
 
-    st.surfaces = named;
+    *surfaces = named;
     st.commit();
 }
 
@@ -264,15 +275,13 @@ pub(crate) fn present(h: SurfaceHandle, part: Part, frame: PaintFrame<'_>) -> bo
         return false;
     };
     let layer = entry.layer_mut(part);
-    let presented = match frame {
+    let outcome = match frame {
         PaintFrame::Accelerated(tex) => {
             if tex.handle().is_null() {
                 return false;
             }
             layer.present(Frame::Shared(&tex), tex.coded())
         }
-        // Only reachable with --disable-gpu-compositing: the painter draws
-        // both frame kinds, so there is nothing to gain by refusing one.
         PaintFrame::Software {
             size,
             pixels,
@@ -286,7 +295,6 @@ pub(crate) fn present(h: SurfaceHandle, part: Part, frame: PaintFrame<'_>) -> bo
                 h: size.h,
             };
             layer.present(
-                // CEF's OnPaint buffer is tightly packed.
                 Frame::Copied(Pixels {
                     size,
                     stride: size.w as u32 * 4,
@@ -297,9 +305,10 @@ pub(crate) fn present(h: SurfaceHandle, part: Part, frame: PaintFrame<'_>) -> bo
             )
         }
     };
-    // Publishes wgpu's own SetContent when the present configured.
-    st.commit();
-    presented
+    if outcome.needs_commit {
+        st.commit();
+    }
+    outcome.presented
 }
 
 /// Place the popup visual at `x`, `y` — logical pixels inside the owning

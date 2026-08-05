@@ -29,6 +29,15 @@ pub(crate) enum Kind {
     Acquire(&'static str),
     #[error("invalid frame dimensions: {}x{}", .0.w, .0.h)]
     BadDimensions(FrameSize),
+    #[error(
+        "frame buffer does not cover {}x{} at stride {stride}: {len} bytes",
+        .size.w, .size.h
+    )]
+    BadPixelBuffer {
+        size: FrameSize,
+        stride: u32,
+        len: usize,
+    },
 }
 
 impl<E: Into<Kind>> From<E> for SurfaceLost {

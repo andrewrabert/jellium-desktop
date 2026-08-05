@@ -3,6 +3,7 @@
 //! Copied frames are uploaded via `queue.write_texture` at dirty-rect
 //! granularity; shared frames are imported as a texture and sampled.
 
+use std::cell::Cell;
 use std::num::NonZeroU32;
 
 #[cfg(target_os = "linux")]
@@ -152,12 +153,33 @@ pub struct Surface<'a> {
     policy: SizePolicy,
     alpha: AlphaSource,
     configure_site: ConfigureSite,
-    // The `CAMetalLayer` this surface presents to, as an address; zero on
-    // every other target. Read only by the post-configure hook.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    metal_layer: usize,
+    // The `CAMetalLayer` this surface presents to. Read only by the
+    // post-configure hook.
+    #[cfg(target_os = "macos")]
+    metal_layer: MetalLayer,
     mode: Option<PaintMode>,
+    // Bind group over the last imported shared texture. Rebuilt whenever the
+    // import is not a cache hit, so it can never sample a stale texture.
+    shared_bind: Option<wgpu::BindGroup>,
+    // Set by every configure, drained by `take_configured`. A Cell because
+    // configures also happen on `&self` paths inside `draw_and_present`.
+    configured: Cell<bool>,
 }
+
+/// The surface's `CAMetalLayer` pointer, when its target has one.
+///
+/// A raw pointer rather than `usize` so the auto traits ask the right
+/// question, answered here: the pointer is dereferenced only by
+/// `after_configure`, and every configure of a [`ConfigureSite::Owner`]
+/// surface — the only kind with a layer — runs on the layer's owner thread
+/// (`Surface::new`, `resize`; the present path skips instead of configuring).
+#[cfg(target_os = "macos")]
+struct MetalLayer(Option<std::ptr::NonNull<std::ffi::c_void>>);
+
+// SAFETY: see the type doc — off the owner thread the pointer is inert data,
+// never dereferenced.
+#[cfg(target_os = "macos")]
+unsafe impl Send for MetalLayer {}
 
 struct UploadTexture {
     tex: wgpu::Texture,
@@ -198,16 +220,20 @@ impl<'a> Surface<'a> {
         let alpha = AlphaSource::for_target(&target);
         let present = PresentPolicy::for_target(&target);
         let configure_site = ConfigureSite::for_target(&target);
-        let metal_layer = match &target {
-            WindowTarget::CoreAnimationLayer { layer } => layer.as_ptr() as usize,
-            _ => 0,
-        };
+        #[cfg(target_os = "macos")]
+        let metal_layer = MetalLayer(match &target {
+            WindowTarget::CoreAnimationLayer { layer } => Some(*layer),
+            _ => None,
+        });
         let extent = texels(size).ok_or(Kind::BadDimensions(size))?;
-        let max = ctx.device.limits().max_texture_dimension_2d;
+        let max = ctx.max_texture_dim;
         if extent.0 > max || extent.1 > max {
             return Err(Kind::BadDimensions(size).into());
         }
 
+        // SAFETY: the caller of `Surfaces::new_surface` guarantees the
+        // target's window/layer outlives this painter (see the `surface`
+        // field note).
         let surface = unsafe { create_surface(&ctx.instance, target)? };
 
         if !ctx.adapter.is_surface_supported(&surface) {
@@ -241,8 +267,11 @@ impl<'a> Surface<'a> {
             policy,
             alpha,
             configure_site,
+            #[cfg(target_os = "macos")]
             metal_layer,
             mode: None,
+            shared_bind: None,
+            configured: Cell::new(false),
         };
         // Other surfaces may be submitting on the shared device while this
         // painter is created, so the first configure must be gated too.
@@ -253,7 +282,16 @@ impl<'a> Surface<'a> {
     /// Configure the swapchain and restore anything wgpu overwrote doing it.
     fn configure_now(&self) {
         self.ctx.configure_surface(&self.surface, &self.config);
+        self.configured.set(true);
         self.after_configure();
+    }
+
+    /// Whether any configure ran since the last call. On dx12 a configure is
+    /// also the `SetContent` that binds the swapchain to the composition
+    /// visual, so this is exactly when the owner has to `Commit` — plain
+    /// presents update the bound swapchain without one.
+    pub fn take_configured(&self) -> bool {
+        self.configured.replace(false)
     }
 
     /// `metal::Surface::configure` clears `allowsNextDrawableTimeout`
@@ -263,10 +301,13 @@ impl<'a> Surface<'a> {
     /// frame.
     #[cfg(target_os = "macos")]
     fn after_configure(&self) {
-        if self.metal_layer == 0 {
+        let Some(layer) = self.metal_layer.0 else {
             return;
-        }
-        let layer = self.metal_layer as *mut objc2::runtime::AnyObject;
+        };
+        let layer = layer.as_ptr().cast::<objc2::runtime::AnyObject>();
+        // SAFETY: `layer` is a live `CAMetalLayer` — its owner keeps it alive
+        // for the painter's lifetime — and this runs on the layer's owner
+        // thread (see [`MetalLayer`]).
         unsafe {
             let _: () = objc2::msg_send![layer, setAllowsNextDrawableTimeout: true];
         }
@@ -276,7 +317,7 @@ impl<'a> Surface<'a> {
     fn after_configure(&self) {}
 
     fn clamp_extent(&self, size: (u32, u32)) -> (u32, u32) {
-        let max = self.ctx.device.limits().max_texture_dimension_2d.max(1);
+        let max = self.ctx.max_texture_dim.max(1);
         (size.0.clamp(1, max), size.1.clamp(1, max))
     }
 
@@ -387,7 +428,7 @@ impl<'a> Surface<'a> {
     /// The frame's extent in texels, rejecting anything the device cannot hold.
     fn frame_extent(&self, size: FrameSize) -> Result<(u32, u32), SurfaceLost> {
         let (w, h) = texels(size).ok_or(Kind::BadDimensions(size))?;
-        let max = self.ctx.device.limits().max_texture_dimension_2d;
+        let max = self.ctx.max_texture_dim;
         if w > max || h > max {
             return Err(Kind::BadDimensions(size).into());
         }
@@ -400,6 +441,7 @@ impl<'a> Surface<'a> {
         on_present: impl FnOnce(),
     ) -> Result<Presented, SurfaceLost> {
         let (fw, fh) = self.frame_extent(frame.size)?;
+        check_buffer(&frame, fw, fh)?;
         if !self.visible {
             return Ok(Presented::Skipped);
         }
@@ -407,17 +449,11 @@ impl<'a> Surface<'a> {
         let (cw, ch) = self.extent_for((fw, fh));
 
         // Upload matches the swapchain, so the fullscreen quad is always 1:1.
-        self.ensure_upload(cw, ch);
-        let Some(upload) = self.upload.as_mut() else {
-            return Ok(Presented::Skipped);
-        };
+        let mut upload = self.take_upload(cw, ch);
         upload.write(&self.ctx.queue, &frame, cw, ch);
-
-        let Some(upload) = self.upload.as_ref() else {
-            return Ok(Presented::Skipped);
-        };
-        let bind_group = &upload.bind_group;
-        self.draw_and_present(bind_group, None, None, on_present)
+        let bind_group = upload.bind_group.clone();
+        self.upload = Some(upload);
+        self.draw_and_present(&bind_group, None, None, on_present)
     }
 
     fn present_shared(
@@ -451,74 +487,103 @@ impl<'a> Surface<'a> {
                 return Ok(Presented::Skipped);
             }
         };
-        let view = imported
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("jfn_gpu_paint shared bg"),
-                layout: &self.ctx.bind_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.ctx.sampler),
-                    },
-                ],
-            });
-
-        self.draw_and_present(&bind_group, imported.acquire, viewport, on_present)
+        // A reused import is the importer's cached texture, so the bind group
+        // over it is reusable too; anything else must be rebound.
+        let bind_group = match self.shared_bind.take() {
+            Some(bind_group) if imported.reused => bind_group,
+            _ => bind_texture(self.ctx, "jfn_gpu_paint shared bg", &imported.texture),
+        };
+        let result = self.draw_and_present(&bind_group, imported.acquire, viewport, on_present);
+        self.shared_bind = Some(bind_group);
+        result
     }
 
     // ----- internals -----
 
-    fn ensure_upload(&mut self, w: u32, h: u32) {
-        let needs_new = self.upload.as_ref().is_none_or(|u| u.w != w || u.h != h);
-        if needs_new {
-            let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("jfn_gpu_paint upload"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: SURFACE_FORMAT,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind_group = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("jfn_gpu_paint bg"),
-                    layout: &self.ctx.bind_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.ctx.sampler),
-                        },
-                    ],
-                });
-            self.upload = Some(UploadTexture {
-                tex,
-                bind_group,
-                w,
-                h,
-                needs_base: true,
-            });
+    /// The persistent upload texture at exactly `w`×`h`, reusing the current
+    /// one when it matches. Taken out of `self` rather than borrowed so the
+    /// caller can write to it while also borrowing `self.ctx`.
+    fn take_upload(&mut self, w: u32, h: u32) -> UploadTexture {
+        match self.upload.take() {
+            Some(upload) if upload.w == w && upload.h == h => upload,
+            _ => self.new_upload(w, h),
+        }
+    }
+
+    fn new_upload(&self, w: u32, h: u32) -> UploadTexture {
+        let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("jfn_gpu_paint upload"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SURFACE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bind_group = bind_texture(self.ctx, "jfn_gpu_paint bg", &tex);
+        UploadTexture {
+            tex,
+            bind_group,
+            w,
+            h,
+            needs_base: true,
+        }
+    }
+
+    /// Acquire the next swapchain frame, reconfiguring once if the swapchain
+    /// is stale. `None` is a skipped frame, never a fault.
+    fn acquire_frame(&self) -> Result<Option<AcquiredFrame<'_>>, SurfaceLost> {
+        use wgpu::CurrentSurfaceTexture::*;
+        let mut gate = self.ctx.submit_gate.read();
+        let mut reconfigured = false;
+        loop {
+            match self.surface.get_current_texture() {
+                Success(frame) => {
+                    return Ok(Some(AcquiredFrame {
+                        frame,
+                        suboptimal: false,
+                        gate,
+                    }));
+                }
+                // The owner configures, and it is not this thread. Skip; the
+                // owner's next resize rebuilds the swapchain. On metal these
+                // three are unreachable — `acquire_texture` returns only
+                // success, `Timeout` or `Occluded` — so this is a guard against
+                // a later edit reintroducing an off-main configure, not a live
+                // path.
+                Suboptimal(_) | Lost | Outdated if self.configure_site == ConfigureSite::Owner => {
+                    return Ok(None);
+                }
+                // The frame is usable, but the swapchain no longer matches the
+                // surface; the caller rebuilds it after presenting.
+                Suboptimal(frame) => {
+                    return Ok(Some(AcquiredFrame {
+                        frame,
+                        suboptimal: true,
+                        gate,
+                    }));
+                }
+                // Stale swapchain (typically a resize). Reconfigure and retry
+                // ONCE, presenting THIS frame — overlay content is event-driven
+                // and may not repaint for a long time, so a drop leaves it stale.
+                // The gate is non-reentrant and configure takes the write side,
+                // so it is dropped for the configure and re-taken after.
+                Lost | Outdated if !reconfigured => {
+                    reconfigured = true;
+                    drop(gate);
+                    self.configure_now();
+                    gate = self.ctx.submit_gate.read();
+                }
+                // Transient (occluded, timed out, or still stale after reconfigure):
+                // skip without faulting — an Err would degrade the backend to SHM.
+                Lost | Outdated | Timeout | Occluded => return Ok(None),
+                Validation => return Err(Kind::Acquire("validation").into()),
+            }
         }
     }
 
@@ -529,46 +594,13 @@ impl<'a> Surface<'a> {
         viewport: Option<(f32, f32, f32, f32)>,
         on_present: impl FnOnce(),
     ) -> Result<Presented, SurfaceLost> {
-        use wgpu::CurrentSurfaceTexture::*;
-        // Hold the read side of the submit gate across the whole
-        // acquire→submit→present so concurrent surfaces submit in parallel but
-        // never overlap a configure (write). The gate is non-reentrant, so it is
-        // dropped before every configure and re-taken afterward.
-        let mut read = self.ctx.submit_gate.read();
-        // Track SUBOPTIMAL explicitly: the frame is usable, but the swapchain no
-        // longer matches the surface, so rebuild it after presenting.
-        let mut suboptimal = false;
-        let mut reconfigured = false;
-        let frame = loop {
-            match self.surface.get_current_texture() {
-                Success(f) => break f,
-                // The owner configures, and it is not this thread. Skip; the
-                // owner's next resize rebuilds the swapchain. On metal these
-                // three are unreachable — `acquire_texture` returns only
-                // success, `Timeout` or `Occluded` — so this is a guard against
-                // a later edit reintroducing an off-main configure, not a live
-                // path.
-                Suboptimal(_) | Lost | Outdated if self.configure_site == ConfigureSite::Owner => {
-                    return Ok(Presented::Skipped);
-                }
-                Suboptimal(f) => {
-                    suboptimal = true;
-                    break f;
-                }
-                // Stale swapchain (typically a resize). Reconfigure and retry
-                // ONCE, presenting THIS frame — overlay content is event-driven
-                // and may not repaint for a long time, so a drop leaves it stale.
-                Lost | Outdated if !reconfigured => {
-                    reconfigured = true;
-                    drop(read);
-                    self.configure_now();
-                    read = self.ctx.submit_gate.read();
-                }
-                // Transient (occluded, timed out, or still stale after reconfigure):
-                // skip without faulting — an Err would degrade the backend to SHM.
-                Lost | Outdated | Timeout | Occluded => return Ok(Presented::Skipped),
-                Validation => return Err(Kind::Acquire("validation").into()),
-            }
+        let Some(AcquiredFrame {
+            frame,
+            suboptimal,
+            gate,
+        }) = self.acquire_frame()?
+        else {
+            return Ok(Presented::Skipped);
         };
         let view = frame
             .texture
@@ -631,13 +663,25 @@ impl<'a> Surface<'a> {
         self.ctx.queue.present(frame);
         // SUBOPTIMAL: the presented frame was fine, but rebuild the swapchain so
         // the next acquire is fresh rather than repeatedly suboptimal. Drop the
-        // read guard first — configure takes the write side, which is exclusive.
-        drop(read);
+        // gate first — configure takes the write side, which is exclusive.
+        drop(gate);
         if suboptimal {
             self.configure_now();
         }
         Ok(Presented::Yes)
     }
+}
+
+/// One acquired swapchain frame, carrying the read side of the submit gate:
+/// acquiring hands the gate over, and everything encoded and presented
+/// against the frame happens under it — so a submit can never overlap a
+/// configure (the write side) — until the holder explicitly drops it.
+struct AcquiredFrame<'g> {
+    frame: wgpu::SurfaceTexture,
+    /// The frame is usable but the swapchain no longer matches the surface;
+    /// reconfigure after presenting.
+    suboptimal: bool,
+    gate: parking_lot::RwLockReadGuard<'g, ()>,
 }
 
 /// Whether the swapchain has to be configured.
@@ -658,6 +702,46 @@ fn texels(size: FrameSize) -> Option<(u32, u32)> {
         (0, _) | (_, 0) => None,
         wh => Some(wh),
     }
+}
+
+/// Reject a frame whose buffer cannot cover its declared extent — the one
+/// invariant [`Pixels`]'s public fields cannot enforce. Every slice
+/// `write_rect` takes is clipped inside `(fw, fh)`, so this single check
+/// bounds them all; without it a producer's stride bug is a slice-index panic
+/// on the paint thread.
+fn check_buffer(frame: &Pixels<'_>, fw: u32, fh: u32) -> Result<(), SurfaceLost> {
+    let stride = frame.stride as usize;
+    let row = fw as usize * 4;
+    let needed = (fh as usize - 1) * stride + row;
+    if stride < row || frame.bgra.len() < needed {
+        return Err(Kind::BadPixelBuffer {
+            size: frame.size,
+            stride: frame.stride,
+            len: frame.bgra.len(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The one bind group shape this crate draws with: the texture at binding 0,
+/// the shared nearest sampler at binding 1.
+fn bind_texture(ctx: &Surfaces, label: &str, texture: &wgpu::Texture) -> wgpu::BindGroup {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: &ctx.bind_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&ctx.sampler),
+            },
+        ],
+    })
 }
 
 fn clip_rect(x: i32, y: i32, w: i32, h: i32, fw: i32, fh: i32) -> (i32, i32, i32, i32) {
@@ -735,6 +819,11 @@ fn pick_alpha_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode
         .unwrap_or(Auto)
 }
 
+/// # Safety
+///
+/// The window-system objects inside `target` must be live, and must outlive
+/// the returned surface: the `'static` lifetime is a promise the caller
+/// makes, not one wgpu can check.
 unsafe fn create_surface(
     instance: &wgpu::Instance,
     target: WindowTarget,
@@ -776,6 +865,8 @@ unsafe fn create_surface(
         // A target belonging to a window system this build cannot present to.
         _ => return Err(Kind::SurfaceUnsupported.into()),
     };
+    // SAFETY: forwards this function's own contract — the caller guarantees
+    // the handles in `unsafe_target` are live and outlive the surface.
     let surface = unsafe { instance.create_surface_unsafe(unsafe_target)? };
     Ok(surface)
 }

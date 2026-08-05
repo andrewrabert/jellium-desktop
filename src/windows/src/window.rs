@@ -18,14 +18,6 @@ use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsZoomed};
 
 static METRICS: Mutex<Option<WindowExtent>> = Mutex::new(None);
 
-// =====================================================================
-// Deferred wakeup. The WndProc hook runs inside the modal resize loop on
-// mpv's window thread; subscribers take locks, post CEF tasks, and write
-// logs, so waking them there lags every interactive resize. The hook
-// samples and marks dirty; this thread does the waking. Consumers are
-// level-triggered pulls, so coalescing bursts is loss-free.
-// =====================================================================
-
 struct NotifyState {
     dirty: bool,
     stop: bool,
@@ -147,8 +139,6 @@ pub(crate) static WIN_WINDOW_SOURCE: WinWindowSource = WinWindowSource;
 impl WindowSource for WinWindowSource {
     fn snapshot(&self) -> WindowSnapshot {
         let fullscreen = crate::platform::win_is_fullscreen();
-        // The two modes are exclusive: mpv's fullscreen window is not zoomed
-        // as far as the app is concerned.
         let maximized = !fullscreen
             && crate::platform::win_hwnd().is_some_and(|hwnd| unsafe { IsZoomed(hwnd) }.as_bool());
         let (mut x, mut y) = (0, 0);

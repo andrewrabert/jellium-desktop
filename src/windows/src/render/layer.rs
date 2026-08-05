@@ -10,6 +10,24 @@ use windows_core::Interface;
 
 use crate::render::device;
 
+/// What one present did, from the visual owner's point of view.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct PresentOutcome {
+    /// The frame is on screen.
+    pub(crate) presented: bool,
+    /// The visual's content binding changed (a configure bound the swapchain,
+    /// or a failure severed it), so the device must `Commit` to publish it.
+    /// Plain presents flip the bound swapchain without one.
+    pub(crate) needs_commit: bool,
+}
+
+impl PresentOutcome {
+    const SKIPPED: PresentOutcome = PresentOutcome {
+        presented: false,
+        needs_commit: false,
+    };
+}
+
 pub(crate) struct Layer {
     visual: IDCompositionVisual,
     /// `None` only until the first frame builds the swapchain, and again
@@ -40,7 +58,6 @@ impl Layer {
         if !visible {
             self.detach();
         }
-        // visible=true: content rebinds on the next present's configure.
         true
     }
 
@@ -70,31 +87,33 @@ impl Layer {
     }
 
     /// Presents one frame, building the swapchain from `size` on first use.
-    pub(crate) fn present(&mut self, frame: Frame<'_>, size: FrameSize) -> bool {
+    pub(crate) fn present(&mut self, frame: Frame<'_>, size: FrameSize) -> PresentOutcome {
         if !self.visible {
-            return false;
+            return PresentOutcome::SKIPPED;
         }
-        // The frame that opens the device is also what names the adapter to
-        // open it on, so it has to reach the painter build and not just the
-        // present.
         let sample = match &frame {
             Frame::Shared(tex) => Some(*tex),
             Frame::Copied(_) => None,
         };
         if self.painter.is_none() && !self.build_painter(size, sample) {
-            return false;
+            return PresentOutcome::SKIPPED;
         }
         let Some(painter) = self.painter.as_mut() else {
-            return false;
+            return PresentOutcome::SKIPPED;
         };
         match painter.present(frame, || {}) {
-            Ok(presented) => presented == Presented::Yes,
+            Ok(presented) => PresentOutcome {
+                presented: presented == Presented::Yes,
+                needs_commit: painter.take_configured(),
+            },
             Err(e) => {
                 tracing::error!(target: "platform", "gpu_paint present failed: {e}");
-                // The next frame builds a fresh swapchain.
                 self.painter = None;
                 self.clear_content();
-                false
+                PresentOutcome {
+                    presented: false,
+                    needs_commit: true,
+                }
             }
         }
     }

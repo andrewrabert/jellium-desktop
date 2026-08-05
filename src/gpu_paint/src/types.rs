@@ -68,6 +68,10 @@ pub struct DamageRect {
     pub h: i32,
 }
 
+/// `bgra` must cover every row: at least `(size.h - 1) * stride + size.w * 4`
+/// bytes, with `stride >= size.w * 4`. [`crate::Surface::present`] rejects a
+/// frame that does not (as an error, not a panic), so a producer bug cannot
+/// read out of bounds.
 pub struct Pixels<'a> {
     pub size: FrameSize,
     pub stride: u32,

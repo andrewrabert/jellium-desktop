@@ -38,14 +38,10 @@ struct Pending {
     on_selected: MenuSelection,
 }
 
-// The request awaiting its turn on the input thread.
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 
-// Set while `TrackPopupMenuEx` sits on the input thread's stack.
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
-// Set by `hide`; makes the tracked menu resolve with MENU_DISMISSED. Cleared
-// when tracking begins.
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct WinMenuHost;
@@ -108,8 +104,6 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) {
     if msg != WM_JFN_MENU_TRACK {
         return;
     }
-    // Re-entered from inside the running menu's own message loop: end that
-    // menu and let the newer request land once its track call unwinds.
     if TRACKING.load(Ordering::Acquire) {
         let _ = unsafe { EndMenu() };
         let _ = unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_TRACK, WPARAM(0), LPARAM(0)) };
@@ -128,8 +122,6 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) {
             let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
             continue;
         }
-        // TPM_RETURNCMD reports 0 for dismissal, so an id of 0 or less could
-        // never be told apart from "nothing was chosen".
         if item.id <= 0 {
             continue;
         }
@@ -168,7 +160,6 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) {
         TPM_RETURNCMD.0 | TPM_NONOTIFY.0 | TPM_LEFTALIGN.0 | TPM_TOPALIGN.0 | TPM_RIGHTBUTTON.0;
     let picked = unsafe { TrackPopupMenuEx(menu, flags, pt.x, pt.y, hwnd, None) };
     TRACKING.store(false, Ordering::Release);
-    // Per MSDN: without this the first click outside the menu is swallowed.
     let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
     let _ = unsafe { DestroyMenu(menu) };
 

@@ -35,17 +35,10 @@ use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_platform_abi::geometry::{Bounds, WindowGeometry, clamp_to_bounds};
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 
-// Input thread lives in `crate::input`.
 use crate::input::{
     jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
     jfn_input_windows_stop_input_thread,
 };
-
-// =====================================================================
-// File-static state — equivalent of the C++ `static WinState g_win`.
-// All access is serialized through `STATE.lock()`. HWND / HHOOK are raw
-// pointer types; we are the sole writer so the Mutex is sufficient.
-// =====================================================================
 
 struct WinState {
     mpv_hwnd_raw: usize,
@@ -73,10 +66,6 @@ fn hwnd_from_raw(raw: usize) -> HWND {
     HWND(raw as *mut c_void)
 }
 
-// =====================================================================
-// Narrow accessors.
-// =====================================================================
-
 /// mpv's HWND, or `None` before it has been resolved / after cleanup.
 pub(crate) fn win_hwnd() -> Option<HWND> {
     let raw = STATE.lock().mpv_hwnd_raw;
@@ -98,7 +87,6 @@ pub(crate) fn win_ensure_hwnd() -> Option<HWND> {
     if rc < 0 || wid == 0 {
         return None;
     }
-    // Two racing resolvers store the same value; the second write is benign.
     STATE.lock().mpv_hwnd_raw = wid as usize;
     Some(hwnd_from_raw(wid as usize))
 }
@@ -118,10 +106,6 @@ pub(crate) fn win_is_fullscreen() -> bool {
     (style & WS_CAPTION.0) == 0 && (style & WS_THICKFRAME.0) == 0
 }
 
-// =====================================================================
-// Scale lookups.
-// =====================================================================
-
 /// The window's own DPI once it exists, the system DPI before it does.
 pub(crate) fn win_get_scale() -> f32 {
     match crate::window::client_scale() {
@@ -130,8 +114,6 @@ pub(crate) fn win_get_scale() -> f32 {
     }
 }
 
-// Called for boot geometry, before any window exists, so there is no HWND to
-// ask; the system DPI is the only answer available and (x, y) is ignored.
 pub(crate) fn win_get_display_scale(_x: c_int, _y: c_int) -> f32 {
     system_scale()
 }
@@ -140,11 +122,6 @@ fn system_scale() -> f32 {
     let dpi = unsafe { GetDpiForSystem() };
     if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
 }
-
-// =====================================================================
-// Fullscreen toggle helpers. mpv owns the window and executes every mode
-// change; the window's own style says which mode it is in.
-// =====================================================================
 
 pub(crate) fn win_set_fullscreen(fullscreen: bool) {
     if jfn_mpv_handle_get().is_null() || win_is_fullscreen() == fullscreen {
@@ -192,11 +169,6 @@ pub(crate) fn win_toggle_fullscreen() {
     }
 }
 
-// =====================================================================
-// WndProc hook. Republish-only: it resamples the window and wakes the
-// window-changed consumers, and enters nothing but `crate::window`.
-// =====================================================================
-
 unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if n_code >= 0 {
         let msg = unsafe { &*(lp.0 as *const CWPRETSTRUCT) };
@@ -217,10 +189,6 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                         jfn_playback::lifecycle::jfn_lifecycle_set_visible(true);
                     }
                 }
-                // A DPI change reaches the window as its own message, and a
-                // fullscreen edge that does not move the client rect reaches
-                // it as a style change; neither is guaranteed to be followed
-                // by WM_SIZE.
                 WM_DPICHANGED | WM_STYLECHANGED => {
                     crate::window::publish_deferred();
                 }
@@ -234,13 +202,7 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
     unsafe { CallNextHookEx(Some(hook), n_code, wp, lp) }
 }
 
-// =====================================================================
-// Platform vtable entry points.
-// =====================================================================
-
-pub(crate) fn win_early_init() {
-    // Nothing needed on Windows before mpv starts.
-}
+pub(crate) fn win_early_init() {}
 
 pub(crate) fn win_init(_mpv: *mut c_void) -> bool {
     let Some(hwnd) = win_ensure_hwnd() else {
@@ -250,7 +212,6 @@ pub(crate) fn win_init(_mpv: *mut c_void) -> bool {
     let hwnd_raw = hwnd.0 as usize;
     crate::window::republish();
 
-    // Enable DWM transparency so DComp visuals with premultiplied alpha work.
     let margins = MARGINS {
         cxLeftWidth: -1,
         cxRightWidth: -1,
@@ -283,7 +244,6 @@ pub(crate) fn win_init(_mpv: *mut c_void) -> bool {
     });
     STATE.lock().input_thread = Some(join);
 
-    // Post-hook: from here every change republishes itself.
     crate::window::republish();
     tracing::info!("Windows DirectComposition compositor initialized");
     true
@@ -309,10 +269,6 @@ pub(crate) fn win_cleanup() {
     crate::window::clear();
     STATE.lock().mpv_hwnd_raw = 0;
 }
-
-// =====================================================================
-// Window-position / geometry helpers.
-// =====================================================================
 
 /// Query window position relative to the monitor's working area (excludes
 /// taskbar), in physical pixels. Matches mpv's `--geometry +X+Y`

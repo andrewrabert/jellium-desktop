@@ -110,6 +110,7 @@ impl Importer {
         Ok(Imported {
             texture,
             acquire: Some(image),
+            reused: false,
         })
     }
 }
