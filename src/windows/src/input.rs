@@ -19,6 +19,9 @@ use windows::Win32::System::SystemServices::{
     MK_RBUTTON, MK_SHIFT,
 };
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_ADD, VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_CAPITAL, VK_CLEAR,
     VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_F4, VK_HOME, VK_INSERT,
@@ -52,6 +55,7 @@ use jfn_platform_abi::event_flags::{
     EVENTFLAG_MIDDLE_MOUSE_BUTTON, EVENTFLAG_NUM_LOCK_ON, EVENTFLAG_RIGHT_MOUSE_BUTTON,
     EVENTFLAG_SHIFT_DOWN,
 };
+use jfn_platform_abi::{LogicalPoint, PhysicalPoint};
 
 use jfn_input::{
     jfn_input_dispatch_char_sys, jfn_input_dispatch_history_nav, jfn_input_dispatch_key_full,
@@ -259,6 +263,31 @@ fn is_button_down(msg: u32) -> bool {
     matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN)
 }
 
+/// The pointer position in the space CEF's view was sized in, mapped through
+/// the extent `crate::window` last sampled. The identity before the first
+/// sample exists.
+fn view_point(x: i32, y: i32) -> LogicalPoint {
+    let physical = PhysicalPoint { x, y };
+    crate::window::client_extent().map_or(LogicalPoint { x, y }, |e| e.to_logical_point(physical))
+}
+
+/// One debug line per press.
+fn log_press(msg: u32, physical: PhysicalPoint, logical: LogicalPoint) {
+    let Some(extent) = crate::window::client_extent() else {
+        return;
+    };
+    let logical_size = extent.logical();
+    let physical_size = extent.physical();
+    let scale = extent.scale();
+    tracing::debug!(
+        target: "platform",
+        "press msg=0x{msg:04x} physical=({},{}) logical=({},{}) \
+         extent=logical {}x{} physical {}x{} scale {}",
+        physical.x, physical.y, logical.x, logical.y,
+        logical_size.w, logical_size.h, physical_size.w, physical_size.h, scale.0,
+    );
+}
+
 unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_SETCURSOR if u32::from(loword_u32(lp.0 as u32)) == HTCLIENT => {
@@ -274,12 +303,8 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_MOUSEMOVE => {
-            jfn_input_dispatch_mouse_move(
-                get_x_lparam(lp),
-                get_y_lparam(lp),
-                mouse_modifiers(wp),
-                0,
-            );
+            let p = view_point(get_x_lparam(lp), get_y_lparam(lp));
+            jfn_input_dispatch_mouse_move(p.x, p.y, mouse_modifiers(wp), 0);
             return LRESULT(0);
         }
 
@@ -294,11 +319,19 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             if down {
                 let _ = unsafe { SetFocus(Some(hwnd)) };
             }
+            let physical = PhysicalPoint {
+                x: get_x_lparam(lp),
+                y: get_y_lparam(lp),
+            };
+            let p = view_point(physical.x, physical.y);
+            if down {
+                log_press(msg, physical, p);
+            }
             jfn_input_dispatch_mouse_button(
                 msg_to_button_code(msg),
                 if down { 1 } else { 0 },
-                get_x_lparam(lp),
-                get_y_lparam(lp),
+                p.x,
+                p.y,
                 mouse_modifiers(wp),
             );
             return LRESULT(0);
@@ -334,7 +367,8 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
-            jfn_input_dispatch_scroll(pt.x, pt.y, 0, delta, mouse_modifiers(wp));
+            let p = view_point(pt.x, pt.y);
+            jfn_input_dispatch_scroll(p.x, p.y, 0, delta, mouse_modifiers(wp));
             return LRESULT(0);
         }
 
@@ -347,7 +381,8 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
-            jfn_input_dispatch_scroll(pt.x, pt.y, delta, 0, mouse_modifiers(wp));
+            let p = view_point(pt.x, pt.y);
+            jfn_input_dispatch_scroll(p.x, p.y, delta, 0, mouse_modifiers(wp));
             return LRESULT(0);
         }
 
@@ -465,6 +500,20 @@ pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void
         }
     };
     STATE.lock().input_hwnd_raw = input_hwnd.0 as usize;
+
+    {
+        let mut ir = RECT::default();
+        let _ = unsafe { GetClientRect(input_hwnd, &mut ir) };
+        let thread_awareness =
+            unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) }.0;
+        tracing::debug!(
+            target: "platform",
+            "input window: size={}x{} parent_client={}x{} thread_awareness={}",
+            ir.right - ir.left, ir.bottom - ir.top,
+            rc.right - rc.left, rc.bottom - rc.top,
+            thread_awareness,
+        );
+    }
 
     let mpv_tid = unsafe { GetWindowThreadProcessId(mpv, None) };
     let _ = unsafe { AttachThreadInput(tid, mpv_tid, true) };

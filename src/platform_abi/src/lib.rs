@@ -33,8 +33,8 @@ pub mod window_source;
 
 pub use cef_host::CefHost;
 pub use geometry::{
-    BootGeometry, LogicalSize, PhysicalSize, Scale, SurfaceSize, WindowExtent, WindowGeometry,
-    WindowPos,
+    BootGeometry, LogicalPoint, LogicalSize, PhysicalPoint, PhysicalSize, Scale, SurfaceSize,
+    WindowExtent, WindowGeometry, WindowPos,
 };
 pub use instance::{Instance, InstanceId};
 pub use jfn_gpu_paint::DamageRect as JfnRect;

@@ -55,6 +55,22 @@ impl PhysicalSize {
     }
 }
 
+/// A point in physical (backing) pixels, relative to the window's client
+/// origin — what Win32 mouse messages and X11 pointer events carry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalPoint {
+    pub x: c_int,
+    pub y: c_int,
+}
+
+/// A point in logical (DIP) pixels — the space [`WindowExtent::logical`]
+/// names, and the space CEF's view coordinates are in.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LogicalPoint {
+    pub x: c_int,
+    pub y: c_int,
+}
+
 /// A coherent (logical, physical, scale) triple. [`WindowExtent::new`]
 /// derives the logical size by division; [`WindowExtent::with_logical`]
 /// preserves a producer's exact logical size, which division at fractional
@@ -94,6 +110,36 @@ impl WindowExtent {
     pub fn scale(&self) -> Scale {
         self.scale
     }
+
+    /// Map a pointer position into the space this extent's logical size names.
+    ///
+    /// Maps through this extent's own logical:physical ratio per axis, so it
+    /// is the exact inverse of the size handed to CEF — including the exact
+    /// logical size of [`WindowExtent::with_logical`], which division by
+    /// [`WindowExtent::scale`] cannot reproduce. Floors toward negative
+    /// infinity, so a point dragged past the client origin stays monotone. A
+    /// degenerate physical extent maps to the identity.
+    pub fn to_logical_point(&self, p: PhysicalPoint) -> LogicalPoint {
+        LogicalPoint {
+            x: map_axis(p.x, self.logical.w, self.physical.w),
+            y: map_axis(p.y, self.logical.h, self.physical.h),
+        }
+    }
+}
+
+/// `v * logical / physical`, floored toward negative infinity; the identity
+/// when `physical` is not positive.
+fn map_axis(v: c_int, logical: c_int, physical: c_int) -> c_int {
+    if physical <= 0 {
+        return v;
+    }
+    let num = i64::from(v) * i64::from(logical);
+    let den = i64::from(physical);
+    let mut q = num / den;
+    if num % den != 0 && (num < 0) {
+        q -= 1;
+    }
+    q as c_int
 }
 
 /// Fully-resolved boot geometry: one typed value computed once from saved

@@ -2,7 +2,6 @@
 //! events and forwards them to the active browser via
 //! [`jfn_platform_abi::browser_bridge`].
 
-use crossbeam_utils::atomic::AtomicCell;
 use jfn_platform_abi::event_flags::EVENTFLAG_PRECISION_SCROLLING_DELTA;
 use jfn_platform_abi::{BrowserBridge, browser_bridge};
 use jfn_playback::hotkey::jfn_hotkey_classify_keydown;
@@ -19,21 +18,6 @@ const MBT_LEFT: c_int = 0;
 const MBT_MIDDLE: c_int = 1;
 const MBT_RIGHT: c_int = 2;
 
-#[derive(Copy, Clone, Default)]
-struct LastMousePos {
-    valid: bool,
-    x: i32,
-    y: i32,
-    modifiers: u32,
-}
-
-static LAST_POS: AtomicCell<LastMousePos> = AtomicCell::new(LastMousePos {
-    valid: false,
-    x: 0,
-    y: 0,
-    modifiers: 0,
-});
-
 fn cef_button(button_code: u32) -> Option<c_int> {
     match button_code {
         buttons::BTN_LEFT => Some(MBT_LEFT),
@@ -49,32 +33,7 @@ fn with_bridge<F: FnOnce(&dyn BrowserBridge)>(f: F) {
     }
 }
 
-/// Reports the last-known mouse position. Returns 1 if valid.
-pub fn jfn_input_last_mouse_pos(
-    out_x: &mut i32,
-    out_y: &mut i32,
-    out_modifiers: &mut u32,
-) -> c_int {
-    let p = LAST_POS.load();
-    *out_x = p.x;
-    *out_y = p.y;
-    *out_modifiers = p.modifiers;
-    if p.valid { 1 } else { 0 }
-}
-
 pub fn jfn_input_dispatch_mouse_move(x: i32, y: i32, mods: u32, leave: c_int) {
-    if leave != 0 {
-        let mut p = LAST_POS.load();
-        p.valid = false;
-        LAST_POS.store(p);
-    } else {
-        LAST_POS.store(LastMousePos {
-            valid: true,
-            x,
-            y,
-            modifiers: mods,
-        });
-    }
     with_bridge(|b| b.send_mouse_move(x, y, mods, leave != 0));
 }
 

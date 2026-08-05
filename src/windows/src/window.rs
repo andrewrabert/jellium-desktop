@@ -12,9 +12,13 @@ use jfn_platform_abi::{
     notify_window_changed,
 };
 use parking_lot::{Condvar, Mutex};
-use windows::Win32::Foundation::RECT;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsZoomed};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetDpiForWindow, GetThreadDpiAwarenessContext,
+    GetWindowDpiAwarenessContext,
+};
+use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsZoomed};
 
 static METRICS: Mutex<Option<WindowExtent>> = Mutex::new(None);
 
@@ -87,8 +91,36 @@ pub(crate) fn sample() -> Option<PhysicalSize> {
     }
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
-    *METRICS.lock() = Some(WindowExtent::new(client, Scale(scale)));
+    let extent = WindowExtent::new(client, Scale(scale));
+    let previous = METRICS.lock().replace(extent);
+    if previous != Some(extent) {
+        log_sample(hwnd, extent);
+    }
     Some(client)
+}
+
+/// The client size, the client origin in screen coordinates, the window rect,
+/// the window DPI, and the DPI awareness of both the window and this thread.
+fn log_sample(hwnd: HWND, extent: WindowExtent) {
+    let physical = extent.physical();
+    let logical = extent.logical();
+    let mut origin = POINT::default();
+    let _ = unsafe { ClientToScreen(hwnd, &mut origin) };
+    let mut wr = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut wr) };
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let window_awareness =
+        unsafe { GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(hwnd)) }.0;
+    let thread_awareness =
+        unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) }.0;
+    tracing::debug!(
+        target: "platform",
+        "window sample: client={}x{} client_origin=({},{}) window=({},{},{},{}) \
+         dpi={} logical={}x{} window_awareness={} thread_awareness={}",
+        physical.w, physical.h, origin.x, origin.y,
+        wr.left, wr.top, wr.right, wr.bottom,
+        dpi, logical.w, logical.h, window_awareness, thread_awareness,
+    );
 }
 
 /// [`sample`], then wake every window-changed consumer synchronously.
