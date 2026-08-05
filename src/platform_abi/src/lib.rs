@@ -607,6 +607,14 @@ pub trait Platform: Send + Sync {
     fn shared_texture_supported(&self) -> bool {
         true
     }
+
+    /// True where `CefInitialize` depends on neither platform init nor a run
+    /// loop the boot wait owns, so CEF's process bring-up may run while mpv's
+    /// core thread creates the VO. False on Wayland and X11 (platform init
+    /// resolves shared-texture support) and on macOS (external pump).
+    fn cef_init_precedes_mpv_window(&self) -> bool {
+        false
+    }
     /// Set during init by Wayland backend (dmabuf probe) when GPU lacks the
     /// shared-texture path.
     fn set_shared_texture_unsupported(&self) {}

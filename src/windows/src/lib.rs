@@ -150,6 +150,10 @@ impl Platform for WindowsPlatform {
         DisplayBackend::Windows
     }
 
+    fn cef_init_precedes_mpv_window(&self) -> bool {
+        true
+    }
+
     fn default_window_decorations(&self) -> WindowDecorations {
         WindowDecorations::ServerThemed
     }
