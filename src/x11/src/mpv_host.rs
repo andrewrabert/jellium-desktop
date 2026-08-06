@@ -27,8 +27,4 @@ impl MpvHost for X11MpvHost {
     fn host_ready(&self) -> bool {
         crate::x11_state::host().is_some()
     }
-
-    fn window_maximized(&self) -> Option<bool> {
-        crate::x11_state::host().map(|_| crate::x11_state::parent_snapshot().maximized)
-    }
 }

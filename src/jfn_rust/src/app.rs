@@ -3,6 +3,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::ptr;
+use std::time::Duration;
 
 use clap::Parser;
 use jfn_cef::{APP_VERSION_FULL, cef_version};
@@ -105,6 +106,14 @@ fn install_mpv_close_binding(raw: *mut jfn_mpv::sys::mpv_handle) {
     let action = cs("quit");
     let argv = [kb.as_ptr(), name.as_ptr(), action.as_ptr(), ptr::null()];
     unsafe { jfn_mpv::sys::mpv_command(raw, argv.as_ptr() as *mut *const c_char) };
+}
+
+/// Wake any thread parked in `mpv_wait_event` whenever a host publishes a
+/// window change, so the VO wait re-reads the readiness inputs mpv never
+/// reports: `MpvHost::host_ready` and the host-owned extent on backends that
+/// own their toplevel.
+fn wake_mpv_on_window_change() {
+    jfn_platform_abi::subscribe_window_changed(jfn_mpv::api::jfn_mpv_wakeup);
 }
 
 fn setup_mpv_environment() {
@@ -242,22 +251,16 @@ fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
 /// Blocks until the window source has a usable extent. Returns false on
 /// a fatal mpv event (shutdown before the VO came up).
 fn wait_for_vo_window() -> bool {
-    let want_max = {
-        let g = jfn_config::window_geometry();
-        g.maximized
-    };
     tracing::info!(target: "Main", "Waiting for mpv window...");
 
-    let mut need_max = want_max;
     let mut fatal = false;
 
     // The platform owns the wait strategy; this pump owns all mpv event
     // handling. It drains everything mpv has queued without blocking —
     // consume_vo_event folds property changes into the ingest layer; a
     // fatal event bails out of jfn_app_main — then, when the platform's
-    // strategy is the generic blocking wait (`may_block`), parks in mpv
-    // until the next wakeup.
-    plat().mpv_host().run_vo_wait(&mut |may_block| {
+    // strategy grants a block budget, parks in mpv for at most that long.
+    plat().mpv_host().run_vo_wait(&mut |budget: Duration| {
         loop {
             match jfn_mpv::api::wait_event_owned(0.0) {
                 jfn_mpv::api::WaitEvent::None => {
@@ -278,11 +281,11 @@ fn wait_for_vo_window() -> bool {
                 }
             }
         }
-        if vo_ready(&mut need_max) {
+        if vo_ready() {
             return false;
         }
-        if may_block {
-            match jfn_mpv::api::wait_event_owned(-1.0) {
+        if !budget.is_zero() {
+            match jfn_mpv::api::wait_event_owned(budget.as_secs_f64()) {
                 jfn_mpv::api::WaitEvent::None => {}
                 jfn_mpv::api::WaitEvent::LogMessage(m) => jfn_mpv::forward_log_to_tracing(&m),
                 jfn_mpv::api::WaitEvent::Event(
@@ -430,23 +433,19 @@ fn boot_mpv_reconcile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) -> f64 {
             &mut display_hidpi_scale as *mut f64 as *mut std::ffi::c_void,
         );
     }
-    let mut fs_flag: c_int = 0;
-    unsafe {
-        let name = cs("fullscreen");
-        jfn_mpv::sys::mpv_get_property(
-            mpv_raw,
-            name.as_ptr(),
-            jfn_mpv::sys::mpv_format::MPV_FORMAT_FLAG,
-            &mut fs_flag as *mut c_int as *mut std::ffi::c_void,
-        );
-    }
     jfn_playback::ingest_driver::jfn_playback_seed_display_hz_sync();
     let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
-    tracing::info!(target: "Main",
-        "[FLOW] display-hidpi-scale={display_hidpi_scale} fullscreen={fs_flag} display-hz={hz}");
-
     let saved = jfn_config::window_geometry();
-    let locked = fs_flag != 0 || jfn_playback::ingest_driver::jfn_playback_window_maximized();
+    let snap = crate::window_geometry::controller().source().snapshot();
+    tracing::info!(target: "Main",
+        "[FLOW] display-hidpi-scale={display_hidpi_scale} fullscreen={} display-hz={hz}",
+        snap.fullscreen
+    );
+
+    // Saved intent, not an observation: the OS may still be applying the
+    // maximize, and a set_geometry landing mid-flight leaves mpv's stored
+    // window size disagreeing with the visible window.
+    let locked = saved.maximized || snap.fullscreen || snap.maximized;
     if let Some(physical) = plat().reconcile_mpv_size(
         display_hidpi_scale,
         saved.scale,
@@ -657,6 +656,8 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
     // the WM close button needs it back.
     install_mpv_close_binding(raw);
 
+    wake_mpv_on_window_change();
+
     if !wait_for_vo_window() {
         return 0;
     }
@@ -707,14 +708,6 @@ fn mpv_log_level_from_filter() -> &'static str {
     }
 }
 
-fn boot_window_size() -> Option<(i32, i32)> {
-    crate::window_geometry::controller()
-        .source()
-        .snapshot()
-        .extent
-        .map(|e| (e.physical().w, e.physical().h))
-}
-
 fn consume_vo_event(event: &jfn_mpv::Event) {
     let scale_raw = plat().get_scale();
     let scale = if scale_raw > 0.0 { scale_raw } else { 1.0 };
@@ -725,15 +718,18 @@ fn consume_vo_event(event: &jfn_mpv::Event) {
     );
 }
 
-fn vo_ready(need_max: &mut bool) -> bool {
-    let reported_max = plat()
-        .mpv_host()
-        .window_maximized()
-        .unwrap_or_else(jfn_playback::ingest_driver::jfn_playback_window_maximized);
-    if reported_max {
-        *need_max = false;
-    }
-    boot_window_size().is_some() && !*need_max && plat().mpv_host().host_ready()
+/// Ready once the window authority reports an extent and the host's own
+/// startup gate is open. The window's mode is never a boot precondition:
+/// where mpv owns the toplevel the `window-maximized` report is an echo of
+/// the boot option, and where a host owns the toplevel the WM/compositor may
+/// decline the maximize outright.
+fn vo_ready() -> bool {
+    crate::window_geometry::controller()
+        .source()
+        .snapshot()
+        .extent
+        .is_some()
+        && plat().mpv_host().host_ready()
 }
 
 // =====================================================================

@@ -4,7 +4,12 @@
 //! No mpv types appear here — shared code owns all mpv event handling via
 //! the `pump` closure, and the platform owns only the wait strategy.
 
+use std::time::Duration;
+
 use crate::WindowDecorations;
+
+/// Longest a VO wait may park before it re-reads the readiness gate.
+pub const VO_WAIT_TICK: Duration = Duration::from_millis(250);
 
 /// Platform side of mpv's lifecycle. Defaults cover backends where mpv
 /// needs no host preparation and the generic blocking wait suffices.
@@ -22,13 +27,6 @@ pub trait MpvHost: Send + Sync {
         true
     }
 
-    /// The host's authoritative maximized state, or `None` when mpv — not the
-    /// host — owns it; core then resolves `None` against mpv's `window-maximized`
-    /// property. A host that owns its own toplevel (Wayland) returns `Some`.
-    fn window_maximized(&self) -> Option<bool> {
-        None
-    }
-
     fn ensure_host_window(&self) {}
 
     /// Native window ID mpv should embed into (its `wid` option), or `None`
@@ -38,13 +36,14 @@ pub trait MpvHost: Send + Sync {
         None
     }
 
-    /// Own the VO wait loop. `pump(may_block)` drains queued mpv events
-    /// (and, when `may_block`, may additionally wait for the next one);
-    /// it returns `false` once waiting is over. Platforms that must keep
-    /// a native run loop serviced call `pump(false)` and block on their
-    /// own loop between calls.
-    fn run_vo_wait(&self, pump: &mut dyn FnMut(bool) -> bool) {
-        while pump(true) {}
+    /// Own the VO wait loop. `pump(budget)` drains every queued mpv event,
+    /// re-reads the readiness gate, and returns `false` once the wait is
+    /// over. A non-zero `budget` parks inside mpv for at most that long
+    /// after the drain; [`Duration::ZERO`] drains and returns. Platforms
+    /// holding a native run loop pass `Duration::ZERO` and block on their
+    /// own loop for at most [`VO_WAIT_TICK`].
+    fn run_vo_wait(&self, pump: &mut dyn FnMut(Duration) -> bool) {
+        while pump(VO_WAIT_TICK) {}
     }
 
     /// Logical content size of the host window in points, when the OS —

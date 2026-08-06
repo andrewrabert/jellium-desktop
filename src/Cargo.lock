@@ -2633,7 +2633,6 @@ dependencies = [
  "jfn-linux-util",
  "jfn-mailbox",
  "jfn-mpris",
- "jfn-mpv",
  "jfn-platform-abi",
  "jfn-playback",
  "jfn-wake-event",

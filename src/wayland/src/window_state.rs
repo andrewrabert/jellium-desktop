@@ -171,10 +171,6 @@ impl WindowState {
             .map_or(1.0, Scale120::ratio_f32)
     }
 
-    pub(crate) fn window_maximized(&self) -> bool {
-        matches!(self.extent().map(|e| e.mode), Some(WindowMode::Maximized))
-    }
-
     /// The consumer notifications below read the value back through the
     /// accessors, so they must run after the write lock is released or they
     /// deadlock.
@@ -207,9 +203,6 @@ impl WindowState {
             wl_ops::on_configure(rt, fullscreen);
         }
         jfn_platform_abi::notify_window_changed();
-        // Wake any thread parked in `mpv_wait_event` (the boot-time VO-wait loop
-        // polls the window source rather than receiving an mpv event).
-        jfn_mpv::api::jfn_mpv_wakeup();
     }
 
     /// Satisfy the boot scale gate when no `wp_fractional_scale_manager_v1`
@@ -233,7 +226,6 @@ impl WindowState {
         if first {
             tracing::info!(target: "Main", "scale known: {scale}");
         }
-        jfn_mpv::api::jfn_mpv_wakeup();
     }
 }
 

@@ -44,7 +44,7 @@ pub use menu::{
     MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface, menu_delivery,
     menu_has_selectable, menu_initial_row, menu_scripts,
 };
-pub use mpv_host::{DefaultMpvHost, MpvHost};
+pub use mpv_host::{DefaultMpvHost, MpvHost, VO_WAIT_TICK};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};
 pub use window_source::{
     WindowSnapshot, WindowSource, notify_window_changed, subscribe_window_changed,

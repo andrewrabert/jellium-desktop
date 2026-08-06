@@ -24,10 +24,6 @@ impl MpvHost for WaylandMpvHost {
         self.rt.window().scale_known()
     }
 
-    fn window_maximized(&self) -> Option<bool> {
-        Some(self.rt.window().window_maximized())
-    }
-
     fn ensure_host_window(&self) {
         crate::root_window::ensure_started(self.rt);
     }
