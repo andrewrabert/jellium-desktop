@@ -108,7 +108,7 @@ const cancelOnEscape = (e) => {
     }
 };
 
-const showConnectionFailedDialog = () => {
+const showConnectionFailedDialog = (server) => {
     const dialog = document.createElement('div');
     dialog.className = 'dialog scaleIn';
 
@@ -118,6 +118,14 @@ const showConnectionFailedDialog = () => {
     const message = document.createElement('div');
     message.innerText = messageUnableToConnectToServerText;
     message.className = 'dialog-message';
+
+    const suggestedUrl = window.jmpDefaultServerUrlForHostOnly(server);
+    let hint = null;
+    if (suggestedUrl) {
+        hint = document.createElement('div');
+        hint.innerText = `No scheme or port was provided. For a default local Jellyfin server, try ${suggestedUrl}.`;
+        hint.className = 'dialog-message dialog-hint';
+    }
 
     const button = document.createElement('button');
     button.innerText = buttonGotItText;
@@ -129,6 +137,7 @@ const showConnectionFailedDialog = () => {
 
     dialog.appendChild(header);
     dialog.appendChild(message);
+    if (hint) dialog.appendChild(hint);
     dialog.appendChild(button);
     document.body.appendChild(dialog);
 };
@@ -166,7 +175,7 @@ const startConnecting = async () => {
         button.style.visibility = 'visible';
         document.removeEventListener('keydown', cancelOnEscape);
         updateButtonState();
-        showConnectionFailedDialog();
+        showConnectionFailedDialog(server);
     }
 };
 
