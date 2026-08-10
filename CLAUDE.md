@@ -17,7 +17,12 @@ just strict-lint # lint + clippy pedantic/nursery
 just appimage build # [linux] build AppImage
 just flatpak build  # [linux] build Flatpak bundle
 just dmg            # [macos] build Apple Disk Image (.dmg)
+just msi            # [windows] build Windows Installer (.msi) → dist/
 ```
+`just msi` forwards its arguments to `dev/windows/installer/build_msi.ps1`
+(`-Scope perUser`, `-Validate`, `-SignThumbprint`, …). It installs the WiX
+Toolset as a .NET global tool on first use, pinned to v5 — v6+ refuses to run
+until its Open Source Maintenance Fee EULA is accepted.
 Platform-specific entry points live in `dev/linux/`, `dev/macos/`, `dev/windows/`, imported by the top-level justfile.
 
 ## Before Committing
