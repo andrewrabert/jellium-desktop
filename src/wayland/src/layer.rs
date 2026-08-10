@@ -77,6 +77,20 @@ impl LayerSurface {
         }
     }
 
+    /// Scale the complete attached buffer to the logical destination. An
+    /// explicit source rectangle is unsafe for WSI surfaces during resize:
+    /// the compositor may still attach a buffer from the retired swapchain,
+    /// whose real extent is not observable through wgpu before presentation.
+    pub(crate) fn set_full_buffer_viewport(&self, dst_w: i32, dst_h: i32) {
+        let Some(viewport) = self.viewport.as_ref() else {
+            return;
+        };
+        viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+        if dst_w > 0 && dst_h > 0 {
+            viewport.set_destination(dst_w, dst_h);
+        }
+    }
+
     pub(crate) fn present(&self, frame: FrameCommit<'_>) {
         self.set_viewport(frame.src_w, frame.src_h, frame.dst_w, frame.dst_h);
         frame.buf.attach_to(&self.surface);
