@@ -691,15 +691,14 @@ impl Runner {
             bgra: &p.pixels,
             dirty: &p.dirty,
         };
-        // Set the viewport source inside the present closure, not here: a
-        // dropped frame must not leave a source pending ahead of the next
-        // buffer. Clamped to min(buffer, physical) to stay within bounds.
-        let src_w = (p.width as i32).min(vps.pw);
-        let src_h = (p.height as i32).min(vps.ph);
+        // WSI owns the attached wl_buffer and can present one buffer from the
+        // retired swapchain during resize. Use the protocol's implicit full-
+        // buffer source so this transaction is valid for whichever buffer WSI
+        // actually attaches; only the logical destination is ours to specify.
         // Map the painter's own present/skip to this layer's — a GPU skip must
         // not be reported as committed, or the frame is lost from the mailbox.
         match painter.present(Frame::Copied(pixel_frame), || {
-            layer.set_viewport(src_w, src_h, vps.lw, vps.lh);
+            layer.set_full_buffer_viewport(vps.lw, vps.lh);
         })? {
             Presented::Yes => Ok(Present::Committed),
             Presented::Skipped => Ok(Present::Skipped),
