@@ -1,11 +1,11 @@
-//! Wayland clipboard (CLIPBOARD selection) read path via wl-clipboard-rs.
+//! Wayland clipboard (CLIPBOARD selection) read/write via wl-clipboard-rs.
 //!
 //! Why not wl_data_device on the main display: wl_data_device is focus-bound,
 //! and the main jellyfin wl_display competes with XWayland's clipboard bridge
 //! on the same seat which CEF (running as an X11 ozone client) relies on for
-//! Ctrl+V. wl-clipboard-rs speaks ext-data-control-v1 (falling back to
+//! Ctrl+C/V. wl-clipboard-rs speaks ext-data-control-v1 (falling back to
 //! wlr-data-control-v1), which is focus-independent, and opens its own
-//! wl_display per read — no shared globals with the main display.
+//! wl_display per operation — no shared globals with the main display.
 
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use parking_lot::Mutex;
@@ -19,6 +19,7 @@ use calloop::generic::Generic;
 use calloop::ping::PingSource;
 use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, Readiness};
 use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
+use wl_clipboard_rs::copy::{MimeType as CopyMimeType, Options as CopyOptions, Source};
 use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents};
 use wl_clipboard_rs::utils::is_primary_selection_supported;
 
@@ -227,6 +228,22 @@ impl Clipboard {
             }
         };
         fire(undelivered, &[]);
+    }
+
+    /// Become the compositor's clipboard owner. `wl-clipboard-rs` keeps the
+    /// source alive on its worker thread so clipboard managers and other
+    /// Wayland clients can retrieve it after this call returns.
+    pub fn write_text(&self, text: String) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        match CopyOptions::new().copy(Source::Bytes(text.into_bytes().into()), CopyMimeType::Text) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(target: "Main", "clipboard: publish text: {error}");
+                false
+            }
+        }
     }
 
     pub fn cleanup(&self) {

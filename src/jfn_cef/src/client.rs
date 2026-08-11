@@ -75,6 +75,9 @@ pub(crate) struct Inner {
     browser: Mutex<Option<Browser>>,
     // Pending RunContextMenuCallback — held while a context menu is open.
     pending_menu_callback: Mutex<Option<RunContextMenuCallback>>,
+    // Latest text selection, supplied by CEF's render handler. Wayland's
+    // clipboard owner needs the text before it can publish a copy operation.
+    selected_text: Mutex<String>,
     // Injection-profile kind ("web" / "overlay" / "about") — looked up at
     // browser-create time to build the extra_info DictionaryValue.
     injection_kind: Mutex<String>,
@@ -178,6 +181,7 @@ impl Inner {
             load_cv: Condvar::new(),
             browser: Mutex::new(None),
             pending_menu_callback: Mutex::new(None),
+            selected_text: Mutex::new(String::new()),
             injection_kind: Mutex::new(String::new()),
             surface: AtomicCell::new(platform_ops::SurfaceHandle::NONE),
             width: AtomicI32::new(0),

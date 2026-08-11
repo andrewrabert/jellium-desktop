@@ -631,6 +631,12 @@ pub trait Platform: Send + Sync {
         // No backend support — invoke with empty text synchronously.
         on_done("");
     }
+    /// Publish plain text to the system clipboard, returning whether the
+    /// backend accepted ownership. Backends which need a compositor-specific
+    /// clipboard owner (notably Wayland) override this.
+    fn clipboard_write_text(&self, _text: String) -> bool {
+        false
+    }
     /// Disable subsequent clipboard reads (set by Wayland when no data
     /// device manager is available).
     fn clear_clipboard_handler(&self) {}

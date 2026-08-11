@@ -7,6 +7,21 @@ use jfn_platform_abi::cursor::CursorShape;
 use super::{Inner, platform_ops, tasks};
 
 impl Inner {
+    pub(crate) fn set_selected_text(&self, text: &str) {
+        *self.selected_text.lock() = text.to_owned();
+    }
+
+    pub(crate) fn try_copy_selected_text(&self) -> bool {
+        let text = self.selected_text.lock().clone();
+        if text.is_empty() {
+            return false;
+        }
+        let Some(platform) = platform_ops::ops() else {
+            return false;
+        };
+        platform.clipboard_write_text(text)
+    }
+
     pub(crate) fn on_fullscreen_mode_change(&self, fullscreen: bool) {
         if let Some(p) = platform_ops::ops() {
             p.set_fullscreen(fullscreen);
