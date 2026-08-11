@@ -516,8 +516,11 @@ impl Platform for MacosPlatform {
         macos_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
-    fn menu_delivery(&self, _kind: MenuKind) -> MenuDelivery {
-        MenuDelivery::Host(&menu::NsMenuHost)
+    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery {
+        match kind {
+            MenuKind::ContextMenu => MenuDelivery::Host(&menu::NsMenuHost),
+            MenuKind::Dropdown => MenuDelivery::Page,
+        }
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {
