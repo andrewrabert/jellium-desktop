@@ -122,5 +122,23 @@ wrap_context_menu_handler! {
             });
             1
         }
+        fn on_context_menu_command(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            command_id: c_int,
+            _event_flags: EventFlags,
+        ) -> c_int {
+            if command_id == MenuId::PASTE.get_raw() as c_int {
+                return self.inner.try_paste() as c_int;
+            }
+            if command_id != MenuId::COPY.get_raw() as c_int {
+                return 0;
+            }
+            let Some(params) = params else { return 0 };
+            self.inner.set_selected_text(&userfree_to_string(&params.selection_text()));
+            self.inner.try_copy_selected_text() as c_int
+        }
     }
 }

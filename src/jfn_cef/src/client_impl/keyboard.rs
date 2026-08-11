@@ -26,6 +26,14 @@ fn is_paste_shortcut(e: &KeyEvent) -> bool {
     e.windows_key_code == b'V' as i32
 }
 
+fn is_copy_shortcut(e: &KeyEvent) -> bool {
+    let kt: sys::cef_key_event_type_t = e.type_.into();
+    kt == sys::cef_key_event_type_t::KEYEVENT_RAWKEYDOWN
+        && (e.modifiers & action_modifier()) != 0
+        && (e.modifiers & EVENTFLAG_ALT_DOWN) == 0
+        && e.windows_key_code == b'C' as i32
+}
+
 wrap_keyboard_handler! {
     pub struct JfnKeyboardHandlerBuilder {
         inner: Arc<Inner>,
@@ -40,10 +48,13 @@ wrap_keyboard_handler! {
             _is_keyboard_shortcut: Option<&mut c_int>,
         ) -> c_int {
             let Some(e) = event else { return 0 };
-            if !is_paste_shortcut(e) {
-                return 0;
+            if is_copy_shortcut(e) {
+                return self.inner.try_copy_selected_text() as c_int;
             }
-            if self.inner.try_paste() { 1 } else { 0 }
+            if is_paste_shortcut(e) {
+                return self.inner.try_paste() as c_int;
+            }
+            0
         }
     }
 }

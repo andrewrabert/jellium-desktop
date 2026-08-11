@@ -304,6 +304,13 @@ impl Platform for WaylandPlatform {
         self.rt().clipboard().read_text_async(on_done);
     }
 
+    fn clipboard_write_text(&self, text: String) -> bool {
+        if !self.clipboard.load(Ordering::Acquire) {
+            return false;
+        }
+        self.rt().clipboard().write_text(text)
+    }
+
     fn open_external_url(&self, url: &str) {
         jfn_linux_util::open_url::open(url);
     }

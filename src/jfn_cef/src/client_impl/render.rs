@@ -38,6 +38,16 @@ wrap_render_handler! {
             let Some(r) = rect else { return };
             self.inner.on_popup_size(r.x, r.y, r.width, r.height);
         }
+        fn on_text_selection_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            selected_text: Option<&CefString>,
+            _selected_range: Option<&Range>,
+        ) {
+            self.inner.set_selected_text(
+                &selected_text.map(ToString::to_string).unwrap_or_default(),
+            );
+        }
         fn on_paint(
             &self,
             _browser: Option<&mut Browser>,
