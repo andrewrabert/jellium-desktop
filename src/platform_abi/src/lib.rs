@@ -23,12 +23,15 @@ pub mod media_sink;
 pub mod menu;
 pub mod mpv_host;
 pub mod osr_popup;
+pub mod paint;
 #[cfg_attr(unix, path = "process_unix.rs")]
 #[cfg_attr(not(unix), path = "process_other.rs")]
 mod process;
 #[cfg_attr(unix, path = "signal_unix.rs")]
 #[cfg_attr(not(unix), path = "signal_other.rs")]
 mod signal;
+pub mod stack;
+pub mod visibility;
 pub mod window_source;
 
 pub use cef_host::CefHost;
@@ -38,6 +41,7 @@ pub use geometry::{
 };
 pub use instance::{Instance, InstanceId};
 pub use jfn_gpu_paint::DamageRect as JfnRect;
+pub use jfn_gpu_paint::WindowTarget;
 pub use media_sink::MediaSink;
 pub use menu::{
     Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem, MenuKind, MenuMetrics,
@@ -46,6 +50,9 @@ pub use menu::{
 };
 pub use mpv_host::{DefaultMpvHost, MpvHost, VO_WAIT_TICK};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};
+pub use paint::{Content, FrameSource, PaintFrame, Presented, Superseded};
+pub use stack::Plane;
+pub use visibility::{Ack, Visibility, VisibilityCommit};
 pub use window_source::{
     WindowSnapshot, WindowSource, notify_window_changed, subscribe_window_changed,
 };
@@ -328,22 +335,6 @@ impl DecorationOptions {
     }
 }
 
-/// One CEF paint callback's payload, decoded.
-///
-/// CEF has exactly two output paths — `OnAcceleratedPaint` and `OnPaint` —
-/// selected once per browser by `shared_texture_enabled`.
-pub enum PaintFrame<'a> {
-    /// A texture the app owns. By value, because a backend that presents off
-    /// the callback thread (X11 and Wayland both do) has to keep it.
-    Accelerated(jfn_gpu_paint::SharedTexture),
-    /// CPU pixels in BGRA, tightly packed, with the regions that changed.
-    Software {
-        size: PhysicalSize,
-        pixels: &'a [u8],
-        dirty: &'a [JfnRect],
-    },
-}
-
 /// Idle-inhibit level.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum IdleInhibitLevel {
@@ -444,16 +435,43 @@ pub trait Platform: Send + Sync {
     fn post_window_cleanup(&self) {}
 
     // Per-surface
-    fn alloc_surface(&self) -> SurfaceHandle {
+    /// The surface starts in `initial`; no surface is born at a default.
+    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+        let _ = initial;
         SurfaceHandle::NONE
     }
     fn free_surface(&self, _s: SurfaceHandle) {}
-    fn surface_present(&self, _s: SurfaceHandle, _frame: PaintFrame<'_>) -> bool {
-        false
+    /// Presents `frame`, or hands it back undischarged when this surface has no
+    /// commit stream for it.
+    fn surface_present<'a>(
+        &self,
+        s: SurfaceHandle,
+        frame: PaintFrame<'a>,
+    ) -> Result<Presented, PaintFrame<'a>> {
+        let _ = s;
+        Err(frame)
     }
     fn surface_resize(&self, _s: SurfaceHandle, _size: SurfaceSize) {}
-    fn surface_set_visible(&self, _s: SurfaceHandle, _visible: bool) {}
-    fn restack(&self, _ordered: &[SurfaceHandle]) {}
+    /// The swapchain target for `s`, or `None` until the backend has created
+    /// the surface's window.
+    ///
+    /// Calling it declares that the caller presents to `s` itself: from the
+    /// first call the backend attaches no buffer to `s`, never calls
+    /// [`Platform::surface_present`] on it, grabs no input on it, and gives it
+    /// an empty input region.
+    fn surface_window_target(&self, s: SurfaceHandle) -> Option<WindowTarget> {
+        let _ = s;
+        None
+    }
+    /// Issues the commit carrying `visibility` before returning.
+    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
+        let _ = s;
+        VisibilityCommit::issued(visibility, Ack::immediate())
+    }
+
+    /// Applies the whole order, bottom first, in one transaction, and pins the
+    /// video plane below every named surface.
+    fn apply_stack(&self, _ordered: &[SurfaceHandle]) {}
 
     /// How this backend delivers `kind`; `Host` names the backend's own menu
     /// host.
@@ -691,64 +709,21 @@ pub fn try_get() -> Option<&'static dyn Platform> {
     PLATFORM.get().copied()
 }
 
-// =====================================================================
-// Browser bridge
-// =====================================================================
-//
-// Lets crates that can't depend on jfn_cef (input, macos) forward events
-// to whichever CEF layer is currently active. jfn_cef installs the impl
-// at boot; the trait methods resolve the active layer internally so
-// callers never see a JfnCefLayer pointer.
+/// Titlebar height, logical pixels.
+pub const TITLEBAR_LOGICAL_HEIGHT: c_int = 32;
 
-pub trait BrowserBridge: Send + Sync {
-    #[allow(clippy::too_many_arguments)] // mirrors CEF's KeyEvent layout 1:1
-    fn send_key_event(
-        &self,
-        type_: c_int,
-        modifiers: u32,
-        windows_key_code: c_int,
-        native_key_code: c_int,
-        is_system_key: bool,
-        character: u16,
-        unmodified_character: u16,
-    );
-    fn send_mouse_click(
-        &self,
-        x: c_int,
-        y: c_int,
-        modifiers: u32,
-        button: c_int,
-        mouse_up: bool,
-        click_count: c_int,
-    );
-    fn send_mouse_move(&self, x: i32, y: i32, modifiers: u32, leave: bool);
-    fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int);
-    fn set_focus(&self, focus: bool);
-    fn navigate_history(&self, forward: bool);
-    fn undo(&self);
-    fn redo(&self);
-    fn cut(&self);
-    fn copy(&self);
-    fn paste(&self);
-    fn select_all(&self);
-    /// True if a layer is currently active. Cheap check used by callers
-    /// that want to early-out before building an event payload.
-    fn has_active(&self) -> bool;
+static ABOUT_HANDLER: OnceLock<fn()> = OnceLock::new();
+
+/// Register the callback that raises the about panel. Single listener,
+/// installed once at boot.
+pub fn set_about_handler(f: fn()) {
+    let _ = ABOUT_HANDLER.set(f);
 }
 
-static BROWSER_BRIDGE: OnceLock<&'static dyn BrowserBridge> = OnceLock::new();
-
-#[allow(clippy::expect_used)] // boot invariant: install exactly once
-pub fn install_browser_bridge(b: Box<dyn BrowserBridge>) {
-    let leaked: &'static dyn BrowserBridge = Box::leak(b);
-    BROWSER_BRIDGE
-        .set(leaked)
-        .map_err(|_| ())
-        .expect("install_browser_bridge called twice");
-}
-
-pub fn browser_bridge() -> Option<&'static dyn BrowserBridge> {
-    BROWSER_BRIDGE.get().copied()
+pub fn request_about() {
+    if let Some(f) = ABOUT_HANDLER.get() {
+        f();
+    }
 }
 
 static DECORATIONS_LISTENER: OnceLock<fn()> = OnceLock::new();

@@ -1,6 +1,6 @@
 use std::ffi::c_int;
 
-use jfn_platform_abi::{OsrPopupSurface, PaintFrame, SurfaceHandle};
+use jfn_platform_abi::{OsrPopupSurface, PaintFrame, Presented, SurfaceHandle};
 
 use crate::render::Part;
 
@@ -15,7 +15,13 @@ impl OsrPopupSurface for WinOsrPopup {
         crate::render::popup_hide(s);
     }
 
-    fn present(&self, s: SurfaceHandle, frame: PaintFrame<'_>, _lw: c_int, _lh: c_int) {
-        crate::render::present(s, Part::Popup, frame);
+    fn present<'a>(
+        &self,
+        s: SurfaceHandle,
+        frame: PaintFrame<'a>,
+        _lw: c_int,
+        _lh: c_int,
+    ) -> Result<Presented, PaintFrame<'a>> {
+        crate::render::present(s, Part::Popup, frame)
     }
 }

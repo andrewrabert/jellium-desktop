@@ -15,7 +15,7 @@ use crate::mpv_proxy::ProxyShared;
 use crate::paint_override::WlPaintOverride;
 use crate::root_window::RootShared;
 use crate::window_state::WindowState;
-use crate::wl_state::{DmabufRegistry, WlState};
+use crate::wl_state::{Callbacks, DmabufRegistry, WlState};
 
 const DECORATION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -25,6 +25,7 @@ pub(crate) struct WlRuntime {
     window: WindowState,
     core: OnceLock<Mutex<WlState>>,
     buffers: DmabufRegistry,
+    callbacks: Callbacks,
     root: RootShared,
     proxy: ProxyShared,
     seat: SeatShared,
@@ -44,6 +45,7 @@ impl WlRuntime {
             window: WindowState::new(),
             core: OnceLock::new(),
             buffers: DmabufRegistry::new(),
+            callbacks: Callbacks::new(),
             root: RootShared::new(),
             proxy: ProxyShared::new(),
             seat: SeatShared::new(),
@@ -70,6 +72,10 @@ impl WlRuntime {
 
     pub(crate) fn buffers(&self) -> &DmabufRegistry {
         &self.buffers
+    }
+
+    pub(crate) fn callbacks(&'static self) -> &'static Callbacks {
+        &self.callbacks
     }
 
     pub(crate) fn root(&self) -> &RootShared {

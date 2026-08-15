@@ -26,8 +26,6 @@ use crate::input::jfn_input_macos_create_view;
 
 use jfn_playback::shutdown::{jfn_shutdown_initiate, jfn_shutting_down};
 
-use jfn_cef::browsers::jfn_browsers_send_external_begin_frame_all;
-use jfn_cef::business_about::jfn_about_open;
 use jfn_mpv::api::jfn_mpv_set_force_window_position;
 
 // Foundation log target for parity with C++ LOG_PLATFORM.
@@ -58,6 +56,10 @@ struct InitState {
     /// `JellyfinLifecycleObserver*` retained for process lifetime —
     /// receives NSApplication hide/unhide + NSWorkspace sleep/wake.
     lifecycle_observer: *mut AnyObject,
+    /// What a CADisplayLink tick drives. Stored by
+    /// `CefHost::start_frame_driver`, which starts the link in the same call,
+    /// so no tick runs before it is here.
+    frame_driver: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 unsafe impl Send for InitState {}
@@ -70,6 +72,7 @@ static INIT_STATE: Mutex<InitState> = Mutex::new(InitState {
     app_menu_target: ptr::null_mut(),
     wake_target: ptr::null_mut(),
     lifecycle_observer: ptr::null_mut(),
+    frame_driver: None,
 });
 
 /// Returns the `NSWindow*` (non-retaining) for use by other modules.
@@ -78,7 +81,7 @@ pub fn jfn_macos_get_window() -> *mut AnyObject {
     INIT_STATE.lock().window
 }
 
-/// Returns the `JellyfinInputView*` (non-retaining) so `macos_restack`
+/// Returns the `JellyfinInputView*` (non-retaining) so `macos_apply_stack`
 /// can re-anchor it on top of the CefLayer subviews after a reorder.
 pub fn jfn_macos_get_input_view() -> *mut AnyObject {
     INIT_STATE.lock().input_view
@@ -245,7 +248,7 @@ define_class!(
     impl JellyfinAppMenuTarget {
         #[unsafe(method(showAbout:))]
         unsafe fn show_about(&self, _sender: *mut AnyObject) {
-            jfn_about_open();
+            jfn_platform_abi::request_about();
         }
     }
 
@@ -351,7 +354,10 @@ define_class!(
             if jfn_shutting_down() {
                 return;
             }
-            jfn_browsers_send_external_begin_frame_all();
+            let driver = INIT_STATE.lock().frame_driver.clone();
+            if let Some(driver) = driver {
+                driver();
+            }
         }
     }
 
@@ -485,6 +491,17 @@ unsafe fn stop_display_link(state: &mut InitState) {
 
 /// Lock `INIT_STATE` and rebuild the display link. Skips while shutting
 /// down (the link is being torn down) and when no window is held yet.
+/// Store the frame driver and add the CADisplayLink to the run loop. Called
+/// once, by `CefHost::start_frame_driver`.
+pub fn start_frame_driver(driver: std::sync::Arc<dyn Fn() + Send + Sync>) -> bool {
+    let mut state = INIT_STATE.lock();
+    state.frame_driver = Some(driver);
+    if !state.display_link.is_null() {
+        return true;
+    }
+    unsafe { start_display_link(&mut state) }
+}
+
 fn restart_display_link_locked() {
     if jfn_shutting_down() {
         return;
@@ -772,13 +789,10 @@ pub fn macos_init(_mpv: *mut c_void) -> bool {
         let _: () = msg_send![state.window, setAcceptsMouseMovedEvents: true];
         let _: () = msg_send![state.window, makeFirstResponder: state.input_view];
 
-        if !start_display_link(&mut state) {
-            tracing::error!(target: LOG_TARGET, "[INIT] failed to start CADisplayLink");
-            return false;
-        }
-
         // Restart the link on wake / screen reconfiguration — otherwise it
-        // stays bound to a display that slept and stops ticking.
+        // stays bound to a display that slept and stops ticking. The link
+        // itself is added to the run loop by `start_frame_driver`, once there
+        // is a driver for its ticks to reach.
         start_wake_observer(&mut state);
 
         tracing::info!(

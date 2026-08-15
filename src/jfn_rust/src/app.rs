@@ -19,6 +19,10 @@ fn plat() -> &'static dyn Platform {
     jfn_platform_abi::get()
 }
 
+/// The started web overlay, for the C handler thunks the playback coordinator
+/// still calls through.
+static WEB_OVERLAY: parking_lot::Mutex<Option<jfn_cef::WebOverlay>> = parking_lot::Mutex::new(None);
+
 // Read once by `jfn_app_main` after CEF boot to seed the theme rotator.
 static VIDEO_BG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -405,7 +409,7 @@ fn start_playback_coordination(instance: &Instance) -> bool {
     true
 }
 
-fn shutdown_runtime(manager_thread: std::thread::JoinHandle<()>) {
+fn shutdown_runtime(manager_thread: std::thread::JoinHandle<()>, overlay: jfn_cef::WebOverlay) {
     // Persist before the joins below: they can block on a VO-teardown
     // roundtrip, and a hang there must not cost the window geometry.
     crate::window_geometry::controller().persist();
@@ -425,7 +429,9 @@ fn shutdown_runtime(manager_thread: std::thread::JoinHandle<()>) {
 
     jfn_config::settings_shutdown_save_worker();
 
-    jfn_cef::browsers::jfn_browsers_shutdown();
+    jfn_shell::shell_shutdown();
+    WEB_OVERLAY.lock().take();
+    overlay.shutdown();
     jfn_cef::ffi::jfn_cef_shutdown();
     CEF_INITED.store(false, std::sync::atomic::Ordering::Release);
 
@@ -453,6 +459,12 @@ fn boot_mpv_reconcile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) -> f64 {
     }
     jfn_playback::ingest_driver::jfn_playback_seed_display_hz_sync();
     let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
+    if hz > 0.0 {
+        jfn_gpu_paint::report_refresh(
+            jfn_gpu_paint::RefreshSource::MpvDisplayFps,
+            std::time::Duration::from_secs_f64(1.0 / hz),
+        );
+    }
     let saved = jfn_config::window_geometry();
     let snap = crate::window_geometry::controller().source().snapshot();
     tracing::info!(target: "Main",
@@ -489,11 +501,11 @@ fn boot_mpv_reconcile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) -> f64 {
     hz
 }
 
-fn init_main_browser(
+fn start_web_overlay(
     hz: f64,
     use_shared_textures: bool,
-) -> (std::thread::JoinHandle<()>, *mut jfn_cef::JfnCefLayer) {
-    // Must run before main browser create: the pre-loaded page fires its
+) -> (std::thread::JoinHandle<()>, jfn_cef::WebOverlay) {
+    // Must run before the browser is created: the pre-loaded page fires its
     // initial theme-color IPC at DOMContentLoaded.
     let titlebar_themed = jfn_config::titlebar_theme_color();
     unsafe {
@@ -508,30 +520,23 @@ fn init_main_browser(
     }
     jfn_color::theme::jfn_theme_color_set_video_bg(video_bg_get());
 
-    jfn_cef::browsers::jfn_browsers_init(hz, use_shared_textures);
-    let manager_thread = crate::manager::jfn_manager_start();
+    // The overlay creates its browser itself, at the first size the window
+    // snapshot and the shell overlay's reserved strip yield.
+    let overlay = jfn_cef::WebOverlay::start(jfn_cef::WebOverlayConfig {
+        frame_rate: hz,
+        shared_textures: use_shared_textures,
+    });
+    let manager_thread = crate::manager::jfn_manager_start(overlay.clone());
     jfn_playback::jfn_shutdown_set_handler(Some(h_shutdown_wake_manager));
 
-    let web_kind = cs("web");
-    let main_layer = unsafe { jfn_cef::browsers::jfn_browsers_create(web_kind.as_ptr()) };
-    jfn_cef::business_web::jfn_web_init(main_layer);
-
-    let server_url = jfn_config::server_url();
-    tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) url={server_url}");
-    unsafe {
-        jfn_cef::client::jfn_cef_layer_create(
-            main_layer,
-            server_url.as_ptr() as *const _,
-            server_url.len(),
-        );
+    if let Some(host) = plat().cef_host() {
+        host.start_frame_driver(std::sync::Arc::new({
+            let overlay = overlay.clone();
+            move || overlay.send_external_begin_frame()
+        }));
     }
-    tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) call returned");
 
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init(main_layer)");
-    jfn_cef::business_overlay::jfn_overlay_init(main_layer);
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init returned");
-
-    (manager_thread, main_layer)
+    (manager_thread, overlay)
 }
 
 pub fn jfn_app_main() -> c_int {
@@ -615,6 +620,8 @@ async fn notify_running(instance: &Instance) -> c_int {
 }
 
 fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
+    let fonts = jfn_shell::shell_warm_fonts();
+
     // Boot geometry resolves before the host prepare so its display probes
     // hit the real server, not the mpv proxy the prepare may install.
     let boot = crate::window_geometry::controller().boot();
@@ -676,6 +683,24 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
         disable_gpu_compositing: opts.disable_gpu_compositing,
         remote_debugging_port: opts.remote_debugging_port,
     };
+
+    // Platform init precedes both the shell overlay and `CefInitialize`: the
+    // overlay's surface needs the backend's compositor devices, and the
+    // connect screen must be on screen while CEF is still starting.
+    if !plat().init(raw as *mut std::ffi::c_void) {
+        tracing::error!(target: "Main", "Platform init failed");
+        return 1;
+    }
+    tracing::info!(target: "Main", "Platform init ok");
+    PLATFORM_INITED.store(true, std::sync::atomic::Ordering::Release);
+
+    jfn_platform_abi::set_about_handler(jfn_shell::shell_open_about);
+    if jfn_shell::shell_start().is_none() {
+        tracing::warn!(target: "Main", "shell overlay unavailable; no connect screen");
+    }
+    // fontdb's directory walk must not run while Chromium is manipulating
+    // process file descriptors.
+    let _ = fonts.join();
 
     // CEF's process bring-up needs nothing mpv owns; where the platform
     // allows it, it runs while the core thread builds the VO and its GPU
@@ -846,13 +871,26 @@ extern "C" fn h_theme_video_mode(active: bool) {
     jfn_color::theme::jfn_theme_color_set_video_mode(active);
 }
 extern "C" fn h_web_exec_js(js: *const c_char) {
-    if !js.is_null() {
-        unsafe { jfn_cef::business_web::jfn_web_exec_js(js) };
+    if js.is_null() {
+        return;
     }
+    let Some(overlay) = WEB_OVERLAY.lock().clone() else {
+        return;
+    };
+    let js = unsafe { CStr::from_ptr(js) }.to_string_lossy();
+    overlay.exec_js(&js);
 }
 extern "C" fn h_browsers_set_refresh_rate(hz: f64) {
     tracing::info!(target: "Main", "Display refresh rate changed: {hz} Hz");
-    jfn_cef::browsers::jfn_browsers_set_refresh_rate(hz);
+    if hz > 0.0 {
+        jfn_gpu_paint::report_refresh(
+            jfn_gpu_paint::RefreshSource::MpvDisplayFps,
+            std::time::Duration::from_secs_f64(1.0 / hz),
+        );
+    }
+    if let Some(overlay) = WEB_OVERLAY.lock().clone() {
+        overlay.set_refresh_rate(hz);
+    }
 }
 extern "C" fn h_theme_set_titlebar(rgb: u32) {
     plat().set_theme_color(rgb);
@@ -872,15 +910,9 @@ fn h_shutdown_wake_manager() {
 
 /// Owns the run_with_cef body — invoked once by `jfn_app_main`.
 unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
-    // 2. Platform init (PlatformScope). Cleanup happens in shutdown_runtime.
+    // Platform init already ran in `run_app`, ahead of the shell overlay and
+    // `CefInitialize`. Cleanup still happens in shutdown_runtime.
     let mpv_raw = jfn_mpv::boot::jfn_mpv_handle_get();
-    let platform_ok = plat().init(mpv_raw as *mut std::ffi::c_void);
-    if !platform_ok {
-        tracing::error!(target: "Main", "Platform init failed");
-        return 1;
-    }
-    tracing::info!(target: "Main", "Platform init ok");
-    PLATFORM_INITED.store(true, std::sync::atomic::Ordering::Release);
 
     // 3. Apply titlebar theme color before CefInitialize so the window doesn't
     //    sit with the system default palette during init.
@@ -899,19 +931,12 @@ unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
 
     let hz = boot_mpv_reconcile(mpv_raw);
 
-    let (manager_thread, main_layer) = init_main_browser(hz, shared_textures());
+    let (manager_thread, overlay) = start_web_overlay(hz, shared_textures());
+    WEB_OVERLAY.lock().replace(overlay.clone());
 
     if !start_playback_coordination(instance) {
         return 1;
     }
-
-    // 14. Wait for the main browser to finish loading. Skipped when the
-    //     platform pumps CEF itself (external pump on the main thread):
-    //     blocking main here would starve the pump and never load.
-    if plat().cef_host().is_none() {
-        unsafe { jfn_cef::client::jfn_cef_layer_wait_for_load(main_layer) };
-    }
-    tracing::info!(target: "Main", "Main browser loaded");
 
     tracing::info!(target: "Main", "[FLOW] Running — about to enter run_main_loop");
 
@@ -925,7 +950,7 @@ unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
     plat().run_main_loop();
     tracing::info!(target: "Main", "[FLOW] run_main_loop returned — browsers drained, running teardown");
 
-    shutdown_runtime(manager_thread);
+    shutdown_runtime(manager_thread, overlay);
 
     0
 }

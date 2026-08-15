@@ -1,13 +1,13 @@
 //! `CAMetalLayer`-based per-surface compositor.
 //!
 //! All AppKit operations must run on the main thread; if Browsers calls
-//! alloc/free/restack/resize/set_visible off-main we `dispatch_sync` (or
+//! alloc/free/apply-stack/resize/set-visibility off-main we `dispatch_sync` (or
 //! `dispatch_async` for fire-and-forget) onto the main queue. On this platform
 //! CEF's UI thread *is* the app main thread (CEF runs under an external message
-//! pump serviced from the main `CFRunLoop`), so alloc, free, restack and
+//! pump serviced from the main `CFRunLoop`), so alloc, free, stack and
 //! present all run there and the `run_on_main_*` helpers take their inline
-//! fast path; `surface_resize` / `surface_set_visible` are the two entry points
-//! that genuinely arrive from other threads.
+//! fast path; `surface_resize` / `set_surface_visibility` are the two entry
+//! points that genuinely arrive from other threads.
 //!
 //! Pixels go through `jfn-gpu-paint`, which owns the device and the layer's
 //! swapchain. The one rule that adds: configuring a surface *is* a
@@ -25,7 +25,6 @@ use parking_lot::Mutex;
 use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::ptr::NonNull;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::rc::Retained;
@@ -38,9 +37,9 @@ use objc2_quartz_core::{CAAction, CAMetalLayer};
 use jfn_compositor_core::stack::SurfaceStack;
 use jfn_compositor_core::transition::TransitionGate;
 use jfn_gpu_paint::{
-    Frame, FrameSize, Pixels, SharedTexture, Surface as Painter, Surfaces, WindowTarget,
+    FrameSize, Pixels, PresentFailed, SharedTexture, Surface as Painter, Surfaces, WindowTarget,
 };
-use jfn_platform_abi::{JfnRect, PhysicalSize};
+use jfn_platform_abi::{Ack, JfnRect, PhysicalSize, Presented, Visibility, VisibilityCommit};
 
 use crate::dispatch::{is_main_thread, run_on_main_async, run_on_main_sync};
 use crate::init::{jfn_macos_get_input_view, jfn_macos_get_window};
@@ -56,8 +55,13 @@ struct Surface {
     /// `CAMetalLayer` the painter presents into. Owned by `view`'s layer
     /// property; non-retained here.
     layer: *mut AnyObject,
-    /// `None` until the layer exists, and again once it is torn down.
+    /// `None` until the first present builds it, and again once it is torn
+    /// down. Never built for an external surface.
     painter: Mutex<Option<Painter<'static>>>,
+    /// Set by [`macos_surface_window_target`]: the caller presents to this
+    /// surface's layer itself, so no painter is ever built for it and every
+    /// frame handed here is dropped.
+    external: AtomicBool,
 }
 
 // `view` and `layer` are written once inside the alloc closure and afterwards
@@ -71,13 +75,14 @@ impl Surface {
             view: ptr::null_mut(),
             layer: ptr::null_mut(),
             painter: Mutex::new(None),
+            external: AtomicBool::new(false),
         }
     }
 }
 
 // =====================================================================
 // Surface registry — current stack order bottom-to-top, as last applied
-// via macos_restack, plus the live set every entry point resolves its
+// via macos_apply_stack, plus the live set every entry point resolves its
 // pointer through. stack[0] is the cef-main surface for transition gating
 // in macos_surface_present.
 //
@@ -120,10 +125,8 @@ pub(crate) fn gate_in_transition() -> bool {
 // thread, before the main-thread bounce.
 // =====================================================================
 
-static GPU: OnceLock<Option<Surfaces>> = OnceLock::new();
-
 fn gpu() -> Option<&'static Surfaces> {
-    GPU.get_or_init(|| Surfaces::init(None, None)).as_ref()
+    Surfaces::init(None)
 }
 
 // =====================================================================
@@ -135,12 +138,16 @@ unsafe fn create_content_layer(
     content_view: *mut AnyObject,
     frame: NSRect,
     scale: f64,
+    visibility: Visibility,
 ) -> (*mut AnyObject, *mut AnyObject) {
     unsafe {
         // SAFETY: callers run inside a main-queue closure.
         let mtm = MainThreadMarker::new_unchecked();
 
         let view = NSView::initWithFrame(NSView::alloc(mtm), frame);
+        // Before the view joins the tree, so a hidden surface never shows a
+        // frame it was not asked for.
+        view.setHidden(!visibility.is_shown());
         view.setWantsLayer(true);
         view.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
@@ -176,8 +183,8 @@ unsafe fn create_content_layer(
 
         view.setLayer(Some(&layer));
 
-        // addSubview:positioned:relativeTo: — order applied by macos_restack
-        // later; positionAbove=nil here.
+        // addSubview:positioned:relativeTo: — order applied by
+        // macos_apply_stack later; positionAbove=nil here.
         // SAFETY: `content_view` is the window's contentView.
         let content_view: &NSView = &*content_view.cast::<NSView>();
         content_view.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Above, None);
@@ -196,7 +203,7 @@ pub fn macos_set_expected_size(w: c_int, h: c_int) {
     G_GATE.lock().set_expected((w, h));
 }
 
-pub fn macos_alloc_surface() -> *mut c_void {
+pub fn macos_alloc_surface(initial: Visibility) -> *mut c_void {
     // Allocate the Surface up front; the AppKit setup happens on the
     // main thread but writes into this stable heap address.
     let surf_ptr = Box::into_raw(Box::new(Surface::new()));
@@ -204,16 +211,8 @@ pub fn macos_alloc_surface() -> *mut c_void {
     // the bounce, so it is live for exactly as long as the handle is public.
     // `register`, not `add_live`: this platform derives its main surface from
     // `stack.first()`, and seeding `main` here would change is-main — and with
-    // it transition gating — before the first restack.
+    // it transition gating — before the first stack apply.
     G_SURFACE_STACK.lock().register(SurfacePtr(surf_ptr));
-
-    let Some(gpu) = gpu() else {
-        // Allocation must still return a valid opaque handle so Browsers
-        // can later free it; the surface will simply have no layer, and
-        // every present is dropped.
-        tracing::error!("[GPU] device init failed; surface has no painter");
-        return surf_ptr as *mut c_void;
-    };
 
     let s_addr = surf_ptr as usize;
     run_on_main_sync(move || unsafe {
@@ -227,23 +226,10 @@ pub fn macos_alloc_surface() -> *mut c_void {
         }
         let frame: objc2_foundation::NSRect = objc2::msg_send![content_view, bounds];
         let scale: f64 = objc2::msg_send![win, backingScaleFactor];
-        let (view, layer) = create_content_layer(content_view, frame, scale);
+        let (view, layer) = create_content_layer(content_view, frame, scale, initial);
         let surf = &mut *(s_addr as *mut Surface);
         surf.view = view;
         surf.layer = layer;
-
-        // The first configure lands here, on the thread that owns the layer.
-        let Some(layer) = NonNull::new(layer.cast::<c_void>()) else {
-            return;
-        };
-        let size = FrameSize {
-            w: (frame.size.width * scale) as c_int,
-            h: (frame.size.height * scale) as c_int,
-        };
-        match gpu.new_surface(WindowTarget::CoreAnimationLayer { layer }, size) {
-            Ok(painter) => *surf.painter.lock() = Some(painter),
-            Err(e) => tracing::error!("[GPU] surface creation failed: {e}"),
-        }
     });
     surf_ptr as *mut c_void
 }
@@ -279,8 +265,8 @@ pub fn macos_free_surface(s: *mut c_void) {
     unsafe { drop(Box::from_raw(s_ptr)) };
 }
 
-pub fn macos_surface_present(s: *mut c_void, tex: &SharedTexture) -> bool {
-    present_frame(s, tex.coded(), Frame::Shared(tex))
+pub fn macos_surface_present(s: *mut c_void, tex: &SharedTexture) -> Option<Presented> {
+    present_frame(s, tex.coded(), |painter| painter.present_shared(tex, || {}))
 }
 
 pub fn macos_surface_present_software(
@@ -288,9 +274,9 @@ pub fn macos_surface_present_software(
     pixels: &[u8],
     size: PhysicalSize,
     dirty: &[JfnRect],
-) -> bool {
+) -> Option<Presented> {
     if pixels.is_empty() || size.w <= 0 || size.h <= 0 {
-        return false;
+        return None;
     }
     present_frame(
         s,
@@ -298,16 +284,21 @@ pub fn macos_surface_present_software(
             w: size.w,
             h: size.h,
         },
-        // CEF's OnPaint buffer is tightly packed.
-        Frame::Copied(Pixels {
-            size: FrameSize {
-                w: size.w,
-                h: size.h,
-            },
-            stride: size.w as u32 * 4,
-            bgra: pixels,
-            dirty,
-        }),
+        |painter| {
+            // CEF's OnPaint buffer is tightly packed.
+            painter.present_pixels(
+                Pixels {
+                    size: FrameSize {
+                        w: size.w,
+                        h: size.h,
+                    },
+                    stride: size.w as u32 * 4,
+                    bgra: pixels,
+                    dirty,
+                },
+                || {},
+            )
+        },
     )
 }
 
@@ -318,9 +309,13 @@ pub fn macos_surface_present_software(
 /// `macos_surface_resize` last set from its main-thread closure. The painter
 /// lock is held for the present alone and released before re-entering the
 /// registry locks, which is the lock order every other entry point follows.
-fn present_frame(s: *mut c_void, size: FrameSize, frame: Frame<'_>) -> bool {
+fn present_frame(
+    s: *mut c_void,
+    size: FrameSize,
+    present: impl FnOnce(&mut Painter<'static>) -> Result<Presented, PresentFailed>,
+) -> Option<Presented> {
     if s.is_null() {
-        return false;
+        return None;
     }
     warn_once_if_off_main();
     let s_ptr = s as *mut Surface;
@@ -330,26 +325,42 @@ fn present_frame(s: *mut c_void, size: FrameSize, frame: Frame<'_>) -> bool {
     let is_main = {
         let stack = G_SURFACE_STACK.lock();
         if !stack.live().contains(&SurfacePtr(s_ptr)) {
-            return false;
+            return None;
         }
         stack.is_main(SurfacePtr(s_ptr))
     };
 
     if is_main && G_GATE.lock().in_transition() {
-        return false;
+        return None;
     }
 
     {
         // SAFETY: the live set says this pointer is still ours.
         let surf = unsafe { &*s_ptr };
+        if surf.external.load(Ordering::Acquire) {
+            return None;
+        }
         let mut painter = surf.painter.lock();
+        if painter.is_none() {
+            *painter = build_painter(surf, size);
+        }
         match painter.as_mut() {
-            Some(painter) => {
-                if let Err(e) = painter.present(frame, || {}) {
-                    tracing::error!("[GPU] present failed: {e}");
+            Some(painter) => match present(painter) {
+                Ok(_presented) => {}
+                // The frame never entered the commit stream; CEF owes the
+                // successor, which is what a `None` return asks it for.
+                Err(PresentFailed::Deferred(_) | PresentFailed::Import | PresentFailed::Kind) => {
+                    return None;
                 }
+                Err(e) => {
+                    tracing::error!("[GPU] present failed: {e}");
+                    return None;
+                }
+            },
+            None => {
+                tracing::warn!("[GPU] present skipped: no painter");
+                return None;
             }
-            None => tracing::warn!("[GPU] present skipped: no painter"),
         }
     }
 
@@ -358,7 +369,7 @@ fn present_frame(s: *mut c_void, size: FrameSize, frame: Frame<'_>) -> bool {
         // size. `coded` is the allocation size.
         G_GATE.lock().note_present_size((size.w, size.h));
     }
-    true
+    Some(Presented::issued())
 }
 
 fn warn_once_if_off_main() {
@@ -366,6 +377,40 @@ fn warn_once_if_off_main() {
     if !is_main_thread() && !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!("[GPU] present arrived off the main thread");
     }
+}
+
+/// Builds the surface's swapchain on its `CAMetalLayer`. Runs on the layer's
+/// owner thread — the same main thread every present arrives on.
+fn build_painter(surf: &Surface, size: FrameSize) -> Option<Painter<'static>> {
+    let gpu = gpu()?;
+    let layer = NonNull::new(surf.layer.cast::<c_void>())?;
+    match gpu.new_surface(WindowTarget::CoreAnimationLayer { layer }, size) {
+        Ok(painter) => Some(painter),
+        Err(e) => {
+            tracing::error!("[GPU] surface creation failed: {e}");
+            None
+        }
+    }
+}
+
+/// The `CAMetalLayer` for `s`, or `None` before it exists.
+///
+/// The first call marks the surface external: [`present_frame`] builds no
+/// painter for it and drops every frame.
+pub fn macos_surface_window_target(s: *mut c_void) -> Option<WindowTarget> {
+    if s.is_null() {
+        return None;
+    }
+    let s_ptr = s as *mut Surface;
+    if !is_live(s_ptr) {
+        return None;
+    }
+    // SAFETY: the live set says this pointer is still ours.
+    let surf = unsafe { &*s_ptr };
+    surf.external.store(true, Ordering::Release);
+    drop(surf.painter.lock().take());
+    let layer = NonNull::new(surf.layer.cast::<c_void>())?;
+    Some(WindowTarget::CoreAnimationLayer { layer })
 }
 
 pub fn macos_surface_resize(s: *mut c_void, lw: c_int, _lh: c_int, pw: c_int, ph: c_int) {
@@ -407,24 +452,37 @@ pub fn macos_surface_resize(s: *mut c_void, lw: c_int, _lh: c_int, pw: c_int, ph
     });
 }
 
-pub fn macos_surface_set_visible(s: *mut c_void, visible: bool) {
-    if s.is_null() {
-        return;
+/// Hides or shows `s`'s view, and nothing else: the view keeps its frame and
+/// its place in the stack, so a surface that comes back is exactly where it
+/// was.
+///
+/// The change is wrapped in an explicit `CATransaction` and flushed before the
+/// main-thread closure returns, so the commit carrying it has been issued by
+/// the time the returned [`VisibilityCommit`] exists — hence
+/// [`Ack::immediate`].
+pub fn macos_set_surface_visibility(s: *mut c_void, visibility: Visibility) -> VisibilityCommit {
+    if !s.is_null() {
+        let s_addr = s as usize;
+        run_on_main_sync(move || unsafe {
+            let s_ptr = s_addr as *mut Surface;
+            if !is_live(s_ptr) {
+                return;
+            }
+            let surf = &*s_ptr;
+            if surf.view.is_null() {
+                return;
+            }
+            let transaction = objc2::class!(CATransaction);
+            let _: () = objc2::msg_send![transaction, begin];
+            let _: () = objc2::msg_send![surf.view, setHidden: !visibility.is_shown()];
+            let _: () = objc2::msg_send![transaction, commit];
+            let _: () = objc2::msg_send![transaction, flush];
+        });
     }
-    let s_addr = s as usize;
-    run_on_main_async(move || unsafe {
-        let s_ptr = s_addr as *mut Surface;
-        if !is_live(s_ptr) {
-            return;
-        }
-        let surf = &*s_ptr;
-        if !surf.view.is_null() {
-            let _: () = objc2::msg_send![surf.view, setHidden: !visible];
-        }
-    });
+    VisibilityCommit::issued(visibility, Ack::immediate())
 }
 
-pub fn macos_restack(ordered: *const *mut c_void, n: usize) {
+pub fn macos_apply_stack(ordered: *const *mut c_void, n: usize) {
     // Copy the order into a Vec<usize> we can move into the closure.
     let order: Vec<usize> = if ordered.is_null() || n == 0 {
         Vec::new()
@@ -487,7 +545,7 @@ pub fn macos_restack(ordered: *const *mut c_void, n: usize) {
             ];
         }
     };
-    // restack must complete before Browsers proceeds — use sync.
+    // The order must be applied before the caller proceeds — use sync.
     run_on_main_sync(apply);
 }
 

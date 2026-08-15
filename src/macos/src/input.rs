@@ -484,42 +484,30 @@ define_class!(
 
         // ---- Edit menu actions ----
         // Without an Edit menu in the responder chain, AppKit never sends
-        // these. Forward each to the active CEF browser's focused frame.
+        // these. Forward each through the input router.
         #[unsafe(method(undo:))]
         fn undo_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.undo();
-            }
+            jfn_input::jfn_input_undo();
         }
         #[unsafe(method(redo:))]
         fn redo_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.redo();
-            }
+            jfn_input::jfn_input_redo();
         }
         #[unsafe(method(cut:))]
         fn cut_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.cut();
-            }
+            jfn_input::jfn_input_cut();
         }
         #[unsafe(method(copy:))]
         fn copy_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.copy();
-            }
+            jfn_input::jfn_input_copy();
         }
         #[unsafe(method(paste:))]
         fn paste_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.paste();
-            }
+            jfn_input::jfn_input_paste();
         }
         #[unsafe(method(selectAll:))]
         fn select_all_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.select_all();
-            }
+            jfn_input::jfn_input_select_all();
         }
     }
 );

@@ -1,7 +1,6 @@
-//! Native-shim injection profiles. Each browser kind ("web", "overlay",
-//! "about") declares the JS function list + script list shipped to the
-//! renderer via the `extra_info` DictionaryValue. The web profile additionally
-//! carries the cached Jellyfin device-profile JSON.
+//! Native-shim injection. jellyfin-web is the process's one browser; its
+//! JS function list + script list ship to the renderer via the `extra_info`
+//! DictionaryValue, together with the cached Jellyfin device-profile JSON.
 //!
 //! Built fresh per-browser-create on the C++ thread that calls
 //! `CefBrowserHost::CreateBrowser`. CEF copies the dictionary into the
@@ -49,19 +48,6 @@ pub(crate) enum NativeFunction {
     ThemeColor,
     SetOsdVisible,
     ToggleFullscreen,
-    GetSavedServerUrl,
-    NavigateMain,
-    DismissOverlay,
-    CheckServerConnectivity,
-    CancelServerConnectivity,
-    AboutOpenPath,
-    AboutDismiss,
-    WindowMinimize,
-    WindowToggleMaximize,
-    WindowClose,
-    WindowStartMove,
-    WindowStartResize,
-    CsdReady,
 }
 
 impl NativeFunction {
@@ -97,19 +83,6 @@ impl NativeFunction {
             "themeColor" => Self::ThemeColor,
             "setOsdVisible" => Self::SetOsdVisible,
             "toggleFullscreen" => Self::ToggleFullscreen,
-            "getSavedServerUrl" => Self::GetSavedServerUrl,
-            "navigateMain" => Self::NavigateMain,
-            "dismissOverlay" => Self::DismissOverlay,
-            "checkServerConnectivity" => Self::CheckServerConnectivity,
-            "cancelServerConnectivity" => Self::CancelServerConnectivity,
-            "aboutOpenPath" => Self::AboutOpenPath,
-            "aboutDismiss" => Self::AboutDismiss,
-            "windowMinimize" => Self::WindowMinimize,
-            "windowToggleMaximize" => Self::WindowToggleMaximize,
-            "windowClose" => Self::WindowClose,
-            "windowStartMove" => Self::WindowStartMove,
-            "windowStartResize" => Self::WindowStartResize,
-            "csdReady" => Self::CsdReady,
             _ => return None,
         })
     }
@@ -146,19 +119,6 @@ impl NativeFunction {
             Self::ThemeColor => "themeColor",
             Self::SetOsdVisible => "setOsdVisible",
             Self::ToggleFullscreen => "toggleFullscreen",
-            Self::GetSavedServerUrl => "getSavedServerUrl",
-            Self::NavigateMain => "navigateMain",
-            Self::DismissOverlay => "dismissOverlay",
-            Self::CheckServerConnectivity => "checkServerConnectivity",
-            Self::CancelServerConnectivity => "cancelServerConnectivity",
-            Self::AboutOpenPath => "aboutOpenPath",
-            Self::AboutDismiss => "aboutDismiss",
-            Self::WindowMinimize => "windowMinimize",
-            Self::WindowToggleMaximize => "windowToggleMaximize",
-            Self::WindowClose => "windowClose",
-            Self::WindowStartMove => "windowStartMove",
-            Self::WindowStartResize => "windowStartResize",
-            Self::CsdReady => "csdReady",
         }
     }
 }
@@ -171,7 +131,6 @@ pub(crate) enum InjectedScript {
     MpvAudioPlayer,
     InputPlugin,
     ClientSettings,
-    Csd,
     SelectMenu,
 }
 
@@ -184,7 +143,6 @@ impl InjectedScript {
             "mpv-audio-player.js" => Self::MpvAudioPlayer,
             "input-plugin.js" => Self::InputPlugin,
             "client-settings.js" => Self::ClientSettings,
-            "csd.js" => Self::Csd,
             "select-menu.js" => Self::SelectMenu,
             _ => return None,
         })
@@ -198,7 +156,6 @@ impl InjectedScript {
             Self::MpvAudioPlayer => "mpv-audio-player.js",
             Self::InputPlugin => "input-plugin.js",
             Self::ClientSettings => "client-settings.js",
-            Self::Csd => "csd.js",
             Self::SelectMenu => "select-menu.js",
         }
     }
@@ -251,27 +208,6 @@ const WEB_SCRIPTS: &[InjectedScript] = &[
     InjectedScript::InputPlugin,
     InjectedScript::ClientSettings,
 ];
-const OVERLAY_FUNCTIONS: &[NativeFunction] = &[
-    NativeFunction::GetSavedServerUrl,
-    NativeFunction::SaveServerUrl,
-    NativeFunction::NavigateMain,
-    NativeFunction::DismissOverlay,
-    NativeFunction::CheckServerConnectivity,
-    NativeFunction::CancelServerConnectivity,
-];
-
-const ABOUT_FUNCTIONS: &[NativeFunction] =
-    &[NativeFunction::AboutOpenPath, NativeFunction::AboutDismiss];
-
-const WINDOW_FUNCTIONS: &[NativeFunction] = &[
-    NativeFunction::WindowMinimize,
-    NativeFunction::WindowToggleMaximize,
-    NativeFunction::WindowClose,
-    NativeFunction::WindowStartMove,
-    NativeFunction::WindowStartResize,
-    NativeFunction::CsdReady,
-];
-
 const FUNCTIONS_KEY: &str = "functions";
 const SCRIPTS_KEY: &str = "scripts";
 const DEVICE_PROFILE_JSON_KEY: &str = "device_profile_json";
@@ -442,69 +378,30 @@ pub unsafe fn jfn_cef_set_device_profile_json(json_utf8: *const c_char, len: usi
     let _ = DEVICE_PROFILE_JSON.set(s);
 }
 
-fn build_extra_info(
-    functions: &[NativeFunction],
-    scripts: &[InjectedScript],
-    add_window: bool,
-    shared_textures_enabled: bool,
-) -> ExtraInfo {
-    let mut functions = functions.to_vec();
-    if add_window {
-        functions.extend_from_slice(WINDOW_FUNCTIONS);
-    }
-
-    let mut scripts = scripts.to_vec();
-    if add_window {
-        scripts.push(InjectedScript::Csd);
-    }
-
-    ExtraInfo {
-        functions,
-        scripts,
+pub(crate) fn build_web(shared_textures_enabled: bool) -> ExtraInfo {
+    let mut extra_info = ExtraInfo {
+        functions: WEB_FUNCTIONS.to_vec(),
+        scripts: WEB_SCRIPTS.to_vec(),
         device_profile_json: None,
         shared_textures_enabled,
-        window_decorations: None,
+        window_decorations: jfn_config::configured_window_decorations(),
         window_decoration_options: Vec::new(),
+    };
+    if let Some(json) = DEVICE_PROFILE_JSON.get()
+        && !json.is_empty()
+    {
+        extra_info.device_profile_json = Some(json.clone());
     }
-}
-
-pub(crate) fn build_for_kind(kind: &str, shared_textures_enabled: bool) -> Option<ExtraInfo> {
-    match kind {
-        "web" => {
-            let mut extra_info =
-                build_extra_info(WEB_FUNCTIONS, WEB_SCRIPTS, true, shared_textures_enabled);
-            if let Some(json) = DEVICE_PROFILE_JSON.get()
-                && !json.is_empty()
-            {
-                extra_info.device_profile_json = Some(json.clone());
-            }
-            extra_info.window_decorations = jfn_config::configured_window_decorations();
-            if let Some(p) = jfn_platform_abi::try_get()
-                && p.window_decorations_supported()
-            {
-                extra_info.window_decoration_options =
-                    p.window_decoration_options().iter().collect();
-            }
-            extra_info.scripts.extend(
-                jfn_platform_abi::menu_scripts(MenuKind::Dropdown)
-                    .iter()
-                    .copied()
-                    .map(InjectedScript::from_menu),
-            );
-            Some(extra_info)
-        }
-        "overlay" => Some(build_extra_info(
-            OVERLAY_FUNCTIONS,
-            &[],
-            true,
-            shared_textures_enabled,
-        )),
-        "about" => Some(build_extra_info(
-            ABOUT_FUNCTIONS,
-            &[],
-            true,
-            shared_textures_enabled,
-        )),
-        _ => None,
+    if let Some(p) = jfn_platform_abi::try_get()
+        && p.window_decorations_supported()
+    {
+        extra_info.window_decoration_options = p.window_decoration_options().iter().collect();
     }
+    extra_info.scripts.extend(
+        jfn_platform_abi::menu_scripts(MenuKind::Dropdown)
+            .iter()
+            .copied()
+            .map(InjectedScript::from_menu),
+    );
+    extra_info
 }

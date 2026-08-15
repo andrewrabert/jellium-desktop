@@ -1,10 +1,13 @@
 use std::os::raw::c_int;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use jfn_platform_abi::cursor::CursorShape;
 
 use super::{Inner, platform_ops, tasks};
+
+/// CEF's `ERR_ABORTED`, taken from the generated bindings rather than its
+/// value.
+const ERR_ABORTED: c_int = cef::sys::cef_errorcode_t::ERR_ABORTED as c_int;
 
 impl Inner {
     pub(crate) fn on_fullscreen_mode_change(&self, fullscreen: bool) {
@@ -14,9 +17,7 @@ impl Inner {
     }
 
     pub(crate) fn emit_cursor(&self, shape: CursorShape) {
-        if let Some(handle) = self.cursor_handle() {
-            crate::browsers::route_cursor(handle, shape);
-        }
+        jfn_input::cursor::cursor_from_web(shape);
     }
 
     pub(crate) fn on_console_message(&self, level: c_int, msg: &str, src: &str, line: c_int) {
@@ -39,6 +40,8 @@ impl Inner {
         jfn_logging::log(jfn_logging::CATEGORY_JS, lvl, &formatted);
     }
 
+    /// Marks which navigation's document is now producing pixels; a frame of
+    /// that document still has to be presented before anything retires.
     pub(crate) fn on_load_end(&self, is_main: bool, code: c_int, url: &str) {
         let formatted = format!(
             "CefLayer::OnLoadEnd name={} main={} code={} url={}",
@@ -53,13 +56,11 @@ impl Inner {
             &formatted,
         );
         if is_main {
-            let _g = self.load_mtx.lock();
-            self.loaded.store(true, Ordering::Release);
-            self.load_cv.notify_all();
+            self.note_main_frame_loaded(url);
         }
     }
 
-    pub(crate) fn on_load_error(&self, code: c_int, text: &str, url: &str) {
+    pub(crate) fn on_load_error(&self, is_main: bool, code: c_int, text: &str, url: &str) {
         let formatted = format!(
             "OnLoadError name={} url={} error={} {}",
             self.name_str(),
@@ -72,15 +73,13 @@ impl Inner {
             jfn_logging::LEVEL_ERROR,
             &formatted,
         );
-    }
-
-    pub(crate) fn set_visible(&self, visible: bool) {
-        let surface = self.surface_handle();
-        if surface.is_none() {
-            return;
-        }
-        if let Some(p) = platform_ops::ops() {
-            p.surface_set_visible(surface, visible);
+        // An aborted main-frame load is another navigation replacing this one,
+        // not a failure.
+        if is_main
+            && code != ERR_ABORTED
+            && let Some(navigation) = self.load_navigation(url)
+        {
+            jfn_bringup::advance(jfn_bringup::Event::NavigationFailed(navigation));
         }
     }
 

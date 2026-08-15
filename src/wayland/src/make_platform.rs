@@ -14,37 +14,15 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::layer::{Present, PresentError};
 use crate::paint_override::WlPaintOverride;
 use crate::runtime::WlRuntime;
 use crate::wl_ops;
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    BootGeometry, DisplayBackend, IdleInhibitLevel, JfnRect, PaintFrame, Platform, SurfaceHandle,
-    SurfaceSize, WindowDecorations,
+    BootGeometry, DisplayBackend, IdleInhibitLevel, JfnRect, PaintFrame, Platform, Presented,
+    SurfaceHandle, SurfaceSize, Visibility, VisibilityCommit, WindowDecorations,
 };
-
-// =====================================================================
-// Helpers
-// =====================================================================
-
-// Background color matches kBgColor (0x101010). Hard-coded here so the
-// surface_set_visible path doesn't need to carry the color.
-const BG_R: u8 = 0x10;
-const BG_G: u8 = 0x10;
-const BG_B: u8 = 0x10;
-
-/// A skip is not a failure: only a real error maps to `false`.
-fn present_ok(result: Result<Present, PresentError>) -> bool {
-    match result {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, "wayland: present rejected");
-            false
-        }
-    }
-}
 
 // =====================================================================
 // Backend
@@ -110,8 +88,8 @@ impl Platform for WaylandPlatform {
         crate::kde_palette::post_window_cleanup(self.rt());
     }
 
-    fn alloc_surface(&self) -> SurfaceHandle {
-        SurfaceHandle::from_ptr(wl_ops::alloc_surface(self.rt()) as *mut c_void)
+    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+        SurfaceHandle::from_ptr(wl_ops::alloc_surface(self.rt(), initial) as *mut c_void)
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
@@ -121,30 +99,42 @@ impl Platform for WaylandPlatform {
         );
     }
 
-    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
-        let ptr = s.as_ptr() as *mut crate::wl_state::PlatformSurface;
-        present_ok(match frame {
-            PaintFrame::Accelerated(tex) => wl_ops::surface_present(self.rt(), ptr, tex),
-            PaintFrame::Software {
-                size,
-                pixels,
-                dirty,
-            } => wl_ops::surface_present_software(self.rt(), ptr, dirty, pixels, size.w, size.h),
-        })
-    }
-
-    fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        wl_ops::surface_set_visible(
+    fn surface_present<'a>(
+        &self,
+        s: SurfaceHandle,
+        frame: PaintFrame<'a>,
+    ) -> Result<Presented, PaintFrame<'a>> {
+        wl_ops::present(
             self.rt(),
             s.as_ptr() as *mut crate::wl_state::PlatformSurface,
-            visible,
-            BG_R,
-            BG_G,
-            BG_B,
+            frame,
+        )
+    }
+
+    fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
+        wl_ops::surface_resize(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+            size,
         );
     }
 
-    fn restack(&self, ordered: &[SurfaceHandle]) {
+    fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
+        wl_ops::window_target(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+        )
+    }
+
+    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
+        wl_ops::set_visibility(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+            visibility,
+        )
+    }
+
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
         // SAFETY: a `&[SurfaceHandle]` (i.e. `&[*mut c_void]`) and a
         // `&[*mut PlatformSurface]` have identical layout; each handle was
         // minted by this backend's `alloc_surface`.

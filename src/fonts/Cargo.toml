@@ -1,0 +1,15 @@
+[package]
+name = "jfn-fonts"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "jfn_fonts"
+crate-type = ["rlib"]
+
+[dependencies]
+iced_graphics.workspace = true
+
+[lints]
+workspace = true

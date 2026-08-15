@@ -20,7 +20,10 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
 
-use jfn_platform_abi::{DisplayBackend, PaintFrame, Platform, WindowDecorations};
+use jfn_platform_abi::{
+    DisplayBackend, PaintFrame, Platform, Presented, Visibility, VisibilityCommit,
+    WindowDecorations,
+};
 
 mod input;
 mod menu;
@@ -170,24 +173,38 @@ impl Platform for WindowsPlatform {
         win_cleanup();
     }
 
-    fn alloc_surface(&self) -> SurfaceHandle {
-        render::alloc()
+    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+        let s = render::alloc();
+        render::set_visibility(s, initial).acknowledged();
+        s
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
         render::free(s);
     }
 
-    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
+    fn surface_present<'a>(
+        &self,
+        s: SurfaceHandle,
+        frame: PaintFrame<'a>,
+    ) -> Result<Presented, PaintFrame<'a>> {
         render::present(s, render::Part::Content, frame)
     }
 
-    fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        render::set_visible(s, visible);
+    fn surface_resize(&self, s: SurfaceHandle, size: jfn_platform_abi::SurfaceSize) {
+        render::resize(s, size);
     }
 
-    fn restack(&self, ordered: &[SurfaceHandle]) {
-        render::restack(ordered);
+    fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
+        render::window_target(s)
+    }
+
+    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
+        render::set_visibility(s, visibility)
+    }
+
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
+        render::apply_stack(ordered);
     }
 
     fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery {

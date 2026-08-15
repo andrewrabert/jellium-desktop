@@ -1,4 +1,4 @@
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
+use jfn_fonts::cosmic_text::{Attrs, Buffer, Color, Family, Metrics, Shaping, SwashCache};
 use tiny_skia::{Color as SkColor, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
 
 use jfn_platform_abi::MenuItem;
@@ -88,30 +88,32 @@ impl Layout {
     }
 }
 
+/// The menu's glyph cache. The font system it shapes through is the process's
+/// one, so the menu thread never runs a font scan of its own.
 pub struct Fonts {
-    system: FontSystem,
     cache: SwashCache,
 }
 
 impl Fonts {
     pub fn new() -> Self {
         Self {
-            system: FontSystem::new(),
             cache: SwashCache::new(),
         }
     }
 
     fn shape(&mut self, text: &str, font_px: f32) -> Buffer {
-        let mut buf = Buffer::new(&mut self.system, Metrics::new(font_px, font_px * 1.3));
-        buf.set_size(None, None);
-        buf.set_text(
-            text,
-            &Attrs::new().family(Family::SansSerif),
-            Shaping::Advanced,
-            None,
-        );
-        buf.shape_until_scroll(&mut self.system, false);
-        buf
+        jfn_fonts::with_font_system(|system| {
+            let mut buf = Buffer::new(system, Metrics::new(font_px, font_px * 1.3));
+            buf.set_size(None, None);
+            buf.set_text(
+                text,
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(system, false);
+            buf
+        })
     }
 
     fn text_width(&mut self, text: &str, font_px: f32) -> f32 {
@@ -253,11 +255,10 @@ fn draw_text(
         let glyphs: Vec<_> = run.glyphs.to_vec();
         for glyph in &glyphs {
             let phys = glyph.physical((ox, oy + run.line_y), 1.0);
-            let Some(img) = fonts
-                .cache
-                .get_image(&mut fonts.system, phys.cache_key)
-                .as_ref()
-            else {
+            let img = jfn_fonts::with_font_system(|system| {
+                fonts.cache.get_image(system, phys.cache_key).clone()
+            });
+            let Some(img) = img.as_ref() else {
                 continue;
             };
             if img.data.is_empty() {

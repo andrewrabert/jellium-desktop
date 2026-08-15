@@ -22,7 +22,7 @@ use jfn_input::{
     jfn_input_dispatch_char, jfn_input_dispatch_history_nav, jfn_input_dispatch_mouse_button,
     jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll,
 };
-use jfn_linux_util::input::jfn_input_dispatch_key_raw;
+use jfn_linux_util::input::{compose_feed, compose_pending, jfn_input_dispatch_key_raw};
 use jfn_playback::shutdown::jfn_shutdown_register_waker;
 use jfn_wake_event::{Drain, WakeEvent, WakeSource};
 
@@ -119,6 +119,10 @@ enum QueuedInputEvent {
         cp: u32,
         modifiers: u32,
         native: u32,
+    },
+    Text {
+        text: String,
+        modifiers: u32,
     },
     HistoryNav {
         forward: c_int,
@@ -329,13 +333,20 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
     });
 
     if pressed {
-        let cp = xst.key_get_utf32(kc);
-        if cp > 0 {
-            let _ = st.dispatch.send(QueuedInputEvent::Char {
-                cp,
+        if let Some(text) = compose_feed(sym) {
+            let _ = st.dispatch.send(QueuedInputEvent::Text {
+                text,
                 modifiers: st.modifiers,
-                native: native as u32,
             });
+        } else if !compose_pending() {
+            let cp = xst.key_get_utf32(kc);
+            if cp > 0 {
+                let _ = st.dispatch.send(QueuedInputEvent::Char {
+                    cp,
+                    modifiers: st.modifiers,
+                    native: native as u32,
+                });
+            }
         }
     }
 
@@ -671,6 +682,9 @@ fn dispatch_input_event(ev: QueuedInputEvent) {
             modifiers,
             native,
         } => jfn_input_dispatch_char(cp, modifiers, native),
+        QueuedInputEvent::Text { text, modifiers } => {
+            jfn_input::jfn_input_dispatch_text(&text, modifiers)
+        }
         QueuedInputEvent::HistoryNav { forward } => jfn_input_dispatch_history_nav(forward),
         QueuedInputEvent::MouseButton {
             code,

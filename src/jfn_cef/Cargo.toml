@@ -13,6 +13,7 @@ parking_lot.workspace = true
 cef = { workspace = true }
 crossbeam-channel.workspace = true
 crossbeam-utils.workspace = true
+jfn-bringup = { path = "../bringup" }
 jfn-color = { path = "../color" }
 jfn-config = { path = "../config" }
 jfn-gpu-paint = { path = "../gpu_paint" }
@@ -32,6 +33,9 @@ slotmap.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 nix.workspace = true
 
+
+[dev-dependencies]
+jfn-bringup = { path = "../bringup", features = ["test-support"] }
 
 [build-dependencies]
 gix = { workspace = true }

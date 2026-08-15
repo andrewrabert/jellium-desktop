@@ -1,0 +1,17 @@
+error: unused `Acquired` that must be used
+ --> tests/ui/discarded_frame.rs:4:5
+  |
+4 |     swapchain.acquire();
+  |     ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: each arm carries an obligation
+note: the lint level is defined here
+ --> tests/ui/discarded_frame.rs:1:9
+  |
+1 | #![deny(warnings)]
+  |         ^^^^^^^^
+  = note: `#[deny(unused_must_use)]` implied by `#[deny(warnings)]`
+help: use `let _ = ...` to ignore the resulting value
+  |
+4 |     let _ = swapchain.acquire();
+  |     +++++++

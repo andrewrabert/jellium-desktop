@@ -6,23 +6,6 @@
 
 use std::ffi::CString;
 
-/// Returns true if the supplied `MutexGuard`-bearing `Option` already holds
-/// a value — i.e. a singleton `init` is being called twice. Crashes loud in
-/// debug; logs + returns true in release so a programmer error never
-/// escalates. `caller` names the offending init for the log line.
-pub(crate) fn reject_double_init<T>(slot: &Option<T>, caller: &str) -> bool {
-    if slot.is_some() {
-        debug_assert!(false, "{caller} called twice");
-        jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_WARN,
-            &format!("{caller} called twice; ignoring"),
-        );
-        return true;
-    }
-    false
-}
-
 // --- generic Rust/C interop ------------------------------------------------
 
 /// Convert a JS-supplied string into a `CString` for FFI, logging + dropping

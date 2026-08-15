@@ -2,21 +2,22 @@ use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use smithay_client_toolkit::shm::slot::SlotPool;
 use wayland_client::QueueHandle;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
-use jfn_gpu_paint::{Frame, FrameSize as PhysicalSize, Pixels, Presented, SharedTexture, Surfaces};
+use jfn_gpu_paint::{FrameSize as PhysicalSize, Pixels, PresentFailed, SharedTexture, Surfaces};
 use jfn_mailbox::Mailbox;
-use jfn_platform_abi::JfnRect;
+use jfn_platform_abi::{Ack, FrameSource, JfnRect, Visibility, VisibilityCommit};
 
-use crate::layer::{FrameCommit, LayerSurface, Present, PresentError, ViewportState};
+use crate::layer::{Committed, FrameCommit, LayerSurface, PresentError, ViewportState};
 use crate::runtime::WlRuntime;
 use crate::wl_ops::dmabuf_pool_key;
 use crate::wl_state::{
-    AttachedBuffer, DispatchState, DmabufBuf, DmabufBuffer, DmabufPlane, FrameBuffer, ShmGlobal,
-    create_dmabuf_buffer, draw_argb8888, draw_from_pixels, new_slot_pool,
+    Acked, AttachedBuffer, DispatchState, DmabufBuf, DmabufBuffer, DmabufPlane, FrameBuffer,
+    ShmGlobal, create_dmabuf_buffer, draw_from_pixels, new_slot_pool,
 };
 
 const DMABUF_POOL_CAP: usize = 16;
@@ -62,15 +63,24 @@ struct ShmPayload {
     height: i32,
 }
 
+/// One software frame as its producer handed it over: the rows it covers, the
+/// regions that changed, and the geometry both are read against.
+struct SoftwareFrame<'a> {
+    pixels: &'a [u8],
+    dirty: &'a [JfnRect],
+    width: i32,
+    height: i32,
+    stride: usize,
+}
+
 enum PendingFrame {
     Gpu(GpuPayload),
     Shm(ShmPayload),
     Dmabuf(SharedTexture),
-    Placeholder(u8, u8, u8),
 }
 
-/// Every event that invalidates the shadow (dmabuf, placeholder, hide, resize)
-/// must reset it to `Stale`, or a later dirty-only frame patches stale pixels.
+/// Every event that invalidates the shadow (dmabuf, hide, resize) must reset it
+/// to `Stale`, or a later dirty-only frame patches stale pixels.
 enum ShadowState {
     Stale,
     Valid { size: (i32, i32) },
@@ -78,34 +88,54 @@ enum ShadowState {
 
 struct LayerState {
     pending: Option<PendingFrame>,
+    /// The producer that owes the pending frame's successor, held so a frame
+    /// the swapchain could not take can ask for the one that replaces it.
+    source: Option<Arc<dyn FrameSource>>,
     shadow: ShadowState,
     viewport: ViewportState,
-    visible: bool,
-    hide_pending: bool,
+    /// The visibility the worker has yet to carry into a commit. Not a second
+    /// statement of visibility: the surface's own field is the only one.
+    requested: Option<Visibility>,
+    /// Numbers the visibility requests; the requester waits for [`Self::acked`]
+    /// to carry its own number or a later one.
+    request_seq: u64,
+    /// The acknowledgement of the commit that carried request `n`, taken by the
+    /// requester waiting on it.
+    acked: Option<(u64, Acked)>,
     viewport_dirty: bool,
     shutdown: bool,
 }
 
 impl LayerState {
-    fn new(viewport: ViewportState, visible: bool) -> Self {
-        Self {
+    fn new(viewport: ViewportState) -> LayerState {
+        LayerState {
             pending: None,
+            source: None,
             shadow: ShadowState::Stale,
             viewport,
-            visible,
-            hide_pending: false,
+            requested: None,
+            request_seq: 0,
+            acked: None,
             viewport_dirty: false,
             shutdown: false,
         }
     }
 
-    fn set_visible(&mut self, visible: bool) {
-        self.visible = visible;
-        if !visible {
+    /// Returns this request's number, the one its acknowledgement carries.
+    fn request_visibility(&mut self, visibility: Visibility) -> u64 {
+        self.requested = Some(visibility);
+        self.request_seq = self.request_seq.wrapping_add(1);
+        if !visibility.is_shown() {
             self.pending = None;
-            self.hide_pending = true;
+            self.source = None;
             self.shadow = ShadowState::Stale;
         }
+        self.request_seq
+    }
+
+    /// A newer frame supersedes the pending one it replaces.
+    fn supersede(&mut self, successor: PendingFrame) {
+        self.pending = Some(successor);
     }
 
     fn resize(&mut self, viewport: ViewportState) {
@@ -119,18 +149,13 @@ impl LayerState {
         self.shadow = ShadowState::Stale;
     }
 
-    fn request_placeholder(&mut self, r: u8, g: u8, b: u8) {
-        self.pending = Some(PendingFrame::Placeholder(r, g, b));
-        self.shadow = ShadowState::Stale;
-    }
-
     fn present_dmabuf(&mut self, frame: SharedTexture) {
-        self.pending = Some(PendingFrame::Dmabuf(frame));
+        self.supersede(PendingFrame::Dmabuf(frame));
         self.shadow = ShadowState::Stale;
     }
 
     fn enqueue_gpu(&mut self, payload: GpuPayload) {
-        self.pending = Some(PendingFrame::Gpu(payload));
+        self.supersede(PendingFrame::Gpu(payload));
     }
 
     fn needs_full_copy(&self, width: i32, height: i32) -> bool {
@@ -145,7 +170,9 @@ impl LayerState {
     }
 
     /// Merges dirty rects into a co-pending dirty-only frame of the same size
-    /// instead of replacing it and dropping the earlier rects.
+    /// instead of replacing it and dropping the earlier rects. An empty-damage
+    /// frame still stores: nothing the stream accepted is dropped for carrying
+    /// no rects.
     fn store_shm(
         &mut self,
         rects: Vec<ShmRect>,
@@ -167,7 +194,7 @@ impl LayerState {
             existing.rects.extend(rects);
             return;
         }
-        self.pending = Some(PendingFrame::Shm(ShmPayload {
+        self.supersede(PendingFrame::Shm(ShmPayload {
             rects,
             full_pixels,
             width,
@@ -189,13 +216,6 @@ fn route_software(kind: Kind, gpu_failed: bool) -> Route {
     }
 }
 
-fn validate_present_dims(width: i32, height: i32) -> Result<(), PresentError> {
-    if width <= 0 || height <= 0 {
-        return Err(PresentError::BadDimensions(width, height));
-    }
-    Ok(())
-}
-
 pub(crate) struct LayerActor {
     kind: Kind,
     mailbox: Mailbox<LayerState>,
@@ -209,18 +229,26 @@ impl LayerActor {
         deps: LayerDeps,
         layer: LayerSurface,
         viewport_state: ViewportState,
-        visible: bool,
+        visibility: Visibility,
     ) -> Self {
         let kind = match backend {
             LayerBackend::Gpu(_) => Kind::Gpu,
             LayerBackend::Shm => Kind::Shm,
         };
-        let mailbox = Mailbox::new(LayerState::new(viewport_state, visible));
+        let mailbox = Mailbox::new(LayerState::new(viewport_state));
         let gpu_failed = Arc::new(AtomicBool::new(false));
         let worker_mailbox = mailbox.clone();
         let worker_failed = Arc::clone(&gpu_failed);
-        let thread =
-            thread::spawn(move || run(backend, deps, layer, worker_mailbox, worker_failed));
+        let thread = thread::spawn(move || {
+            run(
+                backend,
+                deps,
+                layer,
+                worker_mailbox,
+                worker_failed,
+                visibility,
+            );
+        });
         Self {
             kind,
             mailbox,
@@ -237,18 +265,32 @@ impl LayerActor {
             .update(|s| s.resize(ViewportState { lw, lh, pw, ph }));
     }
 
-    pub(crate) fn set_visible(&self, visible: bool) {
-        self.mailbox.update(|s| s.set_visible(visible));
+    /// Requests `visibility`; the returned commit is acknowledged when the
+    /// compositor fires the callback armed with the commit that carried it.
+    pub(crate) fn apply_visibility(&self, visibility: Visibility) -> VisibilityCommit {
+        let seq = self.mailbox.update(|s| s.request_visibility(visibility));
+        let mailbox = self.mailbox.clone();
+        VisibilityCommit::issued(
+            visibility,
+            Ack::deferred(Box::new(move || {
+                let acked = mailbox.wait(
+                    |s| s.acked.as_ref().is_some_and(|(n, _)| *n >= seq) || s.shutdown,
+                    |s| s.acked.take().map(|(_, acked)| acked),
+                );
+                if let Some(acked) = acked {
+                    acked.wait();
+                }
+            })),
+        )
     }
 
-    pub(crate) fn request_placeholder(&self, r: u8, g: u8, b: u8) {
-        self.mailbox.update(|s| s.request_placeholder(r, g, b));
-    }
-
-    pub(crate) fn present_dmabuf(&self, frame: SharedTexture) -> Result<Present, PresentError> {
-        validate_present_dims(frame.coded().w, frame.coded().h)?;
-        self.mailbox.update(|s| s.present_dmabuf(frame));
-        Ok(Present::Committed)
+    /// Enqueues `frame`; the slot's occupant is discharged by a commit or by
+    /// the frame that supersedes it, never by being dropped.
+    pub(crate) fn present_dmabuf(&self, frame: SharedTexture, source: Arc<dyn FrameSource>) {
+        self.mailbox.update(|s| {
+            s.present_dmabuf(frame);
+            s.source = Some(source);
+        });
     }
 
     pub(crate) fn present_software(
@@ -257,76 +299,60 @@ impl LayerActor {
         width: i32,
         height: i32,
         dirty: &[JfnRect],
-    ) -> Result<Present, PresentError> {
-        validate_present_dims(width, height)?;
+        source: Arc<dyn FrameSource>,
+    ) {
         let stride = (width as usize).saturating_mul(4);
-        let Some(len) = (height as usize).checked_mul(stride) else {
-            return Err(PresentError::BadDimensions(width, height));
+        let len = (height as usize).saturating_mul(stride).min(pixels.len());
+        let frame = SoftwareFrame {
+            pixels: &pixels[..len],
+            dirty,
+            width,
+            height,
+            stride,
         };
-        if pixels.len() < len {
-            return Err(PresentError::ShortBuffer {
-                have: pixels.len(),
-                need: len,
-            });
-        }
         match route_software(self.kind, self.gpu_failed.load(Ordering::Acquire)) {
-            Route::Gpu => self.enqueue_gpu(pixels, len, width, height, stride, dirty),
-            Route::Shm => self.enqueue_shm(pixels, len, width, height, stride, dirty),
+            Route::Gpu => self.enqueue_gpu(&frame, source),
+            Route::Shm => self.enqueue_shm(&frame, source),
         }
     }
 
-    fn enqueue_gpu(
-        &self,
-        pixels: &[u8],
-        len: usize,
-        width: i32,
-        height: i32,
-        stride: usize,
-        dirty: &[JfnRect],
-    ) -> Result<Present, PresentError> {
-        let dirty = dirty.to_vec();
+    fn enqueue_gpu(&self, frame: &SoftwareFrame<'_>, source: Arc<dyn FrameSource>) {
+        let dirty = frame.dirty.to_vec();
         self.mailbox.update(|s| {
             s.enqueue_gpu(GpuPayload {
-                pixels: pixels[..len].to_vec(),
+                pixels: frame.pixels.to_vec(),
                 dirty,
-                width: width as u32,
-                height: height as u32,
-                stride: stride as u32,
+                width: frame.width as u32,
+                height: frame.height as u32,
+                stride: frame.stride as u32,
             });
+            s.source = Some(source);
         });
-        Ok(Present::Committed)
     }
 
-    fn enqueue_shm(
-        &self,
-        pixels: &[u8],
-        len: usize,
-        width: i32,
-        height: i32,
-        stride: usize,
-        dirty: &[JfnRect],
-    ) -> Result<Present, PresentError> {
-        let rects: Vec<ShmRect> = dirty
+    fn enqueue_shm(&self, frame: &SoftwareFrame<'_>, source: Arc<dyn FrameSource>) {
+        let rects: Vec<ShmRect> = frame
+            .dirty
             .iter()
-            .filter_map(|rect| copy_dirty_rect(pixels, stride, width, height, rect))
+            .filter_map(|rect| {
+                copy_dirty_rect(frame.pixels, frame.stride, frame.width, frame.height, rect)
+            })
             .collect();
 
         self.mailbox.update(|s| {
             let full_pixels = s
-                .needs_full_copy(width, height)
-                .then(|| pixels[..len].to_vec());
-            if rects.is_empty() && full_pixels.is_none() {
-                return Ok(Present::Skipped);
-            }
-            s.store_shm(rects, full_pixels, width, height);
-            Ok(Present::Committed)
-        })
+                .needs_full_copy(frame.width, frame.height)
+                .then(|| frame.pixels.to_vec());
+            s.store_shm(rects, full_pixels, frame.width, frame.height);
+            s.source = Some(source);
+        });
     }
 
     pub(crate) fn shutdown(mut self) {
         self.mailbox.update(|s| {
             s.shutdown = true;
             s.pending = None;
+            s.source = None;
         });
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -347,38 +373,24 @@ pub(crate) enum Action<F> {
     Nop,
 }
 
-fn next_content<F>(prev: bool, action: &Action<F>, committed: bool, is_placeholder: bool) -> bool {
-    match action {
-        Action::Hide => false,
-        Action::Present(_) if committed && !is_placeholder => true,
-        _ => prev,
-    }
-}
-
 /// The frame op for one worker iteration, from one mailbox snapshot. Driven by
-/// the final desired `visible` state: a frame arriving in the same wake as a
+/// the final desired `visibility`: a frame arriving in the same wake as a
 /// coalesced hide+show is presented, not dropped.
 ///
 /// # Examples
 /// ```ignore
-/// let action = decide(Some(7u32), false, true, false, false);
+/// let action = decide(Some(7u32), Visibility::Shown, false);
 /// assert_eq!(action, Action::Present(7));
 /// ```
 pub(crate) fn decide<F>(
     pending: Option<F>,
-    pending_is_placeholder: bool,
-    visible: bool,
-    has_content: bool,
+    visibility: Visibility,
     viewport_dirty: bool,
 ) -> Action<F> {
-    if !visible {
+    if !visibility.is_shown() {
         Action::Hide
     } else if let Some(frame) = pending {
-        if pending_is_placeholder && has_content {
-            Action::Nop
-        } else {
-            Action::Present(frame)
-        }
+        Action::Present(frame)
     } else if viewport_dirty {
         Action::ReapplyViewport
     } else {
@@ -405,15 +417,11 @@ enum Backend {
     },
 }
 
-fn hide_detaches(backend: &Backend) -> bool {
-    matches!(backend, Backend::Shm { .. })
-}
-
-/// Only a GPU failure degrades. An `Err` from the compositor means the surface
-/// is done — anything it could absorb came back as a skip, including a failed
-/// shared import, which has no CPU fallback to degrade to.
+/// Only a lost surface degrades. Every other GPU failure names what its
+/// producer still owes — a deferred frame is presented again, a failed shared
+/// import has no CPU fallback to degrade to — and the backend stays put.
 fn is_degrading_error(err: &PresentError) -> bool {
-    matches!(err, PresentError::Gpu(_))
+    matches!(err, PresentError::Gpu(PresentFailed::Lost(_)))
 }
 
 fn degrade(
@@ -429,6 +437,14 @@ fn degrade(
     };
     gpu_failed.store(true, Ordering::Release);
     old
+}
+
+/// A frame the swapchain could not take yet, held until `at`, and the producer
+/// that owes its successor. A frame taken from the mailbox supersedes it.
+struct Retry {
+    frame: PendingFrame,
+    source: Arc<dyn FrameSource>,
+    at: Option<Instant>,
 }
 
 struct Runner {
@@ -453,6 +469,7 @@ fn run(
     layer: LayerSurface,
     mailbox: Mailbox<LayerState>,
     gpu_failed: Arc<AtomicBool>,
+    initial: Visibility,
 ) {
     let LayerDeps {
         rt,
@@ -481,51 +498,83 @@ fn run(
         dmabuf_pool: Vec::new(),
         current: None,
     };
-    let mut has_content = false;
+    let mut visibility = initial;
+    let mut retry: Option<Retry> = None;
 
     loop {
-        let (pending, pending_is_placeholder, viewport, visible, viewport_dirty, shutdown) =
-            mailbox.wait(
-                |s| s.pending.is_some() || s.shutdown || s.hide_pending || s.viewport_dirty,
-                |s| {
-                    s.hide_pending = false;
-                    let viewport_dirty = std::mem::take(&mut s.viewport_dirty);
-                    let pending = s.pending.take();
-                    let pending_is_placeholder =
-                        matches!(pending, Some(PendingFrame::Placeholder(..)));
-                    (
-                        pending,
-                        pending_is_placeholder,
-                        s.viewport,
-                        s.visible,
-                        viewport_dirty,
-                        s.shutdown,
-                    )
-                },
-            );
+        let ready = |s: &LayerState| {
+            s.pending.is_some() || s.shutdown || s.requested.is_some() || s.viewport_dirty
+        };
+        let take = |s: &mut LayerState| {
+            let viewport_dirty = std::mem::take(&mut s.viewport_dirty);
+            (
+                s.pending.take().zip(s.source.take()),
+                s.viewport,
+                s.requested.take().map(|v| (v, s.request_seq)),
+                viewport_dirty,
+                s.shutdown,
+            )
+        };
+        let taken = match retry.as_ref().and_then(|pending| pending.at) {
+            Some(at) => mailbox.wait_until(at, ready, take),
+            None => Some(mailbox.wait(ready, take)),
+        };
+        // Nothing arrived before the held frame came due: present it against
+        // the viewport it would have used.
+        let (pending, viewport, requested, viewport_dirty, shutdown) =
+            taken.unwrap_or_else(|| (None, mailbox.peek(|s| s.viewport), None, false, false));
 
         if shutdown {
             break;
         }
+        if let Some((requested, _)) = requested {
+            visibility = requested;
+        }
 
-        let action = decide(
-            pending,
-            pending_is_placeholder,
-            visible,
-            has_content,
-            viewport_dirty,
-        );
+        let pending = match pending {
+            // A frame taken from the mailbox supersedes the held one.
+            Some(fresh) => {
+                retry = None;
+                Some(fresh)
+            }
+            None => retry.take().map(|held| (held.frame, held.source)),
+        };
+        let (pending, source) = match pending {
+            Some((frame, source)) => (Some(frame), Some(source)),
+            None => (None, None),
+        };
 
-        let mut present_committed = false;
-        let mut layer_committed = match &action {
+        let action = decide(pending, visibility, viewport_dirty);
+
+        // Whether this wake's commit stream attached a buffer, which decides
+        // which callback a visibility request's commit can be acknowledged by.
+        let mut carries_buffer = false;
+        let mut layer_committed = match action {
             Action::Hide => runner.hide(&layer),
-            Action::Present(frame) => match runner.present(frame, &layer, viewport) {
-                Ok(Present::Committed) => {
+            Action::Present(frame) => match runner.present(&frame, &layer, viewport) {
+                Ok(_committed) => {
                     runner.present_failing = false;
-                    present_committed = true;
+                    carries_buffer = true;
                     true
                 }
-                Ok(Present::Skipped) => false,
+                Err(PresentError::Gpu(PresentFailed::Deferred(deferred))) => {
+                    // The producer is named by the frame it made; a frame with
+                    // no named producer is not held, because nothing could be
+                    // asked for its successor.
+                    if let Some(source) = source {
+                        match deferred.retry_at() {
+                            Some(at) => {
+                                retry = Some(Retry {
+                                    frame,
+                                    source,
+                                    at: Some(at),
+                                });
+                            }
+                            None => source.request_frame(),
+                        }
+                    }
+                    false
+                }
                 Err(err) => {
                     runner.on_present_error(err);
                     false
@@ -540,16 +589,10 @@ fn run(
             }
             Action::Nop => false,
         };
-        has_content = next_content(
-            has_content,
-            &action,
-            present_committed,
-            pending_is_placeholder,
-        );
 
-        // The `visible` gate keeps this fallback commit off a hidden GPU/WSI
+        // The visibility gate keeps this fallback commit off a hidden GPU/WSI
         // surface, whose buffers the compositor's swapchain owns.
-        if visible && !layer_committed && viewport_dirty {
+        if visibility.is_shown() && !layer_committed && viewport_dirty {
             // Zero source args leave the latched source untouched; only the
             // destination is rescaled to the new logical size.
             layer.set_viewport(0, 0, viewport.lw, viewport.lh);
@@ -557,9 +600,25 @@ fn run(
             layer_committed = true;
         }
 
+        // A request completes only on a commit carrying it, and that commit is
+        // the last one this wake issues, so its acknowledgement stands for
+        // everything before it.
+        let acked = requested.map(|(_, seq)| {
+            (
+                seq,
+                layer.commit_acked(rt.callbacks(), &runner.qh, carries_buffer),
+            )
+        });
+        if acked.is_some() {
+            layer_committed = true;
+        }
+
         if layer_committed {
             layer.flush();
             rt.root().request_present();
+        }
+        if let Some(acked) = acked {
+            mailbox.update(|s| s.acked = Some(acked));
         }
     }
 
@@ -571,23 +630,14 @@ impl Runner {
         self.current = buf;
     }
 
-    /// Returns whether the layer surface was committed. The GPU path leaves the
-    /// surface untouched — Vulkan WSI owns its buffers and an external
-    /// null-attach + commit would fight the swapchain — so it returns `false`.
+    /// Hiding is a commit that empties the surface, never a restack: nothing
+    /// about a surface's position changes with its visibility. Always commits,
+    /// so it always reports `true`.
     fn hide(&mut self, layer: &LayerSurface) -> bool {
-        if let Backend::Gpu { painter } = &mut self.backend
-            && let Some(painter) = painter.as_mut()
-        {
-            painter.set_visible(false);
-        }
-        if hide_detaches(&self.backend) {
-            layer.attach_none();
-            layer.commit();
-            self.set_current(None);
-            true
-        } else {
-            false
-        }
+        layer.attach_none();
+        layer.commit();
+        self.set_current(None);
+        true
     }
 
     fn on_present_error(&mut self, err: PresentError) {
@@ -604,50 +654,55 @@ impl Runner {
         }
     }
 
+    /// Presents through the path this runner's backend has: a gpu payload
+    /// reaching a degraded backend goes out as a full shm frame, and an shm
+    /// payload reaching a gpu backend degrades it first.
     fn present(
         &mut self,
         frame: &PendingFrame,
         layer: &LayerSurface,
         vps: ViewportState,
-    ) -> Result<Present, PresentError> {
+    ) -> Result<Committed, PresentError> {
         match frame {
-            PendingFrame::Gpu(p) => self.present_gpu(layer, vps, p),
-            PendingFrame::Shm(p) => self.present_shm(layer, vps, p),
-            PendingFrame::Dmabuf(frame) => self.present_dmabuf(layer, vps, frame),
-            PendingFrame::Placeholder(r, g, b) => {
-                self.present_placeholder(layer, vps, (*r, *g, *b))
+            PendingFrame::Gpu(p) => match (&self.backend, self.gpu) {
+                (Backend::Gpu { .. }, Some(_)) => self.present_gpu(layer, vps, p),
+                _ => {
+                    self.present_pixels_shm(layer, vps, &p.pixels, p.width as i32, p.height as i32)
+                }
+            },
+            PendingFrame::Shm(p) => {
+                if matches!(self.backend, Backend::Gpu { .. }) {
+                    drop(degrade(&mut self.backend, &self.gpu_failed));
+                }
+                self.present_shm(layer, vps, p)
             }
+            PendingFrame::Dmabuf(frame) => self.present_dmabuf(layer, vps, frame),
         }
     }
 
-    fn present_placeholder(
+    /// The shm path for a payload the gpu path could not take: a full frame,
+    /// because the backend's shadow never saw the pixels this one patches.
+    fn present_pixels_shm(
         &mut self,
         layer: &LayerSurface,
         vps: ViewportState,
-        bg: (u8, u8, u8),
-    ) -> Result<Present, PresentError> {
-        let (r, g, b) = bg;
-        let Some(pool) = self.shm_pool.as_mut() else {
-            return Err(PresentError::ShmAlloc);
-        };
-        let Some(buf) = draw_argb8888(pool, 1, 1, |dst| {
-            // ARGB8888 little-endian byte order = [B, G, R, A].
-            dst.copy_from_slice(&[b, g, r, 0xFF]);
-            true
-        }) else {
-            return Err(PresentError::ShmAlloc);
-        };
-        layer.present(FrameCommit::new(
-            FrameBuffer::Shm(&buf),
-            1,
-            1,
-            1,
-            1,
-            vps.lw,
-            vps.lh,
-        ));
-        self.set_current(Some(AttachedBuffer::Shm(buf)));
-        Ok(Present::Committed)
+        pixels: &[u8],
+        width: i32,
+        height: i32,
+    ) -> Result<Committed, PresentError> {
+        if matches!(self.backend, Backend::Gpu { .. }) {
+            drop(degrade(&mut self.backend, &self.gpu_failed));
+        }
+        self.present_shm(
+            layer,
+            vps,
+            &ShmPayload {
+                rects: Vec::new(),
+                full_pixels: Some(pixels.to_vec()),
+                width,
+                height,
+            },
+        )
     }
 
     fn present_gpu(
@@ -655,29 +710,36 @@ impl Runner {
         layer: &LayerSurface,
         vps: ViewportState,
         p: &GpuPayload,
-    ) -> Result<Present, PresentError> {
+    ) -> Result<Committed, PresentError> {
         let (Backend::Gpu { painter }, Some(gpu)) = (&mut self.backend, self.gpu) else {
-            return Ok(Present::Skipped);
+            return self.present_pixels_shm(layer, vps, &p.pixels, p.width as i32, p.height as i32);
         };
         if painter.is_none() {
             let Some(target) = layer.window_target() else {
-                return Ok(Present::Skipped);
+                return self.present_pixels_shm(
+                    layer,
+                    vps,
+                    &p.pixels,
+                    p.width as i32,
+                    p.height as i32,
+                );
             };
             // This path only ever carries CPU pixels; Wayland's shared frames
             // are a `wl_buffer` dmabuf attach and never reach wgpu.
-            let new = gpu.new_surface(
-                target,
-                PhysicalSize {
-                    w: p.width as i32,
-                    h: p.height as i32,
-                },
-            )?;
+            let new = gpu
+                .new_surface(
+                    target,
+                    PhysicalSize {
+                        w: p.width as i32,
+                        h: p.height as i32,
+                    },
+                )
+                .map_err(|e| PresentError::Gpu(PresentFailed::from(e)))?;
             *painter = Some(Box::new(new));
         }
         let Some(painter) = painter.as_mut() else {
-            return Ok(Present::Skipped);
+            return self.present_pixels_shm(layer, vps, &p.pixels, p.width as i32, p.height as i32);
         };
-        painter.set_visible(true);
         painter.resize(PhysicalSize {
             w: vps.pw.max(1),
             h: vps.ph.max(1),
@@ -696,14 +758,10 @@ impl Runner {
         // buffer. Clamped to min(buffer, physical) to stay within bounds.
         let src_w = (p.width as i32).min(vps.pw);
         let src_h = (p.height as i32).min(vps.ph);
-        // Map the painter's own present/skip to this layer's — a GPU skip must
-        // not be reported as committed, or the frame is lost from the mailbox.
-        match painter.present(Frame::Copied(pixel_frame), || {
+        painter.present_pixels(pixel_frame, || {
             layer.set_viewport(src_w, src_h, vps.lw, vps.lh);
-        })? {
-            Presented::Yes => Ok(Present::Committed),
-            Presented::Skipped => Ok(Present::Skipped),
-        }
+        })?;
+        Ok(Committed::issued())
     }
 
     fn present_shm(
@@ -711,12 +769,12 @@ impl Runner {
         layer: &LayerSurface,
         vps: ViewportState,
         p: &ShmPayload,
-    ) -> Result<Present, PresentError> {
+    ) -> Result<Committed, PresentError> {
         let (width, height) = (p.width, p.height);
         let Backend::Shm { shadow } = &mut self.backend else {
-            return Ok(Present::Skipped);
+            return Err(PresentError::ShmAlloc);
         };
-        compose_shm_shadow(shadow, p)?;
+        compose_shm_shadow(shadow, p);
         let Some(pool) = self.shm_pool.as_mut() else {
             return Err(PresentError::ShmAlloc);
         };
@@ -733,7 +791,7 @@ impl Runner {
             vps.lh,
         ));
         self.set_current(Some(AttachedBuffer::Shm(buf)));
-        Ok(Present::Committed)
+        Ok(Committed::issued())
     }
 
     fn present_dmabuf(
@@ -741,7 +799,7 @@ impl Runner {
         layer: &LayerSurface,
         vps: ViewportState,
         frame: &SharedTexture,
-    ) -> Result<Present, PresentError> {
+    ) -> Result<Committed, PresentError> {
         let (vw, vh) = (frame.visible().w, frame.visible().h);
         let Some(pos) = self.lease_dmabuf(frame) else {
             return Err(PresentError::DmabufCreate);
@@ -773,7 +831,7 @@ impl Runner {
                 self.set_current(Some(AttachedBuffer::Dmabuf(buf)));
             }
         }
-        Ok(Present::Committed)
+        Ok(Committed::issued())
     }
 
     fn lease_dmabuf(&mut self, frame: &SharedTexture) -> Option<DmabufLease> {
@@ -858,13 +916,11 @@ enum DmabufLease {
     OneShot(DmabufBuffer),
 }
 
-fn compose_shm_shadow(shadow: &mut ShmShadow, payload: &ShmPayload) -> Result<(), PresentError> {
+fn compose_shm_shadow(shadow: &mut ShmShadow, payload: &ShmPayload) {
     let (width, height) = (payload.width, payload.height);
     if shadow.size != (width, height) {
-        let stride = (width as usize).saturating_mul(4);
-        let Some(size) = (height as usize).checked_mul(stride) else {
-            return Err(PresentError::BadDimensions(width, height));
-        };
+        let stride = (width.max(0) as usize).saturating_mul(4);
+        let size = (height.max(0) as usize).saturating_mul(stride);
         shadow.pixels.clear();
         shadow.pixels.resize(size, 0);
         shadow.size = (width, height);
@@ -875,7 +931,6 @@ fn compose_shm_shadow(shadow: &mut ShmShadow, payload: &ShmPayload) -> Result<()
         dst.copy_from_slice(full_pixels);
     }
     apply_dirty_to_shadow(&mut shadow.pixels, width, &payload.rects);
-    Ok(())
 }
 
 fn copy_dirty_rect(
@@ -1004,61 +1059,50 @@ mod tests {
     #[test]
     fn coalesced_hide_then_show_frame_presents() {
         assert_eq!(
-            decide(Some(7u32), false, true, false, false),
+            decide(Some(7u32), Visibility::Shown, false),
             Action::Present(7)
         );
     }
 
     #[test]
     fn hide_alone_hides() {
-        assert_eq!(decide(None::<u32>, false, false, true, false), Action::Hide);
+        assert_eq!(decide(None::<u32>, Visibility::Hidden, false), Action::Hide);
     }
 
     #[test]
-    fn placeholder_honored_again_after_hide() {
-        assert_eq!(
-            decide(Some(0u32), true, true, false, false),
-            Action::Present(0)
-        );
-    }
-
-    #[test]
-    fn placeholder_skipped_when_content_present() {
-        assert_eq!(decide(Some(0u32), true, true, true, false), Action::Nop);
-    }
-
-    #[test]
-    fn next_content_transition_table() {
-        // Hide clears regardless of prior state or commit.
-        assert!(!next_content(true, &Action::<()>::Hide, true, false));
-        // A committed non-placeholder present sets it.
-        assert!(next_content(false, &Action::Present(()), true, false));
-        // A placeholder present never sets it.
-        assert!(!next_content(false, &Action::Present(()), true, true));
-        // A skipped/failed present (not committed) leaves the prior value.
-        assert!(next_content(true, &Action::Present(()), false, false));
-        assert!(!next_content(false, &Action::Present(()), false, false));
-        // Viewport/nop leave the prior value.
-        assert!(!next_content(
-            false,
-            &Action::<()>::ReapplyViewport,
-            true,
-            false
-        ));
-        assert!(next_content(true, &Action::<()>::Nop, false, false));
+    fn hide_outranks_a_pending_frame() {
+        assert_eq!(decide(Some(7u32), Visibility::Hidden, true), Action::Hide);
     }
 
     #[test]
     fn viewport_dirty_snapshot_reapplies_viewport() {
         assert_eq!(
-            decide(None::<u32>, false, true, false, true),
+            decide(None::<u32>, Visibility::Shown, true),
             Action::ReapplyViewport
         );
     }
 
     #[test]
+    fn hide_request_drops_the_pending_frame_and_stales_the_shadow() {
+        let mut mb = LayerState::new(vp());
+        mb.shadow = valid_shadow();
+        mb.store_shm(vec![test_rect(1)], None, 100, 100);
+        assert_eq!(mb.request_visibility(Visibility::Hidden), 1);
+        assert!(mb.pending.is_none());
+        assert!(matches!(mb.shadow, ShadowState::Stale));
+        assert_eq!(mb.requested, Some(Visibility::Hidden));
+    }
+
+    #[test]
+    fn each_visibility_request_gets_its_own_number() {
+        let mut mb = LayerState::new(vp());
+        assert_eq!(mb.request_visibility(Visibility::Shown), 1);
+        assert_eq!(mb.request_visibility(Visibility::Hidden), 2);
+    }
+
+    #[test]
     fn store_shm_merges_dirty_only_same_dims() {
-        let mut mb = LayerState::new(vp(), true);
+        let mut mb = LayerState::new(vp());
         mb.store_shm(vec![test_rect(1)], None, 100, 100);
         mb.store_shm(vec![test_rect(2)], None, 100, 100);
         let Some(PendingFrame::Shm(p)) = &mb.pending else {
@@ -1069,7 +1113,7 @@ mod tests {
 
     #[test]
     fn store_shm_replaces_on_dim_mismatch() {
-        let mut mb = LayerState::new(vp(), true);
+        let mut mb = LayerState::new(vp());
         mb.store_shm(vec![test_rect(1)], None, 100, 100);
         mb.store_shm(vec![test_rect(2)], None, 200, 200);
         let Some(PendingFrame::Shm(p)) = &mb.pending else {
@@ -1081,7 +1125,7 @@ mod tests {
 
     #[test]
     fn store_shm_replaces_when_pending_has_full() {
-        let mut mb = LayerState::new(vp(), true);
+        let mut mb = LayerState::new(vp());
         mb.store_shm(vec![], Some(vec![0u8; 4]), 1, 1);
         mb.store_shm(vec![test_rect(2)], None, 1, 1);
         let Some(PendingFrame::Shm(p)) = &mb.pending else {
@@ -1103,7 +1147,7 @@ mod tests {
 
     #[test]
     fn full_copy_marks_shadow_valid() {
-        let mut mb = LayerState::new(vp(), true);
+        let mut mb = LayerState::new(vp());
         assert!(matches!(mb.shadow, ShadowState::Stale));
         mb.store_shm(vec![], Some(vec![0u8; 4]), 1, 1);
         assert!(matches!(mb.shadow, ShadowState::Valid { size: (1, 1) }));
@@ -1111,7 +1155,7 @@ mod tests {
 
     #[test]
     fn valid_shadow_at_wrong_size_still_full_copies() {
-        let mut mb = LayerState::new(vp(), true);
+        let mut mb = LayerState::new(vp());
         mb.store_shm(vec![], Some(vec![0u8; 4 * 100 * 100]), 100, 100);
         mb.pending = None; // worker consumed the full frame
         assert!(!mb.needs_full_copy(100, 100));
@@ -1119,13 +1163,13 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_invalidates_shadow_forcing_full_copy() {
-        let mut mb = LayerState::new(vp(), true);
+    fn hide_invalidates_shadow_forcing_full_copy() {
+        let mut mb = LayerState::new(vp());
         mb.store_shm(vec![], Some(vec![0u8; 4 * 100 * 100]), 100, 100);
         assert!(matches!(mb.shadow, ShadowState::Valid { .. }));
         mb.pending = None; // worker consumed the full frame
         assert!(!mb.needs_full_copy(100, 100));
-        mb.request_placeholder(0, 0, 0);
+        mb.request_visibility(Visibility::Hidden);
         assert!(matches!(mb.shadow, ShadowState::Stale));
         assert!(mb.needs_full_copy(100, 100));
     }
@@ -1157,7 +1201,7 @@ mod tests {
 
     #[test]
     fn resize_noop_when_unchanged() {
-        let mut mb = LayerState::new(vp(), true);
+        let mut mb = LayerState::new(vp());
         mb.shadow = valid_shadow();
         mb.resize(vp());
         assert!(!mb.viewport_dirty);
@@ -1175,16 +1219,16 @@ mod tests {
 
     #[test]
     fn dmabuf_hide_and_resize_invalidate_shadow() {
-        let mut mb = LayerState::new(vp(), true);
+        let mut mb = LayerState::new(vp());
         mb.shadow = valid_shadow();
         mb.present_dmabuf(dmabuf_frame(64, 64));
         assert!(matches!(mb.shadow, ShadowState::Stale));
 
         mb.shadow = valid_shadow();
-        mb.set_visible(false);
+        mb.request_visibility(Visibility::Hidden);
         assert!(matches!(mb.shadow, ShadowState::Stale));
 
-        let mut mb = LayerState::new(vp(), true);
+        let mut mb = LayerState::new(vp());
         mb.shadow = valid_shadow();
         mb.resize(ViewportState {
             lw: 200,
@@ -1204,18 +1248,9 @@ mod tests {
     }
 
     #[test]
-    fn gpu_hide_performs_no_surface_op() {
-        assert!(!hide_detaches(&Backend::Gpu { painter: None }));
-        assert!(hide_detaches(&Backend::Shm {
-            shadow: ShmShadow::default(),
-        }));
-    }
-
-    #[test]
     fn gpu_error_degrades_backend() {
         assert!(!is_degrading_error(&PresentError::ShmAlloc));
         assert!(!is_degrading_error(&PresentError::DmabufCreate));
-        assert!(!is_degrading_error(&PresentError::BadDimensions(0, 0)));
 
         let mut backend = Backend::Gpu { painter: None };
         let flag = AtomicBool::new(false);
@@ -1226,21 +1261,8 @@ mod tests {
     }
 
     #[test]
-    fn dmabuf_producer_rejects_bad_dimensions() {
-        assert!(matches!(
-            validate_present_dims(0, 64),
-            Err(PresentError::BadDimensions(0, 64))
-        ));
-        assert!(matches!(
-            validate_present_dims(64, -1),
-            Err(PresentError::BadDimensions(64, -1))
-        ));
-        assert!(validate_present_dims(64, 64).is_ok());
-    }
-
-    #[test]
     fn first_post_fallback_frame_full_copies() {
-        let mb = LayerState::new(vp(), true);
+        let mb = LayerState::new(vp());
         assert!(mb.needs_full_copy(100, 100));
     }
 
@@ -1340,7 +1362,7 @@ mod tests {
             height: h,
         };
         let mut shadow = ShmShadow::default();
-        compose_shm_shadow(&mut shadow, &payload).unwrap();
+        compose_shm_shadow(&mut shadow, &payload);
         assert_eq!(shadow.pixels, source);
         assert_eq!(shadow.size, (w, h));
     }

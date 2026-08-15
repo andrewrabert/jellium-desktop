@@ -2,11 +2,7 @@
 
 mod app;
 pub mod app_menu;
-pub mod bridge;
-pub mod browsers;
-pub mod business_about;
 mod business_common;
-pub mod business_overlay;
 pub mod business_web;
 mod cef_string;
 pub mod client;
@@ -18,16 +14,18 @@ mod ipc;
 mod menu_ownership;
 mod paint_scheduler;
 pub mod platform_ops;
+pub mod ready;
 mod resource;
-pub mod sink_routing;
+pub mod server_probe;
 mod state;
 mod v8_handler;
 pub mod version;
-pub mod window_controls;
-mod window_sync;
+mod web_input;
+pub mod web_overlay;
 
-pub use client::{BeforeCloseFn, ContextBuilderFn, ContextDispatcherFn, CreatedFn, JfnCefLayer};
+pub use client::{BeforeCloseFn, ContextBuilderFn, ContextDispatcherFn, CreatedFn};
 pub use ffi::*;
+pub use web_overlay::{WebOverlay, WebOverlayConfig};
 
 pub const APP_VERSION: &str = env!("JFN_APP_VERSION");
 pub const APP_VERSION_FULL: &str = env!("JFN_APP_VERSION_FULL");

@@ -16,7 +16,10 @@ use objc2_io_kit::{
 };
 
 use jfn_platform_abi::geometry::{Bounds, clamp_to_bounds};
-pub use jfn_platform_abi::{DisplayBackend, JfnRect, PaintFrame, Platform, WindowDecorations};
+pub use jfn_platform_abi::{
+    Content, DisplayBackend, JfnRect, PaintFrame, Platform, Presented, Visibility,
+    VisibilityCommit, WindowDecorations,
+};
 
 // =====================================================================
 // Backend no-op entry points.
@@ -404,7 +407,7 @@ pub fn macos_open_external_url(url: &str) {
 // =====================================================================
 // CAMetalLayer-based per-surface compositor. Owns:
 //   - the per-surface state (NSView + CAMetalLayer + cached input texture)
-//   - the surface stack (bottom-to-top, set by macos_restack)
+//   - the surface stack (bottom-to-top, set by macos_apply_stack)
 //   - the Metal device / queue / pipeline (lazy-init on first alloc)
 //   - the expected-size transition gate (macos_set_expected_size /
 //     transition clear-on-match in macos_surface_present)
@@ -424,9 +427,9 @@ mod menu;
 mod mpv_host;
 mod ns_menu;
 use compositor::{
-    macos_alloc_surface, macos_free_surface, macos_restack, macos_set_expected_size,
-    macos_surface_present, macos_surface_present_software, macos_surface_resize,
-    macos_surface_set_visible,
+    macos_alloc_surface, macos_apply_stack, macos_free_surface, macos_set_expected_size,
+    macos_set_surface_visibility, macos_surface_present, macos_surface_present_software,
+    macos_surface_resize, macos_surface_window_target,
 };
 
 // =====================================================================
@@ -473,27 +476,32 @@ impl Platform for MacosPlatform {
         macos_cleanup();
     }
 
-    fn alloc_surface(&self) -> SurfaceHandle {
-        SurfaceHandle::from_ptr(macos_alloc_surface())
+    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+        SurfaceHandle::from_ptr(macos_alloc_surface(initial))
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
         macos_free_surface(s.as_ptr());
     }
 
-    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
-        match frame {
-            PaintFrame::Accelerated(tex) => macos_surface_present(s.as_ptr(), &tex),
+    fn surface_present<'a>(
+        &self,
+        s: SurfaceHandle,
+        frame: PaintFrame<'a>,
+    ) -> Result<Presented, PaintFrame<'a>> {
+        let presented = match frame.content() {
+            Content::Accelerated(tex) => macos_surface_present(s.as_ptr(), tex),
             // CEF on macOS runs hardware-accelerated
             // (shared_texture_supported = true), so this is only reachable
             // with --disable-gpu-compositing; the painter draws both frame
             // kinds, so there is nothing to gain by refusing one.
-            PaintFrame::Software {
+            Content::Software {
                 size,
                 pixels,
                 dirty,
-            } => macos_surface_present_software(s.as_ptr(), pixels, size, dirty),
-        }
+            } => macos_surface_present_software(s.as_ptr(), pixels, *size, dirty),
+        };
+        presented.ok_or(frame)
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
@@ -506,14 +514,18 @@ impl Platform for MacosPlatform {
         );
     }
 
-    fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        macos_surface_set_visible(s.as_ptr(), visible);
+    fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
+        macos_surface_window_target(s.as_ptr())
     }
 
-    fn restack(&self, ordered: &[SurfaceHandle]) {
+    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
+        macos_set_surface_visibility(s.as_ptr(), visibility)
+    }
+
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
         // `SurfaceHandle` is `#[repr(transparent)]` over `*mut c_void`, so the
         // slice pointer reinterprets directly.
-        macos_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
+        macos_apply_stack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
     fn menu_delivery(&self, _kind: MenuKind) -> MenuDelivery {

@@ -13,8 +13,28 @@
 
 use parking_lot::Mutex;
 use std::ffi::c_char;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const DEFAULT_BG_RGB: u32 = 0x101010; // kBgColor
+
+/// The colour `apply` last resolved to. Readable without the instance lock so
+/// the titlebar can paint it from its own thread.
+static CURRENT: AtomicU32 = AtomicU32::new(DEFAULT_BG_RGB);
+
+type ColorListener = Box<dyn Fn(u32) + Send + Sync>;
+
+static LISTENERS: Mutex<Vec<ColorListener>> = Mutex::new(Vec::new());
+
+/// The colour `apply` last resolved to, `0x101010` before the first apply.
+pub fn jfn_theme_color_current() -> u32 {
+    CURRENT.load(Ordering::Acquire)
+}
+
+/// Registered once at boot; fired on every applied change, on the applying
+/// thread. A listener must not call back into this module.
+pub fn jfn_theme_color_subscribe<F: Fn(u32) + Send + Sync + 'static>(f: F) {
+    LISTENERS.lock().push(Box::new(f));
+}
 
 struct ThemeColor {
     on_set_theme_color: Option<unsafe extern "C" fn(u32)>,
@@ -41,6 +61,10 @@ impl ThemeColor {
             return;
         }
         self.last_applied = Some(rgb);
+        CURRENT.store(rgb, Ordering::Release);
+        for f in LISTENERS.lock().iter() {
+            f(rgb);
+        }
         if let Some(f) = self.on_set_theme_color {
             unsafe { f(rgb) };
         }
@@ -111,7 +135,7 @@ pub fn jfn_theme_color_on_color(rgb: u32) {
     }
 }
 
-pub fn jfn_theme_color_on_overlay_dismissed() {
+pub fn jfn_theme_color_on_connect_dismissed() {
     let mut g = INSTANCE.lock();
     if let Some(t) = g.as_mut() {
         t.unlocked = true;

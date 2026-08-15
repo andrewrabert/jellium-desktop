@@ -373,6 +373,24 @@ pub fn extract_base_url(url: &str) -> &str {
     &url[..end]
 }
 
+/// Whether `url` is a page of the server at `base`.
+///
+/// `base` is canonical — the probe resolved it, including the path a
+/// subpath-hosted server sits under — so it is compared verbatim and never
+/// reduced again. The match ends on a path boundary, so
+/// `https://host/jellyfin2/web` is not a page of `https://host/jellyfin`, and a
+/// document with no base at all — `about:blank`, an empty URL, a
+/// `chrome-error:` page — is a page of nothing.
+pub fn is_page_of(base: &str, url: &str) -> bool {
+    if base.is_empty() {
+        return false;
+    }
+    let Some(rest) = url.strip_prefix(base) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(['/', '?', '#'])
+}
+
 /// Validate that a Jellyfin `/System/Info/Public` response body is a JSON
 /// object with a non-empty string `Id` field.
 pub fn is_valid_public_info(body: &[u8]) -> bool {
@@ -592,6 +610,40 @@ mod tests {
     fn normalize_passes_non_http_schemes_through() {
         // Only Http:/Https: prefixes are touched; anything else passes through.
         assert_eq!(normalize_input("FTP://example.com"), "FTP://example.com");
+    }
+
+    #[test]
+    fn a_subpath_hosted_servers_pages_are_its_own() {
+        let base = "https://host/jellyfin";
+        assert!(is_page_of(base, base));
+        assert!(is_page_of(base, "https://host/jellyfin/web/index.html"));
+        assert!(is_page_of(base, "https://host/jellyfin/web/#!/home.html"));
+        assert!(is_page_of(base, "https://host/jellyfin?foo=bar"));
+    }
+
+    #[test]
+    fn a_root_hosted_servers_pages_are_its_own() {
+        let base = "https://host";
+        assert!(is_page_of(base, base));
+        assert!(is_page_of(base, "https://host/web/index.html"));
+        assert!(is_page_of(base, "https://host/"));
+    }
+
+    #[test]
+    fn a_sibling_path_is_not_a_page_of_the_base() {
+        let base = "https://host/jellyfin";
+        assert!(!is_page_of(base, "https://host/jellyfin2/web/index.html"));
+        assert!(!is_page_of(base, "https://other/jellyfin/web/index.html"));
+        assert!(!is_page_of(base, "https://host/web/index.html"));
+    }
+
+    #[test]
+    fn a_blank_or_error_document_is_a_page_of_nothing() {
+        let base = "https://host/jellyfin";
+        assert!(!is_page_of(base, "about:blank"));
+        assert!(!is_page_of(base, ""));
+        assert!(!is_page_of(base, "chrome-error://chromewebdata/"));
+        assert!(!is_page_of("", "https://host/jellyfin/web/"));
     }
 
     #[test]

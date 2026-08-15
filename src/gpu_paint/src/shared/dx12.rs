@@ -6,7 +6,6 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
 };
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory2};
 
 use crate::SharedTexture;
 use crate::error::SurfaceLost;
@@ -15,23 +14,12 @@ use crate::shared::{ImportFailed, Imported, Opened};
 /// An adapter LUID, packed into one integer so it compares by value.
 pub type ProducerId = i64;
 
-/// The adapter Chromium's GPU process produced `sample` on, read out of the
-/// frame itself: a shared resource names the adapter that created it, and that
-/// is the only adapter its handle can be opened on.
-///
-/// Without a frame there is nothing to name and nothing to import — a
-/// software-only session takes any adapter.
-pub(crate) fn producer_id(sample: Option<&SharedTexture>) -> Option<ProducerId> {
-    let handle = sample?.handle();
-    if handle.is_null() {
-        return None;
-    }
-    unsafe {
-        let factory: IDXGIFactory2 = CreateDXGIFactory1().ok()?;
-        let luid = pack_luid(factory.GetSharedResourceAdapterLuid(HANDLE(handle)).ok()?);
-        tracing::info!("gpu_paint: CEF's producer adapter LUID {luid:#018x}");
-        Some(luid)
-    }
+/// The adapter this device opened on, packed high:low. Chromium is pinned to
+/// it on the command line, so no frame ever has to name it.
+pub(crate) fn adapter_luid(adapter: &wgpu::Adapter) -> Option<ProducerId> {
+    unsafe { adapter.as_hal::<dx12::Api>() }
+        .and_then(|hal| unsafe { hal.raw_adapter().GetDesc1() }.ok())
+        .map(|desc| pack_luid(desc.AdapterLuid))
 }
 
 pub(crate) fn adapter_matches(adapter: &wgpu::Adapter, want: ProducerId) -> bool {
@@ -139,9 +127,6 @@ impl Importer {
                     usage: wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 },
-                // A cross-device shared resource is handed over in the COMMON
-                // state, which is what UNINITIALIZED maps to on dx12.
-                wgpu::TextureUses::UNINITIALIZED,
             )
         };
         Ok(Imported {

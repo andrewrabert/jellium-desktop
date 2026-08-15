@@ -1441,6 +1441,7 @@ fn root_loop(
         Ok(l) => l,
         Err(e) => {
             tracing::error!(target: "Main", "root window: event loop: {e}");
+            state.rt.callbacks().close();
             return;
         }
     };
@@ -1452,6 +1453,7 @@ fn root_loop(
         }
     }) {
         tracing::error!(target: "Main", "root window: stop source: {e}");
+        state.rt.callbacks().close();
         return;
     }
     let inserted = handle.insert_source(
@@ -1468,6 +1470,7 @@ fn root_loop(
     );
     if let Err(e) = inserted {
         tracing::error!(target: "Main", "root window: wayland source: {e}");
+        state.rt.callbacks().close();
         return;
     }
     // `run` calls its callback only after a dispatch, so settle once here or
@@ -1476,6 +1479,9 @@ fn root_loop(
     if let Err(e) = event_loop.run(None, &mut state, RootState::settle) {
         tracing::error!(target: "Main", "root window: event loop: {e}");
     }
+    // This loop is the only dispatcher of compositor acknowledgements; once it
+    // is gone none can ever resolve, so every waiter is released here.
+    state.rt.callbacks().close();
     // Do not drain the bg's release here: this thread shares the wl_display fd
     // with the other readers, so a blocking roundtrip would deadlock them.
     state.bg_buffer = None;
@@ -1523,12 +1529,38 @@ impl CompositorHandler for RootState {
     }
 }
 
+impl RootState {
+    fn report_output_refresh(&self, output: &WlOutput) {
+        // `wl_output`'s mode refresh is in mHz.
+        if let Some(refresh) = self
+            .output_state
+            .info(output)
+            .and_then(|info| {
+                info.modes
+                    .iter()
+                    .find(|m| m.current)
+                    .map(|m| m.refresh_rate)
+            })
+            .filter(|mhz| *mhz > 0)
+        {
+            jfn_gpu_paint::report_refresh(
+                jfn_gpu_paint::RefreshSource::OutputMode,
+                std::time::Duration::from_secs_f64(1000.0 / f64::from(refresh)),
+            );
+        }
+    }
+}
+
 impl OutputHandler for RootState {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.report_output_refresh(&output);
+    }
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.report_output_refresh(&output);
+    }
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
 }
 

@@ -34,22 +34,57 @@ pub fn build_closure() -> Box<crate::client::ContextBuilderFn> {
     })
 }
 
+/// The same three items, as a host-menu request. Raised by the shell overlay
+/// for a right-press it owns, in window coordinates.
+pub fn open_at(x: c_int, y: c_int) {
+    let jfn_platform_abi::MenuDelivery::Host(host) =
+        jfn_platform_abi::menu_delivery(jfn_platform_abi::MenuKind::ContextMenu)
+    else {
+        return;
+    };
+    let items = [
+        (MENU_ID_TOGGLE_FULLSCREEN, "Toggle Fullscreen"),
+        (MENU_ID_ABOUT, "About"),
+        (MENU_ID_EXIT, "Exit"),
+    ]
+    .into_iter()
+    .map(|(id, label)| jfn_platform_abi::MenuItem {
+        id,
+        label: label.to_owned(),
+        enabled: true,
+        separator: false,
+    })
+    .collect();
+    host.open(jfn_platform_abi::MenuRequest {
+        items,
+        x,
+        y,
+        width: 0,
+        initial: jfn_platform_abi::MENU_DISMISSED,
+        on_selected: jfn_platform_abi::MenuSelection::new(|id| {
+            dispatch(id);
+        }),
+    });
+}
+
 /// Dispatch closure for [`JfnCefLayer::set_context_menu_dispatcher_rust`].
 pub fn dispatch_closure() -> Box<crate::client::ContextDispatcherFn> {
-    Box::new(|cmd: c_int| -> bool {
-        if cmd == MENU_ID_TOGGLE_FULLSCREEN {
-            if let Some(p) = jfn_platform_abi::try_get() {
-                p.toggle_fullscreen();
-            }
-            true
-        } else if cmd == MENU_ID_ABOUT {
-            crate::business_about::jfn_about_open();
-            true
-        } else if cmd == MENU_ID_EXIT {
-            jfn_shutdown_initiate();
-            true
-        } else {
-            false
+    Box::new(dispatch)
+}
+
+fn dispatch(cmd: c_int) -> bool {
+    if cmd == MENU_ID_TOGGLE_FULLSCREEN {
+        if let Some(p) = jfn_platform_abi::try_get() {
+            p.toggle_fullscreen();
         }
-    })
+        true
+    } else if cmd == MENU_ID_ABOUT {
+        jfn_platform_abi::request_about();
+        true
+    } else if cmd == MENU_ID_EXIT {
+        jfn_shutdown_initiate();
+        true
+    } else {
+        false
+    }
 }

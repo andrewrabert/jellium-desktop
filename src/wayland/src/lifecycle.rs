@@ -118,8 +118,8 @@ pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
     }
 
     if want_gpu_paint {
-        match jfn_gpu_paint::Surfaces::init(None, None) {
-            Some(gpu) => core.install_gpu_paint(Box::leak(Box::new(gpu))),
+        match jfn_gpu_paint::Surfaces::init(None) {
+            Some(gpu) => core.install_gpu_paint(gpu),
             None => {
                 tracing::info!("paint: no usable GPU device; using wl_shm");
                 resolved = Req::Shm;

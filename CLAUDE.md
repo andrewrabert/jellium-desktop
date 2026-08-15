@@ -23,6 +23,12 @@ Platform-specific entry points live in `dev/linux/`, `dev/macos/`, `dev/windows/
 ## Before Committing
 Run `just fmt` and `just lint` before every commit; both must pass clean (lint runs `fmt-check` + `clippy`, and CI rejects unformatted or lint-failing code).
 
+## Constants
+Every timing, interval or threshold derives from a value the system reports or
+from a value a requirements note records. A plan that is silent on a value the
+work needs is a blocker back to planning: stop and ask. Inventing the value and
+writing a justification for it is the failure mode, not the mitigation.
+
 ## Architecture
 - **CEF** (Chromium Embedded Framework) — hosts jellyfin-web as an embedded browser; handles JS-to-Rust IPC for player control commands and renders the UI as an overlay texture above the video layer. Multi-process: browser process (main app, owns CefBrowser), renderer process (V8/Blink), GPU process. IPC via `CefProcessMessage`. Bindings via `cef-dll-sys`; project glue lives in `src/jfn_cef`.
 - **mpv** (fork in `third_party/mpv`) — video playback; the desktop client injects native shims to override browser media playback. mpv owns its own window + GPU; libmpv is used only for the control plane (properties/commands/events).

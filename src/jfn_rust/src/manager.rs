@@ -86,7 +86,7 @@ fn manager() -> &'static Manager {
 /// layers can post visibility / suspend / resume events without a direct
 /// dep on this crate.
 #[allow(clippy::expect_used)] // boot invariant: control-plane thread spawn is fatal if it fails
-pub fn jfn_manager_start() -> JoinHandle<()> {
+pub fn jfn_manager_start(overlay: jfn_cef::WebOverlay) -> JoinHandle<()> {
     // Materialize the singleton so its wake event exists before any producer
     // (shutdown handler / sender) signals it.
     let _ = manager();
@@ -97,7 +97,7 @@ pub fn jfn_manager_start() -> JoinHandle<()> {
     );
     thread::Builder::new()
         .name("jfn-manager".into())
-        .spawn(manager_loop)
+        .spawn(move || manager_loop(&overlay))
         .expect("spawn jfn-manager thread")
 }
 
@@ -115,7 +115,7 @@ pub fn jfn_manager_send(msg: ManagerMsg) {
     manager().wake.signal();
 }
 
-fn manager_loop() {
+fn manager_loop(overlay: &jfn_cef::WebOverlay) {
     let m = manager();
     let mut state = LifecycleState::Running;
     loop {
@@ -135,7 +135,7 @@ fn manager_loop() {
             std::mem::take(&mut *q)
         };
         for msg in work {
-            state = transition(state, msg);
+            state = transition(overlay, state, msg);
             if state == LifecycleState::ShuttingDown {
                 return;
             }
@@ -146,34 +146,38 @@ fn manager_loop() {
 /// Apply one message to the lifecycle FSM. Returns the new state; the
 /// caller observes terminal `ShuttingDown` to exit the loop. Side effects
 /// happen inline (CEF visibility fan-out, shutdown drain).
-fn transition(state: LifecycleState, msg: ManagerMsg) -> LifecycleState {
+fn transition(
+    overlay: &jfn_cef::WebOverlay,
+    state: LifecycleState,
+    msg: ManagerMsg,
+) -> LifecycleState {
     use LifecycleState::*;
     match (state, msg) {
         // Shutdown is terminal and idempotent — once seen, ignore everything
         // else and don't re-enter the drain.
         (ShuttingDown, _) => ShuttingDown,
         (_, ManagerMsg::Shutdown) => {
-            run_shutdown();
+            run_shutdown(overlay);
             ShuttingDown
         }
         // Visibility flips while running. Suspended is *not* downgraded by a
         // visibility event — the system must explicitly Resume first.
         (Running, ManagerMsg::SetVisible(false)) => {
-            jfn_cef::browsers::jfn_browsers_set_hidden_all(true);
+            overlay.set_hidden(true);
             Hidden
         }
         (Hidden, ManagerMsg::SetVisible(true)) => {
-            jfn_cef::browsers::jfn_browsers_set_hidden_all(false);
+            overlay.set_hidden(false);
             Running
         }
         (Running | Hidden, ManagerMsg::Suspend) => {
             if state == Running {
-                jfn_cef::browsers::jfn_browsers_set_hidden_all(true);
+                overlay.set_hidden(true);
             }
             Suspended
         }
         (Suspended, ManagerMsg::Resume) => {
-            jfn_cef::browsers::jfn_browsers_set_hidden_all(false);
+            overlay.set_hidden(false);
             Running
         }
         // No-op: already in the requested posture, or a stray event.
@@ -183,12 +187,12 @@ fn transition(state: LifecycleState, msg: ManagerMsg) -> LifecycleState {
 
 /// Orchestrate shutdown off the main thread and off TID_UI: fan out the
 /// shutdown signal to every registered subsystem waker (input threads,
-/// clipboard, …), then a single TID_UI task closes every browser + ships
-/// the wait set back, manager blocks on `OnBeforeClose` for each, then
+/// clipboard, …), then a single TID_UI task closes the browser + ships
+/// the wait set back, manager blocks on `OnBeforeClose`, then
 /// releases the process main thread to run the teardown tail. One
 /// snapshot, no race between close set and wait set.
-fn run_shutdown() {
+fn run_shutdown(overlay: &jfn_cef::WebOverlay) {
     jfn_playback::shutdown::jfn_shutdown_fanout();
-    jfn_cef::browsers::jfn_browsers_close_all_blocking();
+    overlay.close_blocking();
     jfn_platform_abi::get().wake_main_loop();
 }

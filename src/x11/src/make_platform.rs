@@ -9,8 +9,8 @@ use crate::surface;
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    DisplayBackend, IdleInhibitLevel, JfnRect, PaintFrame, Platform, SurfaceHandle, SurfaceSize,
-    WindowDecorations, WindowGeometry, WindowPos,
+    DisplayBackend, IdleInhibitLevel, JfnRect, PaintFrame, Platform, Presented, SurfaceHandle,
+    SurfaceSize, Visibility, VisibilityCommit, WindowDecorations, WindowGeometry, WindowPos,
 };
 
 pub struct X11Platform;
@@ -48,37 +48,39 @@ impl Platform for X11Platform {
         crate::geometry::drop_toplevel_connection();
     }
 
-    fn alloc_surface(&self) -> SurfaceHandle {
-        surface::alloc_surface().to_handle()
+    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+        surface::alloc_surface(initial).to_handle()
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
         surface::free_surface(SurfaceId::from_handle(s));
     }
 
-    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
-        let id = SurfaceId::from_handle(s);
-        match frame {
-            PaintFrame::Accelerated(tex) => surface::surface_present_shared(id, tex),
-            PaintFrame::Software {
-                size,
-                pixels,
-                dirty,
-            } => surface::surface_present_software(id, dirty, pixels, size.w, size.h),
-        }
+    fn surface_present<'a>(
+        &self,
+        s: SurfaceHandle,
+        frame: PaintFrame<'a>,
+    ) -> Result<Presented, PaintFrame<'a>> {
+        surface::present(SurfaceId::from_handle(s), frame)
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
-        surface::surface_resize(SurfaceId::from_handle(s), size.physical_w, size.physical_h);
+        let id = SurfaceId::from_handle(s);
+        surface::surface_resize(id, size.physical_w, size.physical_h);
+        surface::surface_set_top_inset(id, size.physical_top);
     }
 
-    fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        surface::surface_set_visible(SurfaceId::from_handle(s), visible);
+    fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
+        surface::window_target(SurfaceId::from_handle(s))
     }
 
-    fn restack(&self, handles: &[SurfaceHandle]) {
-        let ids: Vec<SurfaceId> = handles.iter().map(|&h| SurfaceId::from_handle(h)).collect();
-        surface::restack(&ids);
+    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
+        surface::set_visibility(SurfaceId::from_handle(s), visibility)
+    }
+
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
+        let ids: Vec<SurfaceId> = ordered.iter().map(|&h| SurfaceId::from_handle(h)).collect();
+        surface::apply_stack(&ids);
     }
 
     fn menu_delivery(&self, kind: jfn_platform_abi::MenuKind) -> jfn_platform_abi::MenuDelivery {

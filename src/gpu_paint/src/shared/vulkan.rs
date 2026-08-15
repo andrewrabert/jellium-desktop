@@ -14,12 +14,6 @@ use crate::{DmabufFormat, SharedTexture};
 /// The DRM render node CEF produces its shared buffers on, as `(major, minor)`.
 pub type ProducerId = (i64, i64);
 
-/// Linux callers discover the producer before opening the GPU and pass it to
-/// [`crate::Surfaces::init`]. A frame itself does not name its DRM device.
-pub(crate) fn producer_id(_sample: Option<&SharedTexture>) -> Option<ProducerId> {
-    None
-}
-
 pub(crate) fn adapter_matches(adapter: &wgpu::Adapter, want: ProducerId) -> bool {
     unsafe { adapter.as_hal::<vulkan::Api>() }
         .and_then(|hal| {
@@ -296,13 +290,7 @@ unsafe fn import(
         usage: wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     };
-    let texture = unsafe {
-        device.create_texture_from_hal::<vulkan::Api>(
-            hal_texture,
-            &desc,
-            wgpu::TextureUses::UNINITIALIZED,
-        )
-    };
+    let texture = unsafe { device.create_texture_from_hal::<vulkan::Api>(hal_texture, &desc) };
     Ok((texture, image.as_raw()))
 }
 
@@ -506,7 +494,7 @@ unsafe fn import_memory(
     match unsafe { ash_device.allocate_memory(&alloc_info, None) } {
         Ok(memory) => {
             // fd consumed by Vulkan — relinquish without closing.
-            let _ = import_fd.into_raw_fd();
+            let _relinquished = import_fd.into_raw_fd();
             Ok(memory)
         }
         // fd not consumed on failure — dropping the dup closes it.

@@ -306,8 +306,17 @@ impl State {
                 if pressed { 1 } else { 0 },
             );
         }
-        if pressed
-            && let Some(f) = self.cb.char_
+        if !pressed {
+            return;
+        }
+        if let Some(composed) = jfn_linux_util::input::compose_feed(event.keysym.raw()) {
+            jfn_input::jfn_input_dispatch_text(&composed, self.modifiers);
+            return;
+        }
+        if jfn_linux_util::input::compose_pending() {
+            return;
+        }
+        if let Some(f) = self.cb.char_
             && let Some(text) = &event.utf8
         {
             for ch in text.chars() {

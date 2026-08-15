@@ -1,6 +1,4 @@
-use cef::rc::Rc;
 use cef::{Browser, CefString, ImplBrowser, ImplBrowserHost, ImplFrame};
-use std::os::raw::c_void;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -35,21 +33,6 @@ impl Inner {
         self.cef_create_browser(url);
     }
 
-    pub(crate) fn reset(&self) {
-        if self.state.load(Ordering::Acquire) != STATE_NORMAL {
-            return;
-        }
-        // Create must be deferred to OnBeforeClose: creating inline reenters
-        // CEF while WebContents is mid-destroy and crashes inside libcef.
-        self.pending_internal_reset.store(true, Ordering::Release);
-        if self.has_browser.load(Ordering::Acquire) {
-            self.state.store(STATE_RECREATING, Ordering::Release);
-            self.cef_close_browser();
-        } else {
-            self.state.store(STATE_PENDING_RESET, Ordering::Release);
-        }
-    }
-
     pub(crate) fn load_url(&self, url: &str) {
         if self.state.load(Ordering::Acquire) != STATE_NORMAL
             || !self.has_browser.load(Ordering::Acquire)
@@ -76,16 +59,11 @@ impl Inner {
             jfn_logging::LEVEL_DEBUG,
             &formatted,
         );
-        *self.browser.lock() = Some(browser.clone());
+        self.browser.lock().browser = Some(browser.clone());
         {
             let _g = self.close_mtx.lock();
             self.closed.store(false, Ordering::Release);
             self.close_cv.notify_all();
-        }
-        {
-            let _g = self.load_mtx.lock();
-            self.loaded.store(false, Ordering::Release);
-            self.load_cv.notify_all();
         }
         if jfn_shutting_down() {
             if let Some(h) = browser.host() {
@@ -110,11 +88,7 @@ impl Inner {
 
         let g = self.created_callback.lock();
         if let Some(f) = g.as_ref() {
-            unsafe {
-                browser.add_ref();
-                let raw = ImplBrowser::get_raw(&browser) as *mut c_void;
-                f(raw);
-            }
+            f();
         }
         drop(g);
 
@@ -133,35 +107,26 @@ impl Inner {
     }
 
     pub(crate) fn handle_on_before_close(self: &Arc<Self>) {
-        *self.browser.lock() = None;
+        {
+            let mut state = self.browser.lock();
+            state.browser = None;
+            state.applied = None;
+        }
         self.paint_scheduler.before_close();
         {
             let _g = self.close_mtx.lock();
             self.closed.store(true, Ordering::Release);
             self.close_cv.notify_all();
         }
-        {
-            let _g = self.load_mtx.lock();
-            self.loaded.store(true, Ordering::Release);
-            self.load_cv.notify_all();
-        }
         self.on_before_close();
-        // Remove from the registry BEFORE the before_close_callback: the
-        // callback may clear an open-status flag and a racing re-open would
-        // otherwise push a second layer onto active_stack while this one is
-        // still mid-teardown.
-        let lp = self.layer_ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !lp.is_null() {
-            jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_DEBUG,
-                &format!(
-                    "CefLayer::OnBeforeClose name={} -> auto-remove",
-                    self.name_str()
-                ),
-            );
-            crate::browsers::jfn_browsers_remove(lp);
-        }
+        jfn_logging::log(
+            jfn_logging::CATEGORY_CEF,
+            jfn_logging::LEVEL_DEBUG,
+            &format!("OnBeforeClose name={}", self.name_str()),
+        );
+        // A browser dying mid-menu must not strand the session slot.
+        self.menu_reset();
+        self.on_deactivated();
         // Take before invoking: the callback may install a new slot, which
         // deadlocks if the lock is still held across the call.
         let slot = self.before_close_callback.lock().take();

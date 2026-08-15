@@ -266,6 +266,9 @@ pub struct SurfaceSize {
     pub logical_h: c_int,
     pub physical_w: c_int,
     pub physical_h: c_int,
+    /// Offset of the surface's top edge from the window's top edge.
+    pub logical_top: c_int,
+    pub physical_top: c_int,
 }
 
 /// Clamp `g` so the window stays fully within `bounds`: shrink oversized
