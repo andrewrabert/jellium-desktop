@@ -128,11 +128,17 @@ impl Titlebar {
     }
 
     pub fn update(&mut self, message: Message) {
-        let plat = jfn_platform_abi::get();
+        if let Message::Close = message {
+            jfn_playback::shutdown::jfn_shutdown_initiate();
+            return;
+        }
+        let Some(controls) = jfn_platform_abi::get().titlebar_controls() else {
+            return;
+        };
         match message {
-            Message::Minimize => plat.window_minimize(),
-            Message::ToggleMaximize => plat.window_toggle_maximize(),
-            Message::Close => jfn_playback::shutdown::jfn_shutdown_initiate(),
+            Message::Minimize => controls.minimize(),
+            Message::ToggleMaximize => controls.toggle_maximize(),
+            Message::Close => {}
         }
     }
 }

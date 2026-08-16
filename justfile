@@ -37,14 +37,14 @@ clean:
 # Run tests
 [group('test')]
 [unix]
-test: build
-    cargo test --manifest-path src/Cargo.toml --workspace
+test:
+    cargo xtask test
 
 # Run tests (loads MSVC + bindgen libclang env via dev/windows/env.ps1)
 [group('test')]
 [windows]
-test: build
-    . 'dev/windows/env.ps1'; cargo test --manifest-path src/Cargo.toml --workspace
+test:
+    . 'dev/windows/env.ps1'; cargo xtask test
 
 # Format workspace
 [group('lint')]
@@ -60,22 +60,13 @@ fmt-check:
 [group('lint')]
 [unix]
 clippy:
-    cargo clippy --manifest-path src/Cargo.toml --workspace --all-targets -- \
-        -D warnings \
-        -D clippy::unwrap_used \
-        -D clippy::expect_used \
-        -D clippy::panic
+    cargo xtask clippy
 
 # Run clippy (loads MSVC + bindgen libclang env via dev/windows/env.ps1)
 [group('lint')]
 [windows]
 clippy:
-    . 'dev/windows/env.ps1'; \
-    cargo clippy --manifest-path src/Cargo.toml --workspace --all-targets -- \
-        -D warnings \
-        -D clippy::unwrap_used \
-        -D clippy::expect_used \
-        -D clippy::panic
+    . 'dev/windows/env.ps1'; cargo xtask clippy
 
 # Lint workspace
 [group('lint')]

@@ -19,16 +19,6 @@ pub use jfn_platform_abi::{
 };
 
 // =====================================================================
-// Backend no-op entry points.
-// =====================================================================
-
-pub fn macos_end_transition() {
-    // Transition-end is detected inline by macos_surface_present when
-    // an incoming frame matches g_expected_w/h; the explicit vtable
-    // entry is a no-op.
-}
-
-// =====================================================================
 // State-bound bodies ported to native Rust. Each reaches the AppKit
 // NSWindow* through the jfn_macos_get_window() accessor (C++ still owns
 // g_window for now); call paths and side-effects mirror the original.
@@ -142,22 +132,6 @@ pub fn macos_query_window_position(x: &mut c_int, y: &mut c_int) -> bool {
     }
 }
 
-// =====================================================================
-// Fullscreen-transition gating. The transition state lives in a
-// jfn-compositor-core `TransitionGate` owned by the compositor module
-// (`compositor::G_GATE`); these thin entry points drive it. The present
-// path clears the gate when an incoming frame matches the expected
-// post-transition size.
-// =====================================================================
-
-pub fn macos_begin_transition() {
-    compositor::gate_begin();
-}
-
-pub fn macos_in_transition() -> bool {
-    compositor::gate_in_transition()
-}
-
 /// Backing scale factor of the main screen. A saved position in backing
 /// pixels cannot be mapped to an `NSScreen` without identity persistence, so
 /// no position selects a screen here.
@@ -202,7 +176,7 @@ pub fn macos_clamp_window_geometry(w: &mut c_int, h: &mut c_int, x: &mut c_int, 
 use crate::init::{macos_cleanup, macos_early_init, macos_init};
 
 // jfn_input_macos_set_cursor lives in src/macos/src/input.rs (Rust).
-use input::jfn_input_macos_set_cursor;
+use crate::input::jfn_input_macos_set_cursor;
 
 // =====================================================================
 // Fullscreen — thin pass-through to mpv. The actual style/state
@@ -389,7 +363,7 @@ pub fn macos_run_blocking(f: Box<dyn FnOnce() + Send>) {
 // =====================================================================
 
 /// `None` when the pasteboard holds no string.
-pub fn macos_clipboard_read_text_async(on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+pub fn macos_clipboard_read_text_async(on_done: OnText) {
     let pb = NSPasteboard::generalPasteboard();
     // SAFETY: reading the framework's pasteboard-type constant.
     let text = pb
@@ -424,18 +398,18 @@ pub fn macos_open_external_url(url: &str) {
 //   - the per-surface state (NSView + CAMetalLayer + cached input texture)
 //   - the surface stack (bottom-to-top, set by macos_apply_stack)
 //   - the Metal device / queue / pipeline (lazy-init on first alloc)
-//   - the expected-size transition gate (macos_set_expected_size /
-//     transition clear-on-match in macos_surface_present)
+//   - the expected-size transition gate (MacosResizeGate / transition
+//     clear-on-match in macos_surface_present)
 // CEF delivers a BGRA8 IOSurface in STRAIGHT alpha via OnAcceleratedPaint;
 // we sample it into a CAMetalLayer drawable with `color.rgb *= color.a`
 // in the fragment shader to convert to CoreAnimation's premultiplied
 // convention. CAMetalLayer.colorspace is set from the IOSurface's
 // kIOSurfaceColorSpace tag (falls back to sRGB).
 // =====================================================================
-use compositor::{
-    macos_alloc_surface, macos_apply_stack, macos_free_surface, macos_set_expected_size,
-    macos_set_surface_visibility, macos_surface_present, macos_surface_present_software,
-    macos_surface_resize, macos_surface_window_target,
+use crate::compositor::{
+    macos_alloc_surface, macos_apply_stack, macos_free_surface, macos_set_surface_visibility,
+    macos_surface_present, macos_surface_present_software, macos_surface_resize,
+    macos_surface_window_target,
 };
 
 // =====================================================================
@@ -443,8 +417,8 @@ use compositor::{
 // =====================================================================
 
 use jfn_platform_abi::{
-    IdleInhibitLevel, MenuDelivery, MenuKind, Scale, SurfaceHandle, SurfaceSize, WindowGeometry,
-    WindowPos,
+    IdleInhibitLevel, MenuDelivery, MenuKind, OnText, Scale, SurfaceHandle, SurfaceSize,
+    WindowGeometry, WindowPos,
 };
 
 /// MPNowPlaying-backed [`jfn_platform_abi::MediaSink`].
@@ -481,6 +455,42 @@ impl Platform for MacosPlatform {
 
     fn cleanup(&self) {
         macos_cleanup();
+    }
+
+    // mpv's window is gone by the time this runs and AppKit owns nothing past
+    // cleanup
+    fn post_window_cleanup(&self) {}
+
+    fn window_decoration_options(&self) -> jfn_platform_abi::DecorationOptions {
+        jfn_platform_abi::DecorationOptions::all()
+    }
+
+    // the decorations setting has no effect here
+    fn window_decorations_supported(&self) -> bool {
+        false
+    }
+
+    // AppKit draws the titlebar; the app draws none
+    fn effective_decorations(&self) -> jfn_platform_abi::EffectiveDecorations {
+        jfn_platform_abi::EffectiveDecorations::ServerSide
+    }
+
+    // CEF runs hardware-accelerated on macOS
+    fn shared_texture_supported(&self) -> bool {
+        true
+    }
+
+    // the shared-texture answer is fixed; nothing revises it
+    fn set_shared_texture_unsupported(&self) {}
+
+    // the external pump ties CefInitialize to the run loop the boot wait owns
+    fn cef_init_precedes_mpv_window(&self) -> bool {
+        false
+    }
+
+    // NSPasteboard is not readable by another app without focus
+    fn web_paste_reads_clipboard(&self) -> bool {
+        true
     }
 
     fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
@@ -530,15 +540,15 @@ impl Platform for MacosPlatform {
     }
 
     fn menu_delivery(&self, _kind: MenuKind) -> MenuDelivery {
-        MenuDelivery::Host(&menu::NsMenuHost)
+        MenuDelivery::Host(&crate::menu::NsMenuHost)
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {
-        &mpv_host::MacosMpvHost
+        &crate::mpv_host::MacosMpvHost
     }
 
     fn cef_host(&self) -> Option<&dyn jfn_platform_abi::CefHost> {
-        Some(&cef_host::MacosCefHost)
+        Some(&crate::cef_host::MacosCefHost)
     }
 
     fn media_session(&self) -> &dyn jfn_platform_abi::MediaSink {
@@ -568,20 +578,13 @@ impl Platform for MacosPlatform {
         macos_toggle_fullscreen();
     }
 
-    fn begin_transition(&self) {
-        macos_begin_transition();
+    fn resize_gate(&self) -> Option<&dyn jfn_platform_abi::ResizeGate> {
+        Some(&crate::compositor::MACOS_RESIZE_GATE)
     }
 
-    fn end_transition(&self) {
-        macos_end_transition();
-    }
-
-    fn in_transition(&self) -> bool {
-        macos_in_transition()
-    }
-
-    fn set_expected_size(&self, w: c_int, h: c_int) {
-        macos_set_expected_size(w, h);
+    // AppKit draws the titlebar
+    fn titlebar_controls(&self) -> Option<&dyn jfn_platform_abi::TitlebarControls> {
+        None
     }
 
     fn scale(&self) -> Scale {
@@ -592,17 +595,9 @@ impl Platform for MacosPlatform {
         crate::scale::display_scale(at)
     }
 
-    fn reconcile_mpv_size(
-        &self,
-        saved_logical: jfn_platform_abi::LogicalSize,
-        saved_physical: jfn_platform_abi::PhysicalSize,
-        locked: bool,
-    ) -> Option<jfn_platform_abi::PhysicalSize> {
-        jfn_platform_abi::mpv_reconcile_size(self.scale(), saved_logical, saved_physical, locked)
-    }
-
-    fn window_source(&self) -> &'static dyn jfn_platform_abi::WindowSource {
-        &jfn_playback::window_source::MPV_WINDOW_SOURCE
+    // mpv creates the NSWindow; ingest's extent cell is its live geometry
+    fn window_owner(&self) -> jfn_platform_abi::WindowOwner<'_> {
+        jfn_platform_abi::WindowOwner::Mpv(&jfn_playback::window_source::MPV_WINDOW_SOURCE)
     }
 
     fn query_window_position(&self) -> Option<WindowPos> {
@@ -645,7 +640,7 @@ impl Platform for MacosPlatform {
         macos_set_theme_color(rgb);
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+    fn clipboard_read_text_async(&self, on_done: OnText) {
         macos_clipboard_read_text_async(on_done);
     }
 

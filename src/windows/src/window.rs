@@ -10,7 +10,7 @@
 use std::thread::JoinHandle;
 
 use jfn_platform_abi::{
-    PhysicalSize, Scale, WindowExtent, WindowPos, WindowSnapshot, WindowSource,
+    MpvCreatedWindow, PhysicalSize, Scale, WindowExtent, WindowPos, WindowSnapshot, WindowSource,
     notify_window_changed,
 };
 use parking_lot::{Condvar, Mutex};
@@ -214,3 +214,5 @@ impl WindowSource for WinWindowSource {
         })
     }
 }
+
+impl MpvCreatedWindow for WinWindowSource {}

@@ -459,8 +459,11 @@ fn boot_mpv_reconcile() -> f64 {
     // maximize, and a set_geometry landing mid-flight leaves mpv's stored
     // window size disagreeing with the visible window.
     let locked = saved.maximized || snap.fullscreen || snap.maximized;
-    let reconciled = crate::window_geometry::saved_sizes(&saved)
-        .and_then(|(logical, physical)| plat().reconcile_mpv_size(logical, physical, locked));
+    let reconciled = crate::window_geometry::saved_sizes(&saved).and_then(|(logical, physical)| {
+        plat()
+            .window_owner()
+            .reconcile_mpv_size(plat().scale(), logical, physical, locked)
+    });
     if let Some(physical) = reconciled {
         let clamped = plat().clamp_window_geometry(WindowGeometry {
             w: physical.w,
@@ -607,7 +610,7 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
         tracing::error!(target: "Main", "boot geometry unrepresentable at the reported scale");
         return 1;
     };
-    plat().apply_boot_geometry(&boot);
+    let mpv_boot = plat().window_owner().apply_boot_geometry(&boot);
 
     setup_mpv_environment();
 
@@ -622,14 +625,12 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
     // when mpv owns the window; toplevel-owning backends size and
     // position/maximize the host window themselves.
     let backend_byte: u8 = plat().display() as u8;
-    let boot_mpv_geometry = plat().boot_mpv_geometry(&boot);
-    let mpv_owns_window = boot_mpv_geometry.is_some();
     let mpv_started = std::time::Instant::now();
     let raw = init_mpv_handle(MpvInitOptions {
         backend_byte,
-        boot_geometry: boot_mpv_geometry.as_deref(),
-        boot_force_position: mpv_owns_window && boot.force_position(),
-        boot_window_max: mpv_owns_window && boot.maximized(),
+        boot_geometry: mpv_boot.as_ref().map(|w| w.geometry.as_str()),
+        boot_force_position: mpv_boot.as_ref().is_some_and(|w| w.force_position),
+        boot_window_max: mpv_boot.as_ref().is_some_and(|w| w.maximized),
         embed_wid: plat().mpv_host().embed_wid(),
         hwdec: &opts.hwdec,
         audio_passthrough: &opts.audio_passthrough,

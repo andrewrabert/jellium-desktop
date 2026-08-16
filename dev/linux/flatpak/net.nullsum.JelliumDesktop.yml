@@ -177,6 +177,7 @@ modules:
         # cargo fetches crates from crates.io during the build
         - --share=network
     build-commands:
+      - cargo xtask test --external-cef /app/cef --external-mpv /app --no-kde-palette
       - cargo xtask install --external-cef /app/cef --external-mpv /app --no-kde-palette --prefix /app
       - mkdir -p /app/bin && ln -sf ../jellium-desktop /app/bin/jellium-desktop
       # Mount point for the codecs-extra extension (add-extensions above);

@@ -217,6 +217,35 @@ pub struct LogicalPoint {
     pub y: c_int,
 }
 
+impl LogicalPoint {
+    /// The point a view reports in its own logical coordinate space.
+    ///
+    /// Each axis is truncated toward zero and saturates at the [`c_int`]
+    /// bounds; a non-finite axis names zero.
+    pub fn from_view(x: f64, y: f64) -> LogicalPoint {
+        LogicalPoint {
+            x: view_axis(x),
+            y: view_axis(y),
+        }
+    }
+}
+
+/// `v` truncated toward zero, saturating at the [`c_int`] bounds. A
+/// non-finite `v` names zero.
+fn view_axis(v: f64) -> c_int {
+    if !v.is_finite() {
+        return 0;
+    }
+    let truncated = v.trunc();
+    if truncated <= f64::from(c_int::MIN) {
+        return c_int::MIN;
+    }
+    if truncated >= f64::from(c_int::MAX) {
+        return c_int::MAX;
+    }
+    truncated as c_int
+}
+
 /// A coherent (logical, physical, scale) triple.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct WindowExtent {
@@ -284,8 +313,8 @@ fn map_axis(v: c_int, logical: c_int, physical: c_int) -> c_int {
 }
 
 /// Fully-resolved boot geometry: one typed value computed once from saved
-/// config, consumed by `Platform::apply_boot_geometry` (logical) and mpv's
-/// `--geometry` (physical).
+/// config, consumed by `WindowOwner::apply_boot_geometry`: it seeds an
+/// app-created window (logical) or hands mpv its `--geometry` (physical).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BootGeometry {
     logical: LogicalSize,
@@ -412,7 +441,7 @@ pub struct SurfaceSize {
 /// `None` when `locked`, when the saved logical size does not map to a
 /// representable physical one, and when the size it maps to is the one the
 /// saved geometry already records.
-pub fn mpv_reconcile_size(
+pub(crate) fn mpv_reconcile_size(
     reported: Scale,
     saved_logical: LogicalSize,
     saved_physical: PhysicalSize,
@@ -423,6 +452,17 @@ pub fn mpv_reconcile_size(
     }
     let physical = saved_logical.to_physical(reported)?;
     (physical != saved_physical).then_some(physical)
+}
+
+/// `g`'s size shrunk to fit `bounds`; its position is untouched.
+///
+/// An axis whose bound is not positive is left alone.
+pub fn clamp_size_to_bounds(g: WindowGeometry, bounds: Bounds) -> WindowGeometry {
+    WindowGeometry {
+        w: if bounds.w > 0 { g.w.min(bounds.w) } else { g.w },
+        h: if bounds.h > 0 { g.h.min(bounds.h) } else { g.h },
+        position: g.position,
+    }
 }
 
 /// Clamp `g` so the window stays fully within `bounds`: shrink oversized
@@ -644,6 +684,56 @@ mod tests {
         assert_eq!(
             describe(100, 50),
             Some(("1600x900+100+50".to_owned(), true))
+        );
+    }
+
+    #[test]
+    fn a_view_position_truncates_toward_zero_and_saturates() {
+        assert_eq!(
+            LogicalPoint::from_view(3.9, -3.9),
+            LogicalPoint { x: 3, y: -3 }
+        );
+        assert_eq!(
+            LogicalPoint::from_view(0.0, -0.5),
+            LogicalPoint { x: 0, y: 0 }
+        );
+        assert_eq!(
+            LogicalPoint::from_view(f64::MAX, f64::MIN),
+            LogicalPoint {
+                x: c_int::MAX,
+                y: c_int::MIN
+            }
+        );
+    }
+
+    #[test]
+    fn a_non_finite_view_axis_names_zero() {
+        assert_eq!(
+            LogicalPoint::from_view(f64::NAN, f64::INFINITY),
+            LogicalPoint { x: 0, y: 0 }
+        );
+        assert_eq!(
+            LogicalPoint::from_view(f64::NEG_INFINITY, 7.5),
+            LogicalPoint { x: 0, y: 7 }
+        );
+    }
+
+    #[test]
+    fn the_size_clamp_shrinks_without_moving_the_window() {
+        let g = WindowGeometry::from_raw(3000, 2000, 1500, 900);
+        assert_eq!(
+            clamp_size_to_bounds(g, Bounds { w: 1920, h: 1080 }),
+            WindowGeometry::from_raw(1920, 1080, 1500, 900)
+        );
+    }
+
+    #[test]
+    fn a_non_positive_bound_leaves_its_axis_alone() {
+        let g = WindowGeometry::from_raw(3000, 2000, -1, -1);
+        assert_eq!(clamp_size_to_bounds(g, Bounds { w: 0, h: -5 }), g);
+        assert_eq!(
+            clamp_size_to_bounds(g, Bounds { w: 1920, h: 0 }),
+            WindowGeometry::from_raw(1920, 2000, -1, -1)
         );
     }
 

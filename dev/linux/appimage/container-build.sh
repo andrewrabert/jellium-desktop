@@ -20,6 +20,10 @@ esac
 cd /src
 
 cargo xtask build --out /build
+cargo xtask test --out /build
+if [ "${JFN_CLIPPY:-0}" = 1 ]; then
+    cargo xtask clippy --out /build
+fi
 strip /build/*.so /build/jellium-desktop
 
 BUILD=/build

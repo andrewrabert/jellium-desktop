@@ -20,18 +20,43 @@ use crate::wl_ops;
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    BootGeometry, DisplayBackend, IdleInhibitLevel, JfnRect, PaintFrame, Platform, Presented,
-    SurfaceHandle, SurfaceSize, Visibility, VisibilityCommit, WindowDecorations,
+    DisplayBackend, IdleInhibitLevel, JfnRect, OnText, PaintFrame, Platform, Presented, ResizeGate,
+    SurfaceHandle, SurfaceSize, TitlebarControls, Visibility, VisibilityCommit, WindowDecorations,
+    WindowOwner,
 };
 
 // =====================================================================
 // Backend
 // =====================================================================
 
+/// The compositor-driven window controls the app-drawn titlebar reaches.
+pub struct WaylandTitlebar {
+    rt: &'static WlRuntime,
+}
+
+impl TitlebarControls for WaylandTitlebar {
+    fn minimize(&self) {
+        self.rt.root().set_minimized();
+    }
+
+    fn toggle_maximize(&self) {
+        self.rt.root().toggle_maximize();
+    }
+
+    fn start_move(&self) {
+        self.rt.root().start_move(self.rt.seat());
+    }
+
+    fn start_resize(&self, edge: c_int) {
+        self.rt.root().start_resize(self.rt.seat(), edge as u32);
+    }
+}
+
 pub struct WaylandPlatform {
     runtime: &'static WlRuntime,
     mpv_host: crate::mpv_host::WaylandMpvHost,
     window_source: crate::window_source::WaylandWindowSource,
+    titlebar: WaylandTitlebar,
     shared_texture: AtomicBool,
     primary: crate::selection::WlPrimary,
 }
@@ -43,6 +68,7 @@ impl WaylandPlatform {
             runtime,
             mpv_host: crate::mpv_host::WaylandMpvHost::new(runtime),
             window_source: crate::window_source::WaylandWindowSource::new(runtime),
+            titlebar: WaylandTitlebar { rt: runtime },
             shared_texture: AtomicBool::new(true),
             primary: crate::selection::WlPrimary { rt: runtime },
         }
@@ -163,24 +189,37 @@ impl Platform for WaylandPlatform {
         jfn_linux_util::cef_paths()
     }
 
-    fn window_source(&self) -> &dyn jfn_platform_abi::WindowSource {
-        &self.window_source
+    // the compositor creates nothing; the app owns the app window
+    fn window_owner(&self) -> WindowOwner<'_> {
+        WindowOwner::App(&self.window_source)
     }
 
-    // Wayland owns its toplevel and sizes it in apply_boot_geometry, so mpv
-    // neither sizes at boot nor reconciles on scale change.
-    fn boot_mpv_geometry(&self, _g: &BootGeometry) -> Option<String> {
+    // the compositor's configure is the one authority for the window's size
+    fn resize_gate(&self) -> Option<&dyn ResizeGate> {
         None
     }
 
-    // this backend owns its toplevel; mpv's sizing is never reconciled
-    fn reconcile_mpv_size(
+    fn titlebar_controls(&self) -> Option<&dyn TitlebarControls> {
+        Some(&self.titlebar)
+    }
+
+    // the compositor places and sizes the window; nothing client-side
+    // constrains saved geometry
+    fn clamp_window_geometry(
         &self,
-        _saved_logical: jfn_platform_abi::LogicalSize,
-        _saved_physical: jfn_platform_abi::PhysicalSize,
-        _locked: bool,
-    ) -> Option<jfn_platform_abi::PhysicalSize> {
-        None
+        g: jfn_platform_abi::WindowGeometry,
+    ) -> jfn_platform_abi::WindowGeometry {
+        g
+    }
+
+    // the Wayland event loop runs on its own thread; the app main thread has
+    // nothing to drain
+    fn pump(&self) {}
+
+    // platform init resolves shared-texture support, so CEF's bring-up cannot
+    // precede mpv's window here
+    fn cef_init_precedes_mpv_window(&self) -> bool {
+        false
     }
 
     fn set_fullscreen(&self, v: bool) {
@@ -189,22 +228,6 @@ impl Platform for WaylandPlatform {
 
     fn toggle_fullscreen(&self) {
         self.rt().root().toggle_fullscreen();
-    }
-
-    fn window_minimize(&self) {
-        self.rt().root().set_minimized();
-    }
-
-    fn window_toggle_maximize(&self) {
-        self.rt().root().toggle_maximize();
-    }
-
-    fn window_start_move(&self) {
-        self.rt().root().start_move(self.rt().seat());
-    }
-
-    fn window_start_resize(&self, edge: c_int) {
-        self.rt().root().start_resize(self.rt().seat(), edge as u32);
     }
 
     fn scale(&self) -> jfn_platform_abi::Scale {
@@ -232,18 +255,6 @@ impl Platform for WaylandPlatform {
     // the compositor tells no client where its window is
     fn query_window_position(&self) -> Option<jfn_platform_abi::WindowPos> {
         None
-    }
-
-    // this backend gates no transition: the compositor's configure is the one
-    // authority for the window's size
-    fn set_expected_size(&self, _w: c_int, _h: c_int) {}
-
-    fn apply_boot_geometry(&self, g: &BootGeometry) {
-        // Only the host's own window geometry uses the boot size; mpv mirrors the
-        // committed window geometry and never the boot guess.
-        self.rt()
-            .root()
-            .set_boot_geometry(g.logical().w, g.logical().h, g.maximized());
     }
 
     fn set_cursor(&self, shape: CursorShape) {
@@ -296,7 +307,7 @@ impl Platform for WaylandPlatform {
         self.shared_texture.store(false, Ordering::Release);
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+    fn clipboard_read_text_async(&self, on_done: OnText) {
         self.rt()
             .selections()
             .read_text_async(crate::selection::Kind::Clipboard, on_done);

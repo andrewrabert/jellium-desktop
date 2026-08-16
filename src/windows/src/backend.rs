@@ -5,14 +5,12 @@ use std::os::windows::ffi::OsStrExt;
 
 use cef::rc::Rc;
 use cef::{ImplTask, Task, ThreadId, WrapTask, post_task, wrap_task};
-use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock,
-};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, EXECUTION_STATE,
@@ -29,8 +27,8 @@ use jfn_platform_abi::{
 
 use crate::input::jfn_input_windows_set_cursor;
 use crate::platform::{
-    win_clamp_window_geometry, win_cleanup, win_display_scale, win_early_init, win_get_scale,
-    win_init, win_set_fullscreen, win_toggle_fullscreen,
+    win_clamp_window_geometry, win_cleanup, win_early_init, win_get_scale, win_init,
+    win_set_fullscreen, win_toggle_fullscreen,
 };
 
 fn win_pump() {}
@@ -127,7 +125,7 @@ unsafe fn win_clipboard_offer(text: &str) -> bool {
 
 /// `None` when the clipboard holds no `CF_UNICODETEXT`, or it could not be
 /// opened.
-fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+fn win_clipboard_read_text_async(on_done: OnText) {
     let mut text: Option<String> = None;
     unsafe {
         if OpenClipboard(None).is_ok() {
@@ -179,7 +177,7 @@ fn win_open_external_url(url: &str) {
 }
 
 use jfn_platform_abi::{
-    IdleInhibitLevel, MenuDelivery, MenuKind, SurfaceHandle, WindowGeometry, WindowPos,
+    IdleInhibitLevel, MenuDelivery, MenuKind, OnText, SurfaceHandle, WindowGeometry, WindowPos,
 };
 
 /// SMTC-backed [`jfn_platform_abi::MediaSink`].
@@ -226,14 +224,45 @@ impl Platform for WindowsPlatform {
         win_cleanup();
     }
 
+    // mpv's window is gone by the time this runs and the compositor devices
+    // are already released
+    fn post_window_cleanup(&self) {}
+
+    fn window_decoration_options(&self) -> jfn_platform_abi::DecorationOptions {
+        jfn_platform_abi::DecorationOptions::all()
+    }
+
+    // the decorations setting has no effect here
+    fn window_decorations_supported(&self) -> bool {
+        false
+    }
+
+    // DWM draws the titlebar; the app draws none
+    fn effective_decorations(&self) -> jfn_platform_abi::EffectiveDecorations {
+        jfn_platform_abi::EffectiveDecorations::ServerSide
+    }
+
+    // CEF runs hardware-accelerated on Windows
+    fn shared_texture_supported(&self) -> bool {
+        true
+    }
+
+    // the shared-texture answer is fixed; nothing revises it
+    fn set_shared_texture_unsupported(&self) {}
+
+    // the clipboard is not readable by another app without focus
+    fn web_paste_reads_clipboard(&self) -> bool {
+        true
+    }
+
     fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
-        let s = render::alloc();
-        render::set_visibility(s, initial).acknowledged();
+        let s = crate::render::alloc();
+        crate::render::set_visibility(s, initial).acknowledged();
         s
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
-        render::free(s);
+        crate::render::free(s);
     }
 
     fn surface_present<'a>(
@@ -241,38 +270,38 @@ impl Platform for WindowsPlatform {
         s: SurfaceHandle,
         frame: PaintFrame<'a>,
     ) -> Result<Presented, PaintFrame<'a>> {
-        render::present(s, render::Part::Content, frame)
+        crate::render::present(s, crate::render::Part::Content, frame)
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: jfn_platform_abi::SurfaceSize) {
-        render::resize(s, size);
+        crate::render::resize(s, size);
     }
 
     fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
-        render::window_target(s)
+        crate::render::window_target(s)
     }
 
     fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
-        render::set_visibility(s, visibility)
+        crate::render::set_visibility(s, visibility)
     }
 
     fn apply_stack(&self, ordered: &[SurfaceHandle]) {
-        render::apply_stack(ordered);
+        crate::render::apply_stack(ordered);
     }
 
     fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery {
         match kind {
-            MenuKind::ContextMenu => MenuDelivery::Host(&menu::WinMenuHost),
+            MenuKind::ContextMenu => MenuDelivery::Host(&crate::menu::WinMenuHost),
             MenuKind::Dropdown => MenuDelivery::Composited,
         }
     }
 
     fn osr_popup_surface(&self) -> &dyn jfn_platform_abi::OsrPopupSurface {
-        &osr_popup::WinOsrPopup
+        &crate::osr_popup::WinOsrPopup
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {
-        &mpv_host::WindowsMpvHost
+        &crate::mpv_host::WindowsMpvHost
     }
 
     fn media_session(&self) -> &dyn jfn_platform_abi::MediaSink {
@@ -300,6 +329,16 @@ impl Platform for WindowsPlatform {
         win_toggle_fullscreen();
     }
 
+    // mpv's own WndProc settles the size; nothing here gates a frame
+    fn resize_gate(&self) -> Option<&dyn jfn_platform_abi::ResizeGate> {
+        None
+    }
+
+    // DWM draws the titlebar
+    fn titlebar_controls(&self) -> Option<&dyn jfn_platform_abi::TitlebarControls> {
+        None
+    }
+
     fn scale(&self) -> jfn_platform_abi::Scale {
         win_get_scale()
     }
@@ -308,17 +347,9 @@ impl Platform for WindowsPlatform {
         crate::scale::display_scale(at)
     }
 
-    fn reconcile_mpv_size(
-        &self,
-        saved_logical: jfn_platform_abi::LogicalSize,
-        saved_physical: jfn_platform_abi::PhysicalSize,
-        locked: bool,
-    ) -> Option<jfn_platform_abi::PhysicalSize> {
-        jfn_platform_abi::mpv_reconcile_size(self.scale(), saved_logical, saved_physical, locked)
-    }
-
-    fn window_source(&self) -> &'static dyn jfn_platform_abi::WindowSource {
-        &crate::window::WIN_WINDOW_SOURCE
+    // mpv creates the HWND; the Win32 sample of it is its live geometry
+    fn window_owner(&self) -> jfn_platform_abi::WindowOwner<'_> {
+        jfn_platform_abi::WindowOwner::Mpv(&crate::window::WIN_WINDOW_SOURCE)
     }
 
     fn query_window_position(&self) -> Option<WindowPos> {
@@ -348,7 +379,7 @@ impl Platform for WindowsPlatform {
         win_set_theme_color(rgb);
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+    fn clipboard_read_text_async(&self, on_done: OnText) {
         win_clipboard_read_text_async(on_done);
     }
 
@@ -370,7 +401,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn install_shutdown_handler(&self, on_shutdown: fn()) {
-        process::install_shutdown(on_shutdown);
+        crate::process::install_shutdown(on_shutdown);
     }
 }
 

@@ -1,7 +1,7 @@
 //! Native [`WindowSource`]: the Wayland backend owns the toplevel, so live
 //! geometry comes from compositor state, not mpv ingest.
 
-use jfn_platform_abi::{WindowSnapshot, WindowSource};
+use jfn_platform_abi::{AppCreatedWindow, BootGeometry, WindowSnapshot, WindowSource};
 
 use crate::runtime::WlRuntime;
 
@@ -28,5 +28,15 @@ impl WindowSource for WaylandWindowSource {
             fullscreen: snap
                 .is_some_and(|e| e.mode() == crate::window_state::WindowMode::Fullscreen),
         }
+    }
+}
+
+impl AppCreatedWindow for WaylandWindowSource {
+    /// Only the app window's own geometry uses the boot size; mpv mirrors the
+    /// committed window geometry and never the boot guess.
+    fn seed_boot_geometry(&self, g: &BootGeometry) {
+        self.rt
+            .root()
+            .set_boot_geometry(g.logical().w, g.logical().h, g.maximized());
     }
 }

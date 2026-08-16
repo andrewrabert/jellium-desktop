@@ -90,6 +90,31 @@ pub fn set_parent_fullscreen(fs: bool) {
     request_resync();
 }
 
+/// Paints `rgb` behind the app window and the video plane and clears both, so
+/// the strip a resize exposes carries the theme colour rather than the stale
+/// texture beneath it.
+///
+/// Both windows are created at the root's depth, so `rgb` is the pixel value
+/// directly.
+pub fn set_theme_color(rgb: u32) {
+    let Some(conn) = crate::x11_state::x11rb_conn() else {
+        return;
+    };
+    let Some(host) = crate::x11_state::host() else {
+        return;
+    };
+    let aux = ChangeWindowAttributesAux::new().background_pixel(rgb & 0x00FF_FFFF);
+    for window in [host.toplevel, host.video_host] {
+        if window == 0 {
+            continue;
+        }
+        let _ = conn.change_window_attributes(window, &aux);
+        // A zero width/height clears to the window's far edge.
+        let _ = conn.clear_area(false, window, 0, 0, 0, 0);
+    }
+    let _ = conn.flush();
+}
+
 fn apply_toplevel_fullscreen(fs: bool) {
     let Some(conn) = crate::x11_state::x11rb_conn() else {
         return;

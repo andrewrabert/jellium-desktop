@@ -14,7 +14,7 @@ RUN dnf -y upgrade && \
         "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" && \
     dnf -y install --allowerasing \
         gcc gcc-c++ make cmake git ninja-build meson python3 pkgconf-pkg-config \
-        cargo rust \
+        cargo rust clippy \
         clang-devel \
         glibc-devel \
         alsa-lib-devel at-spi2-core-devel at-spi2-atk-devel atk-devel cairo-devel cups-devel \

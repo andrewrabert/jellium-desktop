@@ -83,7 +83,7 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// after it tears it down.
 pub(crate) fn input_hwnd() -> Option<HWND> {
     let raw = STATE.lock().input_hwnd_raw;
-    (raw != 0).then(|| HWND(raw as *mut _))
+    (raw != 0).then_some(HWND(raw as *mut _))
 }
 
 #[inline]

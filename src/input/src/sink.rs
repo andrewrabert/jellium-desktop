@@ -45,10 +45,11 @@ pub trait WebInput: Send + Sync {
 
 pub trait ShellInput: Send + Sync {
     /// A press on [`crate::route::ShellHit::Drag`] or
-    /// [`crate::route::ShellHit::Grip`]. The implementation calls
-    /// `Platform::window_start_move` / `window_start_resize` on the press
-    /// itself, and a second press on the drag region inside 400 ms calls
-    /// `window_toggle_maximize` instead. Never reaches the widget tree.
+    /// [`crate::route::ShellHit::Grip`]. The implementation reaches the
+    /// window controls through `Platform::titlebar_controls` and calls
+    /// `TitlebarControls::start_move` / `start_resize` on the press itself;
+    /// a second press on the drag region inside 400 ms calls
+    /// `toggle_maximize` instead. Never reaches the widget tree.
     fn window_gesture(&self, hit: crate::route::ShellHit);
     /// A right-press anywhere the shell owns, modal views included. Raises the
     /// app menu through

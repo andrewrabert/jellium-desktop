@@ -32,6 +32,7 @@ extern_class!(
 
 use jfn_input::buttons::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use jfn_input::scroll::ScrollAccum;
+use jfn_platform_abi::LogicalPoint;
 use jfn_platform_abi::cursor::CursorShape;
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_ALT_DOWN, EVENTFLAG_COMMAND_DOWN, EVENTFLAG_CONTROL_DOWN,
@@ -66,9 +67,8 @@ const NS_TRACKING_IN_VISIBLE_RECT: u64 = 0x200;
 
 use jfn_input::key::{KeyReport, PhysicalKey};
 use jfn_input::{
-    jfn_input_dispatch_history_nav, jfn_input_dispatch_key, jfn_input_dispatch_keyboard_focus,
-    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_move,
-    jfn_input_dispatch_scroll_precise, jfn_input_dispatch_utf16,
+    jfn_input_dispatch_history_nav, jfn_input_dispatch_key, jfn_input_dispatch_mouse_button,
+    jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll_precise, jfn_input_dispatch_utf16,
 };
 
 use crate::dispatch::post_to_main;
@@ -580,11 +580,12 @@ fn dispatch_mouse_button(view: &InputView, event: &AnyObject, button_code: u32, 
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let _click: isize = unsafe { msg_send![event, clickCount] };
     let mods = ns_to_cef_modifiers(raw_flags) | next;
+    let position = LogicalPoint::from_view(loc.x, loc.y);
     jfn_input_dispatch_mouse_button(
         button_code,
         if pressed { 1 } else { 0 },
-        loc.x as i32,
-        loc.y as i32,
+        position.x,
+        position.y,
         mods,
     );
 }
@@ -593,7 +594,8 @@ fn dispatch_mouse_move(view: &InputView, event: &AnyObject, leave: bool) {
     let loc = mouse_loc_in_view(view, event);
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let mods = ns_to_cef_modifiers(raw_flags) | G_MOUSE_BUTTON_MODIFIERS.load(Ordering::SeqCst);
-    jfn_input_dispatch_mouse_move(loc.x as i32, loc.y as i32, mods, if leave { 1 } else { 0 });
+    let position = LogicalPoint::from_view(loc.x, loc.y);
+    jfn_input_dispatch_mouse_move(position.x, position.y, mods, if leave { 1 } else { 0 });
 }
 
 /// AppKit names a function key with a code unit from the private-use block

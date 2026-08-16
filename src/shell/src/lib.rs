@@ -49,7 +49,7 @@ static FONTS_READY: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new())
 pub(crate) fn publish_no_overlay() {
     let plat = jfn_platform_abi::get();
     jfn_input::publish_shell_state(crate::state::shell_state(
-        plat.window_source().snapshot().extent,
+        plat.window_owner().source().snapshot().extent,
         crate::state::ChromeInputs::default(),
         false,
     ));
@@ -237,7 +237,7 @@ fn push_decorations() {
 
 fn push_window_state() {
     let plat = jfn_platform_abi::get();
-    let snap = plat.window_source().snapshot();
+    let snap = plat.window_owner().source().snapshot();
     chrome::set_fullscreen(snap.fullscreen);
     let Some(extent) = snap.extent else { return };
     post(Work::Resize { extent });

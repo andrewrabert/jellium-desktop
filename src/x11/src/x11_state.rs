@@ -162,6 +162,37 @@ static OVERLAY_WINDOWS: OnceLock<ArcSwap<Vec<u32>>> = OnceLock::new();
 /// value type).
 pub static GATE: Mutex<TransitionGate> = Mutex::new(TransitionGate::new());
 
+/// X11's resize-transition gate: it captures the published parent size when a
+/// transition begins, so a stale-size frame is dropped until the window
+/// settles.
+pub(crate) struct X11ResizeGate;
+
+pub(crate) static X11_RESIZE_GATE: X11ResizeGate = X11ResizeGate;
+
+impl jfn_platform_abi::ResizeGate for X11ResizeGate {
+    fn begin(&self) {
+        let Some(snap) = parent_snapshot() else {
+            tracing::warn!(target: "Platform", "no published geometry; nothing to gate");
+            return;
+        };
+        GATE.lock().begin_capturing((snap.width, snap.height));
+    }
+
+    /// Ends the gate only; the geometry thread is the sole owner of overlay
+    /// structure, so nothing is re-applied here.
+    fn end(&self) {
+        GATE.lock().end();
+    }
+
+    fn in_transition(&self) -> bool {
+        GATE.lock().in_transition()
+    }
+
+    fn set_expected(&self, size: jfn_platform_abi::PhysicalSize) {
+        GATE.lock().set_expected((size.w, size.h));
+    }
+}
+
 static CONN: OnceLock<Arc<xcb::Connection>> = OnceLock::new();
 pub static X11RB_CONN: OnceLock<Arc<RustConnection>> = OnceLock::new();
 

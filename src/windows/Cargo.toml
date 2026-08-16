@@ -16,7 +16,6 @@ jfn-mpv = { path = "../mpv" }
 jfn-playback = { path = "../playback" }
 jfn-windows-sink = { path = "../windows_sink" }
 cef.workspace = true
-tracing.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_DirectComposition",
@@ -43,6 +42,7 @@ windows-core.workspace = true
 [dependencies]
 jfn-platform-abi = { path = "../platform_abi" }
 parking_lot.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

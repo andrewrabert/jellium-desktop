@@ -22,7 +22,7 @@
 //! may not run until after a free.
 
 use parking_lot::Mutex;
-use std::ffi::{c_int, c_void};
+use std::ffi::c_void;
 use std::ptr;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,21 +103,36 @@ fn is_live(p: *mut Surface) -> bool {
     G_SURFACE_STACK.lock().live().contains(&SurfacePtr(p))
 }
 
-// Fullscreen/resize transition gate. set_expected_size arms the expected
-// post-transition size; the present path clears the gate when an incoming
+// Fullscreen/resize transition gate. `MacosResizeGate::set_expected` arms the
+// expected post-transition size; the present path clears the gate when an incoming
 // frame matches it. macOS never captures a pre-resize size (it gates on
 // the expected-size match, not a Windows-style begin/end size compare).
 static G_GATE: Mutex<TransitionGate> = Mutex::new(TransitionGate::new());
 
-/// Enter the transition (set by `macos_begin_transition` in lib.rs).
-pub(crate) fn gate_begin() {
-    G_GATE.lock().begin();
-}
+/// macOS's resize-transition gate: it arms an expected post-transition size
+/// and never captures a pre-resize one, because the present path clears the
+/// gate on the expected-size match.
+pub(crate) struct MacosResizeGate;
 
-/// Whether the main surface is currently gated (read by `macos_in_transition`
-/// and the present path).
-pub(crate) fn gate_in_transition() -> bool {
-    G_GATE.lock().in_transition()
+pub(crate) static MACOS_RESIZE_GATE: MacosResizeGate = MacosResizeGate;
+
+impl jfn_platform_abi::ResizeGate for MacosResizeGate {
+    /// Enters the transition without capturing a size.
+    fn begin(&self) {
+        G_GATE.lock().begin();
+    }
+
+    /// The present path clears the gate on a frame matching the expected
+    /// size, so there is nothing for an explicit end to do.
+    fn end(&self) {}
+
+    fn in_transition(&self) -> bool {
+        G_GATE.lock().in_transition()
+    }
+
+    fn set_expected(&self, size: jfn_platform_abi::PhysicalSize) {
+        G_GATE.lock().set_expected((size.w, size.h));
+    }
 }
 
 // =====================================================================
@@ -198,10 +213,6 @@ unsafe fn create_content_layer(
 // =====================================================================
 // Vtable-exposed compositor functions
 // =====================================================================
-
-pub fn macos_set_expected_size(w: c_int, h: c_int) {
-    G_GATE.lock().set_expected((w, h));
-}
 
 pub fn macos_alloc_surface(initial: Visibility) -> *mut c_void {
     // Allocate the Surface up front; the AppKit setup happens on the

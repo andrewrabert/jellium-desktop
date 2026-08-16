@@ -9,6 +9,8 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 use xcb::{Xid, XidNew, x};
 
+use jfn_platform_abi::OnText;
+
 use crate::x11_state::Atoms;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -34,10 +36,8 @@ impl Kind {
     }
 }
 
-type Done = Box<dyn FnOnce(Option<&str>) + Send>;
-
 struct Pending {
-    on_done: Done,
+    on_done: OnText,
 }
 
 /// The `CLIPBOARD` and `PRIMARY` selections this client owns and serves.
@@ -123,7 +123,7 @@ impl Selections {
     /// `on_done` fires with `None` for an unowned selection, a refused
     /// conversion, and an `INCR` reply.
     /// A second read supersedes the first, resolving it with `None`.
-    pub(crate) fn read_text_async(&self, kind: Kind, on_done: Done) {
+    pub(crate) fn read_text_async(&self, kind: Kind, on_done: OnText) {
         let selection = kind.atom(&self.atoms);
         let cookie = self.conn.send_request(&x::GetSelectionOwner { selection });
         drop(self.conn.flush());
@@ -302,7 +302,7 @@ impl Selections {
 pub(crate) struct X11Primary;
 
 impl jfn_platform_abi::PrimarySelection for X11Primary {
-    fn read_text_async(&self, on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+    fn read_text_async(&self, on_done: OnText) {
         match selections() {
             Some(selections) => selections.read_text_async(Kind::Primary, on_done),
             None => on_done(None),

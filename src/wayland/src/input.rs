@@ -44,6 +44,7 @@ use jfn_platform_abi::event_flags::{
 };
 
 use crate::runtime::WlRuntime;
+use jfn_platform_abi::LogicalPoint;
 use jfn_platform_abi::cursor::CursorShape;
 
 const XK_MENU: u32 = 0xff67;
@@ -527,9 +528,10 @@ impl State {
                 self.ptr_x = surface_x;
                 self.ptr_y = surface_y;
                 if self.menu_focus {
+                    let position = LogicalPoint::from_view(surface_x, surface_y);
                     self.rt.menu().motion(MenuPoint::Logical {
-                        x: surface_x as c_int,
-                        y: surface_y as c_int,
+                        x: position.x,
+                        y: position.y,
                     });
                     return;
                 }
@@ -568,9 +570,10 @@ impl State {
                 }
                 if self.rt.menu().is_active() {
                     if self.menu_focus {
+                        let position = LogicalPoint::from_view(surface_x, surface_y);
                         self.rt.menu().motion(MenuPoint::Logical {
-                            x: surface_x as c_int,
-                            y: surface_y as c_int,
+                            x: position.x,
+                            y: position.y,
                         });
                     }
                     return;
