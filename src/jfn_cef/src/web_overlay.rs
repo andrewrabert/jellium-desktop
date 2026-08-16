@@ -18,7 +18,8 @@ use parking_lot::Mutex;
 use jfn_platform_abi::Visibility;
 
 use crate::client::{Inner, post_close_and_collect, post_set_hidden};
-use size::{ViewSize, view_size};
+use jfn_platform_abi::SurfaceSize;
+use size::view_size;
 
 /// Bound on the TID_UI close-and-collect round trip. A TID_UI that is already
 /// dead never runs the posted task, and shutdown must still reach
@@ -126,7 +127,7 @@ impl WebOverlay {
     /// Create the browser once, with the view already sized: CEF reads the view
     /// rect during creation, and a zero-sized one aborts Chromium on the first
     /// navigation.
-    fn ensure_browser(&self, size: ViewSize) {
+    fn ensure_browser(&self, size: SurfaceSize) {
         let mut created = self.inner.created.lock();
         if *created {
             return;
@@ -136,13 +137,14 @@ impl WebOverlay {
             jfn_logging::CATEGORY_CEF,
             jfn_logging::LEVEL_INFO,
             &format!(
-                "CreateBrowser(web) logical={}x{}+{} physical={}x{}+{}",
-                size.logical.w,
-                size.logical.h,
+                "CreateBrowser(web) logical={}x{}+{} physical={}x{}+{} scale={}",
+                size.extent.logical().w,
+                size.extent.logical().h,
                 size.logical_top,
-                size.physical.w,
-                size.physical.h,
+                size.extent.physical().w,
+                size.extent.physical().h,
                 size.physical_top,
+                size.extent.scale(),
             ),
         );
         self.inner.client.create("");

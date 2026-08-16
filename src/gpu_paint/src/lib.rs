@@ -34,7 +34,7 @@ mod types;
 pub use context::{FORMAT, Surfaces, any_adapter, surfaces};
 pub use error::SurfaceLost;
 pub use painter::{PresentFailed, Surface};
-pub use refresh::{RefreshSource, refresh_interval, report_refresh};
+pub use refresh::{RefreshRate, RefreshSource, refresh_interval, report_refresh};
 pub use shared::ProducerId;
 #[cfg(target_os = "linux")]
 pub use shared_texture::{DmabufFormat, DmabufPlane};

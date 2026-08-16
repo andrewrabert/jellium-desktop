@@ -289,6 +289,21 @@ define_class!(
         unsafe fn workspace_did_wake(&self, _n: *mut AnyObject) {
             jfn_playback::lifecycle::jfn_lifecycle_resume();
         }
+        #[unsafe(method(windowDidBecomeKey:))]
+        unsafe fn window_did_become_key(&self, _n: *mut AnyObject) {
+            jfn_input::jfn_input_dispatch_keyboard_focus(1);
+        }
+        #[unsafe(method(windowDidResignKey:))]
+        unsafe fn window_did_resign_key(&self, _n: *mut AnyObject) {
+            jfn_input::jfn_input_dispatch_keyboard_focus(0);
+        }
+        /// The window moved to a screen with a different backing scale.
+        /// Republishes the extent from the OS state current at this moment;
+        /// no mpv property is involved.
+        #[unsafe(method(windowDidChangeBackingProperties:))]
+        unsafe fn window_did_change_backing_properties(&self, _n: *mut AnyObject) {
+            jfn_playback::ingest_driver::jfn_playback_rescale_window_extent();
+        }
     }
 
     unsafe impl NSObjectProtocol for JellyfinLifecycleObserver {}
@@ -305,6 +320,18 @@ unsafe fn install_lifecycle_observer() {
         for (sel, name) in [
             (sel!(appDidHide:), c"NSApplicationDidHideNotification"),
             (sel!(appDidUnhide:), c"NSApplicationDidUnhideNotification"),
+            (
+                sel!(windowDidBecomeKey:),
+                c"NSWindowDidBecomeKeyNotification",
+            ),
+            (
+                sel!(windowDidResignKey:),
+                c"NSWindowDidResignKeyNotification",
+            ),
+            (
+                sel!(windowDidChangeBackingProperties:),
+                c"NSWindowDidChangeBackingPropertiesNotification",
+            ),
         ] {
             let name_ns: *mut AnyObject =
                 msg_send![class!(NSString), stringWithUTF8String: name.as_ptr()];

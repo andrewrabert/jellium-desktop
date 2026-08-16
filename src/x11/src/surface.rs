@@ -108,11 +108,6 @@ fn presentable(content: &Content<'_>) -> bool {
     }
 }
 
-/// CEF content dims are NON-authoritative: overlay size, gate extent, and
-/// swapchain target all derive from parent geometry on the geometry thread.
-/// This entry point deliberately does nothing structural.
-pub fn surface_resize(_id: SurfaceId, _pw: c_int, _ph: c_int) {}
-
 /// Reserve `top_physical` pixels at the top of the window for the shell
 /// overlay. The geometry thread applies it on the next reconcile.
 pub fn surface_set_top_inset(id: SurfaceId, top_physical: c_int) {

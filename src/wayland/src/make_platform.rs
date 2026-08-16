@@ -33,7 +33,7 @@ pub struct WaylandPlatform {
     mpv_host: crate::mpv_host::WaylandMpvHost,
     window_source: crate::window_source::WaylandWindowSource,
     shared_texture: AtomicBool,
-    clipboard: AtomicBool,
+    primary: crate::selection::WlPrimary,
 }
 
 impl WaylandPlatform {
@@ -44,7 +44,7 @@ impl WaylandPlatform {
             mpv_host: crate::mpv_host::WaylandMpvHost::new(runtime),
             window_source: crate::window_source::WaylandWindowSource::new(runtime),
             shared_texture: AtomicBool::new(true),
-            clipboard: AtomicBool::new(true),
+            primary: crate::selection::WlPrimary { rt: runtime },
         }
     }
 
@@ -173,11 +173,11 @@ impl Platform for WaylandPlatform {
         None
     }
 
+    // this backend owns its toplevel; mpv's sizing is never reconciled
     fn reconcile_mpv_size(
         &self,
-        _display_hidpi_scale: f64,
-        _saved_scale: f32,
         _saved_logical: jfn_platform_abi::LogicalSize,
+        _saved_physical: jfn_platform_abi::PhysicalSize,
         _locked: bool,
     ) -> Option<jfn_platform_abi::PhysicalSize> {
         None
@@ -207,18 +207,36 @@ impl Platform for WaylandPlatform {
         self.rt().root().start_resize(self.rt().seat(), edge as u32);
     }
 
-    fn get_scale(&self) -> f32 {
-        self.rt().window().cached_scale()
+    fn scale(&self) -> jfn_platform_abi::Scale {
+        self.rt().window().scale()
     }
 
-    fn effective_scale(&self, _mpv_display_hidpi_scale: f64) -> f32 {
-        self.get_scale()
+    /// The output containing `at`, else the first usable output. When the
+    /// probe names no output this backend answers with the scale it reports
+    /// for its own window, logging the probe's error.
+    fn display_scale(&self, at: Option<jfn_platform_abi::WindowPos>) -> jfn_platform_abi::Scale {
+        let target = crate::scale_probe::ProbeTarget::at(at);
+        match crate::scale_probe::probe_scale(target) {
+            Ok(scale) => scale.scale(),
+            Err(err) => {
+                let scale = self.rt().window().scale();
+                tracing::warn!(
+                    target: "Main",
+                    "no usable output for {target:?} ({err}); Wayland reports {scale}"
+                );
+                scale
+            }
+        }
     }
 
-    fn get_display_scale(&self, x: c_int, y: c_int) -> f32 {
-        crate::scale_probe::probe_scale(crate::scale_probe::ProbeTarget::Point { x, y })
-            .map_or(1.0, |s| s.ratio_f32())
+    // the compositor tells no client where its window is
+    fn query_window_position(&self) -> Option<jfn_platform_abi::WindowPos> {
+        None
     }
+
+    // this backend gates no transition: the compositor's configure is the one
+    // authority for the window's size
+    fn set_expected_size(&self, _w: c_int, _h: c_int) {}
 
     fn apply_boot_geometry(&self, g: &BootGeometry) {
         // Only the host's own window geometry uses the boot size; mpv mirrors the
@@ -278,20 +296,30 @@ impl Platform for WaylandPlatform {
         self.shared_texture.store(false, Ordering::Release);
     }
 
-    fn clipboard_text_supported(&self) -> bool {
-        self.clipboard.load(Ordering::Acquire)
+    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+        self.rt()
+            .selections()
+            .read_text_async(crate::selection::Kind::Clipboard, on_done);
     }
 
-    fn clear_clipboard_handler(&self) {
-        self.clipboard.store(false, Ordering::Release);
+    fn clipboard_write_text(&self, text: &str) {
+        self.rt()
+            .selections()
+            .write_text(crate::selection::Kind::Clipboard, text);
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
-        if !self.clipboard.load(Ordering::Acquire) {
-            on_done("");
-            return;
-        }
-        self.rt().clipboard().read_text_async(on_done);
+    fn primary_selection(&self) -> Option<&dyn jfn_platform_abi::PrimarySelection> {
+        self.rt()
+            .selections()
+            .primary_available()
+            .then_some(&self.primary as &dyn jfn_platform_abi::PrimarySelection)
+    }
+
+    /// jellyfin-web pastes by injection only where another client may read
+    /// this seat's clipboard without focus; elsewhere `frame.Paste()` is the
+    /// only path that reaches the page.
+    fn web_paste_reads_clipboard(&self) -> bool {
+        self.rt().selections().data_control_advertised()
     }
 
     fn open_external_url(&self, url: &str) {

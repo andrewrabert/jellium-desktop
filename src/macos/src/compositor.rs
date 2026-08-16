@@ -137,7 +137,7 @@ fn gpu() -> Option<&'static Surfaces> {
 unsafe fn create_content_layer(
     content_view: *mut AnyObject,
     frame: NSRect,
-    scale: f64,
+    scale: jfn_platform_abi::Scale,
     visibility: Visibility,
 ) -> (*mut AnyObject, *mut AnyObject) {
     unsafe {
@@ -159,7 +159,7 @@ unsafe fn create_content_layer(
         // overwrites anything set behind it.
         let layer = CAMetalLayer::layer();
         layer.setFrame(frame);
-        layer.setContentsScale(scale);
+        layer.setContentsScale(scale.as_f64());
 
         // Disable implicit animations on property changes — present writes
         // contents every frame and CA shouldn't cross-fade them.
@@ -225,8 +225,8 @@ pub fn macos_alloc_surface(initial: Visibility) -> *mut c_void {
             return;
         }
         let frame: objc2_foundation::NSRect = objc2::msg_send![content_view, bounds];
-        let scale: f64 = objc2::msg_send![win, backingScaleFactor];
-        let (view, layer) = create_content_layer(content_view, frame, scale, initial);
+        let (view, layer) =
+            create_content_layer(content_view, frame, crate::backend::macos_scale(), initial);
         let surf = &mut *(s_addr as *mut Surface);
         surf.view = view;
         surf.layer = layer;
@@ -413,10 +413,12 @@ pub fn macos_surface_window_target(s: *mut c_void) -> Option<WindowTarget> {
     Some(WindowTarget::CoreAnimationLayer { layer })
 }
 
-pub fn macos_surface_resize(s: *mut c_void, lw: c_int, _lh: c_int, pw: c_int, ph: c_int) {
+pub fn macos_surface_resize(s: *mut c_void, size: jfn_platform_abi::SurfaceSize) {
     if s.is_null() {
         return;
     }
+    let physical = size.extent.physical();
+    let (pw, ph) = (physical.w, physical.h);
     let s_addr = s as usize;
     run_on_main_async(move || unsafe {
         let s_ptr = s_addr as *mut Surface;
@@ -435,14 +437,7 @@ pub fn macos_surface_resize(s: *mut c_void, lw: c_int, _lh: c_int, pw: c_int, ph
                 let _: () = objc2::msg_send![surf.view, setFrame: bounds];
             }
         }
-        let scale: f64 = if pw > 0 && lw > 0 {
-            pw as f64 / lw as f64
-        } else if !win.is_null() {
-            objc2::msg_send![win, backingScaleFactor]
-        } else {
-            1.0
-        };
-        let _: () = objc2::msg_send![surf.layer, setContentsScale: scale];
+        let _: () = objc2::msg_send![surf.layer, setContentsScale: size.extent.scale().as_f64()];
         if pw > 0 && ph > 0 {
             // The drawable resize, on the thread that owns the layer.
             if let Some(painter) = surf.painter.lock().as_mut() {

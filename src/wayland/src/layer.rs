@@ -37,14 +37,29 @@ pub(crate) struct ViewportState {
     pub(crate) ph: i32,
 }
 
+impl ViewportState {
+    /// The viewport of a surface created before the window published an
+    /// extent: no source and no destination.
+    ///
+    /// [`LayerSurface::set_viewport`] sends neither for a non-positive axis,
+    /// and `wl_ops::accepts` refuses every frame until the first publish, so
+    /// nothing is presented against it.
+    pub(crate) const UNPUBLISHED: ViewportState = ViewportState {
+        lw: 0,
+        lh: 0,
+        pw: 0,
+        ph: 0,
+    };
+}
+
 pub(crate) struct LayerSurface {
     conn: Connection,
     surface: WlSurface,
-    viewport: Option<WpViewport>,
+    viewport: WpViewport,
 }
 
 impl LayerSurface {
-    pub(crate) fn new(conn: Connection, surface: WlSurface, viewport: Option<WpViewport>) -> Self {
+    pub(crate) fn new(conn: Connection, surface: WlSurface, viewport: WpViewport) -> Self {
         Self {
             conn,
             surface,
@@ -63,14 +78,12 @@ impl LayerSurface {
     }
 
     pub(crate) fn set_viewport(&self, src_w: i32, src_h: i32, dst_w: i32, dst_h: i32) {
-        let Some(viewport) = self.viewport.as_ref() else {
-            return;
-        };
         if src_w > 0 && src_h > 0 {
-            viewport.set_source(0.0, 0.0, src_w as f64, src_h as f64);
+            self.viewport
+                .set_source(0.0, 0.0, f64::from(src_w), f64::from(src_h));
         }
         if dst_w > 0 && dst_h > 0 {
-            viewport.set_destination(dst_w, dst_h);
+            self.viewport.set_destination(dst_w, dst_h);
         }
     }
 
@@ -148,11 +161,11 @@ impl<'a> FrameCommit<'a> {
 
 pub(crate) struct SurfaceRef {
     surface: WlSurface,
-    viewport: Option<WpViewport>,
+    viewport: WpViewport,
 }
 
 impl SurfaceRef {
-    pub(crate) fn new(surface: WlSurface, viewport: Option<WpViewport>) -> Self {
+    pub(crate) fn new(surface: WlSurface, viewport: WpViewport) -> Self {
         Self { surface, viewport }
     }
 
@@ -168,18 +181,13 @@ impl SurfaceRef {
     }
 
     pub(crate) fn set_destination(&self, w: i32, h: i32) {
-        let Some(viewport) = self.viewport.as_ref() else {
-            return;
-        };
         if w > 0 && h > 0 {
-            viewport.set_destination(w, h);
+            self.viewport.set_destination(w, h);
         }
     }
 
     pub(crate) fn destroy(self) {
-        if let Some(viewport) = self.viewport {
-            viewport.destroy();
-        }
+        self.viewport.destroy();
         self.surface.destroy();
     }
 }

@@ -9,7 +9,7 @@ use clap::Parser;
 use jfn_cef::{APP_VERSION_FULL, cef_version};
 use jfn_instance_ipc::jfn::{Request, Response};
 use jfn_instance_ipc::{Listener, Start, Stream};
-use jfn_platform_abi::{IdleInhibitLevel, Instance, LogicalSize, Platform, WindowGeometry};
+use jfn_platform_abi::{IdleInhibitLevel, Instance, Platform, WindowGeometry};
 
 use crate::cli;
 
@@ -388,10 +388,6 @@ fn start_playback_coordination(instance: &Instance) -> bool {
 
     plat().media_session().start(instance);
 
-    jfn_playback::ingest_driver::jfn_playback_set_scale_provider(|| {
-        let s = plat().get_scale();
-        if s > 0.0 { s } else { 1.0 }
-    });
     jfn_playback::ingest_driver::jfn_playback_set_fullscreen_handler(|fs| {
         plat().set_fullscreen(fs)
     });
@@ -444,47 +440,28 @@ fn shutdown_runtime(manager_thread: std::thread::JoinHandle<()>, overlay: jfn_ce
     COORD_INITED.store(false, std::sync::atomic::Ordering::Release);
 }
 
-/// Boot-time mpv size reconcile (saved scale vs live display scale);
-/// seeds the display-hz cache and returns it for browser init.
-fn boot_mpv_reconcile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) -> f64 {
-    let mut display_hidpi_scale: f64 = 0.0;
-    unsafe {
-        let name = cs("display-hidpi-scale");
-        jfn_mpv::sys::mpv_get_property(
-            mpv_raw,
-            name.as_ptr(),
-            jfn_mpv::sys::mpv_format::MPV_FORMAT_DOUBLE,
-            &mut display_hidpi_scale as *mut f64 as *mut std::ffi::c_void,
-        );
-    }
+/// Boot-time mpv size reconcile (saved scale vs the scale the platform
+/// reports); seeds the display-hz cache and returns it for browser init.
+fn boot_mpv_reconcile() -> f64 {
     jfn_playback::ingest_driver::jfn_playback_seed_display_hz_sync();
     let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
-    if hz > 0.0 {
-        jfn_gpu_paint::report_refresh(
-            jfn_gpu_paint::RefreshSource::MpvDisplayFps,
-            std::time::Duration::from_secs_f64(1.0 / hz),
-        );
+    if let Some(rate) = jfn_gpu_paint::RefreshRate::from_hz(hz) {
+        jfn_gpu_paint::report_refresh(jfn_gpu_paint::RefreshSource::MpvDisplayFps, rate);
     }
     let saved = jfn_config::window_geometry();
     let snap = crate::window_geometry::controller().source().snapshot();
     tracing::info!(target: "Main",
-        "[FLOW] display-hidpi-scale={display_hidpi_scale} fullscreen={} display-hz={hz}",
-        snap.fullscreen
+        "[FLOW] scale={} fullscreen={} display-hz={hz}",
+        plat().scale(), snap.fullscreen
     );
 
     // Saved intent, not an observation: the OS may still be applying the
     // maximize, and a set_geometry landing mid-flight leaves mpv's stored
     // window size disagreeing with the visible window.
     let locked = saved.maximized || snap.fullscreen || snap.maximized;
-    if let Some(physical) = plat().reconcile_mpv_size(
-        display_hidpi_scale,
-        saved.scale,
-        LogicalSize {
-            w: saved.logical_width,
-            h: saved.logical_height,
-        },
-        locked,
-    ) {
+    let reconciled = crate::window_geometry::saved_sizes(&saved)
+        .and_then(|(logical, physical)| plat().reconcile_mpv_size(logical, physical, locked));
+    if let Some(physical) = reconciled {
         let clamped = plat().clamp_window_geometry(WindowGeometry {
             w: physical.w,
             h: physical.h,
@@ -493,7 +470,9 @@ fn boot_mpv_reconcile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) -> f64 {
         let (new_pw, new_ph) = (clamped.w, clamped.h);
         let geom_str = format!("{new_pw}x{new_ph}");
         tracing::info!(target: "Main",
-            "[FLOW] scale {:.3} -> {:.3}, resize to {}", saved.scale, display_hidpi_scale, geom_str);
+            "[FLOW] scale {}, saved {}x{} logical at {}x{} physical, resize to {}",
+            plat().scale(), saved.logical_width, saved.logical_height,
+            saved.width, saved.height, geom_str);
         let g_c = cs(&geom_str);
         unsafe { jfn_mpv::api::jfn_mpv_set_geometry(g_c.as_ptr()) };
     }
@@ -624,7 +603,10 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
 
     // Boot geometry resolves before the host prepare so its display probes
     // hit the real server, not the mpv proxy the prepare may install.
-    let boot = crate::window_geometry::controller().boot();
+    let Some(boot) = crate::window_geometry::controller().boot() else {
+        tracing::error!(target: "Main", "boot geometry unrepresentable at the reported scale");
+        return 1;
+    };
     plat().apply_boot_geometry(&boot);
 
     setup_mpv_environment();
@@ -788,13 +770,7 @@ fn consume_boot_event(event: jfn_mpv::api::WaitEvent) -> BootEvent {
             BootEvent::Consumed
         }
         jfn_mpv::api::WaitEvent::Event(event) => {
-            let scale_raw = plat().get_scale();
-            let scale = if scale_raw > 0.0 { scale_raw } else { 1.0 };
-            jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(
-                &event,
-                scale,
-                plat().mpv_host().logical_content_size(),
-            );
+            jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(&event);
             BootEvent::Consumed
         }
     }
@@ -882,11 +858,8 @@ extern "C" fn h_web_exec_js(js: *const c_char) {
 }
 extern "C" fn h_browsers_set_refresh_rate(hz: f64) {
     tracing::info!(target: "Main", "Display refresh rate changed: {hz} Hz");
-    if hz > 0.0 {
-        jfn_gpu_paint::report_refresh(
-            jfn_gpu_paint::RefreshSource::MpvDisplayFps,
-            std::time::Duration::from_secs_f64(1.0 / hz),
-        );
+    if let Some(rate) = jfn_gpu_paint::RefreshRate::from_hz(hz) {
+        jfn_gpu_paint::report_refresh(jfn_gpu_paint::RefreshSource::MpvDisplayFps, rate);
     }
     if let Some(overlay) = WEB_OVERLAY.lock().clone() {
         overlay.set_refresh_rate(hz);
@@ -929,7 +902,7 @@ unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
         return 1;
     }
 
-    let hz = boot_mpv_reconcile(mpv_raw);
+    let hz = boot_mpv_reconcile();
 
     let (manager_thread, overlay) = start_web_overlay(hz, shared_textures());
     WEB_OVERLAY.lock().replace(overlay.clone());

@@ -20,7 +20,6 @@ use std::time::Instant;
 use crate::ipc::BrowserMessage;
 use crate::menu_ownership::{MenuOwnership, Session};
 use crate::platform_ops;
-use crate::web_overlay::size::ViewSize;
 
 use crate::paint_scheduler::{PaintMode, PaintScheduler};
 
@@ -124,7 +123,7 @@ impl Painting {
 /// derived while no browser exists is never recorded as applied.
 pub(crate) struct BrowserState {
     pub(crate) browser: Option<Browser>,
-    pub(crate) applied: Option<ViewSize>,
+    pub(crate) applied: Option<jfn_platform_abi::SurfaceSize>,
 }
 
 pub(crate) struct Inner {
@@ -150,11 +149,12 @@ pub(crate) struct Inner {
     // C++ platform vtable for surface_resize / present / popup.
     surface: AtomicCell<platform_ops::SurfaceHandle>,
 
-    // logical/physical dims (slice 3)
+    // logical dims + the scale CEF is told about (slice 3)
     width: AtomicI32,
     height: AtomicI32,
-    physical_w: AtomicI32,
-    physical_h: AtomicI32,
+    /// The scale the platform reported for the last applied size; `None`
+    /// before any size has been applied.
+    scale: AtomicCell<Option<jfn_platform_abi::Scale>>,
 
     paint_scheduler: PaintScheduler,
 
@@ -181,7 +181,7 @@ pub(crate) struct Inner {
 
     // app-level callback slots, stored as boxed closures.
     message_handler: Mutex<Option<Box<MessageFn>>>,
-    created_callback: Mutex<Option<Box<CreatedFn>>>,
+    created_callback: Mutex<Option<Arc<CreatedFn>>>,
     before_close_callback: Mutex<Option<Box<BeforeCloseFn>>>,
     context_menu_builder: Mutex<Option<Box<ContextBuilderFn>>>,
     context_menu_dispatcher: Mutex<Option<Box<ContextDispatcherFn>>>,
@@ -240,8 +240,7 @@ impl Inner {
             surface: AtomicCell::new(platform_ops::SurfaceHandle::NONE),
             width: AtomicI32::new(0),
             height: AtomicI32::new(0),
-            physical_w: AtomicI32::new(0),
-            physical_h: AtomicI32::new(0),
+            scale: AtomicCell::new(None),
             paint_scheduler,
             frame_rate: AtomicI32::new(0),
             current_frame_rate: AtomicI32::new(0),
@@ -292,7 +291,7 @@ impl Inner {
     /// Hand `size` to the platform surface and, when a browser exists, to CEF.
     /// A size derived before the browser exists is applied but never recorded,
     /// so the next reconcile applies it again once the browser is there.
-    pub(crate) fn apply_view_size(self: &Arc<Self>, size: ViewSize) {
+    pub(crate) fn apply_view_size(self: &Arc<Self>, size: jfn_platform_abi::SurfaceSize) {
         {
             let mut state = self.browser.lock();
             if state.browser.is_none() {
@@ -303,14 +302,7 @@ impl Inner {
                 state.applied = Some(size);
             }
         }
-        self.resize(
-            size.logical.w,
-            size.logical.h,
-            size.physical.w,
-            size.physical.h,
-            size.logical_top,
-            size.physical_top,
-        );
+        self.resize(size);
     }
 
     pub(crate) fn menu_open(&self) -> Option<Session> {
@@ -328,7 +320,7 @@ impl Inner {
     pub(crate) fn set_message_handler(&self, f: Option<Box<MessageFn>>) {
         *self.message_handler.lock() = f;
     }
-    pub(crate) fn set_created_callback(&self, f: Option<Box<CreatedFn>>) {
+    pub(crate) fn set_created_callback(&self, f: Option<Arc<CreatedFn>>) {
         *self.created_callback.lock() = f;
     }
     pub(crate) fn set_context_menu_builder(&self, f: Option<Box<ContextBuilderFn>>) {

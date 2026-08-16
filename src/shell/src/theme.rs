@@ -90,32 +90,22 @@ impl iced_core::widget::text::Catalog for Theme {
     }
 }
 
-impl iced_widget::text_input::Catalog for Theme {
-    type Class<'a> = ();
-
-    fn default<'a>() -> Self::Class<'a> {}
-
-    fn style(
-        &self,
-        _class: &Self::Class<'_>,
-        status: iced_widget::text_input::Status,
-    ) -> iced_widget::text_input::Style {
-        use iced_widget::text_input::Status;
-        let focused = matches!(status, Status::Focused { .. });
-        iced_widget::text_input::Style {
-            background: iced_core::Background::Color(FIELD),
-            border: iced_core::Border {
-                color: if focused { ACCENT } else { FIELD },
-                width: 2.0,
-                radius: 3.0.into(),
-            },
-            placeholder: Color {
-                a: 0.3,
-                ..Color::WHITE
-            },
-            value: TEXT,
-            selection: ACCENT,
-        }
+/// [`FIELD`] fill, a two-pixel border that is [`ACCENT`] while focused and
+/// [`FIELD`] otherwise, [`TEXT`] value, [`ACCENT`] selection.
+pub fn field_style(focused: bool) -> crate::field::Style {
+    crate::field::Style {
+        background: iced_core::Background::Color(FIELD),
+        border: iced_core::Border {
+            color: if focused { ACCENT } else { FIELD },
+            width: 2.0,
+            radius: 3.0.into(),
+        },
+        placeholder: Color {
+            a: 0.3,
+            ..Color::WHITE
+        },
+        value: TEXT,
+        selection: ACCENT,
     }
 }
 

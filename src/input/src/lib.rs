@@ -10,14 +10,16 @@ use std::os::raw::c_int;
 
 pub mod buttons;
 pub mod cursor;
+pub mod key;
 pub mod route;
 pub mod scroll;
 pub mod sink;
+pub mod text;
 
 pub use route::{ShellHit, ShellState, Target};
 pub use sink::{
-    EditCommand, ShellInput, WebInput, install_shell, install_web, on_shell_state,
-    publish_shell_state, shell_state,
+    EditCommand, FieldEdit, ShellInput, WebInput, field_edit, install_shell, install_web,
+    on_shell_state, publish_field_edit, publish_shell_state, shell_state, web_became_live,
 };
 
 use route::{is_text, route_key, route_pointer, to_web_point};
@@ -104,6 +106,10 @@ pub fn jfn_input_dispatch_mouse_button(
         with_shell(|s| s.context_menu(p));
         return;
     }
+    if pressed != 0 && btn == MBT_MIDDLE {
+        with_shell(|s| s.primary_paste(p));
+        return;
+    }
     // The window gestures are press gestures and never reach the widget tree;
     // the window controls are buttons and act on release like every other one.
     if pressed != 0 && btn == MBT_LEFT && matches!(hit, ShellHit::Drag | ShellHit::Grip(_)) {
@@ -154,59 +160,86 @@ pub fn jfn_input_dispatch_history_nav(forward: c_int) {
     }
 }
 
+/// The window's keyboard focus. It reaches the shell overlay whole, and the web
+/// overlay through the sink, which serialises this report against the shell
+/// overlay's modal flips.
 pub fn jfn_input_dispatch_keyboard_focus(gained: c_int) {
-    match target_for_key() {
-        Target::Shell => with_shell(|s| s.set_focus(gained != 0)),
-        Target::Web => with_web(|b| b.set_focus(gained != 0)),
-        Target::None => {}
-    }
+    with_shell(|s| s.set_focus(gained != 0));
+    sink::set_window_focused(gained != 0);
 }
 
-/// Char event with explicit is_system_key (for WM_SYSCHAR on Windows). The
-/// 3-arg `jfn_input_dispatch_char` below is the wayland/x11 path which never
-/// generates system chars. jellyfin-web takes CEF's char event; the shell
-/// overlay takes text, and only what [`route::is_text`] admits.
-pub fn jfn_input_dispatch_char_sys(
-    codepoint: u32,
-    mods: u32,
-    native_code: u32,
-    is_system_key: c_int,
-) {
-    if codepoint == 0 || codepoint >= 0x10_FFFF {
+/// The UTF-16 pairing state of the typed-character stream. The platform
+/// delivers a non-BMP character as two units, and only the pair is a
+/// character the shell overlay can insert.
+static TYPED: parking_lot::Mutex<text::Utf16> = parking_lot::Mutex::new(text::Utf16::new());
+
+/// One UTF-16 code unit the platform typed: Windows' `WM_CHAR`/`WM_SYSCHAR`
+/// and macOS's `-characters`.
+///
+/// jellyfin-web takes the unit; the shell overlay takes the character the unit
+/// completes, and only what [`route::is_text`] admits.
+pub fn jfn_input_dispatch_utf16(unit: u16, modifiers: u32, native_code: u32, is_system_key: bool) {
+    if unit == 0 {
         return;
     }
+    let paired = TYPED.lock().feed(unit);
     match target_for_key() {
-        Target::Shell => shell_text(codepoint, mods, is_system_key != 0),
-        Target::Web => {
-            let cp16 = codepoint as u16;
-            with_web(|b| {
-                b.send_key_event(
-                    KEYEVENT_CHAR,
-                    mods,
-                    codepoint as c_int,
-                    native_code as c_int,
-                    is_system_key != 0,
-                    cp16,
-                    cp16,
-                );
-            });
+        Target::Shell => {
+            if let Some(ch) = paired {
+                shell_text(ch, modifiers, is_system_key);
+            }
         }
+        Target::Web => with_web(|b| {
+            b.send_key_event(
+                KEYEVENT_CHAR,
+                modifiers,
+                c_int::from(unit),
+                native_code as c_int,
+                is_system_key,
+                unit,
+                unit,
+            );
+        }),
         Target::None => {}
     }
 }
 
-/// The shell overlay's focused widget inserts whole characters; a lone
-/// surrogate is half of one, and only CEF's UTF-16 char event carries it.
-fn shell_text(codepoint: u32, mods: u32, is_system_key: bool) {
-    let Some(ch) = char::from_u32(codepoint).filter(|c| is_text(*c, mods, is_system_key)) else {
+/// The shell overlay's focused widget inserts whole characters.
+fn shell_text(ch: char, mods: u32, is_system_key: bool) {
+    if !is_text(ch, mods, is_system_key) {
         return;
-    };
+    }
     let mut utf8 = [0u8; 4];
     with_shell(|s| s.send_text(ch.encode_utf8(&mut utf8)));
 }
 
+/// A whole codepoint the platform typed; the Wayland and X11 paths, which
+/// deliver UTF-8 and never a lone surrogate.
 pub fn jfn_input_dispatch_char(codepoint: u32, mods: u32, native_code: u32) {
-    jfn_input_dispatch_char_sys(codepoint, mods, native_code, 0);
+    let Some(ch) = char::from_u32(codepoint) else {
+        return;
+    };
+    match target_for_key() {
+        Target::Shell => shell_text(ch, mods, false),
+        Target::Web => {
+            let mut units = [0u16; 2];
+            for unit in ch.encode_utf16(&mut units) {
+                let unit = *unit;
+                with_web(|b| {
+                    b.send_key_event(
+                        KEYEVENT_CHAR,
+                        mods,
+                        c_int::from(unit),
+                        native_code as c_int,
+                        false,
+                        unit,
+                        unit,
+                    );
+                });
+            }
+        }
+        Target::None => {}
+    }
 }
 
 /// Composed text from an xkb compose sequence or a dead key; routed as text,
@@ -223,20 +256,11 @@ pub fn jfn_input_dispatch_text(text: &str, mods: u32) {
     }
 }
 
-/// Flat key dispatch used by macOS and Windows input shims. Linux paths use
-/// `jfn_linux_util::input::jfn_input_dispatch_key_raw`, which routes through
-/// the xkb keysym → VK mapping first.
-pub fn jfn_input_dispatch_key_full(
-    pressed: c_int,
-    windows_key_code: i32,
-    native_key_code: i32,
-    modifiers: u32,
-    character: u16,
-    unmodified_character: u16,
-    is_system_key: c_int,
-) {
-    if pressed != 0 {
-        match jfn_hotkey_classify_keydown(windows_key_code, modifiers) {
+/// Classifies the hotkeys first, then routes: the shell overlay's focused
+/// widget takes [`key::ShellKey`], jellyfin-web takes CEF's `KeyEvent`.
+pub fn jfn_input_dispatch_key(report: key::KeyReport) {
+    if report.pressed {
+        match jfn_hotkey_classify_keydown(report.windows_key_code, report.modifiers) {
             1 => {
                 jfn_shutdown_initiate();
                 return;
@@ -250,43 +274,21 @@ pub fn jfn_input_dispatch_key_full(
             _ => {}
         }
     }
-    key_event(
-        pressed != 0,
-        modifiers,
-        windows_key_code,
-        native_key_code,
-        is_system_key != 0,
-        character,
-        unmodified_character,
-    );
-}
-
-fn key_event(
-    pressed: bool,
-    modifiers: u32,
-    windows_key_code: c_int,
-    native_key_code: c_int,
-    is_system_key: bool,
-    character: u16,
-    unmodified_character: u16,
-) {
     match target_for_key() {
-        Target::Shell => {
-            with_shell(|s| s.send_key(pressed, modifiers, windows_key_code, character));
-        }
+        Target::Shell => with_shell(|s| s.send_key(report.shell_key())),
         Target::Web => with_web(|b| {
             b.send_key_event(
-                if pressed {
+                if report.pressed {
                     KEYEVENT_RAWKEYDOWN
                 } else {
                     KEYEVENT_KEYUP
                 },
-                modifiers,
-                windows_key_code,
-                native_key_code,
-                is_system_key,
-                character,
-                unmodified_character,
+                report.modifiers,
+                report.windows_key_code,
+                report.native_key_code,
+                report.is_system_key,
+                report.character,
+                report.unmodified_character,
             );
         }),
         Target::None => {}

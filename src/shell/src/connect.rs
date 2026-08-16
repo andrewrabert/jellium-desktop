@@ -10,12 +10,12 @@ use std::time::Instant;
 
 use iced_core::widget::Id;
 use iced_core::{Alignment, Color, Element, Length, Padding};
-use iced_widget::{button, column, container, image, text, text_input};
+use iced_widget::{button, column, container, image, text};
 
 use jfn_bringup::{FADE, Screen};
 
 use crate::actor::Deadline;
-use crate::lang::{self, Strings};
+use crate::lang::strings;
 use crate::theme::{self, Theme};
 
 pub const URL_FIELD: Id = Id::new("shell-connect-url");
@@ -28,7 +28,6 @@ pub enum Message {
 }
 
 pub struct Connect {
-    strings: Strings,
     /// Owned here so a widget-cache rebuild does not restart the turn.
     spinner_started: Instant,
 }
@@ -42,7 +41,6 @@ impl Default for Connect {
 impl Connect {
     pub fn new() -> Connect {
         Connect {
-            strings: lang::strings_for(&lang::system_locale()),
             spinner_started: Instant::now(),
         }
     }
@@ -70,15 +68,14 @@ impl Connect {
     fn form_view<'a>(&'a self, url: &'a str) -> Element<'a, Message, Theme, iced_wgpu::Renderer> {
         let submit = (!url.trim().is_empty()).then_some(Message::Submit);
         column![
-            image(crate::logo::handle()).width(Length::Fixed(500.0)),
-            text(self.strings.server_host).size(24),
-            text_input(self.strings.server_host_help, url)
-                .id(URL_FIELD)
+            image(crate::logo::handle()).width(Length::Fixed(crate::logo::CONNECT_WIDTH)),
+            text(strings().server_host).size(24),
+            crate::field::field(URL_FIELD, strings().server_host_help, url)
                 .on_input(Message::UrlEdited)
                 .on_submit(Message::Submit)
                 .padding(Padding::from([10, 13]))
                 .size(16),
-            button(text(self.strings.connect).center())
+            button(text(strings().connect).center())
                 .on_press_maybe(submit)
                 .width(Length::Fill)
                 .padding(Padding::from([12, 24])),
@@ -93,7 +90,7 @@ impl Connect {
         let o = opacity(screen);
         column![
             image(crate::logo::handle())
-                .width(Length::Fixed(500.0))
+                .width(Length::Fixed(crate::logo::CONNECT_WIDTH))
                 .opacity(o),
             crate::spinner::Spinner::new(
                 fade(theme::ACCENT, o),
@@ -109,11 +106,11 @@ impl Connect {
 
     fn failure_view(&self) -> Element<'_, Message, Theme, iced_wgpu::Renderer> {
         column![
-            text(self.strings.connection_failure).size(24),
-            container(text(self.strings.unable_to_connect).center())
+            text(strings().connection_failure).size(24),
+            container(text(strings().unable_to_connect).center())
                 .width(Length::Fixed(350.0))
                 .padding(Padding::from([0, 24])),
-            button(text(self.strings.got_it).center()).on_press(Message::DismissFailure),
+            button(text(strings().got_it).center()).on_press(Message::DismissFailure),
         ]
         .spacing(32)
         .align_x(Alignment::Center)

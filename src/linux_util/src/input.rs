@@ -5,7 +5,8 @@ use xkbcommon::xkb;
 use xkbcommon::xkb::compose::{COMPILE_NO_FLAGS, STATE_NO_FLAGS, State, Status, Table};
 
 use crate::keysym;
-use jfn_input::{jfn_input_dispatch_history_nav, jfn_input_dispatch_key_full};
+use jfn_input::key::{KeyReport, PhysicalKey};
+use jfn_input::{jfn_input_dispatch_history_nav, jfn_input_dispatch_key};
 
 // The compose state is fed from the key-dispatch thread and read back on the
 // same call, so it lives on that thread rather than behind a lock.
@@ -83,8 +84,23 @@ pub fn jfn_input_dispatch_key_raw(keysym: u32, native_code: u32, mods: u32, pres
         }
         return;
     }
-    let vkey = keysym::keysym_to_vkey(keysym);
-    // CEF on Linux expects an X11 keycode (evdev keycode + 8) for native_key_code.
-    let native = native_code as i32 + 8;
-    jfn_input_dispatch_key_full(pressed, vkey, native, mods, 0, 0, 0);
+    // CEF on Linux expects an X11 keycode (evdev keycode + 8) for
+    // native_key_code, which is also the xkb keycode.
+    let xkb_code = native_code + 8;
+    jfn_input_dispatch_key(KeyReport {
+        pressed: pressed != 0,
+        modifiers: mods,
+        windows_key_code: keysym::keysym_to_vkey(keysym),
+        native_key_code: xkb_code as c_int,
+        is_system_key: false,
+        character: 0,
+        unmodified_character: 0,
+        logical: keysym_logical_char(keysym),
+        physical: PhysicalKey::Xkb(xkb_code as u16),
+    });
+}
+
+/// The character `keysym` produces with no modifier applied.
+pub fn keysym_logical_char(keysym: u32) -> Option<char> {
+    jfn_input::key::logical_char(xkb::keysym_to_utf32(xkb::Keysym::new(keysym)))
 }

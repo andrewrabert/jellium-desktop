@@ -6,7 +6,6 @@
 #![cfg(target_os = "linux")]
 
 pub(crate) mod app_conn;
-pub(crate) mod clipboard;
 pub(crate) mod decoration_probe;
 pub(crate) mod input;
 pub(crate) mod input_lifecycle;
@@ -25,6 +24,7 @@ pub(crate) mod runtime;
 pub(crate) mod scale;
 pub(crate) mod scale_probe;
 pub(crate) mod scene;
+pub(crate) mod selection;
 pub(crate) mod window_source;
 pub(crate) mod window_state;
 pub(crate) mod wl_ops;

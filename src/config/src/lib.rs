@@ -28,7 +28,6 @@ pub struct JfnWindowGeometry {
     pub height: i32,
     pub logical_width: i32,
     pub logical_height: i32,
-    pub scale: f32,
     pub maximized: bool,
 }
 
@@ -41,7 +40,6 @@ impl Default for JfnWindowGeometry {
             height: 0,
             logical_width: 0,
             logical_height: 0,
-            scale: 0.0,
             maximized: false,
         }
     }
@@ -103,11 +101,6 @@ struct SettingsFile {
 
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     window_logical_height: Option<i32>,
-
-    // f64 on the wire: the stored value is an f32, and widening before
-    // formatting keeps the digits identical to files written so far.
-    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
-    window_scale: Option<f64>,
 
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     window_x: Option<i32>,
@@ -263,9 +256,6 @@ impl SettingsData {
         if let Some(v) = file.window_logical_height {
             self.window.logical_height = v;
         }
-        if let Some(v) = file.window_scale {
-            self.window.scale = v as f32;
-        }
         if let Some(v) = file.window_x {
             self.window.x = v;
         }
@@ -305,7 +295,6 @@ impl SettingsData {
             window_height: size.then_some(self.window.height),
             window_logical_width: logical.then_some(self.window.logical_width),
             window_logical_height: logical.then_some(self.window.logical_height),
-            window_scale: (self.window.scale > 0.0).then(|| f64::from(self.window.scale)),
             window_x: position.then_some(self.window.x),
             window_y: position.then_some(self.window.y),
             window_maximized: Some(self.window.maximized),
@@ -714,7 +703,6 @@ mod tests {
                 height: 4,
                 logical_width: 5,
                 logical_height: 6,
-                scale: 1.5,
                 maximized: true,
             },
             audio_exclusive: true,
@@ -733,7 +721,6 @@ mod tests {
                 "windowHeight",
                 "windowLogicalWidth",
                 "windowLogicalHeight",
-                "windowScale",
                 "windowX",
                 "windowY",
                 "windowMaximized",
@@ -751,7 +738,6 @@ mod tests {
             ]
         );
         assert!(text.contains(r#""windowDecorations":"serverThemed""#));
-        assert!(text.contains(r#""windowScale":1.5"#));
     }
 
     #[test]

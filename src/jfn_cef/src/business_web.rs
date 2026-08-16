@@ -51,13 +51,10 @@ static WAS_FULLSCREEN_BEFORE_OSD: Mutex<bool> = Mutex::new(false);
 pub(crate) fn install(overlay: &WebOverlay) {
     let client = overlay.client();
 
-    client.set_created_callback(Some(Box::new({
-        let client = Arc::clone(client);
-        move || {
-            // jellyfin-web is the only browser; it holds CEF focus for its
-            // whole life and the input router decides what reaches it.
-            client.set_focus(true);
-        }
+    client.set_created_callback(Some(Arc::new(|| {
+        // The router owns this browser's CEF focus: it is live here, and a
+        // focus published before it existed reached nothing.
+        jfn_input::web_became_live();
     })));
 
     client.set_message_handler(Some(Box::new(handle_message)));

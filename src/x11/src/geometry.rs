@@ -119,12 +119,18 @@ fn apply_toplevel_fullscreen(fs: bool) {
 // `parent` is the WM-managed app top-level; `video_host` is the app-owned child
 // mpv embeds into (`--wid`). `conn` must be the connection that *created*
 // `parent` — the WM delivers its `WM_DELETE` only to the creating client.
-pub fn start(conn: Arc<RustConnection>, parent: u32, video_host: u32, root: u32) {
+pub fn start(
+    conn: Arc<RustConnection>,
+    parent: u32,
+    video_host: u32,
+    root: u32,
+    boot: ParentSnapshot,
+) {
     *CONN_HOLD.lock() = Some(conn.clone());
     crate::registry::install_command_channel();
     let join = match std::thread::Builder::new()
         .name("jfn-x11-geometry".into())
-        .spawn(move || geometry_thread_body(conn, parent, video_host, root))
+        .spawn(move || geometry_thread_body(conn, parent, video_host, root, boot))
     {
         Ok(j) => j,
         Err(e) => {
@@ -154,7 +160,7 @@ struct GeoWork {
     ph: i32,
     fullscreen: bool,
     maximized: bool,
-    scale: f32,
+    scale: jfn_platform_abi::Scale,
     structures: HashMap<SurfaceId, StructureSurface>,
     fsm: HashMap<SurfaceId, OverlayState>,
     /// The one visibility value each surface has; this map is its owner.
@@ -168,7 +174,7 @@ struct GeoWork {
 }
 
 impl GeoWork {
-    fn new(scale: f32, snap: &ParentSnapshot) -> Self {
+    fn new(scale: jfn_platform_abi::Scale, snap: &ParentSnapshot) -> Self {
         Self {
             parent_x: snap.origin_x,
             parent_y: snap.origin_y,
@@ -814,6 +820,7 @@ impl GeoLoop {
         video_host: Window,
         root: Window,
         signal: LoopSignal,
+        boot: ParentSnapshot,
     ) -> GeoLoop {
         let watch_mask = EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE;
         watch_window(&conn, parent, watch_mask);
@@ -826,8 +833,7 @@ impl GeoLoop {
         watch_compositor(&conn, root);
         let _ = conn.flush();
 
-        let snap = crate::x11_state::parent_snapshot();
-        let work = GeoWork::new(snap.scale, &snap);
+        let work = GeoWork::new(boot.scale, &boot);
 
         GeoLoop {
             conn,
@@ -908,17 +914,18 @@ impl GeoLoop {
         publish_applied(u64::MAX);
     }
 
+    /// Republishes on any change; [`Scale`] compares exactly, so there is no
+    /// tolerance to pick.
     fn refresh_display_scale(&mut self) -> Pending {
-        let scale = crate::scale::query_display_scale().unwrap_or(1.0);
-        if (self.work.scale - scale).abs() > f32::EPSILON {
-            self.work.scale = scale;
-            self.work.publish();
-            tracing::info!(target: "Platform", "display scale changed: {scale}");
-            jfn_platform_abi::notify_window_changed();
-            Pending::Reconcile
-        } else {
-            Pending::Idle
+        let scale = crate::scale::query_display_scale();
+        if self.work.scale == scale {
+            return Pending::Idle;
         }
+        self.work.scale = scale;
+        self.work.publish();
+        tracing::info!(target: "Platform", "display scale changed: {scale}");
+        jfn_platform_abi::notify_window_changed();
+        Pending::Reconcile
     }
 }
 
@@ -1040,6 +1047,7 @@ fn geometry_thread_body(
     parent: Window,
     video_host: Window,
     root: Window,
+    boot: ParentSnapshot,
 ) {
     let mut event_loop: EventLoop<'_, GeoLoop> = match EventLoop::try_new() {
         Ok(el) => el,
@@ -1049,7 +1057,7 @@ fn geometry_thread_body(
         }
     };
     let signal = event_loop.get_signal();
-    let mut state = GeoLoop::new(conn.clone(), parent, video_host, root, signal);
+    let mut state = GeoLoop::new(conn.clone(), parent, video_host, root, signal, boot);
     let handle = event_loop.handle();
 
     if let Err(e) = handle.insert_source(X11Source::new(conn), |ev, (), state: &mut GeoLoop| {

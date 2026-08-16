@@ -27,6 +27,7 @@ pub mod paint;
 #[cfg_attr(unix, path = "process_unix.rs")]
 #[cfg_attr(not(unix), path = "process_other.rs")]
 mod process;
+pub mod selection;
 #[cfg_attr(unix, path = "signal_unix.rs")]
 #[cfg_attr(not(unix), path = "signal_other.rs")]
 mod signal;
@@ -36,8 +37,8 @@ pub mod window_source;
 
 pub use cef_host::CefHost;
 pub use geometry::{
-    BootGeometry, LogicalPoint, LogicalSize, PhysicalPoint, PhysicalSize, Scale, SurfaceSize,
-    WindowExtent, WindowGeometry, WindowPos,
+    BootGeometry, COVERED_SCALES, LogicalPoint, LogicalSize, PhysicalPoint, PhysicalSize, Scale,
+    SurfaceSize, WindowExtent, WindowGeometry, WindowPos, mpv_reconcile_size,
 };
 pub use instance::{Instance, InstanceId};
 pub use jfn_gpu_paint::DamageRect as JfnRect;
@@ -51,6 +52,7 @@ pub use menu::{
 pub use mpv_host::{DefaultMpvHost, MpvHost, VO_WAIT_TICK};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};
 pub use paint::{Content, FrameSource, PaintFrame, Presented, Superseded};
+pub use selection::{OnText, PrimarySelection};
 pub use stack::Plane;
 pub use visibility::{Ack, Visibility, VisibilityCommit};
 pub use window_source::{
@@ -451,7 +453,8 @@ pub trait Platform: Send + Sync {
         let _ = s;
         Err(frame)
     }
-    fn surface_resize(&self, _s: SurfaceHandle, _size: SurfaceSize) {}
+    /// Applies `size` to `s` before returning.
+    fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize);
     /// The swapchain target for `s`, or `None` until the backend has created
     /// the surface's window.
     ///
@@ -521,69 +524,42 @@ pub trait Platform: Send + Sync {
     fn in_transition(&self) -> bool {
         false
     }
-    fn set_expected_size(&self, _w: c_int, _h: c_int) {}
+    /// Records the physical size a transition is expected to settle at, or
+    /// states that this backend gates no transition.
+    fn set_expected_size(&self, w: c_int, h: c_int);
 
-    fn get_scale(&self) -> f32 {
-        1.0
-    }
-    fn get_display_scale(&self, _x: c_int, _y: c_int) -> f32 {
-        1.0
-    }
+    /// The display scale this backend reports for the app window.
+    fn scale(&self) -> Scale;
 
-    /// Scale used to convert physical window pixels to CEF logical size.
-    /// Default trusts mpv's `display-hidpi-scale` when known; Wayland
-    /// overrides to always use the compositor scale (mpv doesn't own the
-    /// surface there, so its value isn't authoritative).
-    fn effective_scale(&self, mpv_display_hidpi_scale: f64) -> f32 {
-        if mpv_display_hidpi_scale > 0.0 {
-            mpv_display_hidpi_scale as f32
-        } else {
-            self.get_scale()
-        }
-    }
+    /// The display scale this backend reports for the display holding `at`,
+    /// or for its own default display when `at` is `None`.
+    fn display_scale(&self, at: Option<WindowPos>) -> Scale;
 
-    /// Seed the window owner with the restored boot geometry. Backends that
-    /// own their toplevel (Wayland) size it here; mpv-backed backends rely on
-    /// mpv's `--geometry` instead and keep the no-op default.
-    fn apply_boot_geometry(&self, _g: &BootGeometry) {}
+    /// Seeds the window owner with `g` before returning.
+    fn apply_boot_geometry(&self, g: &BootGeometry);
 
-    /// Current window position, or `None` if it can't be determined.
-    fn query_window_position(&self) -> Option<WindowPos> {
-        None
-    }
+    /// The window's current position in backing pixels, or `None` when this
+    /// backend has no window position to report.
+    fn query_window_position(&self) -> Option<WindowPos>;
 
     /// Live window-geometry authority for this backend: the compositor-backed
     /// source where the backend owns its toplevel (Wayland), the mpv-backed
     /// source everywhere else.
     fn window_source(&self) -> &dyn WindowSource;
 
-    /// The mpv `--geometry` string for boot, or `None` when the backend owns
-    /// its toplevel and sizes it itself. The default sizes via mpv; toplevel-
-    /// owning backends (Wayland) override to `None`.
-    fn boot_mpv_geometry(&self, g: &BootGeometry) -> Option<String> {
-        Some(g.mpv_geometry_string())
-    }
+    /// The mpv `--geometry` string for boot, or `None` when this backend owns
+    /// its toplevel and sizes it itself.
+    fn boot_mpv_geometry(&self, g: &BootGeometry) -> Option<String>;
 
-    /// Physical size mpv should be resized to when the boot display scale
-    /// differs from the saved scale, or `None` to leave sizing untouched. The
-    /// default performs the mpv reconcile; `locked` (booting fullscreen or
-    /// maximized) and toplevel-owning backends yield `None`.
+    /// The physical size mpv should be resized to at boot, or `None` to leave
+    /// mpv's sizing untouched. `locked` names a window booting fullscreen or
+    /// maximized; toplevel-owning backends yield `None` throughout.
     fn reconcile_mpv_size(
         &self,
-        display_hidpi_scale: f64,
-        saved_scale: f32,
         saved_logical: LogicalSize,
+        saved_physical: PhysicalSize,
         locked: bool,
-    ) -> Option<PhysicalSize> {
-        if locked
-            || display_hidpi_scale <= 0.0
-            || saved_scale <= 0.0
-            || (display_hidpi_scale - f64::from(saved_scale)).abs() < 0.01
-        {
-            return None;
-        }
-        Some(saved_logical.to_physical(Scale(display_hidpi_scale as f32)))
-    }
+    ) -> Option<PhysicalSize>;
 
     /// Clamp saved geometry to stay on-screen. Backends that don't constrain
     /// geometry return `g` unchanged (the default).
@@ -637,21 +613,27 @@ pub trait Platform: Send + Sync {
     /// shared-texture path.
     fn set_shared_texture_unsupported(&self) {}
 
-    /// Whether [`clipboard_read_text_async`] will actually invoke the
-    /// backend clipboard. Wayland clears this in `wl_init` when no data
-    /// device manager is present; the menu Paste path uses it to decide
-    /// between native OS read vs CEF `frame.Paste()`.
-    fn clipboard_text_supported(&self) -> bool {
-        true
+    /// The OS clipboard's text.
+    /// `None` when it holds no text, or the read failed.
+    fn clipboard_read_text_async(&self, on_done: OnText) {
+        on_done(None);
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
-        // No backend support — invoke with empty text synchronously.
-        on_done("");
+    /// Places `text` on the OS clipboard.
+    /// A backend that cannot take the selection leaves the previous contents.
+    fn clipboard_write_text(&self, _text: &str) {}
+
+    /// The primary selection, on the backends that serve one.
+    fn primary_selection(&self) -> Option<&dyn PrimarySelection> {
+        None
     }
-    /// Disable subsequent clipboard reads (set by Wayland when no data
-    /// device manager is available).
-    fn clear_clipboard_handler(&self) {}
+
+    /// Whether the web overlay pastes by reading the OS clipboard and
+    /// injecting the text, rather than by calling `frame.Paste()`.
+    /// Pinned per backend, and unrelated to the shell overlay's clipboard.
+    fn web_paste_reads_clipboard(&self) -> bool {
+        true
+    }
 
     fn open_external_url(&self, _url: &str) {}
 

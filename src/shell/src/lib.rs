@@ -11,8 +11,12 @@ pub mod about;
 pub mod actor;
 pub mod chrome;
 pub mod connect;
+pub mod field;
+pub mod fields;
+pub mod key;
 pub mod lang;
 pub mod logo;
+pub mod menu;
 pub mod modal;
 pub mod paint;
 pub mod router_sink;
@@ -44,16 +48,11 @@ static FONTS_READY: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new())
 /// titlebar, no reserved strip, at the window's current logical size.
 pub(crate) fn publish_no_overlay() {
     let plat = jfn_platform_abi::get();
-    let logical = plat.window_source().snapshot().extent.map(|e| e.logical());
-    jfn_input::publish_shell_state(jfn_input::ShellState {
-        modal_open: false,
-        titlebar_shown: false,
-        window_w: logical.map_or(0, |l| l.w),
-        window_h: logical.map_or(0, |l| l.h),
-        titlebar_h: jfn_platform_abi::TITLEBAR_LOGICAL_HEIGHT,
-        controls_w: chrome::CONTROLS_LOGICAL_WIDTH,
-        reserved_strip: 0,
-    });
+    jfn_input::publish_shell_state(crate::state::shell_state(
+        plat.window_source().snapshot().extent,
+        crate::state::ChromeInputs::default(),
+        false,
+    ));
 }
 
 /// Opens the process's wgpu device, allocates the shell overlay surface,
@@ -241,16 +240,7 @@ fn push_window_state() {
     let snap = plat.window_source().snapshot();
     chrome::set_fullscreen(snap.fullscreen);
     let Some(extent) = snap.extent else { return };
-    let scale = f64::from(plat.get_scale()).max(1.0);
-    let logical = extent.logical();
-    let physical = extent.physical();
-    post(Work::Resize {
-        size: jfn_gpu_paint::FrameSize {
-            w: physical.w,
-            h: physical.h,
-        },
-        scale,
-    });
+    post(Work::Resize { extent });
     let surface = shell_surface();
     if surface != SurfaceHandle::NONE {
         // The overlay spans the whole window: the reserved strip is the web
@@ -258,10 +248,7 @@ fn push_window_state() {
         plat.surface_resize(
             surface,
             SurfaceSize {
-                logical_w: logical.w,
-                logical_h: logical.h,
-                physical_w: physical.w,
-                physical_h: physical.h,
+                extent,
                 logical_top: 0,
                 physical_top: 0,
             },

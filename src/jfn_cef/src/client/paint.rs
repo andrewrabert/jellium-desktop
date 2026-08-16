@@ -38,16 +38,15 @@ impl Inner {
         )
     }
 
-    pub(crate) fn screen_info_values(&self) -> (f32, i32, i32) {
-        let w = self.width.load(Ordering::Acquire);
-        let h = self.height.load(Ordering::Acquire);
-        let pw = self.physical_w.load(Ordering::Acquire);
-        let scale = if pw > 0 && w > 0 {
-            pw as f32 / w as f32
-        } else {
-            1.0
-        };
-        (scale, w, h)
+    /// The scale and logical view size CEF's `GetScreenInfo` answers with, or
+    /// `None` before a size has been applied.
+    pub(crate) fn screen_info_values(&self) -> Option<(jfn_platform_abi::Scale, i32, i32)> {
+        let scale = self.scale.load()?;
+        Some((
+            scale,
+            self.width.load(Ordering::Acquire),
+            self.height.load(Ordering::Acquire),
+        ))
     }
 
     pub(crate) fn on_paint(

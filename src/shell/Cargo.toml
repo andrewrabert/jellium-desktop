@@ -31,6 +31,7 @@ jfn-playback = { path = "../playback" }
 parking_lot.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
+keycode = "1"
 
 [lints]
 workspace = true

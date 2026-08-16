@@ -1,3 +1,4 @@
+use std::ffi::c_int;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -16,12 +17,17 @@ use x11rb::rust_connection::RustConnection;
 
 use jfn_linux_util::menu::{MenuPoint, SoftwareMenu};
 use jfn_platform_abi::{
-    Generation, MenuClose, MenuHost, MenuMetrics, MenuPaint, MenuPlacement, PopupSurface,
+    Generation, LogicalPoint, MenuClose, MenuHost, MenuMetrics, MenuPaint, MenuPlacement,
+    PhysicalSize, PopupSurface,
 };
 
 use crate::conn_source::X11Source;
 use crate::shm::{shm_alloc, shm_free};
 use crate::x11_state::ShmBuffer;
+
+/// The smallest window `CreateWindow` admits: it answers a zero width or
+/// height with `BadValue`.
+const ARMED_SIZE: PhysicalSize = PhysicalSize { w: 1, h: 1 };
 
 const GRAB_RETRY: Duration = Duration::from_millis(5);
 const GRAB_ATTEMPTS: u32 = 40;
@@ -65,7 +71,7 @@ impl X11PopupSurface {
             rx.into_iter()
                 .flat_map(|rx| {
                     std::iter::from_fn(move || rx.try_recv().ok()).filter_map(|op| match op {
-                        Op::Create { generation, .. } => Some(generation),
+                        Op::Arm { generation, .. } => Some(generation),
                         _ => None,
                     })
                 })
@@ -79,19 +85,22 @@ impl X11PopupSurface {
 
 impl PopupSurface for X11PopupSurface {
     fn metrics(&self) -> MenuMetrics {
-        let scale = crate::x11_state::parent_snapshot().scale;
         MenuMetrics {
-            scale: if scale > 0.0 { scale } else { 1.0 },
+            scale: crate::scale::window_scale(),
             clamp_ph: None,
         }
     }
 
-    fn create(&self, generation: Generation, place: MenuPlacement, _serial: u32) {
-        if !self.send(Op::Create { generation, place }) {
+    fn arm(&self, generation: Generation, anchor: LogicalPoint, _serial: u32) {
+        if !self.send(Op::Arm { generation, anchor }) {
             tracing::error!(target: "x11::menu", "popup thread gone; dismissing menu");
             host().on_done(generation);
         }
     }
+
+    // the grab window is mapped and its grab retry running from `Op::Arm`;
+    // there is no second mapping to do
+    fn map_armed(&self, _generation: Generation) {}
 
     fn reposition(&self, generation: Generation, place: MenuPlacement) {
         self.send(Op::Reposition { generation, place });
@@ -107,9 +116,9 @@ impl PopupSurface for X11PopupSurface {
 }
 
 enum Op {
-    Create {
+    Arm {
         generation: Generation,
-        place: MenuPlacement,
+        anchor: LogicalPoint,
     },
     Reposition {
         generation: Generation,
@@ -221,7 +230,7 @@ impl PopupLoop {
 
     fn on_op(&mut self, op: Op) {
         match op {
-            Op::Create { generation, place } => self.create(generation, place),
+            Op::Arm { generation, anchor } => self.arm(generation, anchor),
             Op::Reposition { generation, place } => self.reposition(generation, place),
             Op::Present(paint) => self.present(paint),
             Op::Destroy { generation } => {
@@ -238,9 +247,11 @@ impl PopupLoop {
             .is_some_and(|w| w.generation == generation)
     }
 
-    fn create(&mut self, generation: Generation, place: MenuPlacement) {
+    /// Puts up the grab window at `anchor`, sized [`ARMED_SIZE`], and starts
+    /// the grab retry.
+    fn arm(&mut self, generation: Generation, anchor: LogicalPoint) {
         self.tear_down();
-        let Some(window) = self.build(generation, place) else {
+        let Some(window) = self.build(generation, anchor, ARMED_SIZE) else {
             host().on_done(generation);
             return;
         };
@@ -255,19 +266,27 @@ impl PopupLoop {
             })
             .is_err()
         {
-            tracing::error!(target: "x11::menu", "create: grab timer failed; dismissing");
+            tracing::error!(target: "x11::menu", "arm: grab timer failed; dismissing");
             self.tear_down();
             host().on_done(generation);
         }
     }
 
     /// On `None`, nothing is left on the server for the caller to clean up.
-    fn build(&mut self, generation: Generation, place: MenuPlacement) -> Option<Window> {
+    fn build(
+        &mut self,
+        generation: Generation,
+        anchor: LogicalPoint,
+        size: PhysicalSize,
+    ) -> Option<Window> {
         let snap = snapshot(&self.conn).or_else(|| {
             tracing::warn!(target: "x11::menu", "build: no X11 state snapshot; dismissing");
             None
         })?;
-        let (wx, wy) = self.place(&snap, place);
+        let Some((wx, wy)) = self.place(&snap, anchor, size) else {
+            tracing::error!(target: "x11::menu", "anchor {},{} is unrepresentable at scale {}", anchor.x, anchor.y, snap.scale);
+            return None;
+        };
         let win = self.conn.generate_id().ok()?;
         let aux = CreateWindowAux::new()
             .background_pixel(0)
@@ -283,8 +302,8 @@ impl PopupLoop {
                 snap.root,
                 wx as i16,
                 wy as i16,
-                place.pw.max(1) as u16,
-                place.ph.max(1) as u16,
+                size.w as u16,
+                size.h as u16,
                 0,
                 WindowClass::INPUT_OUTPUT,
                 snap.visual,
@@ -320,10 +339,14 @@ impl PopupLoop {
         })
     }
 
-    fn place(&self, snap: &Snap, place: MenuPlacement) -> (i32, i32) {
-        let (w, h) = (place.pw.max(1), place.ph.max(1));
-        let mut x = snap.parent_x + (place.x as f32 * snap.scale).round() as i32;
-        let mut y = snap.parent_y + (place.y as f32 * snap.scale).round() as i32;
+    /// The root-relative top-left of a window of `size` whose anchor is
+    /// `anchor`, kept inside the root.
+    ///
+    /// `None` when the scale does not map the anchor into buffer pixels.
+    fn place(&self, snap: &Snap, anchor: LogicalPoint, size: PhysicalSize) -> Option<(i32, i32)> {
+        let (w, h) = (size.w, size.h);
+        let mut x = snap.parent_x + snap.scale.to_physical(anchor.x)?;
+        let mut y = snap.parent_y + snap.scale.to_physical(anchor.y)?;
         if x + w > snap.root_w {
             x = (snap.root_w - w).max(0);
         }
@@ -335,7 +358,7 @@ impl PopupLoop {
                 (snap.root_h - h).max(0)
             };
         }
-        (x.max(0), y.max(0))
+        Some((x.max(0), y.max(0)))
     }
 
     fn reposition(&mut self, generation: Generation, place: MenuPlacement) {
@@ -345,7 +368,11 @@ impl PopupLoop {
         let Some(snap) = snapshot(&self.conn) else {
             return;
         };
-        let (wx, wy) = self.place(&snap, place);
+        let size = place.view.physical();
+        let Some((wx, wy)) = self.place(&snap, place.anchor, size) else {
+            tracing::error!(target: "x11::menu", "anchor {},{} is unrepresentable at scale {}", place.anchor.x, place.anchor.y, snap.scale);
+            return;
+        };
         let Some(window) = self.phase.window() else {
             return;
         };
@@ -354,8 +381,8 @@ impl PopupLoop {
             &ConfigureWindowAux::new()
                 .x(wx)
                 .y(wy)
-                .width(place.pw.max(1) as u32)
-                .height(place.ph.max(1) as u32),
+                .width(size.w as u32)
+                .height(size.h as u32),
         );
         let _ = self.conn.flush();
     }
@@ -368,7 +395,7 @@ impl PopupLoop {
         let Some(window) = self.phase.window() else {
             return;
         };
-        let (w, h) = (paint.pw.max(1), paint.ph.max(1));
+        let (w, h) = (paint.buffer.w.max(1), paint.buffer.h.max(1));
         if !shm_alloc(&mut window.buf, &conn, w, h) {
             return;
         }
@@ -434,12 +461,12 @@ impl PopupLoop {
         match ev {
             Event::Expose(_) => host().expose(),
             Event::MotionNotify(e) => host().motion(MenuPoint::Physical {
-                x: f32::from(e.event_x),
-                y: f32::from(e.event_y),
+                x: c_int::from(e.event_x),
+                y: c_int::from(e.event_y),
             }),
             Event::ButtonPress(e) => host().press(MenuPoint::Physical {
-                x: f32::from(e.event_x),
-                y: f32::from(e.event_y),
+                x: c_int::from(e.event_x),
+                y: c_int::from(e.event_y),
             }),
             Event::KeyPress(e) => host().key(self.keymap.lookup(e.detail)),
             _ => {}
@@ -469,7 +496,7 @@ struct Snap {
     root: u32,
     parent_x: i32,
     parent_y: i32,
-    scale: f32,
+    scale: jfn_platform_abi::Scale,
     root_w: i32,
     root_h: i32,
 }
@@ -477,7 +504,7 @@ struct Snap {
 fn snapshot(conn: &RustConnection) -> Option<Snap> {
     let host = crate::x11_state::host()?;
     let paint = crate::x11_state::paint()?;
-    let parent = crate::x11_state::parent_snapshot();
+    let parent = crate::x11_state::parent_snapshot()?;
     let screen = conn
         .setup()
         .roots
@@ -491,11 +518,7 @@ fn snapshot(conn: &RustConnection) -> Option<Snap> {
         root: host.root,
         parent_x: parent.origin_x,
         parent_y: parent.origin_y,
-        scale: if parent.scale > 0.0 {
-            parent.scale
-        } else {
-            1.0
-        },
+        scale: parent.scale,
         root_w: screen.width_in_pixels as i32,
         root_h: screen.height_in_pixels as i32,
     })

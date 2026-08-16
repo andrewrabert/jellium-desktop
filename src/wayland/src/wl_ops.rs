@@ -59,10 +59,7 @@ pub(crate) fn alloc_surface(rt: &'static WlRuntime, initial: Visibility) -> *mut
         surface.set_input_region(Some(empty.wl_region()));
     }
 
-    let viewport = st
-        .viewporter
-        .as_ref()
-        .map(|vp| vp.get_viewport(&surface, &st.qh, ()));
+    let viewport = st.viewporter.get_viewport(&surface, &st.qh, ());
 
     surface.commit();
     st.flush();
@@ -184,21 +181,18 @@ pub(crate) fn surface_resize(
     }
     let Some(st) = core(rt) else { return };
     let s = unsafe { surface_mut(ptr) };
+    let logical = size.extent.logical();
+    let physical = size.extent.physical();
     s.top_logical = size.logical_top.max(0);
     s.top_physical = size.physical_top.max(0);
     if let Some(sub) = s.subsurface.as_ref() {
         sub.set_position(0, s.top_logical);
     }
     if let Some(surface) = s.surface.as_ref() {
-        surface.set_destination(size.logical_w, size.logical_h);
+        surface.set_destination(logical.w, logical.h);
     }
     if let Some(actor) = s.layer_actor.as_ref() {
-        actor.resize(
-            size.logical_w,
-            size.logical_h,
-            size.physical_w,
-            size.physical_h,
-        );
+        actor.resize(logical.w, logical.h, physical.w, physical.h);
     }
     st.flush();
 }
@@ -246,14 +240,13 @@ fn build_actor(
     rt: &'static WlRuntime,
     st: &WlState,
     surface: &WlSurface,
-    viewport: &Option<WpViewport>,
+    viewport: &WpViewport,
     visibility: Visibility,
 ) -> LayerActor {
     let backend = match (st.use_gpu_paint, st.gpu) {
         (true, Some(ctx)) => LayerBackend::Gpu(ctx),
         _ => LayerBackend::Shm,
     };
-    let (lw, lh, pw, ph) = extent_or(rt, 0, 0);
     let layer = LayerSurface::new(st.conn.clone(), surface.clone(), viewport.clone());
     LayerActor::new(
         backend,
@@ -264,56 +257,58 @@ fn build_actor(
             dmabuf: st.dmabuf.clone(),
         },
         layer,
-        ViewportState { lw, lh, pw, ph },
+        window_viewport(rt),
         visibility,
     )
 }
 
-/// The window extent minus the surface's reserved top inset — the size the
+/// The published window extent minus `s`'s reserved top inset — the size the
 /// subsurface actually covers.
-fn inset_extent(rt: &WlRuntime, s: &PlatformSurface, w: i32, h: i32) -> (i32, i32, i32, i32) {
-    let (lw, lh, pw, ph) = extent_or(rt, w, h);
+fn inset_extent(
+    s: &PlatformSurface,
+    extent: crate::window_state::WindowExtentSnapshot,
+) -> (i32, i32, i32, i32) {
     (
-        lw,
-        (lh - s.top_logical).max(1),
-        pw,
-        (ph - s.top_physical).max(1),
+        extent.logical().w(),
+        (extent.logical().h() - s.top_logical).max(1),
+        extent.physical().w(),
+        (extent.physical().h() - s.top_physical).max(1),
     )
 }
 
-fn extent_or(rt: &WlRuntime, w: i32, h: i32) -> (i32, i32, i32, i32) {
-    rt.window().window_extent().map_or((w, h, w, h), |ext| {
-        (
-            ext.logical().w(),
-            ext.logical().h(),
-            ext.physical().w(),
-            ext.physical().h(),
-        )
-    })
+/// The viewport the published window extent names, or
+/// [`ViewportState::UNPUBLISHED`] before the first publish.
+fn window_viewport(rt: &WlRuntime) -> ViewportState {
+    rt.window()
+        .window_extent()
+        .map_or(ViewportState::UNPUBLISHED, |ext| ViewportState {
+            lw: ext.logical().w(),
+            lh: ext.logical().h(),
+            pw: ext.physical().w(),
+            ph: ext.physical().h(),
+        })
 }
 
-/// The frame's own extent, in texels.
-fn frame_extent(content: &Content<'_>) -> (i32, i32) {
-    match content {
-        Content::Accelerated(tex) => (tex.coded().w, tex.coded().h),
-        Content::Software { size, .. } => (size.w, size.h),
-    }
-}
-
-/// Whether the surface has a commit stream for `content` right now. Everything
-/// that can reject a frame is asked here, before the frame is consumed, so no
-/// producer is handed a commit proof for a frame that goes nowhere. A dmabuf
-/// frame additionally needs the protocol and a size the window still expects;
-/// mid-transition frames of the old size would flash the wrong geometry.
+/// The window extent `content` may be presented against, or `None` when this
+/// surface has no commit stream for it right now.
+///
+/// Everything that can reject a frame is asked here, before the frame is
+/// consumed, so no producer is handed a commit proof for a frame that goes
+/// nowhere. A window that has published no extent rejects every frame: the
+/// frame's own texel size names no scale, and nothing here may name one. A
+/// dmabuf frame additionally needs the protocol and a size the window still
+/// expects; mid-transition frames of the old size would flash the wrong
+/// geometry.
 fn accepts(
     rt: &'static WlRuntime,
     st: &WlState,
     s: &PlatformSurface,
     content: &Content<'_>,
-) -> bool {
+) -> Option<crate::window_state::WindowExtentSnapshot> {
     if s.surface.is_none() || !s.visibility.is_shown() || s.external || s.layer_actor.is_none() {
-        return false;
+        return None;
     }
+    let extent = rt.window().window_extent()?;
     match content {
         Content::Accelerated(tex) => {
             st.dmabuf.is_some()
@@ -329,6 +324,7 @@ fn accepts(
                     .is_some_and(|need| pixels.len() >= need)
         }
     }
+    .then_some(extent)
 }
 
 /// Hands `frame` to the surface's actor, or back to its producer when this
@@ -345,11 +341,10 @@ pub(crate) fn present<'a>(
         return Err(frame);
     };
     let s = unsafe { surface_mut(ptr) };
-    if !accepts(rt, &st, s, frame.content()) {
+    let Some(extent) = accepts(rt, &st, s, frame.content()) else {
         return Err(frame);
-    }
-    let (w, h) = frame_extent(frame.content());
-    let (lw, lh, pw, ph) = inset_extent(rt, s, w, h);
+    };
+    let (lw, lh, pw, ph) = inset_extent(s, extent);
     let Some(actor) = s.layer_actor.as_ref() else {
         return Err(frame);
     };

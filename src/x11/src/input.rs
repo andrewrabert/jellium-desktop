@@ -127,6 +127,9 @@ enum QueuedInputEvent {
     HistoryNav {
         forward: c_int,
     },
+    KeyboardFocus {
+        gained: bool,
+    },
     MouseButton {
         code: u32,
         pressed: c_int,
@@ -154,6 +157,7 @@ struct State {
     window: u32,
     root: u32,
     net_active_window: u32,
+    screen_num: i32,
     xkb_ctx: xkb::Context,
     xkb_kmap: Option<xkb::Keymap>,
     xkb_st: Option<xkb::State>,
@@ -293,10 +297,19 @@ fn cef_modifiers(st: &State) -> u32 {
     st.modifiers | st.mouse_button_modifiers
 }
 
-fn to_logical(physical: i32) -> i32 {
-    let scale = crate::x11_state::parent_snapshot().scale;
-    let s = if scale > 0.0 { f64::from(scale) } else { 1.0 };
-    (physical as f64 / s) as i32
+/// The pointer position in the space the window's logical size names; the
+/// identity before the geometry thread has published an extent.
+fn view_point(x: i32, y: i32) -> jfn_platform_abi::LogicalPoint {
+    let extent = crate::x11_state::parent_snapshot().and_then(|s| {
+        crate::scale::extent(
+            jfn_platform_abi::PhysicalSize {
+                w: s.width,
+                h: s.height,
+            },
+            s.scale,
+        )
+    });
+    crate::scale::view_point(extent, jfn_platform_abi::PhysicalPoint { x, y })
 }
 
 fn handle_key(st: &mut State, detail: u8, pressed: bool) {
@@ -363,8 +376,8 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
 
 fn handle_button(st: &mut State, detail: u8, event_x: i16, event_y: i16, pressed: bool) {
     let button = detail as u32;
-    let x = to_logical(event_x as i32);
-    let y = to_logical(event_y as i32);
+    let point = view_point(event_x as i32, event_y as i32);
+    let (x, y) = (point.x, point.y);
 
     if (4..=7).contains(&button) {
         if !pressed {
@@ -446,8 +459,9 @@ fn activate_parent(st: &State) {
 }
 
 fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) {
-    st.ptr_x = to_logical(ev.event_x() as i32);
-    st.ptr_y = to_logical(ev.event_y() as i32);
+    let point = view_point(ev.event_x() as i32, ev.event_y() as i32);
+    st.ptr_x = point.x;
+    st.ptr_y = point.y;
     let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
         x: st.ptr_x,
         y: st.ptr_y,
@@ -457,8 +471,9 @@ fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) {
 }
 
 fn handle_enter(st: &mut State, ev: &xcb::x::EnterNotifyEvent) {
-    st.ptr_x = to_logical(ev.event_x() as i32);
-    st.ptr_y = to_logical(ev.event_y() as i32);
+    let point = view_point(ev.event_x() as i32, ev.event_y() as i32);
+    st.ptr_x = point.x;
+    st.ptr_y = point.y;
     st.cursor.resend_latest();
     let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
         x: st.ptr_x,
@@ -582,12 +597,14 @@ fn input_thread_body(mut st: State) {
         | x::EventMask::BUTTON_RELEASE
         | x::EventMask::POINTER_MOTION
         | x::EventMask::ENTER_WINDOW
-        | x::EventMask::LEAVE_WINDOW;
+        | x::EventMask::LEAVE_WINDOW
+        | x::EventMask::FOCUS_CHANGE;
     st.conn.send_request(&x::ChangeWindowAttributes {
         window: x::Window::new(st.window),
         value_list: &[x::Cw::EventMask(mask)],
     });
     let _ = st.conn.flush();
+    crate::selection::install(&st.conn, st.screen_num);
 
     let mut event_loop: EventLoop<'_, State> = match EventLoop::try_new() {
         Ok(el) => el,
@@ -686,6 +703,9 @@ fn dispatch_input_event(ev: QueuedInputEvent) {
             jfn_input::jfn_input_dispatch_text(&text, modifiers)
         }
         QueuedInputEvent::HistoryNav { forward } => jfn_input_dispatch_history_nav(forward),
+        QueuedInputEvent::KeyboardFocus { gained } => {
+            jfn_input::jfn_input_dispatch_keyboard_focus(c_int::from(gained));
+        }
         QueuedInputEvent::MouseButton {
             code,
             pressed,
@@ -734,6 +754,22 @@ fn input_dispatch_thread_body(events: Channel<QueuedInputEvent>) {
     }
 }
 
+/// A focus change the window itself took or lost. A `NotifyGrab` or
+/// `NotifyUngrab` mode is the menu's keyboard grab and changes nothing, and so
+/// is a `NotifyPointer`, `NotifyPointerRoot` or `NotifyInferior` detail.
+fn handle_focus(st: &State, mode: x::NotifyMode, detail: x::NotifyDetail, gained: bool) {
+    if matches!(mode, x::NotifyMode::Grab | x::NotifyMode::Ungrab) {
+        return;
+    }
+    if matches!(
+        detail,
+        x::NotifyDetail::Pointer | x::NotifyDetail::PointerRoot | x::NotifyDetail::Inferior
+    ) {
+        return;
+    }
+    let _ = st.dispatch.send(QueuedInputEvent::KeyboardFocus { gained });
+}
+
 fn handle_event(st: &mut State, ev: xcb::Event) {
     use xcb::Event;
     match ev {
@@ -746,6 +782,23 @@ fn handle_event(st: &mut State, ev: xcb::Event) {
             handle_button(st, e.detail(), e.event_x(), e.event_y(), false)
         }
         Event::X(x::Event::MotionNotify(e)) => handle_motion(st, &e),
+        Event::X(x::Event::FocusIn(e)) => handle_focus(st, e.mode(), e.detail(), true),
+        Event::X(x::Event::FocusOut(e)) => handle_focus(st, e.mode(), e.detail(), false),
+        Event::X(x::Event::SelectionRequest(e)) => {
+            if let Some(selections) = crate::selection::selections() {
+                selections.on_selection_request(&e);
+            }
+        }
+        Event::X(x::Event::SelectionNotify(e)) => {
+            if let Some(selections) = crate::selection::selections() {
+                selections.on_selection_notify(&e);
+            }
+        }
+        Event::X(x::Event::SelectionClear(e)) => {
+            if let Some(selections) = crate::selection::selections() {
+                selections.on_selection_clear(&e);
+            }
+        }
         Event::X(x::Event::EnterNotify(e)) => handle_enter(st, &e),
         Event::X(x::Event::LeaveNotify(e)) => handle_leave(st, &e),
         Event::Xkb(xkb_ev) => {
@@ -778,6 +831,7 @@ pub fn start(screen_num: i32, parent: u32) -> Option<Handle> {
         window: parent,
         root,
         net_active_window,
+        screen_num,
         xkb_ctx: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
         xkb_kmap: None,
         xkb_st: None,

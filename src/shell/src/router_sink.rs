@@ -6,7 +6,6 @@
 use std::os::raw::c_int;
 use std::time::{Duration, Instant};
 
-use iced_core::keyboard::{self, Key, Location, Modifiers, key};
 use iced_core::{Event, mouse};
 use jfn_platform_abi::LogicalPoint;
 use jfn_platform_abi::cursor::CursorShape;
@@ -53,45 +52,26 @@ impl jfn_input::ShellInput for ShellSink {
     }
 
     fn context_menu(&self, p: LogicalPoint) {
-        jfn_cef::app_menu::open_at(p.x, p.y);
+        crate::post(Work::ContextMenu(p));
     }
 
-    fn send_key(&self, pressed: bool, modifiers: u32, windows_key_code: c_int, character: u16) {
-        let mods = modifiers_from(modifiers);
-        let key = key_from(windows_key_code, character);
-        let event = if pressed {
-            keyboard::Event::KeyPressed {
-                key: key.clone(),
-                modified_key: key,
-                physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
-                location: Location::Standard,
-                modifiers: mods,
-                text: None,
-                repeat: false,
-            }
-        } else {
-            keyboard::Event::KeyReleased {
-                key: key.clone(),
-                modified_key: key,
-                physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
-                location: Location::Standard,
-                modifiers: mods,
-            }
-        };
-        crate::post(Work::Event(Event::Keyboard(event)));
+    fn send_key(&self, key: jfn_input::key::ShellKey) {
+        let backend = jfn_platform_abi::get().display();
+        if crate::key::opens_edit_menu(backend, key) {
+            crate::post(Work::EditMenuAtCaret);
+            return;
+        }
+        crate::post(Work::Event(Event::Keyboard(crate::key::key_event(key))));
     }
 
     fn send_text(&self, text: &str) {
-        let key = Key::Character(text.into());
-        crate::post(Work::Event(Event::Keyboard(keyboard::Event::KeyPressed {
-            key: key.clone(),
-            modified_key: key,
-            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
-            location: Location::Standard,
-            modifiers: Modifiers::default(),
-            text: Some(text.into()),
-            repeat: false,
-        })));
+        for ch in text.chars() {
+            crate::post(Work::Event(Event::Keyboard(crate::key::text_event(ch))));
+        }
+    }
+
+    fn primary_paste(&self, p: LogicalPoint) {
+        crate::post(Work::PrimaryPaste(p));
     }
 
     fn send_mouse_move(&self, p: LogicalPoint, _modifiers: u32, leave: bool) {
@@ -152,46 +132,10 @@ impl jfn_input::ShellInput for ShellSink {
     }
 
     fn edit(&self, command: jfn_input::EditCommand) {
-        crate::post(Work::Edit(command));
-    }
-}
-
-fn modifiers_from(raw: u32) -> Modifiers {
-    use jfn_platform_abi::event_flags as ef;
-    let mut mods = Modifiers::empty();
-    mods.set(Modifiers::SHIFT, raw & ef::EVENTFLAG_SHIFT_DOWN != 0);
-    mods.set(Modifiers::CTRL, raw & ef::EVENTFLAG_CONTROL_DOWN != 0);
-    mods.set(Modifiers::ALT, raw & ef::EVENTFLAG_ALT_DOWN != 0);
-    mods.set(Modifiers::LOGO, raw & ef::EVENTFLAG_COMMAND_DOWN != 0);
-    mods
-}
-
-/// Windows virtual-key codes, the same set CEF's `KeyEvent` carries.
-fn key_from(windows_key_code: c_int, character: u16) -> Key {
-    let named = match windows_key_code {
-        0x08 => Some(key::Named::Backspace),
-        0x09 => Some(key::Named::Tab),
-        0x0d => Some(key::Named::Enter),
-        0x10 => Some(key::Named::Shift),
-        0x11 => Some(key::Named::Control),
-        0x12 => Some(key::Named::Alt),
-        0x1b => Some(key::Named::Escape),
-        0x20 => Some(key::Named::Space),
-        0x23 => Some(key::Named::End),
-        0x24 => Some(key::Named::Home),
-        0x25 => Some(key::Named::ArrowLeft),
-        0x26 => Some(key::Named::ArrowUp),
-        0x27 => Some(key::Named::ArrowRight),
-        0x28 => Some(key::Named::ArrowDown),
-        0x2e => Some(key::Named::Delete),
-        _ => None,
-    };
-    match named {
-        Some(named) => Key::Named(named),
-        None => match char::from_u32(u32::from(character)).filter(|c| !c.is_control()) {
-            Some(c) => Key::Character(c.to_string().into()),
-            None => Key::Unidentified,
-        },
+        crate::post(Work::EditAt {
+            field: crate::actor::Target::Focused,
+            command,
+        });
     }
 }
 

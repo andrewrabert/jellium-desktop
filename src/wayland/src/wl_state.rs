@@ -306,7 +306,7 @@ pub(crate) struct WlState {
     pub subcompositor: WlSubcompositor,
     pub shm: ShmGlobal,
     pub dmabuf: Option<ZwpLinuxDmabufV1>,
-    pub viewporter: Option<WpViewporter>,
+    pub viewporter: WpViewporter,
 
     pub root_surface: Option<RootParent>,
 
@@ -650,7 +650,9 @@ pub(crate) unsafe fn init(
         .map_err(bind_error("wl_subcompositor"))?;
     let shm = ShmGlobal::new(globals.bind(&qh, 1..=1, ()).map_err(bind_error("wl_shm"))?);
     let dmabuf: Option<ZwpLinuxDmabufV1> = globals.bind(&qh, 1..=4, ()).ok();
-    let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+    let viewporter: WpViewporter = globals
+        .bind(&qh, 1..=1, ())
+        .map_err(bind_error("wp_viewporter"))?;
 
     let mut state = WlState {
         conn,

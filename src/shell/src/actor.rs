@@ -10,10 +10,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use iced_core::mouse::{self, Cursor};
+use iced_core::widget::Id;
 use iced_core::{Element, Event, Point, Size, clipboard, renderer, shell, window};
 use iced_runtime::user_interface::{self, UserInterface};
-use jfn_gpu_paint::{Acquired, FrameSize, Presented};
-use jfn_platform_abi::{FrameSource, SurfaceHandle, Visibility};
+use jfn_gpu_paint::{Acquired, Presented};
+use jfn_platform_abi::{
+    FrameSource, LogicalPoint, LogicalSize, SurfaceHandle, Visibility, WindowExtent,
+};
+
+use crate::field::Act;
+use crate::fields::{Apply, Fields};
 
 use crate::chrome::Titlebar;
 use crate::modal::{Stack, Transition};
@@ -29,19 +35,53 @@ const TARGET_POLL: Duration = Duration::from_millis(10);
 pub enum Work {
     Event(Event),
     Resize {
-        size: FrameSize,
-        scale: f64,
+        extent: WindowExtent,
     },
     Redraw,
     OpenAbout,
     Chrome(ChromeInputs),
     /// The buffered theme colour changed; the titlebar and backdrop repaint.
     ChromeBackground(iced_core::Color),
-    ClipboardText(String),
-    Edit(jfn_input::EditCommand),
+    /// A selection read's text; `None` for a read that fetched nothing.
+    SelectionText {
+        reader: Reader,
+        text: Option<String>,
+    },
+    /// A right press the shell overlay owns, in window coordinates.
+    ContextMenu(LogicalPoint),
+    /// The Menu key or Shift+F10: the edit menu at the focused field's caret.
+    /// With no field focused it raises nothing.
+    EditMenuAtCaret,
+    /// A middle press the shell overlay owns, in window coordinates.
+    PrimaryPaste(LogicalPoint),
+    /// An edit menu's selection, for the field it named.
+    EditAt {
+        field: Target,
+        command: jfn_input::EditCommand,
+    },
     /// Bring-up advanced; the pass re-reads its screen.
     BringUpChanged,
     Shutdown,
+}
+
+/// Which field an edit acts on.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Target {
+    /// The field holding keyboard focus, whichever it is.
+    Focused,
+    /// The field a menu was raised over, focused or not.
+    Named(Id),
+}
+
+/// Where a selection read's text goes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Reader {
+    /// iced asked for it; it reaches the focused field as
+    /// [`iced_core::clipboard::Event::Read`].
+    Iced,
+    /// A menu paste or a middle press asked for it; it is applied to the field
+    /// it names.
+    Field(Id),
 }
 
 /// Bound on the render thread's shutdown drain; a wedged present must not hold
@@ -276,16 +316,18 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
         return;
     };
 
-    let plat = jfn_platform_abi::get();
-    let scale = f64::from(plat.get_scale()).max(1.0);
-    let size = initial_size(scale);
+    let Some(extent) = initial_extent() else {
+        tracing::error!("shell: no extent to start the overlay at");
+        crate::publish_no_overlay();
+        return;
+    };
     let wake = {
         let tx = wake_tx.clone();
         Arc::new(move || {
             drop(tx.send(Work::Redraw));
         }) as Arc<dyn Fn() + Send + Sync>
     };
-    let mut painter = match Painter::new(gpu, target, size, scale, Arc::clone(&wake)) {
+    let mut painter = match Painter::new(gpu, target, extent, Arc::clone(&wake)) {
         Ok(painter) => painter,
         Err(e) => {
             tracing::error!("shell: swapchain creation failed: {e}");
@@ -312,11 +354,11 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
         move || wake()
     });
     let redraw = Redraw(wake_tx.clone());
-    let mut window_size = painter.logical_size();
+    let mut current = extent;
     // Every pass that discarded the widget cache re-applies focus, so the URL
     // field keeps the caret across a window resize.
     let mut refocus = true;
-    publish(&model, window_size);
+    publish(&model, current);
     apply_visibility(surface, &model);
 
     let mut pending = Deadline::none();
@@ -324,6 +366,13 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
     // waiting and draws nothing until it does settle.
     let mut immediate = false;
     let mut batch: Vec<Work> = Vec::new();
+    // Edits waiting for a widget tree to apply them to, and the requests that
+    // need one to resolve against.
+    let mut queued: Vec<Apply> = Vec::new();
+    let mut deferred: Vec<Deferred> = Vec::new();
+    // The primary selection this process last published, so an unchanged
+    // selection does not re-take the selection every pass.
+    let mut last_primary: Option<(Id, u64)> = None;
     // The first draw waits for the bundled font; every later one does not.
     let mut drew_nothing_yet = true;
 
@@ -371,9 +420,9 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
                     }
                     events.push(event);
                 }
-                Work::Resize { size, scale } => {
-                    painter.resize(size, scale);
-                    window_size = painter.logical_size();
+                Work::Resize { extent } => {
+                    painter.resize(extent);
+                    current = extent;
                     cache = user_interface::Cache::new();
                     refocus = true;
                 }
@@ -381,10 +430,21 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
                 Work::OpenAbout => model.advance(Transition::OpenAbout),
                 Work::Chrome(inputs) => model.inputs = inputs,
                 Work::ChromeBackground(color) => model.theme.chrome_background = color,
-                Work::ClipboardText(text) => events.push(Event::Clipboard(clipboard::Event::Read(
-                    Ok(Arc::new(clipboard::Content::Text(text))),
-                ))),
-                Work::Edit(command) => events.push(Event::Keyboard(edit_event(command))),
+                Work::SelectionText { reader, text } => match (reader, text) {
+                    (Reader::Iced, Some(text)) => {
+                        events.push(Event::Clipboard(clipboard::Event::Read(Ok(Arc::new(
+                            clipboard::Content::Text(text),
+                        )))));
+                    }
+                    (Reader::Field(id), Some(text)) => {
+                        queued.push(Apply::act(id, Act::Paste(text)))
+                    }
+                    (_, None) => {}
+                },
+                Work::ContextMenu(p) => deferred.push(Deferred::ContextMenu(p)),
+                Work::EditMenuAtCaret => deferred.push(Deferred::EditMenuAtCaret),
+                Work::PrimaryPaste(p) => deferred.push(Deferred::PrimaryPaste(p)),
+                Work::EditAt { field, command } => deferred.push(Deferred::Edit(field, command)),
                 Work::BringUpChanged => {}
                 Work::Shutdown => break 'pass,
             }
@@ -401,7 +461,7 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
         let focus_target = model.stack.focus_target(&model.screen);
         let mut ui = UserInterface::build(
             model.view(),
-            window_size,
+            Size::new(current.logical().w as f32, current.logical().h as f32),
             std::mem::replace(&mut cache, user_interface::Cache::new()),
             painter.renderer(),
         );
@@ -414,6 +474,36 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
                 );
             }
         }
+        let fields = Fields::collect(&mut ui, painter.renderer());
+        let mut menu_anchor = None;
+        for request in deferred.drain(..) {
+            match request {
+                Deferred::ContextMenu(p) => {
+                    menu_anchor = menu_anchor.or(raise_menu(&fields, p, &mut queued));
+                }
+                Deferred::EditMenuAtCaret => {
+                    menu_anchor = menu_anchor.or_else(|| fields.focused().map(caret_anchor));
+                }
+                Deferred::PrimaryPaste(p) => {
+                    if let Some(field) = fields.at(point(p.x, p.y)) {
+                        read_primary(wake_tx.clone(), Reader::Field(field.id.clone()));
+                    }
+                }
+                Deferred::Edit(target, command) => {
+                    queue_edit(&fields, &target, command, &mut queued, wake_tx);
+                }
+            }
+        }
+        for text in apply_queued(&mut ui, painter.renderer(), &mut queued) {
+            jfn_platform_abi::get().clipboard_write_text(&text);
+        }
+        if let Some(anchor) = menu_anchor {
+            let raised = Fields::collect(&mut ui, painter.renderer());
+            if let Some(field) = raised.at(point(anchor.x, anchor.y)) {
+                crate::menu::open_edit(field, anchor, crate::lang::strings());
+            }
+        }
+
         // The event widgets commit hover, press, focus and caret state on.
         events.push(Event::Window(
             window::Event::RedrawRequested(Instant::now()),
@@ -453,11 +543,19 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
             }
             user_interface::State::Outdated => mouse::Interaction::None,
         };
-        if let user_interface::State::Updated { clipboard, .. } = &state
-            && !clipboard.reads.is_empty()
-        {
-            request_clipboard(wake_tx.clone());
+        if let user_interface::State::Updated { clipboard, .. } = &state {
+            write_clipboard(clipboard);
+            if clipboard.reads.contains(&clipboard::Kind::Text) {
+                read_clipboard(wake_tx.clone(), Reader::Iced);
+            }
         }
+        let settled_fields = Fields::collect(&mut ui, painter.renderer());
+        publish_primary(&settled_fields, &mut last_primary);
+        jfn_input::publish_field_edit(
+            settled_fields
+                .focused()
+                .map(crate::fields::Snapshot::edit_state),
+        );
         crate::router_sink::set_interaction(interaction);
 
         // Asked while the widget tree still borrows the model, because applying
@@ -478,7 +576,7 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
                 Painted::Deferred(retry_at) => pending = pending.merge(Deadline::at(retry_at)),
             }
             cache = ui.into_cache();
-            publish(&model, window_size);
+            publish(&model, current);
             continue;
         }
 
@@ -495,7 +593,7 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
         // rather than inherited.
         refocus = true;
         immediate = true;
-        publish(&model, window_size);
+        publish(&model, current);
         apply_visibility(surface, &model);
     }
 }
@@ -561,46 +659,160 @@ fn paint(
     }
 }
 
-/// The iced event an edit command becomes for the focused widget.
-fn edit_event(command: jfn_input::EditCommand) -> iced_core::keyboard::Event {
-    use iced_core::keyboard::{self, Key, Location, Modifiers, key};
-    use jfn_input::EditCommand as E;
-    let (character, modifiers) = match command {
-        E::Undo => ("z", Modifiers::COMMAND),
-        E::Redo => ("z", Modifiers::COMMAND | Modifiers::SHIFT),
-        E::Cut => ("x", Modifiers::COMMAND),
-        E::Copy => ("c", Modifiers::COMMAND),
-        E::Paste => ("v", Modifiers::COMMAND),
-        E::SelectAll => ("a", Modifiers::COMMAND),
-    };
-    let key = Key::Character(character.into());
-    keyboard::Event::KeyPressed {
-        key: key.clone(),
-        modified_key: key,
-        physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
-        location: Location::Standard,
-        modifiers,
-        text: None,
-        repeat: false,
-    }
+/// A request that needs a widget tree to resolve against, held until the pass
+/// has built one.
+enum Deferred {
+    ContextMenu(LogicalPoint),
+    EditMenuAtCaret,
+    PrimaryPaste(LogicalPoint),
+    Edit(Target, jfn_input::EditCommand),
 }
 
-fn request_clipboard(tx: Sender<Work>) {
+/// Applies every queued [`Apply`] and returns what `Cut` and `Copy` produced,
+/// in order.
+fn apply_queued<Message>(
+    ui: &mut UserInterface<'_, Message, Theme, iced_wgpu::Renderer>,
+    renderer: &iced_wgpu::Renderer,
+    queued: &mut Vec<Apply>,
+) -> Vec<String> {
+    let mut produced = Vec::new();
+    for mut apply in queued.drain(..) {
+        ui.operate(renderer, &mut apply);
+        if let Some(text) = apply.produced() {
+            produced.push(text.to_owned());
+        }
+    }
+    produced
+}
+
+/// Queues the acts `command` becomes for `target`, and requests the clipboard
+/// read that `Paste` needs. An edit chosen from a menu leaves keyboard focus
+/// where it is, so the edit menu acts on an unfocused field on Wayland and X11.
+fn queue_edit(
+    fields: &Fields,
+    target: &Target,
+    command: jfn_input::EditCommand,
+    queued: &mut Vec<Apply>,
+    tx: &Sender<Work>,
+) {
+    use jfn_input::EditCommand as E;
+    let field = match target {
+        Target::Focused => fields.focused(),
+        Target::Named(id) => fields.named(id),
+    };
+    let Some(field) = field else {
+        return;
+    };
+    let id = field.id.clone();
+    let act = match command {
+        E::Undo => Act::Undo,
+        E::Redo => Act::Redo,
+        E::Cut => Act::Cut,
+        E::Copy => Act::Copy,
+        E::SelectAll => Act::SelectAll,
+        E::Paste => {
+            read_clipboard(tx.clone(), Reader::Field(id));
+            return;
+        }
+    };
+    queued.push(Apply::act(id, act));
+}
+
+/// Requests the OS clipboard's text; the reply arrives as
+/// [`Work::SelectionText`].
+fn read_clipboard(tx: Sender<Work>, reader: Reader) {
     jfn_platform_abi::get().clipboard_read_text_async(Box::new(move |text| {
-        drop(tx.send(Work::ClipboardText(text.to_owned())));
+        drop(tx.send(Work::SelectionText {
+            reader,
+            text: text.map(str::to_owned),
+        }));
     }));
 }
 
-fn publish(model: &Model, window_size: Size) {
-    jfn_input::publish_shell_state(jfn_input::ShellState {
-        modal_open: model.stack.occupied(),
-        titlebar_shown: model.titlebar_shown(),
-        window_w: window_size.width as i32,
-        window_h: window_size.height as i32,
-        titlebar_h: jfn_platform_abi::TITLEBAR_LOGICAL_HEIGHT,
-        controls_w: crate::chrome::CONTROLS_LOGICAL_WIDTH,
-        reserved_strip: state::reserved_strip(model.inputs),
-    });
+/// Requests the primary selection's text, replying `None` on a backend that
+/// serves none.
+fn read_primary(tx: Sender<Work>, reader: Reader) {
+    let plat = jfn_platform_abi::get();
+    let Some(primary) = plat.primary_selection() else {
+        drop(tx.send(Work::SelectionText { reader, text: None }));
+        return;
+    };
+    primary.read_text_async(Box::new(move |text| {
+        drop(tx.send(Work::SelectionText {
+            reader,
+            text: text.map(str::to_owned),
+        }));
+    }));
+}
+
+/// Writes iced's pending clipboard content, text alone.
+fn write_clipboard(clipboard: &clipboard::Clipboard) {
+    if let Some(clipboard::Content::Text(text)) = &clipboard.write {
+        jfn_platform_abi::get().clipboard_write_text(text);
+    }
+}
+
+/// Writes the focused field's selection to the primary selection whenever the
+/// selection changed and is not empty; a selection replaced by an identical
+/// one is a change, and a backend that serves none writes nothing.
+fn publish_primary(fields: &Fields, last: &mut Option<(Id, u64)>) {
+    let plat = jfn_platform_abi::get();
+    let Some(primary) = plat.primary_selection() else {
+        return;
+    };
+    let Some(field) = fields.focused() else {
+        return;
+    };
+    let mark = (field.id.clone(), field.selection_generation);
+    if last.as_ref() == Some(&mark) {
+        return;
+    }
+    *last = Some(mark);
+    let Some(text) = &field.selection else {
+        return;
+    };
+    primary.write_text(text);
+}
+
+/// The window point an edit menu raised from the keyboard anchors at: the
+/// focused field's caret.
+fn caret_anchor(field: &crate::fields::Snapshot) -> LogicalPoint {
+    LogicalPoint {
+        x: field.caret.x as i32,
+        y: field.caret.y as i32,
+    }
+}
+
+/// The menu a right press raises: the edit menu over a shell field, with the
+/// focus and the caret act ADR 0012 gives the backend queued first, and the app
+/// menu everywhere else the shell overlay owns.
+///
+/// The field takes focus on Windows and macOS whether or not the press landed
+/// inside its selection, so the keys typed after the menu closes reach it and
+/// macOS's own Edit menu resolves [`Target::Focused`] to it.
+fn raise_menu(fields: &Fields, p: LogicalPoint, queued: &mut Vec<Apply>) -> Option<LogicalPoint> {
+    let at = point(p.x, p.y);
+    let Some(field) = fields.at(at) else {
+        jfn_cef::app_menu::open_at(p.x, p.y);
+        return None;
+    };
+    let backend = jfn_platform_abi::get().display();
+    let caret = crate::fields::press_caret(backend, field, at);
+    if crate::fields::press_focuses(backend) {
+        queued.push(Apply::focus(field.id.clone(), caret));
+    } else if let Some(act) = caret {
+        queued.push(Apply::act(field.id.clone(), act));
+    }
+    Some(p)
+}
+
+/// Publishes the routing state at the extent's exact logical size.
+fn publish(model: &Model, extent: WindowExtent) {
+    jfn_input::publish_shell_state(crate::state::shell_state(
+        Some(extent),
+        model.inputs,
+        model.stack.occupied(),
+    ));
 }
 
 /// Writes the overlay surface's visibility and returns once the commit
@@ -626,21 +838,16 @@ fn wait_for_target(surface: SurfaceHandle) -> Option<jfn_gpu_paint::WindowTarget
     }
 }
 
-fn initial_size(scale: f64) -> FrameSize {
-    let snap = jfn_platform_abi::get().window_source().snapshot();
-    match snap.extent {
-        Some(extent) => {
-            let physical = extent.physical();
-            FrameSize {
-                w: physical.w,
-                h: physical.h,
-            }
-        }
-        None => FrameSize {
-            w: (1280.0 * scale).round() as i32,
-            h: (720.0 * scale).round() as i32,
-        },
+/// The extent the overlay starts at: the window source's own when it has one,
+/// else 1280x720 logical at the platform's reported scale.
+fn initial_extent() -> Option<WindowExtent> {
+    let plat = jfn_platform_abi::get();
+    if let Some(extent) = plat.window_source().snapshot().extent {
+        return Some(extent);
     }
+    let scale = plat.scale();
+    let logical = LogicalSize { w: 1280, h: 720 };
+    WindowExtent::new(logical.to_physical(scale)?, scale, logical)
 }
 
 /// The pointer position an iced event carries, for the sink's convenience.

@@ -86,11 +86,12 @@ impl Inner {
             return;
         }
 
-        let g = self.created_callback.lock();
-        if let Some(f) = g.as_ref() {
+        // Cloned out before invoking: the callback runs under no lock of this
+        // client's, and the slot keeps it for the browser after this one.
+        let created = self.created_callback.lock().clone();
+        if let Some(f) = created {
             f();
         }
-        drop(g);
 
         if let Some(url) = self.take_pending_url()
             && let Some(f) = browser.main_frame()

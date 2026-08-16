@@ -31,8 +31,7 @@ use std::ffi::c_int;
 
 use jfn_gpu_paint::{FrameSize, Pixels, WindowTarget};
 use jfn_platform_abi::{
-    Ack, Content, PaintFrame, Presented, Scale, SurfaceHandle, SurfaceSize, Visibility,
-    VisibilityCommit,
+    Ack, Content, PaintFrame, Presented, SurfaceHandle, SurfaceSize, Visibility, VisibilityCommit,
 };
 use parking_lot::Mutex;
 use windows::Win32::Foundation::HWND;
@@ -356,15 +355,16 @@ pub(crate) fn window_target(h: SurfaceHandle) -> Option<WindowTarget> {
 /// Place the popup visual at `x`, `y` — logical pixels inside the owning
 /// surface. The popup shows itself with its first frame.
 pub(crate) fn popup_show(h: SurfaceHandle, x: c_int, y: c_int) {
-    let scale = crate::window::client_scale()
-        .unwrap_or(Scale(1.0))
-        .or_one()
-        .0;
+    let scale = crate::platform::win_get_scale();
+    let (Some(px), Some(py)) = (scale.to_physical(x), scale.to_physical(y)) else {
+        tracing::error!(target: "platform", "popup offset {x},{y} is unrepresentable at scale {scale}");
+        return;
+    };
     let mut st = STATE.lock();
     let Some(entry) = st.find_mut(h) else {
         return;
     };
-    entry.popup.set_offset(x as f32 * scale, y as f32 * scale);
+    entry.popup.set_offset(px as f32, py as f32);
     st.commit();
 }
 

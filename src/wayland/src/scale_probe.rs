@@ -17,6 +17,8 @@ use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_output;
 use wayland_client::{Connection, QueueHandle};
 
+use jfn_platform_abi::WindowPos;
+
 use crate::scale::Scale120;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -42,6 +44,17 @@ pub(crate) enum ProbeTarget {
     Point { x: i32, y: i32 },
     /// The first usable output, for callers with no better anchor.
     FirstOutput,
+}
+
+impl ProbeTarget {
+    /// The output holding `position`, or the first usable output when the
+    /// caller has no position to anchor to.
+    pub(crate) fn at(position: Option<WindowPos>) -> ProbeTarget {
+        match position {
+            Some(p) => ProbeTarget::Point { x: p.x, y: p.y },
+            None => ProbeTarget::FirstOutput,
+        }
+    }
 }
 
 /// One output's geometry as needed for scale derivation. Constructed only
@@ -237,9 +250,11 @@ mod tests {
         OutputCandidate::new((2560, 0), (1440, 2560), (3840, 2160), true)
     }
 
-    fn scale_of(r: Result<Scale120, ScaleProbeError>) -> f32 {
-        r.unwrap().ratio_f32()
+    fn scale_of(r: Result<Scale120, ScaleProbeError>) -> Option<f64> {
+        r.ok().map(|s| s.scale().as_f64())
     }
+
+    const ONE_AND_A_HALF: Option<f64> = Some(1.5);
 
     #[test]
     fn first_output_uses_first_usable() {
@@ -248,7 +263,7 @@ mod tests {
                 &[landscape(), portrait()],
                 ProbeTarget::FirstOutput
             )),
-            1.5
+            ONE_AND_A_HALF
         );
     }
 
@@ -257,11 +272,11 @@ mod tests {
         let outs = [landscape(), portrait()];
         assert_eq!(
             scale_of(select_scale(&outs, ProbeTarget::Point { x: 100, y: 100 })),
-            1.5
+            ONE_AND_A_HALF
         );
         assert_eq!(
             scale_of(select_scale(&outs, ProbeTarget::Point { x: 2560, y: 0 })),
-            1.5
+            ONE_AND_A_HALF
         );
     }
 
@@ -271,7 +286,7 @@ mod tests {
         // instead of 2160/1440 = 1.5.
         assert_eq!(
             scale_of(select_scale(&[portrait()], ProbeTarget::FirstOutput)),
-            1.5
+            ONE_AND_A_HALF
         );
     }
 
@@ -282,7 +297,7 @@ mod tests {
                 &[landscape()],
                 ProbeTarget::Point { x: -5000, y: -5000 }
             )),
-            1.5
+            ONE_AND_A_HALF
         );
     }
 
@@ -308,7 +323,7 @@ mod tests {
                 &[zero_logical, landscape()],
                 ProbeTarget::FirstOutput
             )),
-            1.5
+            ONE_AND_A_HALF
         );
     }
 
@@ -322,7 +337,7 @@ mod tests {
                 &[broken_at_origin, portrait()],
                 ProbeTarget::Point { x: 10, y: 10 }
             )),
-            1.5
+            ONE_AND_A_HALF
         );
     }
 

@@ -1,5 +1,5 @@
 use jfn_platform_abi::{
-    Generation, MenuClose, MenuMetrics, MenuPaint, MenuPlacement, PopupSurface,
+    Generation, LogicalPoint, MenuClose, MenuMetrics, MenuPaint, MenuPlacement, PopupSurface,
 };
 
 use crate::root_window::PopupCommand;
@@ -13,12 +13,12 @@ impl PopupSurface for WlPopupSurface {
     fn metrics(&self) -> MenuMetrics {
         let extent = self.rt.window().window_extent();
         MenuMetrics {
-            scale: extent.map_or_else(|| self.rt.window().cached_scale(), |e| e.scale()),
+            scale: extent.map_or_else(|| self.rt.window().scale(), |e| e.scale()),
             clamp_ph: extent.map(|e| e.physical().h()),
         }
     }
 
-    fn create(&self, generation: Generation, place: MenuPlacement, serial: u32) {
+    fn arm(&self, generation: Generation, anchor: LogicalPoint, serial: u32) {
         let serial = if serial != 0 {
             serial
         } else {
@@ -26,12 +26,16 @@ impl PopupSurface for WlPopupSurface {
         };
         crate::root_window::popup(
             self.rt,
-            PopupCommand::Create {
+            PopupCommand::Arm {
                 generation,
-                place,
+                anchor,
                 serial,
             },
         );
+    }
+
+    fn map_armed(&self, generation: Generation) {
+        crate::root_window::popup(self.rt, PopupCommand::MapArmed { generation });
     }
 
     fn reposition(&self, generation: Generation, place: MenuPlacement) {

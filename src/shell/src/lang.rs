@@ -9,7 +9,36 @@ pub struct Strings {
     pub connection_failure: &'static str,
     pub unable_to_connect: &'static str,
     pub got_it: &'static str,
+    pub undo: &'static str,
+    pub redo: &'static str,
+    pub cut: &'static str,
+    pub copy: &'static str,
+    pub paste: &'static str,
+    pub select_all: &'static str,
 }
+
+/// The edit menu's labels for one language.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EditEntry {
+    pub lang: &'static str,
+    pub undo: &'static str,
+    pub redo: &'static str,
+    pub cut: &'static str,
+    pub copy: &'static str,
+    pub paste: &'static str,
+    pub select_all: &'static str,
+}
+
+/// Resolved per language, falling back to [`FALLBACK_LANGUAGE`].
+pub const EDIT_LANGUAGES: &[EditEntry] = &[EditEntry {
+    lang: "en-us",
+    undo: "Undo",
+    redo: "Redo",
+    cut: "Cut",
+    copy: "Copy",
+    paste: "Paste",
+    select_all: "Select All",
+}];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Entry {
@@ -1079,6 +1108,7 @@ pub fn entry_for(locale: &str) -> &'static Entry {
 pub fn strings_for(locale: &str) -> Strings {
     let e = entry_for(locale);
     let f = fallback();
+    let edit = edit_entry_for(locale);
     Strings {
         server_host: e
             .label_server_host
@@ -1098,7 +1128,30 @@ pub fn strings_for(locale: &str) -> Strings {
             .or(f.message_unable_to_connect_to_server)
             .unwrap_or_default(),
         got_it: e.button_got_it.or(f.button_got_it).unwrap_or_default(),
+        undo: edit.undo,
+        redo: edit.redo,
+        cut: edit.cut,
+        copy: edit.copy,
+        paste: edit.paste,
+        select_all: edit.select_all,
     }
+}
+
+/// Exact tag, then the primary subtag, then [`FALLBACK_LANGUAGE`]; the last is
+/// the only entry the table is guaranteed to hold, so a miss on it yields the
+/// first entry rather than none.
+fn edit_entry_for(locale: &str) -> &'static EditEntry {
+    let find = |lang: &str| EDIT_LANGUAGES.iter().find(|e| e.lang == lang);
+    find(locale)
+        .or_else(|| find(locale.split('-').next().unwrap_or(locale)))
+        .or_else(|| find(FALLBACK_LANGUAGE))
+        .unwrap_or(&EDIT_LANGUAGES[0])
+}
+
+/// The overlay's strings, resolved once from the system locale.
+pub fn strings() -> &'static Strings {
+    static STRINGS: std::sync::OnceLock<Strings> = std::sync::OnceLock::new();
+    STRINGS.get_or_init(|| strings_for(&system_locale()))
 }
 
 /// `LC_ALL`, `LC_MESSAGES`, `LANG`, lowercased, `_` folded to `-`, encoding and

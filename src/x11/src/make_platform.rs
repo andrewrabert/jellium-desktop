@@ -64,10 +64,10 @@ impl Platform for X11Platform {
         surface::present(SurfaceId::from_handle(s), frame)
     }
 
+    /// X11 owns the overlay's size through parent geometry; the only part of
+    /// the request this backend applies is the reserved top strip.
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
-        let id = SurfaceId::from_handle(s);
-        surface::surface_resize(id, size.physical_w, size.physical_h);
-        surface::surface_set_top_inset(id, size.physical_top);
+        surface::surface_set_top_inset(SurfaceId::from_handle(s), size.physical_top);
     }
 
     fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
@@ -113,7 +113,10 @@ impl Platform for X11Platform {
     }
 
     fn begin_transition(&self) {
-        let snap = crate::x11_state::parent_snapshot();
+        let Some(snap) = crate::x11_state::parent_snapshot() else {
+            tracing::warn!(target: "Platform", "no published geometry; nothing to gate");
+            return;
+        };
         crate::x11_state::GATE
             .lock()
             .begin_capturing((snap.width, snap.height));
@@ -140,25 +143,19 @@ impl Platform for X11Platform {
     }
 
     fn toggle_fullscreen(&self) {
-        let fullscreen = crate::x11_state::parent_snapshot().fullscreen;
-        crate::geometry::set_parent_fullscreen(!fullscreen);
+        let Some(snap) = crate::x11_state::parent_snapshot() else {
+            tracing::warn!(target: "Platform", "no published geometry; nothing to gate");
+            return;
+        };
+        crate::geometry::set_parent_fullscreen(!snap.fullscreen);
     }
 
-    fn get_scale(&self) -> f32 {
-        // App-owned scale (Xft.dpi probe), seeded at host-window creation and
-        // refreshed by the geometry thread on RESOURCE_MANAGER changes.
-        let scale = crate::x11_state::parent_snapshot().scale;
-        if scale > 0.0 { scale } else { 1.0 }
+    fn scale(&self) -> jfn_platform_abi::Scale {
+        crate::scale::window_scale()
     }
 
-    // The app owns the toplevel and the display scale; mpv's
-    // `display-hidpi-scale` is not authoritative here.
-    fn effective_scale(&self, _mpv_display_hidpi_scale: f64) -> f32 {
-        self.get_scale()
-    }
-
-    fn get_display_scale(&self, _x: c_int, _y: c_int) -> f32 {
-        crate::scale::query_display_scale().unwrap_or(1.0)
+    fn display_scale(&self, at: Option<WindowPos>) -> jfn_platform_abi::Scale {
+        crate::scale::display_scale(at)
     }
 
     fn apply_boot_geometry(&self, g: &jfn_platform_abi::BootGeometry) {
@@ -171,11 +168,11 @@ impl Platform for X11Platform {
         None
     }
 
+    // this backend owns its toplevel; mpv's sizing is never reconciled
     fn reconcile_mpv_size(
         &self,
-        _display_hidpi_scale: f64,
-        _saved_scale: f32,
         _saved_logical: jfn_platform_abi::LogicalSize,
+        _saved_physical: jfn_platform_abi::PhysicalSize,
         _locked: bool,
     ) -> Option<jfn_platform_abi::PhysicalSize> {
         None
@@ -216,13 +213,29 @@ impl Platform for X11Platform {
         crate::paint::resolved().is_some_and(|t| t.use_dmabuf)
     }
 
-    fn clipboard_text_supported(&self) -> bool {
-        false
+    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+        match crate::selection::selections() {
+            Some(selections) => {
+                selections.read_text_async(crate::selection::Kind::Clipboard, on_done);
+            }
+            None => on_done(None),
+        }
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
-        // X11 has no native clipboard read path here — fire empty result.
-        on_done("");
+    fn clipboard_write_text(&self, text: &str) {
+        if let Some(selections) = crate::selection::selections() {
+            selections.write_text(crate::selection::Kind::Clipboard, text);
+        }
+    }
+
+    fn primary_selection(&self) -> Option<&dyn jfn_platform_abi::PrimarySelection> {
+        crate::selection::selections()
+            .map(|_| &crate::selection::X11Primary as &dyn jfn_platform_abi::PrimarySelection)
+    }
+
+    /// CEF owns its own X11 clipboard; the shell overlay's does not reach it.
+    fn web_paste_reads_clipboard(&self) -> bool {
+        false
     }
 
     fn open_external_url(&self, url: &str) {

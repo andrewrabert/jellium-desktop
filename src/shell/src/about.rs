@@ -2,8 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+use iced_core::text::{IntoFragment, Wrapping};
 use iced_core::{Alignment, Element, Length, Padding};
-use iced_widget::{button, column, container, image, mouse_area, row, text};
+use iced_widget::{Text, button, column, container, image, mouse_area, row, stack, text};
 
 use crate::theme::{self, Theme};
 
@@ -70,28 +71,34 @@ impl About {
         }
 
         let panel = column![
-            row![
-                image(crate::logo::handle()).width(Length::Fixed(240.0)),
-                button(text("\u{00d7}").size(18))
-                    .on_press(Message::Dismiss)
-                    .class(theme::ButtonClass::Chrome),
-            ]
-            .align_y(Alignment::Start)
-            .spacing(12),
+            image(crate::logo::handle()).width(Length::Fixed(crate::logo::ABOUT_WIDTH)),
             rows,
         ]
         .spacing(16)
         .width(Length::Fixed(460.0));
 
+        // The card is the bubble: it fixes the panel's width, so no content
+        // length widens it, and clips its content, so no glyph reaches past its
+        // fill.
+        let card = container(panel)
+            .padding(Padding::from([18, 24]))
+            .clip(true)
+            .class(theme::ContainerClass::Card);
+
+        // The upper stack layer is the card's own size, so aligning the button
+        // right and top puts it in the card's corner.
+        let close = container(
+            button(text("\u{00d7}").size(18))
+                .on_press(Message::Dismiss)
+                .class(theme::ButtonClass::Chrome),
+        )
+        .align_right(Length::Fill)
+        .align_top(Length::Fill);
+
         // The backdrop is a window-filling interactive region that publishes
         // `Dismiss` on press; the panel body captures presses first, so a click
         // inside never dismisses.
-        let body = mouse_area(
-            container(panel)
-                .padding(Padding::from([18, 24]))
-                .class(theme::ContainerClass::Card),
-        )
-        .on_press(Message::Swallow);
+        let body = mouse_area(stack![card, close]).on_press(Message::Swallow);
 
         mouse_area(
             container(body)
@@ -113,15 +120,15 @@ impl About {
     ) -> Element<'a, Message, Theme, iced_wgpu::Renderer> {
         let value = value.to_owned();
         let value: Element<'a, Message, Theme, iced_wgpu::Renderer> = match path {
-            Some(p) => button(text(value).class(Some(theme::LINK)))
+            Some(p) => button(wrapped(value).class(Some(theme::LINK)))
                 .on_press(Message::OpenPath(p))
                 .class(theme::ButtonClass::Chrome)
                 .padding(0)
                 .into(),
-            None => text(value).into(),
+            None => wrapped(value).into(),
         };
         row![
-            container(text(label).class(Some(theme::MUTED))).width(Length::Fixed(140.0)),
+            container(wrapped(label).class(Some(theme::MUTED))).width(Length::Fixed(140.0)),
             value,
         ]
         .into()
@@ -131,6 +138,13 @@ impl About {
     pub fn open(&self, path: &Path) {
         jfn_platform_abi::get().open_path(path);
     }
+}
+
+/// Panel text that wraps on a word where it can and inside a token where it
+/// cannot: a path is one unbreakable word, and word wrapping alone paints it
+/// past the width its column was given.
+fn wrapped<'a>(content: impl IntoFragment<'a>) -> Text<'a, Theme, iced_wgpu::Renderer> {
+    text(content).wrapping(Wrapping::WordOrGlyph)
 }
 
 fn absolute(path: PathBuf) -> PathBuf {

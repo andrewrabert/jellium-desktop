@@ -87,15 +87,15 @@ impl Inner {
         let Some(p) = platform_ops::ops() else {
             return false;
         };
-        if !p.clipboard_text_supported() {
+        if !p.web_paste_reads_clipboard() {
             return false;
         }
         let inner = Arc::clone(self);
         p.clipboard_read_text_async(Box::new(move |text| {
-            if text.is_empty() {
+            let Some(text) = text.filter(|t| !t.is_empty()) else {
                 return;
-            }
-            tasks::post_paste_js(Arc::clone(&inner), text.to_string());
+            };
+            tasks::post_paste_js(Arc::clone(&inner), text.to_owned());
         }));
         true
     }

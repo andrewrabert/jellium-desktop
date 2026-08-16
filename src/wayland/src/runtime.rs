@@ -6,8 +6,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::app_conn::AppConn;
-use crate::clipboard::Clipboard;
 use crate::decoration_probe::DecorationGlobals;
+use crate::selection::Selections;
 use jfn_linux_util::menu::SoftwareMenu;
 
 use crate::input::{InputThread, SeatShared};
@@ -31,7 +31,7 @@ pub(crate) struct WlRuntime {
     seat: SeatShared,
     input: OnceLock<InputThread>,
     menu: OnceLock<SoftwareMenu>,
-    clipboard: Clipboard,
+    selections: Selections,
     app_conn: AppConn,
     #[cfg(feature = "kde-palette")]
     palette: crate::kde_palette::Palette,
@@ -51,7 +51,7 @@ impl WlRuntime {
             seat: SeatShared::new(),
             input: OnceLock::new(),
             menu: OnceLock::new(),
-            clipboard: Clipboard::new(),
+            selections: Selections::new(),
             app_conn: AppConn::new(),
             #[cfg(feature = "kde-palette")]
             palette: crate::kde_palette::Palette::new(),
@@ -110,8 +110,8 @@ impl WlRuntime {
         self.menu.get()
     }
 
-    pub(crate) fn clipboard(&self) -> &Clipboard {
-        &self.clipboard
+    pub(crate) fn selections(&self) -> &Selections {
+        &self.selections
     }
 
     pub(crate) fn app_conn(&self) -> &AppConn {

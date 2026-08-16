@@ -93,6 +93,11 @@ pub fn route_key(state: ShellState) -> Target {
     }
 }
 
+/// The window's own focus while no modal owns input, never while one does.
+pub fn web_focus(window_focused: bool, modal_open: bool) -> bool {
+    window_focused && !modal_open
+}
+
 // text the shell overlay's focused widget inserts
 // a control codepoint restates the named key the key event already carried
 // a system char is Windows' WM_SYSCHAR, an Alt-modified accelerator
@@ -284,6 +289,13 @@ mod tests {
             ),
             at(10, 40)
         );
+    }
+
+    #[test]
+    fn a_modal_takes_the_window_focus_from_the_page() {
+        assert!(web_focus(true, false));
+        assert!(!web_focus(true, true));
+        assert!(!web_focus(false, false));
     }
 
     #[test]
