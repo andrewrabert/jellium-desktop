@@ -41,6 +41,8 @@ use wayland_client::{Connection, QueueHandle};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1;
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1;
 
+use jfn_platform_abi::OnText;
+
 use crate::input::State;
 
 /// The mime types the source offers, in the order a read prefers them.
@@ -65,10 +67,8 @@ pub(crate) enum Kind {
     Primary,
 }
 
-type Done = Box<dyn FnOnce(Option<&str>) + Send>;
-
 enum Job {
-    Read { kind: Kind, on_done: Done },
+    Read { kind: Kind, on_done: OnText },
     Write { kind: Kind, text: String },
 }
 
@@ -111,7 +111,7 @@ impl Selections {
 
     /// Queued to the input thread; `on_done` fires there, with `None` for a
     /// selection that holds no text and for a receive that failed.
-    pub(crate) fn read_text_async(&self, kind: Kind, on_done: Done) {
+    pub(crate) fn read_text_async(&self, kind: Kind, on_done: OnText) {
         let queued = self.queue(Job::Read { kind, on_done });
         if let Some(Job::Read { on_done, .. }) = queued {
             on_done(None);
@@ -198,7 +198,7 @@ pub(crate) struct SelectionState {
 
 struct Read_ {
     token: u64,
-    on_done: Option<Done>,
+    on_done: Option<OnText>,
     buffer: Vec<u8>,
 }
 
@@ -302,7 +302,7 @@ impl State {
         }
     }
 
-    fn start_read(&mut self, kind: Kind, on_done: Done) {
+    fn start_read(&mut self, kind: Kind, on_done: OnText) {
         let pipe = match kind {
             Kind::Clipboard => self
                 .selection
@@ -638,7 +638,7 @@ pub(crate) struct WlPrimary {
 }
 
 impl jfn_platform_abi::PrimarySelection for WlPrimary {
-    fn read_text_async(&self, on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+    fn read_text_async(&self, on_done: OnText) {
         self.rt.selections().read_text_async(Kind::Primary, on_done);
     }
 

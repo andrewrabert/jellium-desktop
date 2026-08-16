@@ -27,22 +27,24 @@ pub struct ShellSink;
 
 impl jfn_input::ShellInput for ShellSink {
     fn window_gesture(&self, hit: jfn_input::ShellHit) {
-        let plat = jfn_platform_abi::get();
+        let Some(controls) = jfn_platform_abi::get().titlebar_controls() else {
+            return;
+        };
         match hit {
             jfn_input::ShellHit::Grip(edge) => {
                 *LAST_DRAG_PRESS.lock() = None;
-                plat.window_start_resize(edge);
+                controls.start_resize(edge);
             }
             jfn_input::ShellHit::Drag => {
                 let mut last = LAST_DRAG_PRESS.lock();
                 if last.is_some_and(|t| t.elapsed() < DOUBLE_PRESS) {
                     *last = None;
                     drop(last);
-                    plat.window_toggle_maximize();
+                    controls.toggle_maximize();
                 } else {
                     *last = Some(Instant::now());
                     drop(last);
-                    plat.window_start_move();
+                    controls.start_move();
                 }
             }
             jfn_input::ShellHit::Modal

@@ -116,7 +116,7 @@ impl WebOverlay {
         let Some(state) = jfn_input::shell_state() else {
             return;
         };
-        let snapshot = jfn_platform_abi::get().window_source().snapshot();
+        let snapshot = jfn_platform_abi::get().window_owner().source().snapshot();
         let Some(size) = view_size(&snapshot, state.reserved_strip) else {
             return;
         };

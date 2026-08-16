@@ -281,7 +281,7 @@ fn frame_extent(content: &Content<'_>) -> Option<FrameSize> {
     match content {
         Content::Accelerated(tex) => (!tex.handle().is_null()).then(|| tex.coded()),
         Content::Software { size, pixels, .. } => (!pixels.is_empty() && size.w > 0 && size.h > 0)
-            .then(|| FrameSize {
+            .then_some(FrameSize {
                 w: size.w,
                 h: size.h,
             }),

@@ -44,9 +44,9 @@ pub trait IngestCtx {
     /// The display scale the platform reports.
     fn scale(&self) -> Scale;
 
-    /// The host window's logical content size where the OS, not mpv's
+    /// The app window's logical size where the OS, not mpv's
     /// `osd-dimensions`, is the authority for it.
-    fn macos_logical_size(&self) -> Option<LogicalSize>;
+    fn os_logical_size(&self) -> Option<LogicalSize>;
 }
 
 /// One ingest-loop output. Most map to coordinator inputs; the two side
@@ -257,7 +257,7 @@ fn digest_osd_dims<C: IngestCtx>(
     };
     let physical = PhysicalSize { w, h };
     let scale = ctx.scale();
-    let extent = match ctx.macos_logical_size().filter(|l| l.w > 0 && l.h > 0) {
+    let extent = match ctx.os_logical_size().filter(|l| l.w > 0 && l.h > 0) {
         Some(logical) => extent_at(scale, logical),
         None => extent_of(scale, physical),
     };
@@ -345,7 +345,7 @@ mod tests {
         fn scale(&self) -> Scale {
             self.scale
         }
-        fn macos_logical_size(&self) -> Option<LogicalSize> {
+        fn os_logical_size(&self) -> Option<LogicalSize> {
             self.mac
         }
     }

@@ -25,7 +25,7 @@ pub struct WindowGeometryController {
 impl WindowGeometryController {
     fn new() -> Self {
         Self {
-            source: plat().window_source(),
+            source: plat().window_owner().source(),
         }
     }
 

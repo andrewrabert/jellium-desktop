@@ -27,13 +27,10 @@ pub fn report_dpi(source: &str, dpi: u32) -> Scale {
         return scale;
     }
     let reported = Scale::ONE;
-    // `tracing` is a target-gated dependency of this crate.
-    #[cfg(target_os = "windows")]
     tracing::warn!(
         target: "platform",
         "{source} reported {dpi} DPI; Windows reports {reported}"
     );
-    let _ = source;
     reported
 }
 

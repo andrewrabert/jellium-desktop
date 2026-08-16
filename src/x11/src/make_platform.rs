@@ -2,15 +2,16 @@
 
 #![allow(non_snake_case)]
 
-use std::ffi::{c_int, c_void};
+use std::ffi::c_void;
 
 use crate::registry::SurfaceId;
 use crate::surface;
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    DisplayBackend, IdleInhibitLevel, JfnRect, PaintFrame, Platform, Presented, SurfaceHandle,
-    SurfaceSize, Visibility, VisibilityCommit, WindowDecorations, WindowGeometry, WindowPos,
+    DisplayBackend, IdleInhibitLevel, JfnRect, OnText, PaintFrame, Platform, Presented, ResizeGate,
+    SurfaceHandle, SurfaceSize, TitlebarControls, Visibility, VisibilityCommit, WindowDecorations,
+    WindowGeometry, WindowOwner, WindowPos,
 };
 
 pub struct X11Platform;
@@ -33,6 +34,9 @@ impl Platform for X11Platform {
             other => other,
         }
     }
+
+    // the paint tier resolves in the mpv host's prepare, before init
+    fn early_init(&self) {}
 
     fn init(&self, _mpv: *mut c_void) -> bool {
         crate::lifecycle::init()
@@ -112,28 +116,18 @@ impl Platform for X11Platform {
         jfn_platform_abi::DecorationOptions::with_server(false)
     }
 
-    fn begin_transition(&self) {
-        let Some(snap) = crate::x11_state::parent_snapshot() else {
-            tracing::warn!(target: "Platform", "no published geometry; nothing to gate");
-            return;
-        };
-        crate::x11_state::GATE
-            .lock()
-            .begin_capturing((snap.width, snap.height));
+    fn resize_gate(&self) -> Option<&dyn ResizeGate> {
+        Some(&crate::x11_state::X11_RESIZE_GATE)
     }
 
-    fn end_transition(&self) {
-        // Only end the gate; the geometry thread is the sole owner of overlay
-        // structure, so do not re-apply it here.
-        crate::x11_state::GATE.lock().end();
+    // the window manager draws the titlebar
+    fn titlebar_controls(&self) -> Option<&dyn TitlebarControls> {
+        None
     }
 
-    fn in_transition(&self) -> bool {
-        crate::x11_state::GATE.lock().in_transition()
-    }
-
-    fn set_expected_size(&self, w: c_int, h: c_int) {
-        crate::x11_state::GATE.lock().set_expected((w, h));
+    // the window manager draws the titlebar; the app draws none
+    fn effective_decorations(&self) -> jfn_platform_abi::EffectiveDecorations {
+        jfn_platform_abi::EffectiveDecorations::ServerSide
     }
 
     fn set_fullscreen(&self, fullscreen: bool) {
@@ -158,28 +152,9 @@ impl Platform for X11Platform {
         crate::scale::display_scale(at)
     }
 
-    fn apply_boot_geometry(&self, g: &jfn_platform_abi::BootGeometry) {
-        crate::lifecycle::set_boot_geometry(*g);
-    }
-
-    // The app owns its toplevel and sizes it in ensure_host_window, so mpv
-    // neither sizes at boot nor reconciles on scale change.
-    fn boot_mpv_geometry(&self, _g: &jfn_platform_abi::BootGeometry) -> Option<String> {
-        None
-    }
-
-    // this backend owns its toplevel; mpv's sizing is never reconciled
-    fn reconcile_mpv_size(
-        &self,
-        _saved_logical: jfn_platform_abi::LogicalSize,
-        _saved_physical: jfn_platform_abi::PhysicalSize,
-        _locked: bool,
-    ) -> Option<jfn_platform_abi::PhysicalSize> {
-        None
-    }
-
-    fn window_source(&self) -> &'static dyn jfn_platform_abi::WindowSource {
-        &crate::window_source::X11_WINDOW_SOURCE
+    // the app creates the WM-managed window; mpv embeds into its child
+    fn window_owner(&self) -> WindowOwner<'_> {
+        WindowOwner::App(&crate::window_source::X11_WINDOW_SOURCE)
     }
 
     fn query_window_position(&self) -> Option<WindowPos> {
@@ -190,15 +165,19 @@ impl Platform for X11Platform {
         Some(WindowPos { x, y })
     }
 
+    /// X11 constrains only the size; position is left to the WM.
     fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry {
-        // X11 constrains only the size; position is left to the WM.
-        let (mut w, mut h) = (g.w, g.h);
-        crate::lifecycle::clamp_window_geometry(&mut w, &mut h);
-        WindowGeometry {
-            w,
-            h,
-            position: g.position,
+        match crate::lifecycle::screen_bounds() {
+            Some(bounds) => jfn_platform_abi::geometry::clamp_size_to_bounds(g, bounds),
+            None => g,
         }
+    }
+
+    // the geometry and input threads own their own loops
+    fn pump(&self) {}
+
+    fn set_theme_color(&self, rgb: u32) {
+        crate::geometry::set_theme_color(rgb);
     }
 
     fn set_cursor(&self, shape: CursorShape) {
@@ -213,7 +192,15 @@ impl Platform for X11Platform {
         crate::paint::resolved().is_some_and(|t| t.use_dmabuf)
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(Option<&str>) + Send>) {
+    // the paint tier resolves shared-texture support once and never revises it
+    fn set_shared_texture_unsupported(&self) {}
+
+    // platform init resolves shared-texture support
+    fn cef_init_precedes_mpv_window(&self) -> bool {
+        false
+    }
+
+    fn clipboard_read_text_async(&self, on_done: OnText) {
         match crate::selection::selections() {
             Some(selections) => {
                 selections.read_text_async(crate::selection::Kind::Clipboard, on_done);

@@ -842,7 +842,7 @@ fn wait_for_target(surface: SurfaceHandle) -> Option<jfn_gpu_paint::WindowTarget
 /// else 1280x720 logical at the platform's reported scale.
 fn initial_extent() -> Option<WindowExtent> {
     let plat = jfn_platform_abi::get();
-    if let Some(extent) = plat.window_source().snapshot().extent {
+    if let Some(extent) = plat.window_owner().source().snapshot().extent {
         return Some(extent);
     }
     let scale = plat.scale();

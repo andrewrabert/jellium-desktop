@@ -37,7 +37,7 @@ impl IngestCtx for PlatformCtx {
         jfn_platform_abi::get().scale()
     }
 
-    fn macos_logical_size(&self) -> Option<LogicalSize> {
+    fn os_logical_size(&self) -> Option<LogicalSize> {
         jfn_platform_abi::get().mpv_host().logical_content_size()
     }
 }
@@ -85,7 +85,7 @@ pub fn jfn_playback_ingest_mpv_event_owned(event: &Event) -> u8 {
 /// Idempotent — the state machine dedupes, so an unchanged mode emits
 /// nothing.
 pub fn jfn_playback_reconcile_window_mode() {
-    let snap = jfn_platform_abi::get().window_source().snapshot();
+    let snap = jfn_platform_abi::get().window_owner().source().snapshot();
     post_window_state(snap.fullscreen, snap.maximized);
 }
 

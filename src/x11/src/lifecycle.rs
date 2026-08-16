@@ -187,7 +187,7 @@ pub(crate) fn ensure_host_window() -> bool {
     let Some(boot) = *BOOT_GEOMETRY.lock() else {
         tracing::error!(
             target: "Main",
-            "x11: no boot geometry; apply_boot_geometry runs before the host window"
+            "x11: no boot geometry; WindowOwner::apply_boot_geometry must seed it before the host window is created"
         );
         return false;
     };
@@ -501,23 +501,17 @@ pub fn cleanup() {
     crate::mpv_proxy::stop();
 }
 
-/// Clamp saved window geometry to the primary screen extent. Runs before
-/// `init()` so it opens its own short-lived connection (to the real display,
-/// in case the mpv proxy has `DISPLAY` repointed).
-pub fn clamp_window_geometry(w: &mut i32, h: &mut i32) {
+/// The primary screen's pixel extent, read on a short-lived connection to the
+/// real display. `None` when that connection could not be opened.
+///
+/// Runs before `init()`, so it opens its own connection — the mpv proxy may
+/// have `DISPLAY` repointed by then.
+pub fn screen_bounds() -> Option<jfn_platform_abi::geometry::Bounds> {
     let display = crate::mpv_proxy::real_display();
-    let Ok((conn, screen_num)) = RustConnection::connect(display.as_deref()) else {
-        return;
-    };
-    let Some(root) = conn.setup().roots.get(screen_num) else {
-        return;
-    };
-    let sw = root.width_in_pixels as i32;
-    let sh = root.height_in_pixels as i32;
-    if sw > 0 && *w > sw {
-        *w = sw;
-    }
-    if sh > 0 && *h > sh {
-        *h = sh;
-    }
+    let (conn, screen_num) = RustConnection::connect(display.as_deref()).ok()?;
+    let root = conn.setup().roots.get(screen_num)?;
+    Some(jfn_platform_abi::geometry::Bounds {
+        w: i32::from(root.width_in_pixels),
+        h: i32::from(root.height_in_pixels),
+    })
 }

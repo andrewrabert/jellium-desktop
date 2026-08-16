@@ -33,12 +33,13 @@ pub mod selection;
 mod signal;
 pub mod stack;
 pub mod visibility;
+pub mod window_owner;
 pub mod window_source;
 
 pub use cef_host::CefHost;
 pub use geometry::{
     BootGeometry, COVERED_SCALES, LogicalPoint, LogicalSize, PhysicalPoint, PhysicalSize, Scale,
-    SurfaceSize, WindowExtent, WindowGeometry, WindowPos, mpv_reconcile_size,
+    SurfaceSize, WindowExtent, WindowGeometry, WindowPos,
 };
 pub use instance::{Instance, InstanceId};
 pub use jfn_gpu_paint::DamageRect as JfnRect;
@@ -55,6 +56,7 @@ pub use paint::{Content, FrameSource, PaintFrame, Presented, Superseded};
 pub use selection::{OnText, PrimarySelection};
 pub use stack::Plane;
 pub use visibility::{Ack, Visibility, VisibilityCommit};
+pub use window_owner::{AppCreatedWindow, MpvBootWindow, MpvCreatedWindow, WindowOwner};
 pub use window_source::{
     WindowSnapshot, WindowSource, notify_window_changed, subscribe_window_changed,
 };
@@ -398,8 +400,40 @@ impl SurfaceHandle {
     }
 }
 
-/// Process-wide platform handle. Optional methods have no-op defaults so
-/// backends only override what they care about.
+/// The gate a backend arms at the physical size a resize transition settles
+/// at. Reachable only through [`Platform::resize_gate`].
+pub trait ResizeGate: Send + Sync {
+    fn begin(&self);
+
+    fn end(&self);
+
+    fn in_transition(&self) -> bool;
+
+    fn set_expected(&self, size: PhysicalSize);
+}
+
+/// The window controls an app-drawn titlebar drives. Reachable only through
+/// [`Platform::titlebar_controls`].
+pub trait TitlebarControls: Send + Sync {
+    fn minimize(&self);
+
+    fn toggle_maximize(&self);
+
+    /// Begin an interactive, compositor-driven window move. Must be called in
+    /// response to a pointer button press on the titlebar drag region.
+    fn start_move(&self);
+
+    /// Begin an interactive, compositor-driven resize from the given edge.
+    /// `edge` is the xdg_toplevel resize-edge mask: top=1, bottom=2, left=4,
+    /// right=8, corners are the ORs.
+    fn start_resize(&self, edge: c_int);
+}
+
+/// Process-wide platform handle.
+///
+/// A default body here expresses shared mechanism or an absence the type
+/// makes total, and nothing else: every method carrying a platform answer is
+/// required, so adding one fails to compile all four backends.
 ///
 /// All methods take `&self` — backends keep their own interior mutability
 /// (`Mutex`, `AtomicBool`, etc) where they need it.
@@ -408,12 +442,8 @@ pub trait Platform: Send + Sync {
 
     fn default_window_decorations(&self) -> WindowDecorations;
 
-    /// Decoration modes this backend can honor. The default keeps every mode
-    /// valid; backends with an authoritative availability source (Wayland
-    /// derives it from the compositor's advertised protocols) narrow the set.
-    fn window_decoration_options(&self) -> DecorationOptions {
-        DecorationOptions::all()
-    }
+    /// Decoration modes this backend can honor.
+    fn window_decoration_options(&self) -> DecorationOptions;
 
     fn resolve_window_decorations(
         &self,
@@ -427,32 +457,23 @@ pub trait Platform: Send + Sync {
         }
     }
 
-    fn early_init(&self) {}
+    fn early_init(&self);
     /// `mpv` is the opaque libmpv `mpv_handle` — a raw C handle, stays raw.
-    fn init(&self, mpv: *mut c_void) -> bool {
-        let _ = mpv;
-        true
-    }
-    fn cleanup(&self) {}
-    fn post_window_cleanup(&self) {}
+    fn init(&self, mpv: *mut c_void) -> bool;
+    fn cleanup(&self);
+    fn post_window_cleanup(&self);
 
     // Per-surface
     /// The surface starts in `initial`; no surface is born at a default.
-    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
-        let _ = initial;
-        SurfaceHandle::NONE
-    }
-    fn free_surface(&self, _s: SurfaceHandle) {}
+    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle;
+    fn free_surface(&self, s: SurfaceHandle);
     /// Presents `frame`, or hands it back undischarged when this surface has no
     /// commit stream for it.
     fn surface_present<'a>(
         &self,
         s: SurfaceHandle,
         frame: PaintFrame<'a>,
-    ) -> Result<Presented, PaintFrame<'a>> {
-        let _ = s;
-        Err(frame)
-    }
+    ) -> Result<Presented, PaintFrame<'a>>;
     /// Applies `size` to `s` before returning.
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize);
     /// The swapchain target for `s`, or `None` until the backend has created
@@ -462,19 +483,13 @@ pub trait Platform: Send + Sync {
     /// first call the backend attaches no buffer to `s`, never calls
     /// [`Platform::surface_present`] on it, grabs no input on it, and gives it
     /// an empty input region.
-    fn surface_window_target(&self, s: SurfaceHandle) -> Option<WindowTarget> {
-        let _ = s;
-        None
-    }
+    fn surface_window_target(&self, s: SurfaceHandle) -> Option<WindowTarget>;
     /// Issues the commit carrying `visibility` before returning.
-    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
-        let _ = s;
-        VisibilityCommit::issued(visibility, Ack::immediate())
-    }
+    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit;
 
     /// Applies the whole order, bottom first, in one transaction, and pins the
     /// video plane below every named surface.
-    fn apply_stack(&self, _ordered: &[SurfaceHandle]) {}
+    fn apply_stack(&self, ordered: &[SurfaceHandle]);
 
     /// How this backend delivers `kind`; `Host` names the backend's own menu
     /// host.
@@ -485,10 +500,8 @@ pub trait Platform: Send + Sync {
     }
 
     /// How this platform hosts mpv's lifecycle (env prep, VO wait,
-    /// teardown detach). Default: mpv needs nothing from the platform.
-    fn mpv_host(&self) -> &dyn MpvHost {
-        &DefaultMpvHost
-    }
+    /// teardown detach).
+    fn mpv_host(&self) -> &dyn MpvHost;
 
     /// `Some` when the platform drives CEF's message loop itself
     /// (external pump); `None` runs CEF's multi-threaded message loop.
@@ -503,30 +516,15 @@ pub trait Platform: Send + Sync {
     fn cef_paths(&self) -> CefPaths;
 
     // Fullscreen
-    fn set_fullscreen(&self, _v: bool) {}
-    fn toggle_fullscreen(&self) {}
+    fn set_fullscreen(&self, v: bool);
+    fn toggle_fullscreen(&self);
 
-    // Window controls for client-side decorations. Default no-ops cover
-    // backends without CSD (X11 WMs / macOS / Windows draw their own).
-    fn window_minimize(&self) {}
-    fn window_toggle_maximize(&self) {}
-    /// Begin an interactive, compositor-driven window move. Must be called in
-    /// response to a pointer button press on the titlebar drag region.
-    fn window_start_move(&self) {}
-    /// Begin an interactive, compositor-driven resize from the given edge.
-    /// `edge` uses xdg_toplevel resize-edge values (1=top, 2=bottom, 4=left,
-    /// 8=right, corners are the ORs, e.g. 5=top-left).
-    fn window_start_resize(&self, _edge: c_int) {}
+    /// The controls an app-drawn titlebar drives, or `None` where the OS or
+    /// the window manager draws the app window's titlebar.
+    fn titlebar_controls(&self) -> Option<&dyn TitlebarControls>;
 
-    // Transition
-    fn begin_transition(&self) {}
-    fn end_transition(&self) {}
-    fn in_transition(&self) -> bool {
-        false
-    }
-    /// Records the physical size a transition is expected to settle at, or
-    /// states that this backend gates no transition.
-    fn set_expected_size(&self, w: c_int, h: c_int);
+    /// The resize-transition gate, or `None` where this backend gates none.
+    fn resize_gate(&self) -> Option<&dyn ResizeGate>;
 
     /// The display scale this backend reports for the app window.
     fn scale(&self) -> Scale;
@@ -535,39 +533,17 @@ pub trait Platform: Send + Sync {
     /// or for its own default display when `at` is `None`.
     fn display_scale(&self, at: Option<WindowPos>) -> Scale;
 
-    /// Seeds the window owner with `g` before returning.
-    fn apply_boot_geometry(&self, g: &BootGeometry);
-
     /// The window's current position in backing pixels, or `None` when this
     /// backend has no window position to report.
     fn query_window_position(&self) -> Option<WindowPos>;
 
-    /// Live window-geometry authority for this backend: the compositor-backed
-    /// source where the backend owns its toplevel (Wayland), the mpv-backed
-    /// source everywhere else.
-    fn window_source(&self) -> &dyn WindowSource;
+    /// Who creates the app window, and the live geometry authority for it.
+    fn window_owner(&self) -> WindowOwner<'_>;
 
-    /// The mpv `--geometry` string for boot, or `None` when this backend owns
-    /// its toplevel and sizes it itself.
-    fn boot_mpv_geometry(&self, g: &BootGeometry) -> Option<String>;
+    /// Clamp saved geometry to stay on-screen.
+    fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry;
 
-    /// The physical size mpv should be resized to at boot, or `None` to leave
-    /// mpv's sizing untouched. `locked` names a window booting fullscreen or
-    /// maximized; toplevel-owning backends yield `None` throughout.
-    fn reconcile_mpv_size(
-        &self,
-        saved_logical: LogicalSize,
-        saved_physical: PhysicalSize,
-        locked: bool,
-    ) -> Option<PhysicalSize>;
-
-    /// Clamp saved geometry to stay on-screen. Backends that don't constrain
-    /// geometry return `g` unchanged (the default).
-    fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry {
-        g
-    }
-
-    fn pump(&self) {}
+    fn pump(&self);
     /// Block the process main thread until [`wake_main_loop`] is called.
     /// Default parks on the process-wide [`main_park_wait`]; macOS overrides
     /// with `[NSApp run]`.
@@ -581,47 +557,35 @@ pub trait Platform: Send + Sync {
         main_park_signal();
     }
 
-    fn set_cursor(&self, _shape: cursor::CursorShape) {}
-    fn set_idle_inhibit(&self, _level: IdleInhibitLevel) {}
-    fn set_theme_color(&self, _rgb: u32) {}
+    fn set_cursor(&self, shape: cursor::CursorShape);
+    fn set_idle_inhibit(&self, level: IdleInhibitLevel);
+    fn set_theme_color(&self, rgb: u32);
 
     /// Whether the window-decorations setting (client-side vs server-side
     /// titlebar) applies on this platform. Gates the settings UI entry; the
     /// entry's option list comes from [`Platform::window_decoration_options`].
-    fn window_decorations_supported(&self) -> bool {
-        false
-    }
-    /// The decoration mode currently in effect. Defaults to ServerSide — on
-    /// macOS/Windows/X11 the OS/WM draws the titlebar, so the app never
-    /// does. Changes are announced via [`notify_decorations_changed`].
-    fn effective_decorations(&self) -> EffectiveDecorations {
-        EffectiveDecorations::ServerSide
-    }
+    fn window_decorations_supported(&self) -> bool;
+    /// The decoration mode currently in effect. Changes are announced via
+    /// [`notify_decorations_changed`].
+    fn effective_decorations(&self) -> EffectiveDecorations;
 
-    fn shared_texture_supported(&self) -> bool {
-        true
-    }
+    fn shared_texture_supported(&self) -> bool;
 
     /// True where `CefInitialize` depends on neither platform init nor a run
     /// loop the boot wait owns, so CEF's process bring-up may run while mpv's
-    /// core thread creates the VO. False on Wayland and X11 (platform init
-    /// resolves shared-texture support) and on macOS (external pump).
-    fn cef_init_precedes_mpv_window(&self) -> bool {
-        false
-    }
-    /// Set during init by Wayland backend (dmabuf probe) when GPU lacks the
-    /// shared-texture path.
-    fn set_shared_texture_unsupported(&self) {}
+    /// core thread creates the VO.
+    fn cef_init_precedes_mpv_window(&self) -> bool;
+    /// Revises [`Platform::shared_texture_supported`] to `false` where the
+    /// backend resolves the shared-texture path after init.
+    fn set_shared_texture_unsupported(&self);
 
     /// The OS clipboard's text.
     /// `None` when it holds no text, or the read failed.
-    fn clipboard_read_text_async(&self, on_done: OnText) {
-        on_done(None);
-    }
+    fn clipboard_read_text_async(&self, on_done: OnText);
 
     /// Places `text` on the OS clipboard.
     /// A backend that cannot take the selection leaves the previous contents.
-    fn clipboard_write_text(&self, _text: &str) {}
+    fn clipboard_write_text(&self, text: &str);
 
     /// The primary selection, on the backends that serve one.
     fn primary_selection(&self) -> Option<&dyn PrimarySelection> {
@@ -631,14 +595,12 @@ pub trait Platform: Send + Sync {
     /// Whether the web overlay pastes by reading the OS clipboard and
     /// injecting the text, rather than by calling `frame.Paste()`.
     /// Pinned per backend, and unrelated to the shell overlay's clipboard.
-    fn web_paste_reads_clipboard(&self) -> bool {
-        true
-    }
+    fn web_paste_reads_clipboard(&self) -> bool;
 
-    fn open_external_url(&self, _url: &str) {}
+    fn open_external_url(&self, url: &str);
 
     /// Open a filesystem path in the OS file manager.
-    fn open_path(&self, _path: &Path) {}
+    fn open_path(&self, path: &Path);
 
     /// Run `f` to completion without deadlocking work that needs the
     /// main thread (e.g. mpv's VO uninit doing `DispatchQueue.main.sync`).
