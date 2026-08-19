@@ -4,9 +4,11 @@ let cancelWait = null;
 // script load; the reply arrives through _onSavedServerUrl (defined below)
 // and resolves savedServerUrlReady.
 let savedServerUrl = null;
+let manualServerSwitch = false;
 const savedServerUrlReady = new Promise((resolve) => {
-    window._onSavedServerUrl = (url) => {
+    window._onSavedServerUrl = (url, switchServer) => {
         savedServerUrl = url || null;
+        manualServerSwitch = !!switchServer;
         resolve(savedServerUrl);
     };
 });
@@ -102,6 +104,19 @@ const updateButtonState = () => {
     }
 };
 
+const setCancelButtonVisible = (visible) => {
+    const button = document.getElementById('cancel-button');
+    button.style.visibility = visible ? 'visible' : 'hidden';
+};
+
+const cancelServerSwitch = () => {
+    if (window.jmpNative?.cancelServerConnectivity) {
+        window.jmpNative.cancelServerConnectivity();
+    }
+    if (cancelWait) cancelWait();
+    window.close();
+};
+
 const cancelOnEscape = (e) => {
     if (isConnecting && e.key === 'Escape') {
         cancelConnection();
@@ -138,6 +153,7 @@ const startConnecting = async () => {
     const title = document.getElementById('title');
     const spinner = document.getElementById('spinner');
     const button = document.getElementById('connect-button');
+    const cancelButton = document.getElementById('cancel-button');
     const server = address.value;
 
     // Show connecting UI
@@ -150,6 +166,7 @@ const startConnecting = async () => {
     spinner.style.display = 'block';
     const spinnerStart = Date.now();
     button.style.visibility = 'hidden';
+    cancelButton.style.visibility = 'hidden';
     document.addEventListener('keydown', cancelOnEscape);
 
     // C++ handles retries, just wait for result
@@ -164,6 +181,7 @@ const startConnecting = async () => {
         address.disabled = false;
         spinner.style.display = 'none';
         button.style.visibility = 'visible';
+        setCancelButtonVisible(manualServerSwitch);
         document.removeEventListener('keydown', cancelOnEscape);
         updateButtonState();
         showConnectionFailedDialog();
@@ -174,8 +192,6 @@ const cancelConnection = () => {
     if (!isConnecting) return;
 
     console.debug("Cancelling connection");
-    // Native resets main on cancelServerConnectivity.
-    mainLoaded = false;
     isConnecting = false;
 
     // Cancel C++ connectivity check and abort JS promise.
@@ -185,6 +201,13 @@ const cancelConnection = () => {
         window.jmpCheckServerConnectivity.abort();
     }
     if (cancelWait) cancelWait();
+
+    if (manualServerSwitch) {
+        window.close();
+    } else {
+        // Native resets main on cancelServerConnectivity.
+        mainLoaded = false;
+    }
 };
 
 // Button click handler
@@ -207,11 +230,25 @@ document.getElementById('connect-form').addEventListener('submit', (e) => {
 
 // Input change handler
 document.getElementById('address').addEventListener('input', updateButtonState);
+document.getElementById('cancel-button').addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (isConnecting) {
+        cancelConnection();
+    } else if (manualServerSwitch) {
+        cancelServerSwitch();
+    }
+});
 
 
 // Enter key handler
 document.addEventListener('keydown', (e) => {
     const address = document.getElementById('address');
+    if (e.key === 'Escape' && manualServerSwitch && !isConnecting) {
+        e.preventDefault();
+        cancelServerSwitch();
+        return;
+    }
     if (e.key === 'Enter' && !isConnecting && !address.disabled && address.value.trim()) {
         e.preventDefault();
         startConnecting();
@@ -223,9 +260,9 @@ document.addEventListener('keydown', (e) => {
     console.log('Auto-connect: starting');
 
     const savedServer = await savedServerUrlReady;
-    console.debug('Auto-connect: savedServer =', savedServer);
+    console.debug('Auto-connect: savedServer =', savedServer, 'manualServerSwitch =', manualServerSwitch);
 
-    if (savedServer) {
+    if (savedServer && !manualServerSwitch) {
         console.debug('Auto-connect: checking saved server', savedServer);
 
         // main.cpp pre-loads the saved URL into the main browser in parallel
@@ -243,10 +280,17 @@ document.addEventListener('keydown', (e) => {
         const address = document.getElementById('address');
         const button = document.getElementById('connect-button');
 
+        if (savedServer) {
+            address.value = savedServer;
+        }
         title.style.visibility = 'visible';
         address.style.visibility = 'visible';
         button.style.visibility = 'visible';
+        setCancelButtonVisible(manualServerSwitch);
         address.focus();
+        if (manualServerSwitch && savedServer) {
+            address.select();
+        }
         updateButtonState();
     }
 })();

@@ -400,6 +400,62 @@
         return _deviceProfile;
     }
 
+    function isNativeServerSwitcherRoute(url) {
+        if (url === undefined || url === null) return false;
+        return /(^|[#/])(selectserver|addserver)([/?#]|$)/i.test(String(url));
+    }
+
+    function openNativeServerSwitcher() {
+        if (window.jmpNative && window.jmpNative.showServerOverlay) {
+            window.jmpNative.showServerOverlay();
+            return true;
+        }
+        return false;
+    }
+
+    (function installNativeServerSwitcherRouteGuard() {
+        const history = window.history;
+        if (history) {
+            const pushState = history.pushState;
+            if (typeof pushState === 'function') {
+                history.pushState = function(state, title, url) {
+                    if (isNativeServerSwitcherRoute(url) && openNativeServerSwitcher()) return;
+                    return pushState.apply(this, arguments);
+                };
+            }
+
+            const replaceState = history.replaceState;
+            if (typeof replaceState === 'function') {
+                history.replaceState = function(state, title, url) {
+                    if (isNativeServerSwitcherRoute(url) && openNativeServerSwitcher()) return;
+                    return replaceState.apply(this, arguments);
+                };
+            }
+        }
+
+        document.addEventListener('click', (event) => {
+            const target = event.target && event.target.closest
+                ? event.target.closest('a[href]')
+                : null;
+            const href = target && target.getAttribute ? target.getAttribute('href') : '';
+            if (!isNativeServerSwitcherRoute(href) || !openNativeServerSwitcher()) return;
+            event.preventDefault();
+            event.stopPropagation();
+        }, true);
+
+        window.addEventListener('hashchange', () => {
+            const location = window.location || {};
+            if (isNativeServerSwitcherRoute(location.hash) || isNativeServerSwitcherRoute(location.href)) {
+                openNativeServerSwitcher();
+            }
+        });
+
+        const location = window.location || {};
+        if (isNativeServerSwitcherRoute(location.hash) || isNativeServerSwitcherRoute(location.href)) {
+            openNativeServerSwitcher();
+        }
+    })();
+
     window.NativeShell.AppHost = {
         init() {
             return Promise.resolve({
@@ -414,9 +470,9 @@
         supports(command) {
             const features = [
                 'fileinput', 'filedownload', 'displaylanguage', 'htmlaudioautoplay',
-                'htmlvideoautoplay', 'externallinks', 'multiserver',
+                'htmlvideoautoplay', 'externallinks',
                 'fullscreenchange', 'remotevideo', 'displaymode',
-                'exitmenu', 'clientsettings'
+                'exitmenu', 'clientsettings', 'multiserver'
             ];
             return features.includes(command.toLowerCase());
         },

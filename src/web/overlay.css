@@ -127,6 +127,16 @@ button:disabled {
     min-height: 2.5em;
     visibility: hidden;
 }
+#cancel-button {
+    max-width: 450px;
+    min-height: 2.5em;
+    margin-top: 0.75em;
+    visibility: hidden;
+    background: #444;
+}
+#cancel-button:hover:not(:disabled) {
+    background: #555;
+}
 @keyframes spin {
     0% { transform: rotate(0deg); }
     100% { transform: rotate(360deg); }

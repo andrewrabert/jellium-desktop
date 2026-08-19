@@ -26,9 +26,16 @@ use crate::ipc::{BrowserMessage, list_opt_string, list_string, send_to_renderer}
 use jfn_color::theme::jfn_theme_color_on_overlay_dismissed;
 use jfn_jellyfin::{extract_base_url, is_valid_public_info, normalize_input};
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OverlayMode {
+    Startup,
+    SwitchServer,
+}
+
 struct OverlayState {
     main_layer: Arc<Inner>,
     active_probe: Option<Urlrequest>,
+    mode: OverlayMode,
 }
 
 static INSTANCE: Mutex<Option<OverlayState>> = Mutex::new(None);
@@ -36,10 +43,23 @@ static INSTANCE: Mutex<Option<OverlayState>> = Mutex::new(None);
 /// Create the overlay layer over `main_layer`, install handlers, load the
 /// overlay URL. Called once after the main browser is created.
 pub fn jfn_overlay_init(main_layer: *mut JfnCefLayer) {
+    create_overlay(main_layer, OverlayMode::Startup, "jfn_overlay_init");
+}
+
+/// Show the same overlay from the already-loaded web UI for server switching.
+pub fn jfn_overlay_show_switcher(main_layer: *mut JfnCefLayer) {
+    create_overlay(
+        main_layer,
+        OverlayMode::SwitchServer,
+        "jfn_overlay_show_switcher",
+    );
+}
+
+fn create_overlay(main_layer: *mut JfnCefLayer, mode: OverlayMode, caller: &str) {
     if main_layer.is_null() {
         return;
     }
-    if reject_double_init(&INSTANCE.lock(), "jfn_overlay_init") {
+    if reject_double_init(&INSTANCE.lock(), caller) {
         return;
     }
 
@@ -65,6 +85,7 @@ pub fn jfn_overlay_init(main_layer: *mut JfnCefLayer) {
     *INSTANCE.lock() = Some(OverlayState {
         main_layer: main_inner,
         active_probe: None,
+        mode,
     });
 }
 
@@ -96,6 +117,10 @@ fn main_layer_arc() -> Option<Arc<Inner>> {
     INSTANCE.lock().as_ref().map(|s| Arc::clone(&s.main_layer))
 }
 
+fn overlay_mode() -> Option<OverlayMode> {
+    INSTANCE.lock().as_ref().map(|s| s.mode)
+}
+
 fn handle_message(message: BrowserMessage) -> bool {
     let args = message.args();
 
@@ -105,8 +130,10 @@ fn handle_message(message: BrowserMessage) -> bool {
                 return true;
             };
             let url = jfn_config::server_url();
+            let switch_server = overlay_mode() == Some(OverlayMode::SwitchServer);
             send_to_renderer(&frame, "savedServerUrl", |args| {
                 args.set_string(0, Some(&CefString::from(url.as_str())));
+                args.set_bool(1, if switch_server { 1 } else { 0 });
             });
             true
         }
@@ -169,9 +196,28 @@ fn handle_message(message: BrowserMessage) -> bool {
         }
         "cancelServerConnectivity" => {
             cancel_active_probe();
-            // Kill the pre-load.
-            if let Some(ml) = main_layer_arc() {
-                ml.reset();
+            match overlay_mode() {
+                Some(OverlayMode::Startup) | None => {
+                    // Kill the startup pre-load.
+                    if let Some(ml) = main_layer_arc() {
+                        ml.reset();
+                    }
+                }
+                Some(OverlayMode::SwitchServer) => {
+                    // Leave the current app loaded and return input to it.
+                    if let Some(ml) = main_layer_arc() {
+                        let p = ml.layer_ptr();
+                        if !p.is_null() {
+                            jfn_browsers_set_active(p);
+                        }
+                    }
+                    if let Some(b) = message.browser()
+                        && let Some(host) = b.host()
+                    {
+                        host.close_browser(0);
+                    }
+                    jfn_theme_color_on_overlay_dismissed();
+                }
             }
             true
         }

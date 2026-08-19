@@ -274,6 +274,15 @@ fn with_args(args: Option<&ListValue>, f: impl FnOnce(&ListValue)) -> bool {
     true
 }
 
+fn show_server_overlay() {
+    let layer = INSTANCE.lock().as_ref().map(|s| Arc::clone(&s.layer));
+    let Some(layer) = layer else { return };
+    let p = layer.layer_ptr();
+    if !p.is_null() {
+        crate::business_overlay::jfn_overlay_show_switcher(p);
+    }
+}
+
 fn handle_message(message: BrowserMessage) -> bool {
     let args = message.args();
 
@@ -362,6 +371,10 @@ fn handle_message(message: BrowserMessage) -> bool {
         }),
         "toggleFullscreen" => {
             jfn_platform_abi::get().toggle_fullscreen();
+            true
+        }
+        "showServerOverlay" => {
+            show_server_overlay();
             true
         }
         "saveServerUrl" => with_args(args, |a| {

@@ -40,6 +40,11 @@ clean:
 test: build
     cargo test --manifest-path src/Cargo.toml --workspace
 
+# Run web shim tests
+[group('test')]
+test-web:
+    node src/web/native-shim.test.mjs
+
 # Run tests (loads MSVC + bindgen libclang env via dev/windows/env.ps1)
 [group('test')]
 [windows]

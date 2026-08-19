@@ -291,7 +291,12 @@ wrap_render_process_handler! {
                 "savedServerUrl" => {
                     let Some(args) = args else { return 1 };
                     let url = userfree_to_string(&args.string(0));
-                    call_js_global_string(frame, "_onSavedServerUrl", &[Arg::Str(&url)]);
+                    let switch_server = args.bool(1) != 0;
+                    call_js_global_string(
+                        frame,
+                        "_onSavedServerUrl",
+                        &[Arg::Str(&url), Arg::Bool(switch_server)],
+                    );
                     1
                 }
                 "serverConnectivityResult" => {
