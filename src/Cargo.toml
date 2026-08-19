@@ -1,9 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
+    "bringup",
     "color",
     "compositor_core",
     "config",
+    "fonts",
     "gpu_paint",
     "input",
     "jellyfin",
@@ -21,6 +23,7 @@ members = [
     "platform_abi",
     "playback",
     "instance_ipc",
+    "shell",
     "wake_event",
     "wayland",
     "windows",
@@ -43,6 +46,11 @@ crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
 dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 gethostname = "1"
+iced_graphics = { git = "https://github.com/iced-rs/iced", rev = "2cffa99b395d84fe469b44dccb56bbacd2f1a157", default-features = false }
+iced_core = { git = "https://github.com/iced-rs/iced", rev = "2cffa99b395d84fe469b44dccb56bbacd2f1a157", default-features = false, features = ["advanced"] }
+iced_runtime = { git = "https://github.com/iced-rs/iced", rev = "2cffa99b395d84fe469b44dccb56bbacd2f1a157", default-features = false }
+iced_widget = { git = "https://github.com/iced-rs/iced", rev = "2cffa99b395d84fe469b44dccb56bbacd2f1a157", default-features = false, features = ["advanced", "canvas", "image", "wgpu"] }
+iced_wgpu = { git = "https://github.com/iced-rs/iced", rev = "2cffa99b395d84fe469b44dccb56bbacd2f1a157", default-features = false, features = ["geometry", "image", "web-colors"] }
 gix = { version = "0.85", default-features = false, features = ["status", "sha1"] }
 interprocess = { version = "2", features = ["tokio"] }
 libc = "0.2"
@@ -63,6 +71,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1" }
 tracing = "0.1"
+wgpu = "=29.0.4"
 windows = "0.62"
 windows-core = "0.62"
 windows-sys = "0.61"
@@ -73,6 +82,7 @@ warnings = "deny"
 
 [workspace.lints.clippy]
 all = "deny"
+mem_forget = "deny"
 
 [profile.release]
 opt-level = 3

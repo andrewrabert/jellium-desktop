@@ -1,0 +1,21 @@
+[package]
+name = "jfn-bringup"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "jfn_bringup"
+crate-type = ["rlib"]
+
+[features]
+test-support = []
+
+[dependencies]
+jfn-color = { path = "../color" }
+jfn-config = { path = "../config" }
+jfn-gpu-paint = { path = "../gpu_paint" }
+parking_lot.workspace = true
+
+[lints]
+workspace = true

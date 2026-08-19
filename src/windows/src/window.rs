@@ -10,7 +10,7 @@
 use std::thread::JoinHandle;
 
 use jfn_platform_abi::{
-    PhysicalSize, Scale, WindowExtent, WindowPos, WindowSnapshot, WindowSource,
+    MpvCreatedWindow, PhysicalSize, Scale, WindowExtent, WindowPos, WindowSnapshot, WindowSource,
     notify_window_changed,
 };
 use parking_lot::{Condvar, Mutex};
@@ -95,8 +95,7 @@ pub(crate) fn sample() -> Option<PhysicalSize> {
         return None;
     }
     let dpi = unsafe { GetDpiForWindow(hwnd) };
-    let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
-    let extent = WindowExtent::new(client, Scale(scale));
+    let extent = crate::scale::extent(client, dpi)?;
     let fullscreen = crate::platform::win_is_fullscreen();
     let snap = WindowSnapshot {
         extent: Some(extent),
@@ -106,7 +105,7 @@ pub(crate) fn sample() -> Option<PhysicalSize> {
     };
     let previous = SNAPSHOT.lock().replace(snap);
     if previous.and_then(|p| p.extent) != Some(extent) {
-        log_sample(hwnd, extent);
+        log_sample(hwnd, dpi, extent);
     }
     Some(client)
 }
@@ -132,15 +131,15 @@ fn window_position(hwnd: HWND) -> Option<WindowPos> {
 }
 
 /// The client size, the client origin in screen coordinates, the window rect,
-/// the window DPI, and the DPI awareness of both the window and this thread.
-fn log_sample(hwnd: HWND, extent: WindowExtent) {
+/// the DPI the extent was built from, and the DPI awareness of both the window
+/// and this thread.
+fn log_sample(hwnd: HWND, dpi: u32, extent: WindowExtent) {
     let physical = extent.physical();
     let logical = extent.logical();
     let mut origin = POINT::default();
     let _ = unsafe { ClientToScreen(hwnd, &mut origin) };
     let mut wr = RECT::default();
     let _ = unsafe { GetWindowRect(hwnd, &mut wr) };
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
     let window_awareness =
         unsafe { GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(hwnd)) }.0;
     let thread_awareness =
@@ -187,9 +186,13 @@ pub(crate) fn client_extent() -> Option<WindowExtent> {
     snapshot()?.extent
 }
 
-/// Window DPI scale as of the last sample.
+/// The scale the client window's DPI named at the last sample, or `None`
+/// before the window exists.
+///
+/// One sample names the extent and the scale together, so a menu anchor and
+/// the extent the pointer maps through can never come from two DPIs.
 pub(crate) fn client_scale() -> Option<Scale> {
-    client_extent().map(|e| e.scale())
+    Some(client_extent()?.scale())
 }
 
 /// Forget the stored snapshot.
@@ -211,3 +214,5 @@ impl WindowSource for WinWindowSource {
         })
     }
 }
+
+impl MpvCreatedWindow for WinWindowSource {}

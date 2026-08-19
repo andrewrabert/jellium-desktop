@@ -1,0 +1,38 @@
+[package]
+name = "jfn-shell"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "jfn_shell"
+crate-type = ["rlib"]
+
+[build-dependencies]
+png = "0.18"
+
+[dependencies]
+iced_core.workspace = true
+iced_runtime.workspace = true
+iced_widget.workspace = true
+iced_wgpu.workspace = true
+jfn-cef = { path = "../jfn_cef" }
+jfn-color = { path = "../color" }
+jfn-config = { path = "../config" }
+jfn-fonts = { path = "../fonts" }
+jfn-bringup = { path = "../bringup" }
+jfn-gpu-paint = { path = "../gpu_paint" }
+jfn-input = { path = "../input" }
+jfn-logging = { path = "../logging" }
+jfn-mailbox = { path = "../mailbox" }
+jfn-mpv = { path = "../mpv" }
+jfn-paths = { path = "../paths" }
+jfn-platform-abi = { path = "../platform_abi" }
+jfn-playback = { path = "../playback" }
+parking_lot.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+keycode = "1"
+
+[lints]
+workspace = true

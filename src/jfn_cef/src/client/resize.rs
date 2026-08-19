@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use jfn_playback::ingest_driver::jfn_playback_display_hz;
-
 use super::{Inner, now_ns, platform_ops, tasks};
 
 impl Inner {
@@ -27,11 +25,11 @@ impl Inner {
         });
     }
 
-    pub(super) fn resize(self: &Arc<Self>, w: i32, h: i32, pw: i32, ph: i32) {
-        self.width.store(w, Ordering::Release);
-        self.height.store(h, Ordering::Release);
-        self.physical_w.store(pw, Ordering::Release);
-        self.physical_h.store(ph, Ordering::Release);
+    pub(crate) fn resize(self: &Arc<Self>, size: jfn_platform_abi::SurfaceSize) {
+        let logical = size.extent.logical();
+        self.width.store(logical.w, Ordering::Release);
+        self.height.store(logical.h, Ordering::Release);
+        self.scale.store(Some(size.extent.scale()));
 
         // Wayland viewport must update on every configure (not debounced) or
         // src/dst go stale.
@@ -39,15 +37,7 @@ impl Inner {
         if !surface.is_none()
             && let Some(p) = platform_ops::ops()
         {
-            p.surface_resize(
-                surface,
-                platform_ops::SurfaceSize {
-                    logical_w: w,
-                    logical_h: h,
-                    physical_w: pw,
-                    physical_h: ph,
-                },
-            );
+            p.surface_resize(surface, size);
         }
 
         if !self.browser_alive() {
@@ -55,12 +45,10 @@ impl Inner {
         }
 
         let now = now_ns();
-        let hz = jfn_playback_display_hz();
-        let period_ns = if hz > 0.0 {
-            (1e9 / hz) as i64
-        } else {
-            16_666_667
-        };
+        // A display that reports no refresh spaces nothing: the resize applies
+        // on the spot rather than wait out an interval this process invented.
+        let period_ns = jfn_gpu_paint::refresh_interval()
+            .map_or(0, |period| period.as_nanos().min(i64::MAX as u128) as i64);
         let last = self.last_was_resized_ns.load(Ordering::Acquire);
         self.paint_scheduler.during_resize(self, || {
             if now - last >= period_ns {
@@ -80,7 +68,7 @@ impl Inner {
         });
     }
 
-    pub(super) fn set_refresh_rate(self: &Arc<Self>, hz: f64) {
+    pub(crate) fn set_refresh_rate(self: &Arc<Self>, hz: f64) {
         if hz <= 0.0 {
             return;
         }

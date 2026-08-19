@@ -15,8 +15,8 @@ parking_lot.workspace = true
 # elsewhere and the workspace builds uniformly on every platform.
 [target.'cfg(target_os = "linux")'.dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
-cosmic-text = "0.19"
 drm-fourcc = "2"
+jfn-fonts = { path = "../fonts" }
 jfn-input = { path = "../input" }
 jfn-mailbox = { path = "../mailbox" }
 jfn-platform-abi = { path = "../platform_abi" }

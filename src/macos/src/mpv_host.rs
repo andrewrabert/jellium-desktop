@@ -80,11 +80,11 @@ impl MpvHost for MacosMpvHost {
         jfn_mpv::api::jfn_mpv_clear_wakeup_callback();
     }
 
-    fn logical_content_size(&self) -> Option<(i32, i32)> {
+    fn logical_content_size(&self) -> Option<jfn_platform_abi::LogicalSize> {
         let mut w: c_int = 0;
         let mut h: c_int = 0;
         if crate::init::jfn_macos_query_logical_content_size(&mut w, &mut h) {
-            Some((w, h))
+            Some(jfn_platform_abi::LogicalSize { w, h })
         } else {
             None
         }

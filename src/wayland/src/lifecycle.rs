@@ -118,8 +118,8 @@ pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
     }
 
     if want_gpu_paint {
-        match jfn_gpu_paint::Surfaces::init(None, None) {
-            Some(gpu) => core.install_gpu_paint(Box::leak(Box::new(gpu))),
+        match jfn_gpu_paint::Surfaces::init(None) {
+            Some(gpu) => core.install_gpu_paint(gpu),
             None => {
                 tracing::info!("paint: no usable GPU device; using wl_shm");
                 resolved = Req::Shm;
@@ -146,11 +146,6 @@ pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
     #[cfg(feature = "kde-palette")]
     crate::kde_palette::init(rt);
 
-    rt.clipboard().init();
-    if !rt.clipboard().available() {
-        jfn_platform_abi::get().clear_clipboard_handler();
-    }
-
     jfn_platform_abi::MenuHost::warm(rt.menu());
 
     true
@@ -161,7 +156,7 @@ pub(crate) fn cleanup(rt: &'static crate::runtime::WlRuntime) {
     // window. The scheme file is unlinked separately via
     // kde_palette::post_window_cleanup after mpv tears down the surface.
     jfn_linux_util::idle_inhibit::cleanup();
-    rt.clipboard().cleanup();
+    rt.selections().cleanup();
     // Must precede root_window::cleanup: the menu's teardown ops go through
     // the root thread's queue.
     if let Some(menu) = rt.try_menu() {

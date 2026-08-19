@@ -37,4 +37,10 @@ impl CefHost for MacosCefHost {
     fn external_begin_frame(&self) -> bool {
         true
     }
+
+    fn start_frame_driver(&self, driver: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        if !crate::init::start_frame_driver(driver) {
+            tracing::error!(target: "Platform", "[INIT] failed to start CADisplayLink");
+        }
+    }
 }

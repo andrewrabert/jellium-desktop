@@ -100,6 +100,14 @@ jobs:
           ninja -C build
           ninja -C build install
 
+      - name: Export dependency environment
+        run: |
+          {
+            echo "PKG_CONFIG_PATH=$HOME/jellyfin-deps/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+            echo "CMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+            echo "CMAKE_PREFIX_PATH=$HOME/jellyfin-deps"
+          } >> "$GITHUB_ENV"
+
       - name: Patch mpv for macOS 12 Swift compatibility
         run: |
           python3 -c "
@@ -130,11 +138,10 @@ jobs:
           platform: ${{ github.workflow }}
 
       - name: Build app bundle
-        run: |
-          export PKG_CONFIG_PATH="$HOME/jellyfin-deps/lib/pkgconfig:$PKG_CONFIG_PATH"
-          export CMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET}"
-          export CMAKE_PREFIX_PATH="$HOME/jellyfin-deps"
-          cargo xtask install --prefix build/output
+        run: cargo xtask install --prefix build/output
+
+      - name: Test
+        run: cargo xtask test
 
       - name: Create DMG
         run: |

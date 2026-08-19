@@ -26,4 +26,8 @@ pub trait CefHost: Send + Sync {
     /// Whether browsers are created with external BeginFrame enabled —
     /// the platform drives frame production (e.g. via CADisplayLink).
     fn external_begin_frame(&self) -> bool;
+
+    /// Stores `driver` and starts the platform's frame source. A tick never
+    /// runs before the driver is stored.
+    fn start_frame_driver(&self, driver: std::sync::Arc<dyn Fn() + Send + Sync>);
 }

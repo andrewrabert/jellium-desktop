@@ -6,6 +6,7 @@
 //! non-blocking: sinks own their own consumer threads.
 
 pub mod browser_sink;
+pub mod chrome;
 mod coordinator;
 pub mod exec_js;
 pub mod ffi;

@@ -1,14 +1,20 @@
-use crate::sink_routing::Handle;
 use slotmap::SlotMap;
+
+slotmap::new_key_type! {
+    /// Opaque, `Copy` menu-session identity. Generational: a key to a
+    /// resolved session never aliases a later one, so a late resolve is a
+    /// no-op.
+    pub struct Session;
+}
 
 #[derive(Default)]
 pub struct MenuOwnership {
-    sessions: SlotMap<Handle, ()>,
-    current: Option<Handle>,
+    sessions: SlotMap<Session, ()>,
+    current: Option<Session>,
 }
 
 impl MenuOwnership {
-    pub fn open(&mut self) -> Option<Handle> {
+    pub fn open(&mut self) -> Option<Session> {
         if self.current.is_some() {
             return None;
         }
@@ -17,7 +23,7 @@ impl MenuOwnership {
         Some(h)
     }
 
-    pub fn resolve(&mut self, h: Handle) -> bool {
+    pub fn resolve(&mut self, h: Session) -> bool {
         if self.current != Some(h) {
             return false;
         }

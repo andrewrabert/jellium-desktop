@@ -16,8 +16,8 @@
 //! every visual-tree call, every swapchain build, and every present happens
 //! under it, each entry point taking it exactly once. That is only sound
 //! while no window-message thread enters this module — `alloc`, `free`,
-//! `restack`, `set_visible`, `present` and the popup entry points all run on
-//! the CEF UI thread and are already serialized by it, leaving `init` and
+//! `apply_stack`, `set_visibility`, `present` and the popup entry points all
+//! run on the CEF UI thread and are already serialized by it, leaving `init` and
 //! `cleanup` on the app main thread at the process edges as the sole
 //! cross-thread contention, where waiting out an in-flight `configure` costs
 //! nothing. The WndProc hook in `crate::platform` must therefore stay
@@ -29,8 +29,10 @@ mod layer;
 
 use std::ffi::c_int;
 
-use jfn_gpu_paint::{Frame, FrameSize, Pixels};
-use jfn_platform_abi::{PaintFrame, Scale, SurfaceHandle};
+use jfn_gpu_paint::{FrameSize, Pixels, WindowTarget};
+use jfn_platform_abi::{
+    Ack, Content, PaintFrame, Presented, SurfaceHandle, SurfaceSize, Visibility, VisibilityCommit,
+};
 use parking_lot::Mutex;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::DirectComposition::IDCompositionVisual;
@@ -75,8 +77,8 @@ impl Entry {
         }
         Ok(Entry {
             id,
-            content: Layer::new(content, true),
-            popup: Layer::new(popup, false),
+            content: Layer::new(content),
+            popup: Layer::new(popup),
         })
     }
 
@@ -120,6 +122,12 @@ impl Registry {
     fn commit(&self) {
         if let Some(devices) = self.devices.as_ref() {
             devices.commit();
+        }
+    }
+
+    fn commit_and_wait(&self) {
+        if let Some(devices) = self.devices.as_ref() {
+            devices.commit_and_wait();
         }
     }
 }
@@ -211,10 +219,11 @@ pub(crate) fn free(h: SurfaceHandle) {
     }
 }
 
-/// Reorder the root's children bottom-to-top. Live surfaces `ordered` does
-/// not name keep their relative order above those it does, so every live
-/// surface stays parented.
-pub(crate) fn restack(ordered: &[SurfaceHandle]) {
+/// Apply the whole z-order to the root's children, bottom-to-top. Live
+/// surfaces `ordered` does not name keep their relative order above those it
+/// does, so every live surface stays parented. Video needs no placing: the
+/// composition target is mpv's own HWND, so every visual is above it.
+pub(crate) fn apply_stack(ordered: &[SurfaceHandle]) {
     let mut st = STATE.lock();
     let Registry {
         devices, surfaces, ..
@@ -243,7 +252,9 @@ pub(crate) fn restack(ordered: &[SurfaceHandle]) {
             };
             match placed {
                 Ok(()) => prev = Some(visual),
-                Err(e) => tracing::error!(target: "platform", "restack AddVisual failed: {e:?}"),
+                Err(e) => {
+                    tracing::error!(target: "platform", "apply_stack AddVisual failed: {e:?}");
+                }
             }
         }
     }
@@ -252,88 +263,118 @@ pub(crate) fn restack(ordered: &[SurfaceHandle]) {
     st.commit();
 }
 
-/// Show or hide a surface's content visual. Hiding detaches its content, so
-/// showing it again cannot flash the frame it was hidden with.
-pub(crate) fn set_visible(h: SurfaceHandle, visible: bool) {
+/// Set a surface's content visual to `visibility`, publish it, and wait for
+/// the composition engine to process the commit. Nothing here moves the visual
+/// or touches its content binding.
+pub(crate) fn set_visibility(h: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
     let mut st = STATE.lock();
-    let changed = st
-        .find_mut(h)
-        .is_some_and(|entry| entry.content.set_visible(visible));
-    if changed {
-        st.commit();
+    if let Some(entry) = st.find_mut(h) {
+        entry.content.set_visible(visibility.is_shown());
     }
+    st.commit_and_wait();
+    VisibilityCommit::issued(visibility, Ack::immediate())
 }
 
-/// Present one frame to `part`. False when the surface is gone, the part is
-/// hidden, or the swapchain refused the frame.
-pub(crate) fn present(h: SurfaceHandle, part: Part, frame: PaintFrame<'_>) -> bool {
-    let mut st = STATE.lock();
-    if st.devices.is_none() {
-        return false;
-    }
-    let Some(entry) = st.find_mut(h) else {
-        return false;
-    };
-    let layer = entry.layer_mut(part);
-    let outcome = match frame {
-        PaintFrame::Accelerated(tex) => {
-            if tex.handle().is_null() {
-                return false;
-            }
-            layer.present(Frame::Shared(&tex), tex.coded())
-        }
-        PaintFrame::Software {
-            size,
-            pixels,
-            dirty,
-        } => {
-            if pixels.is_empty() || size.w <= 0 || size.h <= 0 {
-                return false;
-            }
-            let size = FrameSize {
+/// The extent a frame's content asks the swapchain for, or `None` when the
+/// content carries nothing presentable.
+fn frame_extent(content: &Content<'_>) -> Option<FrameSize> {
+    match content {
+        Content::Accelerated(tex) => (!tex.handle().is_null()).then(|| tex.coded()),
+        Content::Software { size, pixels, .. } => (!pixels.is_empty() && size.w > 0 && size.h > 0)
+            .then_some(FrameSize {
                 w: size.w,
                 h: size.h,
-            };
-            layer.present(
-                Frame::Copied(Pixels {
-                    size,
-                    stride: size.w as u32 * 4,
-                    bgra: pixels,
-                    dirty,
-                }),
-                size,
-            )
-        }
-    };
-    if outcome.needs_commit {
-        st.commit();
+            }),
     }
-    outcome.presented
 }
 
-/// Place the popup visual at `x`, `y` — logical pixels inside the owning
-/// surface — and show it.
-pub(crate) fn popup_show(h: SurfaceHandle, x: c_int, y: c_int) {
-    let scale = crate::window::client_scale()
-        .unwrap_or(Scale(1.0))
-        .or_one()
-        .0;
+/// Present one frame to `part`. The frame comes back undischarged when the
+/// surface is gone, the content carries no picture, or the layer has no
+/// swapchain to take it.
+pub(crate) fn present<'a>(
+    h: SurfaceHandle,
+    part: Part,
+    frame: PaintFrame<'a>,
+) -> Result<Presented, PaintFrame<'a>> {
+    let mut st = STATE.lock();
+    if st.devices.is_none() {
+        return Err(frame);
+    }
+    let Some(size) = frame_extent(frame.content()) else {
+        return Err(frame);
+    };
+    let (presented, needs_commit) = {
+        let Some(entry) = st.find_mut(h) else {
+            return Err(frame);
+        };
+        let layer = entry.layer_mut(part);
+        if !layer.ready(size) {
+            return Err(frame);
+        }
+        let presented = match frame.content() {
+            Content::Accelerated(tex) => layer.present_shared(tex),
+            Content::Software { pixels, dirty, .. } => layer.present_pixels(Pixels {
+                size,
+                stride: size.w as u32 * 4,
+                bgra: pixels,
+                dirty,
+            }),
+        };
+        (presented, layer.take_needs_commit())
+    };
+    if needs_commit {
+        st.commit();
+    }
+    if !presented {
+        // The surface is fine and the frame never entered a commit stream, so
+        // its producer owes the successor.
+        return Err(frame);
+    }
+    Ok(frame.present(|_content| Presented::issued()))
+}
+
+/// Offsets the content visual by the reserved top inset and sizes it to match.
+pub(crate) fn resize(h: SurfaceHandle, size: SurfaceSize) {
     let mut st = STATE.lock();
     let Some(entry) = st.find_mut(h) else {
         return;
     };
-    entry.popup.set_offset(x as f32 * scale, y as f32 * scale);
-    entry.popup.set_visible(true);
+    entry.content.set_offset(0.0, size.physical_top as f32);
     st.commit();
 }
 
-/// Hide the popup visual and detach its content.
+/// The content `IDCompositionVisual` for `h`.
+///
+/// The first call marks the surface external: its [`Layer`] builds no painter
+/// and drops every present.
+pub(crate) fn window_target(h: SurfaceHandle) -> Option<WindowTarget> {
+    let mut st = STATE.lock();
+    st.find_mut(h)?.content.window_target()
+}
+
+/// Place the popup visual at `x`, `y` — logical pixels inside the owning
+/// surface. The popup shows itself with its first frame.
+pub(crate) fn popup_show(h: SurfaceHandle, x: c_int, y: c_int) {
+    let scale = crate::platform::win_get_scale();
+    let (Some(px), Some(py)) = (scale.to_physical(x), scale.to_physical(y)) else {
+        tracing::error!(target: "platform", "popup offset {x},{y} is unrepresentable at scale {scale}");
+        return;
+    };
+    let mut st = STATE.lock();
+    let Some(entry) = st.find_mut(h) else {
+        return;
+    };
+    entry.popup.set_offset(px as f32, py as f32);
+    st.commit();
+}
+
+/// Detach the popup visual's content, so reopening it cannot flash the frame
+/// it was closed with.
 pub(crate) fn popup_hide(h: SurfaceHandle) {
     let mut st = STATE.lock();
-    let changed = st
-        .find_mut(h)
-        .is_some_and(|entry| entry.popup.set_visible(false));
-    if changed {
-        st.commit();
-    }
+    let Some(entry) = st.find_mut(h) else {
+        return;
+    };
+    entry.popup.detach();
+    st.commit();
 }

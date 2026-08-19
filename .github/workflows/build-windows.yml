@@ -87,6 +87,33 @@ jobs:
           set "PATH=%PATH%;%MSYS_BIN%"
           cargo xtask package --external-mpv "%CD%\third_party\mpv-install" --prefix build/install --dist dist
 
+      - name: Clippy
+        if: matrix.arch == 'x64'
+        shell: cmd
+        env:
+          LIBCLANG_PATH: C:\msys64\${{ matrix.msystem }}\bin
+          MSYS_BIN: C:\msys64\${{ matrix.msystem }}\bin
+          BINDGEN_EXTRA_CLANG_ARGS: --target=${{ matrix.triple }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSINSTALL=%%i"
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" %MATRIX_ARCH% || exit /b 1
+          set "PATH=%PATH%;%MSYS_BIN%"
+          cargo xtask clippy --external-mpv "%CD%\third_party\mpv-install"
+
+      - name: Test
+        shell: cmd
+        env:
+          LIBCLANG_PATH: C:\msys64\${{ matrix.msystem }}\bin
+          MSYS_BIN: C:\msys64\${{ matrix.msystem }}\bin
+          BINDGEN_EXTRA_CLANG_ARGS: --target=${{ matrix.triple }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSINSTALL=%%i"
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" %MATRIX_ARCH% || exit /b 1
+          set "PATH=%PATH%;%MSYS_BIN%"
+          cargo xtask test --external-mpv "%CD%\third_party\mpv-install"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:

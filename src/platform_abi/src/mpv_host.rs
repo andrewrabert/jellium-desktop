@@ -46,11 +46,9 @@ pub trait MpvHost: Send + Sync {
         while pump(VO_WAIT_TICK) {}
     }
 
-    /// Logical content size of the host window in points, when the OS —
-    /// not mpv's osd-dimensions — is the authority for it.
-    fn logical_content_size(&self) -> Option<(i32, i32)> {
-        None
-    }
+    /// The host window's logical content size, or `None` when mpv's
+    /// `osd-dimensions`, not the OS, is the authority for it here.
+    fn logical_content_size(&self) -> Option<crate::geometry::LogicalSize>;
 
     /// Sever host↔mpv links that could deadlock teardown. Called
     /// immediately before CEF teardown.
@@ -61,4 +59,9 @@ pub trait MpvHost: Send + Sync {
 /// platform (macOS / Windows: mpv owns its window outright).
 pub struct DefaultMpvHost;
 
-impl MpvHost for DefaultMpvHost {}
+impl MpvHost for DefaultMpvHost {
+    // mpv's own window: `osd-dimensions` is the authority for its size
+    fn logical_content_size(&self) -> Option<crate::geometry::LogicalSize> {
+        None
+    }
+}

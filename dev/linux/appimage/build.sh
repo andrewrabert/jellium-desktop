@@ -30,6 +30,7 @@ mkdir -p "${PROJECT_ROOT}/build/appimage/build" "${PROJECT_ROOT}/dist"
     -v "${PROJECT_ROOT}/build/appimage/build:/build" \
     -v "${PROJECT_ROOT}/dist:/host-output" \
     -e VERSION="$VERSION" \
+    -e JFN_CLIPPY="${JFN_CLIPPY:-0}" \
     "$IMG" /src/dev/linux/appimage/container-build.sh
 
 ARCH="$(uname -m)"

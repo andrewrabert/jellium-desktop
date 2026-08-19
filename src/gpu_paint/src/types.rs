@@ -1,7 +1,8 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::time::Instant;
 
-use crate::{FrameSize, SharedTexture};
+use crate::FrameSize;
 
 /// Where a [`crate::Surface`] attaches its swapchain. One variant per window
 /// system; new platforms are added here rather than by reshaping the API.
@@ -18,10 +19,11 @@ pub enum WindowTarget {
         screen: i32,
         visual: u32,
     },
-    /// Wayland — `display` is `wl_display*`, `surface` is `wl_surface*`.
-    /// Once a wl_surface is handed to Vulkan WSI, no other client code
-    /// may call `wl_surface_attach`/`commit` on it; presents go through
-    /// the swapchain only.
+    /// Wayland — `display` is `wl_display*`, `surface` is `wl_surface*`. The
+    /// swapchain owns every buffer this surface carries: no other client code
+    /// attaches one. The surface's owner still commits it with no buffer to
+    /// empty it, and blocks on that commit's acknowledgement before returning,
+    /// so such a commit never interleaves with a present.
     Wayland {
         display: NonNull<c_void>,
         surface: NonNull<c_void>,
@@ -38,8 +40,8 @@ pub enum WindowTarget {
 }
 
 /// Which kind of frame a surface carries. Latched from the first frame and
-/// never public: callers say what a frame *is* by picking a [`Frame`] variant,
-/// which is the same information.
+/// never public: callers say what a frame *is* by picking the present method
+/// they call, which is the same information.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) enum PaintMode {
     /// Frames arrive as a platform shared-buffer handle.
@@ -48,13 +50,45 @@ pub(crate) enum PaintMode {
     Copied,
 }
 
-/// Whether a frame reached the screen. A `Skipped` is a deliberate no-op — the
-/// surface was hidden, or the swapchain was transiently unavailable — not a
-/// failure, and never an `Err`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Presented {
-    Yes,
-    Skipped,
+/// Proof that a frame entered its surface's commit stream, minted at the site
+/// that issued the commit.
+#[derive(Clone, Copy, Debug)]
+pub struct Presented(());
+
+impl Presented {
+    pub fn issued() -> Presented {
+        Presented(())
+    }
+}
+
+/// A swapchain that had no texture this cycle: occluded, timed out, or stale
+/// where the calling thread may not configure it.
+///
+/// It carries the instant the swapchain may be asked again, so the caller
+/// schedules the retry that succeeds this attempt instead of spinning on it.
+#[must_use = "the retry this names must be scheduled"]
+#[derive(Debug)]
+pub struct Deferred(());
+
+impl Deferred {
+    pub fn new() -> Deferred {
+        Deferred(())
+    }
+
+    /// One refresh interval from now, or `None` where the display reports no
+    /// refresh — then the caller asks its frame source for the wake instead.
+    ///
+    /// Sooner than one interval is a spin on a compositor that has not moved,
+    /// later is a visibly late frame.
+    pub fn retry_at(self) -> Option<Instant> {
+        crate::refresh::refresh_interval().map(|interval| Instant::now() + interval)
+    }
+}
+
+impl Default for Deferred {
+    fn default() -> Deferred {
+        Deferred::new()
+    }
 }
 
 /// A borrowed CPU frame plus the regions that changed since the last one.
@@ -69,28 +103,13 @@ pub struct DamageRect {
 }
 
 /// `bgra` must cover every row: at least `(size.h - 1) * stride + size.w * 4`
-/// bytes, with `stride >= size.w * 4`. [`crate::Surface::present`] rejects a
-/// frame that does not (as an error, not a panic), so a producer bug cannot
+/// bytes, with `stride >= size.w * 4`. [`crate::Surface::present_pixels`]
+/// rejects a frame that does not (as an error, not a panic), so a producer
+/// bug cannot
 /// read out of bounds.
 pub struct Pixels<'a> {
     pub size: FrameSize,
     pub stride: u32,
     pub bgra: &'a [u8],
     pub dirty: &'a [DamageRect],
-}
-
-/// One frame handed to [`crate::Surface::present`]. The variant must match the
-/// [`PaintMode`] the surface was created with.
-pub enum Frame<'a> {
-    Shared(&'a SharedTexture),
-    Copied(Pixels<'a>),
-}
-
-impl Frame<'_> {
-    pub(crate) fn mode(&self) -> PaintMode {
-        match self {
-            Frame::Shared(_) => PaintMode::Shared,
-            Frame::Copied(_) => PaintMode::Copied,
-        }
-    }
 }

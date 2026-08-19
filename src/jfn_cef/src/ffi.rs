@@ -100,7 +100,21 @@ pub fn jfn_cef_set_platform_switches(backend: DisplayBackend) {
             c.pending_switches
                 .push(state::PendingSwitch::with_value("password-store", "basic"));
         }
-        DisplayBackend::Windows => {}
+        DisplayBackend::Windows => {
+            c.pending_switches
+                .push(state::PendingSwitch::with_value("use-angle", "d3d11"));
+            // The LUID is a Windows-only concept; the arm itself compiles
+            // everywhere because `DisplayBackend` does.
+            #[cfg(windows)]
+            if let Some(luid) =
+                jfn_gpu_paint::surfaces().and_then(jfn_gpu_paint::Surfaces::adapter_luid)
+            {
+                c.pending_switches.push(state::PendingSwitch::with_value(
+                    "use-adapter-luid",
+                    &format!("{},{}", luid >> 32, luid as u32),
+                ));
+            }
+        }
     });
 }
 
@@ -174,12 +188,16 @@ pub fn jfn_cef_initialize() -> bool {
             args::Args::new().as_main_args().clone()
         }
     };
-    initialize(
+    let ok = initialize(
         Some(&main_args),
         Some(&settings),
         Some(&mut app),
         std::ptr::null_mut(),
-    ) == 1
+    ) == 1;
+    if ok {
+        crate::ready::post_cef_ready();
+    }
+    ok
 }
 
 // Construct Chromium's browser-process `MainArgs` as `[argv[0]]`. The

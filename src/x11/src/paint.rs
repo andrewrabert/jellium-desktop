@@ -24,63 +24,53 @@ static RESOLVED: OnceLock<PaintTier> = OnceLock::new();
 
 /// The app's compositor tier, resolved down the dmabuf → gpu → shm chain.
 pub(crate) struct PaintTier {
-    /// The GPU device, shared across surfaces. `None` on the SHM tier, where
-    /// presents go through MIT-SHM instead.
-    pub gpu: Option<Surfaces>,
     /// Whether CEF should produce shared textures: both halves of the question
     /// answered yes.
     pub use_dmabuf: bool,
 }
 
 impl PaintTier {
-    /// The SHM tier: no GPU device, software presents only.
-    const SHM: Self = Self {
-        gpu: None,
-        use_dmabuf: false,
-    };
+    /// The SHM tier: software presents only.
+    const SHM: Self = Self { use_dmabuf: false };
 
     /// Resolve the paint preference down the dmabuf → gpu → shm chain, where
     /// `--platform-paint` only picks the entry tier and an unusable tier
-    /// degrades to the next. Opens the GPU device on the gpu/dmabuf path — see
-    /// the module docs for why the timing matters.
+    /// degrades to the next. Opens the GPU device on every tier, SHM included:
+    /// this is the last point before the mpv proxy repoints `DISPLAY` — see the
+    /// module docs — and the shell overlay needs a device whatever CEF's frames
+    /// travel over.
     fn resolve() -> Self {
         use X11PaintOverride as Req;
         let requested = crate::paint_override::paint_override();
         let want_gpu = !matches!(requested, Some(Req::Shm));
         let want_dmabuf = matches!(requested, None | Some(Req::Dmabuf));
 
-        let (tier, resolved) = if !want_gpu {
-            tracing::info!("paint: using SHM");
-            (Self::SHM, Req::Shm)
-        } else {
-            let producer = unsafe {
-                jfn_linux_util::dmabuf_probe::cef_render_node(c"x11".as_ptr(), std::ptr::null_mut())
-            };
-            match Surfaces::init(None, producer) {
-                None => {
-                    tracing::info!("paint: no usable GPU device; using SHM");
-                    (Self::SHM, Req::Shm)
+        let producer = unsafe {
+            jfn_linux_util::dmabuf_probe::cef_render_node(c"x11".as_ptr(), std::ptr::null_mut())
+        };
+        let gpu = Surfaces::init(producer);
+
+        let (tier, resolved) = match gpu {
+            _ if !want_gpu => {
+                tracing::info!("paint: using SHM");
+                (Self::SHM, Req::Shm)
+            }
+            None => {
+                tracing::info!("paint: no usable GPU device; using SHM");
+                (Self::SHM, Req::Shm)
+            }
+            Some(gpu) => {
+                // Two independent halves. `can_import_shared` proves only
+                // that our device can consume; CEF's producer must also
+                // work, and it is broken on NVIDIA proprietary X11.
+                let use_dmabuf = want_dmabuf && gpu.can_import_shared() && cef_dmabuf_producer_ok();
+                if use_dmabuf {
+                    tracing::info!("paint: dmabuf import");
+                } else {
+                    tracing::info!("paint: GPU pixel-upload");
                 }
-                Some(gpu) => {
-                    // Two independent halves. `can_import_shared` proves only
-                    // that our device can consume; CEF's producer must also
-                    // work, and it is broken on NVIDIA proprietary X11.
-                    let use_dmabuf =
-                        want_dmabuf && gpu.can_import_shared() && cef_dmabuf_producer_ok();
-                    if use_dmabuf {
-                        tracing::info!("paint: dmabuf import");
-                    } else {
-                        tracing::info!("paint: GPU pixel-upload");
-                    }
-                    let entry = if use_dmabuf { Req::Dmabuf } else { Req::Gpu };
-                    (
-                        Self {
-                            gpu: Some(gpu),
-                            use_dmabuf,
-                        },
-                        entry,
-                    )
-                }
+                let entry = if use_dmabuf { Req::Dmabuf } else { Req::Gpu };
+                (Self { use_dmabuf }, entry)
             }
         };
 
@@ -110,9 +100,9 @@ pub(crate) fn resolved() -> Option<&'static PaintTier> {
     RESOLVED.get()
 }
 
-/// The GPU device, if the resolved tier has one.
+/// The process's GPU device, if one opened.
 pub(crate) fn gpu() -> Option<&'static Surfaces> {
-    RESOLVED.get()?.gpu.as_ref()
+    jfn_gpu_paint::surfaces()
 }
 
 /// Whether the paint tier has been resolved. Used as an ordering tripwire.

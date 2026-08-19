@@ -36,6 +36,8 @@ jobs:
           platform: ${{ github.workflow }}-${{ matrix.arch }}
 
       - name: Build AppImage
+        env:
+          JFN_CLIPPY: ${{ matrix.arch == 'x86_64' && '1' || '0' }}
         run: ./dev/linux/appimage/build.sh
 
       - name: Upload artifact

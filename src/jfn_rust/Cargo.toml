@@ -26,11 +26,13 @@ jfn-platform-abi = { path = "../platform_abi" }
 jfn-cef = { path = "../jfn_cef", default-features = false }
 jfn-color = { path = "../color" }
 jfn-config = { path = "../config" }
+jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-jellyfin = { path = "../jellyfin" }
 jfn-logging = { path = "../logging" }
 jfn-mpv = { path = "../mpv" }
 jfn-paths = { path = "../paths" }
 jfn-playback = { path = "../playback" }
+jfn-shell = { path = "../shell" }
 jfn-instance-ipc = { path = "../instance_ipc" }
 jfn-wake-event = { path = "../wake_event" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -6,6 +6,7 @@ mod build;
 #[cfg(target_os = "macos")]
 mod bundle_macos;
 mod cef;
+mod check;
 mod fs;
 mod install;
 mod mpv;
@@ -35,6 +36,10 @@ enum Cmd {
     Install(InstallArgs),
     Package(PackageArgs),
     FetchCef,
+    /// Clippy over the workspace with the project's denies.
+    Clippy(BuildArgs),
+    /// The workspace test suite.
+    Test(BuildArgs),
     /// Print the full version string (`<semver>+<short-sha>[-dirty]`).
     Version,
 }
@@ -91,6 +96,8 @@ fn main() -> Result<()> {
         Cmd::FetchCef => {
             cef::ensure(&paths::cef_cache_dir()).map(|dir| println!("CEF ready: {}", dir.display()))
         }
+        Cmd::Clippy(a) => check::clippy(&a),
+        Cmd::Test(a) => check::test(&a),
         Cmd::Version => {
             println!("{}", version::read()?.full);
             Ok(())

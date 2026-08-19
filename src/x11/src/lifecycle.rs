@@ -164,6 +164,15 @@ fn intern_atoms(conn: &RustConnection) -> Atoms {
         cardinal: u32::from(AtomEnum::CARDINAL),
         motif_wm_hints: intern_atom(conn, b"_MOTIF_WM_HINTS"),
         net_active_window: intern_atom(conn, b"_NET_ACTIVE_WINDOW"),
+        clipboard: intern_atom(conn, b"CLIPBOARD"),
+        primary: u32::from(AtomEnum::PRIMARY),
+        targets: intern_atom(conn, b"TARGETS"),
+        timestamp: intern_atom(conn, b"TIMESTAMP"),
+        utf8_string: intern_atom(conn, b"UTF8_STRING"),
+        text: intern_atom(conn, b"TEXT"),
+        text_plain_utf8: intern_atom(conn, b"text/plain;charset=utf-8"),
+        incr: intern_atom(conn, b"INCR"),
+        jfn_selection: intern_atom(conn, b"JFN_SELECTION"),
     }
 }
 
@@ -175,7 +184,13 @@ pub(crate) fn ensure_host_window() -> bool {
     if host().is_some() {
         return true;
     }
-    let boot = *BOOT_GEOMETRY.lock();
+    let Some(boot) = *BOOT_GEOMETRY.lock() else {
+        tracing::error!(
+            target: "Main",
+            "x11: no boot geometry; WindowOwner::apply_boot_geometry must seed it before the host window is created"
+        );
+        return false;
+    };
 
     // The top-level is created on the connection the geometry thread owns and
     // polls: the WM delivers `WM_DELETE` (empty-mask SendEvent) only to the
@@ -196,18 +211,11 @@ pub(crate) fn ensure_host_window() -> bool {
     let black_pixel = screen.black_pixel;
     let atoms = intern_atoms(&geo_conn);
     let net_wm_state = atoms.net_wm_state;
-    let scale = crate::scale::query_display_scale().unwrap_or(1.0);
+    let scale = crate::scale::query_display_scale();
 
-    let (boot_w, boot_h) = boot.map_or_else(
-        || {
-            let s = f64::from(scale);
-            ((1600.0 * s) as i32, (900.0 * s) as i32)
-        },
-        |b| (b.physical().w.max(1), b.physical().h.max(1)),
-    );
-    let position = boot.and_then(|b| b.position());
-    let maximized = boot.is_some_and(|b| b.maximized());
-    let (boot_x, boot_y) = position.map_or((0, 0), |p| (p.x, p.y));
+    let (boot_w, boot_h) = (boot.physical().w.max(1), boot.physical().h.max(1));
+    let (boot_x, boot_y) = boot.position().map_or((0, 0), |p| (p.x, p.y));
+    let maximized = boot.maximized();
 
     let Ok(toplevel) = geo_conn.generate_id() else {
         eprintln!("[x11] failed to allocate top-level window id");
@@ -236,7 +244,7 @@ pub(crate) fn ensure_host_window() -> bool {
         return false;
     }
     let sync_counter = set_toplevel_identity(&geo_conn, toplevel, &atoms);
-    if position.is_some() {
+    if boot.position().is_some() {
         // User-specified hints make the WM honor the restored position
         // instead of applying its own placement policy.
         let mut hints = WmSizeHints::new();
@@ -302,7 +310,7 @@ pub(crate) fn ensure_host_window() -> bool {
         eprintln!("[x11] host services already initialized");
         return false;
     }
-    crate::x11_state::publish_parent(ParentSnapshot {
+    let boot_snapshot = ParentSnapshot {
         origin_x: parent_x,
         origin_y: parent_y,
         width: pw,
@@ -310,7 +318,8 @@ pub(crate) fn ensure_host_window() -> bool {
         fullscreen: false,
         maximized: false,
         scale,
-    });
+    };
+    crate::x11_state::publish_parent(boot_snapshot);
 
     let xfixes_opcode = geo_conn
         .query_extension(x11rb::protocol::xfixes::X11_EXTENSION_NAME.as_bytes())
@@ -326,7 +335,7 @@ pub(crate) fn ensure_host_window() -> bool {
         ph.max(1) as u16,
     );
 
-    crate::geometry::start(geo_conn, toplevel, video_host, root);
+    crate::geometry::start(geo_conn, toplevel, video_host, root, boot_snapshot);
     eprintln!("[x11] host window created (toplevel=0x{toplevel:x} video_host=0x{video_host:x})");
     true
 }
@@ -459,6 +468,9 @@ pub fn init() -> bool {
 }
 
 pub fn cleanup() {
+    if let Some(selections) = crate::selection::selections() {
+        selections.cleanup();
+    }
     // Stop every surviving content actor (frees content GCs + SHM + GPU
     // resources on the content connection). Structure teardown (unmap/destroy)
     // rides on the geometry thread's shutdown + the top-level connection close.
@@ -489,23 +501,17 @@ pub fn cleanup() {
     crate::mpv_proxy::stop();
 }
 
-/// Clamp saved window geometry to the primary screen extent. Runs before
-/// `init()` so it opens its own short-lived connection (to the real display,
-/// in case the mpv proxy has `DISPLAY` repointed).
-pub fn clamp_window_geometry(w: &mut i32, h: &mut i32) {
+/// The primary screen's pixel extent, read on a short-lived connection to the
+/// real display. `None` when that connection could not be opened.
+///
+/// Runs before `init()`, so it opens its own connection — the mpv proxy may
+/// have `DISPLAY` repointed by then.
+pub fn screen_bounds() -> Option<jfn_platform_abi::geometry::Bounds> {
     let display = crate::mpv_proxy::real_display();
-    let Ok((conn, screen_num)) = RustConnection::connect(display.as_deref()) else {
-        return;
-    };
-    let Some(root) = conn.setup().roots.get(screen_num) else {
-        return;
-    };
-    let sw = root.width_in_pixels as i32;
-    let sh = root.height_in_pixels as i32;
-    if sw > 0 && *w > sw {
-        *w = sw;
-    }
-    if sh > 0 && *h > sh {
-        *h = sh;
-    }
+    let (conn, screen_num) = RustConnection::connect(display.as_deref()).ok()?;
+    let root = conn.setup().roots.get(screen_num)?;
+    Some(jfn_platform_abi::geometry::Bounds {
+        w: i32::from(root.width_in_pixels),
+        h: i32::from(root.height_in_pixels),
+    })
 }

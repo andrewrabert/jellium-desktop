@@ -1,25 +1,17 @@
-// JfnCefLayer is an opaque internal handle; callers within this crate
-// pass it back unchanged. Marking each consumer unsafe would cascade
-// without adding type safety, so the lint is suppressed module-wide.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-
-//! WebBrowser business logic.
+//! jellyfin-web's business logic.
 //!
-//! Routes the ~20 jellyfin-web IPC names to mpv, settings, theme color,
-//! and the playback coordinator. The web layer's exec_js sink for the
-//! playback coordinator is exposed as [`jfn_web_exec_js`] for boot wiring.
+//! Routes the ~20 jellyfin-web IPC names to mpv, settings, theme color, and the
+//! playback coordinator. The state it keeps across those names is owned by the
+//! web overlay whose handlers it installs.
 
 use cef::{ImplListValue, ListValue};
 use parking_lot::Mutex;
 use serde_json::Value;
-use std::ffi::c_char;
-use std::os::raw::c_void;
 use std::sync::Arc;
 
-use crate::browsers::{jfn_browsers_active, jfn_browsers_set_active};
-use crate::business_common::{apply_setting_value, js_cstr_or_warn, reject_double_init};
-use crate::client::{Inner, JfnCefLayer, jfn_cef_layer_inner, jfn_cef_layer_set_name};
+use crate::business_common::{apply_setting_value, js_cstr_or_warn};
 use crate::ipc::{BrowserMessage, list_int, list_opt_string, list_string};
+use crate::web_overlay::WebOverlay;
 use jfn_color::jfn_cef_parse_color;
 use jfn_color::theme::{jfn_theme_color_on_color, jfn_theme_color_set_video_mode};
 use jfn_mpv::api::{
@@ -51,78 +43,24 @@ struct MediaMetadata {
     media_type: u8,
 }
 
-struct WebState {
-    layer: Arc<Inner>,
-    was_fullscreen_before_osd: bool,
-}
+/// Whether the window was already fullscreen when jellyfin-web raised the video
+/// OSD, so dismissing the OSD only leaves fullscreen if the OSD put us there.
+static WAS_FULLSCREEN_BEFORE_OSD: Mutex<bool> = Mutex::new(false);
 
-static INSTANCE: Mutex<Option<WebState>> = Mutex::new(None);
+/// Install jellyfin-web's handlers on `overlay`'s browser.
+pub(crate) fn install(overlay: &WebOverlay) {
+    let client = overlay.client();
 
-pub fn jfn_web_init(layer: *mut JfnCefLayer) {
-    if layer.is_null() {
-        return;
-    }
-    // Reject double-init: prior INSTANCE would be silently overwritten and
-    // its `was_fullscreen_before_osd` state lost.
-    if reject_double_init(&INSTANCE.lock(), "jfn_web_init") {
-        return;
-    }
-
-    let name = c"web";
-    unsafe { jfn_cef_layer_set_name(layer, name.as_ptr()) };
-
-    let inner = unsafe { jfn_cef_layer_inner(layer) };
-    install_handlers(layer, Arc::clone(&inner));
-
-    *INSTANCE.lock() = Some(WebState {
-        layer: inner,
-        was_fullscreen_before_osd: false,
-    });
-}
-
-/// Execute JS in the main web layer. Called by the playback browser sink.
-///
-/// # Safety
-/// `js_utf8` must be a NUL-terminated UTF-8 pointer, or null.
-pub unsafe fn jfn_web_exec_js(js_utf8: *const c_char) {
-    if js_utf8.is_null() {
-        return;
-    }
-    // Clone the Arc<Inner> out under lock then release the lock before the
-    // CEF call. The Arc keeps Inner alive across the call even if the layer
-    // is closed mid-way; no TOCTOU window between lock-drop and use.
-    let inner = match INSTANCE.lock().as_ref() {
-        Some(s) => Arc::clone(&s.layer),
-        None => return,
-    };
-    let js = unsafe { std::ffi::CStr::from_ptr(js_utf8) }.to_string_lossy();
-    inner.exec_js(&js);
-}
-
-fn install_handlers(layer: *mut JfnCefLayer, inner_for_created: Arc<Inner>) {
-    let l = unsafe { &*layer };
-
-    l.set_created_callback_rust(Some(Box::new(move |_b: *mut c_void| {
-        // Main browser takes input only if no other layer has already
-        // claimed it (e.g. the server-selection overlay).
-        if jfn_browsers_active().is_null() {
-            let p = inner_for_created.layer_ptr();
-            if !p.is_null() {
-                jfn_browsers_set_active(p);
-            }
-        }
+    client.set_created_callback(Some(Arc::new(|| {
+        // The router owns this browser's CEF focus: it is live here, and a
+        // focus published before it existed reached nothing.
+        jfn_input::web_became_live();
     })));
 
-    l.set_message_handler_rust(Some(Box::new(handle_message)));
+    client.set_message_handler(Some(Box::new(handle_message)));
 
-    // BeforeClose: clear INSTANCE so any post-close jfn_web_exec_js becomes
-    // a no-op instead of touching a torn-down layer.
-    l.set_before_close_callback_rust(Some(Box::new(|| {
-        *INSTANCE.lock() = None;
-    })));
-
-    l.set_context_menu_builder_rust(Some(crate::app_menu::build_closure()));
-    l.set_context_menu_dispatcher_rust(Some(crate::app_menu::dispatch_closure()));
+    client.set_context_menu_builder(Some(crate::app_menu::build_closure()));
+    client.set_context_menu_dispatcher(Some(crate::app_menu::dispatch_closure()));
 }
 
 fn parse_metadata_json(json: &str) -> MediaMetadata {
@@ -240,6 +178,7 @@ fn handle_player_load(args: &ListValue) {
 
     if !metadata_json.is_empty() {
         jfn_theme_color_set_video_mode(meta.media_type == MT_VIDEO);
+        jfn_playback::chrome::set_video_active(meta.media_type == MT_VIDEO);
         post_metadata(&meta);
     }
 
@@ -276,6 +215,11 @@ fn with_args(args: Option<&ListValue>, f: impl FnOnce(&ListValue)) -> bool {
 
 fn handle_message(message: BrowserMessage) -> bool {
     let args = message.args();
+
+    if message.name() == "openClientSettings" {
+        jfn_platform_abi::request_client_settings();
+        return true;
+    }
 
     // mpv handle not yet initialised — return false so CEF treats the message as unhandled.
     if jfn_mpv_handle_get().is_null() {
@@ -352,11 +296,10 @@ fn handle_message(message: BrowserMessage) -> bool {
         }),
         "playerOsdActive" => with_args(args, |a| {
             let active = a.bool(0) != 0;
-            let mut g = INSTANCE.lock();
-            let Some(st) = g.as_mut() else { return };
+            let mut was_fullscreen = WAS_FULLSCREEN_BEFORE_OSD.lock();
             if active {
-                st.was_fullscreen_before_osd = jfn_playback_fullscreen();
-            } else if !st.was_fullscreen_before_osd {
+                *was_fullscreen = jfn_playback_fullscreen();
+            } else if !*was_fullscreen {
                 jfn_platform_abi::get().set_fullscreen(false);
             }
         }),
@@ -386,9 +329,13 @@ fn handle_message(message: BrowserMessage) -> bool {
                 jfn_theme_color_on_color(rgb);
             }
         }),
+        "setOsdVisible" => with_args(args, |a| {
+            jfn_playback::chrome::set_osd_visible(a.bool(0) != 0);
+        }),
         "notifyMetadata" => with_args(args, |a| {
             let meta = parse_metadata_json(&list_string(a, 0));
             jfn_theme_color_set_video_mode(meta.media_type == MT_VIDEO);
+            jfn_playback::chrome::set_video_active(meta.media_type == MT_VIDEO);
             post_metadata(&meta);
         }),
         "notifyArtwork" => with_args(args, |a| {

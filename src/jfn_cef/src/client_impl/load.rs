@@ -25,7 +25,7 @@ wrap_load_handler! {
         fn on_load_error(
             &self,
             _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
+            frame: Option<&mut Frame>,
             error_code: Errorcode,
             error_text: Option<&CefString>,
             failed_url: Option<&CefString>,
@@ -33,7 +33,8 @@ wrap_load_handler! {
             let code: sys::cef_errorcode_t = error_code.into();
             let text = error_text.map(|s| s.to_string()).unwrap_or_default();
             let url = failed_url.map(|s| s.to_string()).unwrap_or_default();
-            self.inner.on_load_error(code as c_int, &text, &url);
+            let is_main = frame.is_some_and(|f| f.is_main() == 1);
+            self.inner.on_load_error(is_main, code as c_int, &text, &url);
         }
     }
 }

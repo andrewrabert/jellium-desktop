@@ -139,7 +139,7 @@ impl Inner {
         }
     }
 
-    pub(super) fn on_deactivated(&self) {
+    pub(crate) fn on_deactivated(&self) {
         let was_visible = {
             let mut p = self.popup.lock();
             let was = p.visible;

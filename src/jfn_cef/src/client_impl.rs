@@ -49,12 +49,12 @@ wrap_client! {
         }
         fn on_process_message_received(
             &self,
-            browser: Option<&mut Browser>,
+            _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             _source_process: ProcessId,
             message: Option<&mut ProcessMessage>,
         ) -> c_int {
-            process_message::on_process_message_received(&self.inner, browser, message)
+            process_message::on_process_message_received(&self.inner, message)
         }
     }
 }

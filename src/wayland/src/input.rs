@@ -44,6 +44,7 @@ use jfn_platform_abi::event_flags::{
 };
 
 use crate::runtime::WlRuntime;
+use jfn_platform_abi::LogicalPoint;
 use jfn_platform_abi::cursor::CursorShape;
 
 const XK_MENU: u32 = 0xff67;
@@ -51,6 +52,14 @@ const XK_F10: u32 = 0xffc7;
 
 fn is_context_menu_key(sym: u32, mods: u32) -> bool {
     sym == XK_MENU || (sym == XK_F10 && mods & EVENTFLAG_SHIFT_DOWN != 0)
+}
+
+/// Whether jellyfin-web owns the keyboard. Its page menu is the only menu a
+/// key press raises through CEF's asynchronous callback, so it is the only one
+/// that needs the grab armed while the press's serial is live; the shell
+/// overlay raises its edit menu from the caret with the surface's own serial.
+fn web_owns_keys() -> bool {
+    jfn_input::shell_state().map(jfn_input::route::route_key) == Some(jfn_input::Target::Web)
 }
 
 fn cef_to_cursor_icon(shape: CursorShape) -> CursorIcon {
@@ -169,8 +178,8 @@ unsafe impl Sync for Callbacks {}
 // crate restricts them to the worker thread by construction.
 unsafe impl Send for State {}
 
-struct State {
-    rt: &'static WlRuntime,
+pub(crate) struct State {
+    pub(crate) rt: &'static WlRuntime,
     cb: Callbacks,
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -213,13 +222,17 @@ struct State {
 
     stop: Arc<AtomicBool>,
     signal: Option<LoopSignal>,
-    loop_handle: Option<LoopHandle<'static, State>>,
+    pub(crate) loop_handle: Option<LoopHandle<'static, State>>,
     /// Bumped by every arm/disarm; a timer whose generation is stale drops
     /// itself instead of firing, so no source is ever removed mid-dispatch.
     repeat_generation: u64,
     repeat_rate: i32,
     repeat_delay: i32,
     repeat_key: Option<KeyEvent>,
+    /// The last key press, so a `Repeated` event carrying no UTF-8 can stand
+    /// for the text the press carried.
+    pressed_key: Option<KeyEvent>,
+    pub(crate) selection: crate::selection::SelectionState,
 }
 
 impl State {
@@ -306,13 +319,41 @@ impl State {
                 if pressed { 1 } else { 0 },
             );
         }
-        if pressed
-            && let Some(f) = self.cb.char_
+        if !pressed {
+            return;
+        }
+        if let Some(composed) = jfn_linux_util::input::compose_feed(event.keysym.raw()) {
+            jfn_input::jfn_input_dispatch_text(&composed, self.modifiers);
+            return;
+        }
+        if jfn_linux_util::input::compose_pending() {
+            return;
+        }
+        if let Some(f) = self.cb.char_
             && let Some(text) = &event.utf8
         {
             for ch in text.chars() {
                 f(ch as u32, self.modifiers, event.raw_code);
             }
+        }
+    }
+
+    /// The [`KeyEvent`] a `Repeated` key event stands for: a version 10
+    /// compositor reports the repeat with no UTF-8, so the pressed key's text
+    /// is substituted when the raw codes match.
+    fn repeated(&self, event: KeyEvent) -> KeyEvent {
+        if event.utf8.is_some() {
+            return event;
+        }
+        let Some(pressed) = self.pressed_key.as_ref() else {
+            return event;
+        };
+        if pressed.raw_code != event.raw_code {
+            return event;
+        }
+        KeyEvent {
+            utf8: pressed.utf8.clone(),
+            ..event
         }
     }
 
@@ -487,9 +528,10 @@ impl State {
                 self.ptr_x = surface_x;
                 self.ptr_y = surface_y;
                 if self.menu_focus {
+                    let position = LogicalPoint::from_view(surface_x, surface_y);
                     self.rt.menu().motion(MenuPoint::Logical {
-                        x: surface_x as f32,
-                        y: surface_y as f32,
+                        x: position.x,
+                        y: position.y,
                     });
                     return;
                 }
@@ -528,9 +570,10 @@ impl State {
                 }
                 if self.rt.menu().is_active() {
                     if self.menu_focus {
+                        let position = LogicalPoint::from_view(surface_x, surface_y);
                         self.rt.menu().motion(MenuPoint::Logical {
-                            x: surface_x as f32,
-                            y: surface_y as f32,
+                            x: position.x,
+                            y: position.y,
                         });
                     }
                     return;
@@ -565,8 +608,8 @@ impl State {
                         }
                         if self.menu_focus {
                             self.rt.menu().press(MenuPoint::Logical {
-                                x: self.ptr_x as f32,
-                                y: self.ptr_y as f32,
+                                x: self.ptr_x as c_int,
+                                y: self.ptr_y as c_int,
                             });
                         } else {
                             // Click on our own window outside the menu: the popup grab
@@ -781,7 +824,7 @@ impl KeyboardHandler for State {
             self.rt.menu().key(event.keysym.raw());
             return;
         }
-        if is_context_menu_key(event.keysym.raw(), self.modifiers) {
+        if is_context_menu_key(event.keysym.raw(), self.modifiers) && web_owns_keys() {
             // popup::active() only flips true once the async
             // configure lands, so disarm now rather than rely on it.
             self.disarm_repeat();
@@ -789,6 +832,7 @@ impl KeyboardHandler for State {
                 .menu()
                 .arm(self.ptr_x as i32, self.ptr_y as i32, serial);
         }
+        self.pressed_key = Some(event.clone());
         self.send_key(&event, true);
         // A version-10 compositor repeats keys itself and delivers them through
         // `repeat_key`; arming the timer as well would double every repeat.
@@ -832,6 +876,7 @@ impl KeyboardHandler for State {
             self.rt.menu().key(event.keysym.raw());
             return;
         }
+        let event = self.repeated(event);
         self.send_key(&event, true);
     }
 
@@ -934,6 +979,15 @@ fn run_input_loop(
     state.signal = Some(event_loop.get_signal());
     state.loop_handle = Some(handle.clone());
 
+    if let Some(source) = state.rt.selections().take_source() {
+        let qh = queue.handle();
+        if let Err(e) = handle.insert_source(source, move |(), (), state: &mut State| {
+            state.serve_selections(&qh);
+        }) {
+            tracing::error!(target: "Main", "input: selection source: {e}");
+        }
+    }
+
     let wake_conn = conn.clone();
     let stop = state.stop.clone();
     if let Err(e) = handle.insert_source(wake, move |(), (), state: &mut State| {
@@ -958,6 +1012,7 @@ fn run_input_loop(
     if let Err(e) = event_loop.run(None, &mut state, |_| {}) {
         tracing::error!(target: "Main", "input: event loop: {e}");
     }
+    state.drain_selection_reads();
 }
 
 fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Option<InputThread> {
@@ -973,7 +1028,7 @@ fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Opt
     let qh = queue.handle();
 
     let seat_state = SeatState::new(&globals, &qh);
-    seat_state.seats().next()?;
+    let seat = seat_state.seats().next()?;
     let output_state = OutputState::new(&globals, &qh);
     let compositor = CompositorState::bind(&globals, &qh)
         .inspect_err(|e| tracing::error!(target: "Main", "input: wl_compositor: {e}"))
@@ -1020,6 +1075,8 @@ fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Opt
         repeat_rate: 0,
         repeat_delay: 0,
         repeat_key: None,
+        pressed_key: None,
+        selection: crate::selection::SelectionState::bind(rt.selections(), &globals, &qh, &seat),
     };
 
     let worker = thread::spawn(move || run_input_loop(conn, queue, state, wake));

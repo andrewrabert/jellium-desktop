@@ -81,17 +81,25 @@ pub(super) fn post_paste_js(inner: Arc<Inner>, text: String) {
 
 wrap_task! {
     struct CloseAndCollectTask {
-        tx: Sender<Vec<Arc<Inner>>>,
+        inner: Arc<Inner>,
+        tx: Sender<Arc<Inner>>,
     }
     impl Task {
         fn execute(&self) {
-            let _ = self.tx.send(crate::browsers::jfn_browsers_close_and_snapshot());
+            // A browser dying mid-menu must not strand the session slot. The
+            // close runs after the send is prepared so the waiter always holds
+            // the `Arc` whose `close_cv` it parks on.
+            self.inner.menu_reset();
+            let inner = Arc::clone(&self.inner);
+            let _ = self.tx.send(Arc::clone(&inner));
+            inner.close_browser_force();
         }
     }
 }
 
-pub(crate) fn jfn_cef_post_close_and_collect(tx: Sender<Vec<Arc<Inner>>>) {
-    let mut task = CloseAndCollectTask::new(tx);
+/// Post the one close-and-collect task onto TID_UI. MUST run off TID_UI.
+pub(crate) fn post_close_and_collect(inner: Arc<Inner>, tx: Sender<Arc<Inner>>) {
+    let mut task = CloseAndCollectTask::new(inner, tx);
     assert!(
         post_task(ThreadId::UI, Some(&mut task)) != 0,
         "TID_UI post during shutdown — CEF UI thread invariant broken"
@@ -99,31 +107,18 @@ pub(crate) fn jfn_cef_post_close_and_collect(tx: Sender<Vec<Arc<Inner>>>) {
 }
 
 wrap_task! {
-    struct SetHiddenAllTask {
+    struct SetHiddenTask {
+        inner: Arc<Inner>,
         hidden: bool,
     }
     impl Task {
         fn execute(&self) {
-            crate::browsers::jfn_browsers_apply_hidden_all(self.hidden);
+            self.inner.cef_was_hidden(self.hidden);
         }
     }
 }
 
-pub(crate) fn jfn_cef_post_set_hidden_all(hidden: bool) {
-    let mut task = SetHiddenAllTask::new(hidden);
-    let _ = post_task(ThreadId::UI, Some(&mut task));
-}
-
-wrap_task! {
-    struct PushCsdStateAllTask {}
-    impl Task {
-        fn execute(&self) {
-            crate::browsers::jfn_browsers_apply_csd_state_all();
-        }
-    }
-}
-
-pub(crate) fn jfn_cef_post_csd_state_all() {
-    let mut task = PushCsdStateAllTask::new();
+pub(crate) fn post_set_hidden(inner: Arc<Inner>, hidden: bool) {
+    let mut task = SetHiddenTask::new(inner, hidden);
     let _ = post_task(ThreadId::UI, Some(&mut task));
 }

@@ -21,7 +21,13 @@ impl MpvHost for WaylandMpvHost {
     }
 
     fn host_ready(&self) -> bool {
-        self.rt.window().scale_known()
+        self.rt.window().stated_scale().is_some()
+    }
+
+    // the compositor's configure, not the OS, is the authority for this
+    // window's size; mpv's `osd-dimensions` is what ingest reads
+    fn logical_content_size(&self) -> Option<jfn_platform_abi::LogicalSize> {
+        None
     }
 
     fn ensure_host_window(&self) {

@@ -12,7 +12,7 @@ use super::{DEFAULT_FRAME_RATE, Inner, PAINT_MODE};
 
 impl Inner {
     pub(super) fn browser_clone(&self) -> Option<Browser> {
-        self.browser.lock().clone()
+        self.browser.lock().browser.clone()
     }
 
     pub(super) fn host(&self) -> Option<BrowserHost> {
@@ -105,18 +105,18 @@ impl Inner {
         let fr_layer = self.frame_rate.load(Ordering::Acquire);
         let fr_default = DEFAULT_FRAME_RATE.load(Ordering::Acquire);
         let fr = if fr_layer > 0 { fr_layer } else { fr_default };
+        // Left at CEF's own default where no display has reported a refresh.
         let bs = BrowserSettings {
             background_color: 0,
-            windowless_frame_rate: if fr > 0 { fr } else { 60 },
+            windowless_frame_rate: fr.max(0),
             ..BrowserSettings::default()
         };
 
-        let kind = self.injection_kind.lock().clone();
-        let extra = crate::injection::build_for_kind(&kind, shared);
+        let extra = crate::injection::build_web(shared);
 
         let mut client = crate::client_impl::make_client(Arc::clone(self));
         let url_cef = CefString::from(url);
-        let mut extra_opt = extra.and_then(crate::injection::ExtraInfo::into_dictionary);
+        let mut extra_opt = extra.into_dictionary();
         let _ = browser_host_create_browser(
             Some(&wi),
             Some(&mut client),
@@ -125,12 +125,6 @@ impl Inner {
             extra_opt.as_mut(),
             None,
         );
-    }
-
-    pub(super) fn cef_close_browser(&self) {
-        if let Some(h) = self.host() {
-            h.close_browser(1);
-        }
     }
 
     pub(super) fn cef_load_url(&self, url: &str) {
@@ -151,43 +145,43 @@ impl Inner {
         f.execute_java_script(Some(&code), Some(&url), 0);
     }
 
-    pub(super) fn frame_paste(&self) {
+    pub(crate) fn frame_paste(&self) {
         if let Some(f) = self.focused_or_main() {
             f.paste();
         }
     }
 
-    pub(super) fn frame_undo(&self) {
+    pub(crate) fn frame_undo(&self) {
         if let Some(f) = self.focused_or_main() {
             f.undo();
         }
     }
 
-    pub(super) fn frame_redo(&self) {
+    pub(crate) fn frame_redo(&self) {
         if let Some(f) = self.focused_or_main() {
             f.redo();
         }
     }
 
-    pub(super) fn frame_cut(&self) {
+    pub(crate) fn frame_cut(&self) {
         if let Some(f) = self.focused_or_main() {
             f.cut();
         }
     }
 
-    pub(super) fn frame_copy(&self) {
+    pub(crate) fn frame_copy(&self) {
         if let Some(f) = self.focused_or_main() {
             f.copy();
         }
     }
 
-    pub(super) fn frame_select_all(&self) {
+    pub(crate) fn frame_select_all(&self) {
         if let Some(f) = self.focused_or_main() {
             f.select_all();
         }
     }
 
     pub(crate) fn browser_alive(&self) -> bool {
-        self.browser.lock().is_some() && !self.closed.load(Ordering::Acquire)
+        self.browser.lock().browser.is_some() && !self.closed.load(Ordering::Acquire)
     }
 }

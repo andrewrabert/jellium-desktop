@@ -2,7 +2,7 @@
 
 use wayland_client::protocol::wl_surface::WlSurface;
 
-use super::{Above, Effect, LayerId};
+use super::{Effect, LayerId};
 use crate::wl_state::PlatformSurface;
 
 pub trait SceneSink {
@@ -48,7 +48,7 @@ impl WlSink {
         Self { rt }
     }
 
-    fn place_above(&mut self, layer: LayerId, above: Above) {
+    fn place_above(&mut self, layer: LayerId, below: LayerId) {
         let p = layer_ptr(layer);
         if p.is_null() {
             return;
@@ -58,23 +58,21 @@ impl WlSink {
         let Some(sub) = s.subsurface.as_ref() else {
             return;
         };
-        match above {
-            // Empty by design: re-stacking the bottom layer onto the root would
-            // sink it below mpv.
-            Above::Parent => {}
-            Above::Layer(pp) => {
-                if let Some(surf) = layer_surface(pp) {
-                    sub.place_above(&surf);
-                }
-            }
+        if let Some(surf) = layer_surface(below) {
+            sub.place_above(&surf);
         }
+    }
+
+    fn pin_video_bottom(&mut self) {
+        self.rt.proxy().pin_video_bottom();
     }
 }
 
 impl SceneSink for WlSink {
     fn apply(&mut self, effect: &Effect) {
         match *effect {
-            Effect::PlaceAbove { layer, above } => self.place_above(layer, above),
+            Effect::PlaceAbove { layer, below } => self.place_above(layer, below),
+            Effect::PinVideoBottom => self.pin_video_bottom(),
             Effect::CommitParent => self.rt.root().request_present(),
         }
     }
@@ -82,7 +80,7 @@ impl SceneSink for WlSink {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Above, Effect, LayerId, Scene, SceneEvent, reduce};
+    use super::super::{Effect, LayerId, Scene, SceneEvent, reduce};
     use super::{RecordingSink, SceneSink};
 
     #[test]
@@ -100,18 +98,12 @@ mod tests {
         assert_eq!(
             sink.effects,
             vec![
-                Effect::PlaceAbove {
-                    layer: LayerId(1),
-                    above: Above::Parent
-                },
+                Effect::PinVideoBottom,
                 Effect::CommitParent,
-                Effect::PlaceAbove {
-                    layer: LayerId(1),
-                    above: Above::Parent
-                },
+                Effect::PinVideoBottom,
                 Effect::PlaceAbove {
                     layer: LayerId(2),
-                    above: Above::Layer(LayerId(1))
+                    below: LayerId(1)
                 },
                 Effect::CommitParent,
             ]

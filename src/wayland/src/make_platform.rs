@@ -14,48 +14,51 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::layer::{Present, PresentError};
 use crate::paint_override::WlPaintOverride;
 use crate::runtime::WlRuntime;
 use crate::wl_ops;
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    BootGeometry, DisplayBackend, IdleInhibitLevel, JfnRect, PaintFrame, Platform, SurfaceHandle,
-    SurfaceSize, WindowDecorations,
+    DisplayBackend, IdleInhibitLevel, JfnRect, OnText, PaintFrame, Platform, Presented, ResizeGate,
+    SurfaceHandle, SurfaceSize, TitlebarControls, Visibility, VisibilityCommit, WindowDecorations,
+    WindowOwner,
 };
-
-// =====================================================================
-// Helpers
-// =====================================================================
-
-// Background color matches kBgColor (0x101010). Hard-coded here so the
-// surface_set_visible path doesn't need to carry the color.
-const BG_R: u8 = 0x10;
-const BG_G: u8 = 0x10;
-const BG_B: u8 = 0x10;
-
-/// A skip is not a failure: only a real error maps to `false`.
-fn present_ok(result: Result<Present, PresentError>) -> bool {
-    match result {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, "wayland: present rejected");
-            false
-        }
-    }
-}
 
 // =====================================================================
 // Backend
 // =====================================================================
 
+/// The compositor-driven window controls the app-drawn titlebar reaches.
+pub struct WaylandTitlebar {
+    rt: &'static WlRuntime,
+}
+
+impl TitlebarControls for WaylandTitlebar {
+    fn minimize(&self) {
+        self.rt.root().set_minimized();
+    }
+
+    fn toggle_maximize(&self) {
+        self.rt.root().toggle_maximize();
+    }
+
+    fn start_move(&self) {
+        self.rt.root().start_move(self.rt.seat());
+    }
+
+    fn start_resize(&self, edge: c_int) {
+        self.rt.root().start_resize(self.rt.seat(), edge as u32);
+    }
+}
+
 pub struct WaylandPlatform {
     runtime: &'static WlRuntime,
     mpv_host: crate::mpv_host::WaylandMpvHost,
     window_source: crate::window_source::WaylandWindowSource,
+    titlebar: WaylandTitlebar,
     shared_texture: AtomicBool,
-    clipboard: AtomicBool,
+    primary: crate::selection::WlPrimary,
 }
 
 impl WaylandPlatform {
@@ -65,8 +68,9 @@ impl WaylandPlatform {
             runtime,
             mpv_host: crate::mpv_host::WaylandMpvHost::new(runtime),
             window_source: crate::window_source::WaylandWindowSource::new(runtime),
+            titlebar: WaylandTitlebar { rt: runtime },
             shared_texture: AtomicBool::new(true),
-            clipboard: AtomicBool::new(true),
+            primary: crate::selection::WlPrimary { rt: runtime },
         }
     }
 
@@ -110,8 +114,8 @@ impl Platform for WaylandPlatform {
         crate::kde_palette::post_window_cleanup(self.rt());
     }
 
-    fn alloc_surface(&self) -> SurfaceHandle {
-        SurfaceHandle::from_ptr(wl_ops::alloc_surface(self.rt()) as *mut c_void)
+    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+        SurfaceHandle::from_ptr(wl_ops::alloc_surface(self.rt(), initial) as *mut c_void)
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
@@ -121,30 +125,42 @@ impl Platform for WaylandPlatform {
         );
     }
 
-    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
-        let ptr = s.as_ptr() as *mut crate::wl_state::PlatformSurface;
-        present_ok(match frame {
-            PaintFrame::Accelerated(tex) => wl_ops::surface_present(self.rt(), ptr, tex),
-            PaintFrame::Software {
-                size,
-                pixels,
-                dirty,
-            } => wl_ops::surface_present_software(self.rt(), ptr, dirty, pixels, size.w, size.h),
-        })
-    }
-
-    fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        wl_ops::surface_set_visible(
+    fn surface_present<'a>(
+        &self,
+        s: SurfaceHandle,
+        frame: PaintFrame<'a>,
+    ) -> Result<Presented, PaintFrame<'a>> {
+        wl_ops::present(
             self.rt(),
             s.as_ptr() as *mut crate::wl_state::PlatformSurface,
-            visible,
-            BG_R,
-            BG_G,
-            BG_B,
+            frame,
+        )
+    }
+
+    fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
+        wl_ops::surface_resize(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+            size,
         );
     }
 
-    fn restack(&self, ordered: &[SurfaceHandle]) {
+    fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
+        wl_ops::window_target(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+        )
+    }
+
+    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
+        wl_ops::set_visibility(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+            visibility,
+        )
+    }
+
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
         // SAFETY: a `&[SurfaceHandle]` (i.e. `&[*mut c_void]`) and a
         // `&[*mut PlatformSurface]` have identical layout; each handle was
         // minted by this backend's `alloc_surface`.
@@ -173,24 +189,37 @@ impl Platform for WaylandPlatform {
         jfn_linux_util::cef_paths()
     }
 
-    fn window_source(&self) -> &dyn jfn_platform_abi::WindowSource {
-        &self.window_source
+    // the compositor creates nothing; the app owns the app window
+    fn window_owner(&self) -> WindowOwner<'_> {
+        WindowOwner::App(&self.window_source)
     }
 
-    // Wayland owns its toplevel and sizes it in apply_boot_geometry, so mpv
-    // neither sizes at boot nor reconciles on scale change.
-    fn boot_mpv_geometry(&self, _g: &BootGeometry) -> Option<String> {
+    // the compositor's configure is the one authority for the window's size
+    fn resize_gate(&self) -> Option<&dyn ResizeGate> {
         None
     }
 
-    fn reconcile_mpv_size(
+    fn titlebar_controls(&self) -> Option<&dyn TitlebarControls> {
+        Some(&self.titlebar)
+    }
+
+    // the compositor places and sizes the window; nothing client-side
+    // constrains saved geometry
+    fn clamp_window_geometry(
         &self,
-        _display_hidpi_scale: f64,
-        _saved_scale: f32,
-        _saved_logical: jfn_platform_abi::LogicalSize,
-        _locked: bool,
-    ) -> Option<jfn_platform_abi::PhysicalSize> {
-        None
+        g: jfn_platform_abi::WindowGeometry,
+    ) -> jfn_platform_abi::WindowGeometry {
+        g
+    }
+
+    // the Wayland event loop runs on its own thread; the app main thread has
+    // nothing to drain
+    fn pump(&self) {}
+
+    // platform init resolves shared-texture support, so CEF's bring-up cannot
+    // precede mpv's window here
+    fn cef_init_precedes_mpv_window(&self) -> bool {
+        false
     }
 
     fn set_fullscreen(&self, v: bool) {
@@ -201,41 +230,31 @@ impl Platform for WaylandPlatform {
         self.rt().root().toggle_fullscreen();
     }
 
-    fn window_minimize(&self) {
-        self.rt().root().set_minimized();
+    fn scale(&self) -> jfn_platform_abi::Scale {
+        self.rt().window().scale()
     }
 
-    fn window_toggle_maximize(&self) {
-        self.rt().root().toggle_maximize();
+    /// The output containing `at`, else the first usable output. When the
+    /// probe names no output this backend answers with the scale it reports
+    /// for its own window, logging the probe's error.
+    fn display_scale(&self, at: Option<jfn_platform_abi::WindowPos>) -> jfn_platform_abi::Scale {
+        let target = crate::scale_probe::ProbeTarget::at(at);
+        match crate::scale_probe::probe_scale(target) {
+            Ok(scale) => scale.scale(),
+            Err(err) => {
+                let scale = self.rt().window().scale();
+                tracing::warn!(
+                    target: "Main",
+                    "no usable output for {target:?} ({err}); Wayland reports {scale}"
+                );
+                scale
+            }
+        }
     }
 
-    fn window_start_move(&self) {
-        self.rt().root().start_move(self.rt().seat());
-    }
-
-    fn window_start_resize(&self, edge: c_int) {
-        self.rt().root().start_resize(self.rt().seat(), edge as u32);
-    }
-
-    fn get_scale(&self) -> f32 {
-        self.rt().window().cached_scale()
-    }
-
-    fn effective_scale(&self, _mpv_display_hidpi_scale: f64) -> f32 {
-        self.get_scale()
-    }
-
-    fn get_display_scale(&self, x: c_int, y: c_int) -> f32 {
-        crate::scale_probe::probe_scale(crate::scale_probe::ProbeTarget::Point { x, y })
-            .map_or(1.0, |s| s.ratio_f32())
-    }
-
-    fn apply_boot_geometry(&self, g: &BootGeometry) {
-        // Only the host's own window geometry uses the boot size; mpv mirrors the
-        // committed window geometry and never the boot guess.
-        self.rt()
-            .root()
-            .set_boot_geometry(g.logical().w, g.logical().h, g.maximized());
+    // the compositor tells no client where its window is
+    fn query_window_position(&self) -> Option<jfn_platform_abi::WindowPos> {
+        None
     }
 
     fn set_cursor(&self, shape: CursorShape) {
@@ -288,20 +307,30 @@ impl Platform for WaylandPlatform {
         self.shared_texture.store(false, Ordering::Release);
     }
 
-    fn clipboard_text_supported(&self) -> bool {
-        self.clipboard.load(Ordering::Acquire)
+    fn clipboard_read_text_async(&self, on_done: OnText) {
+        self.rt()
+            .selections()
+            .read_text_async(crate::selection::Kind::Clipboard, on_done);
     }
 
-    fn clear_clipboard_handler(&self) {
-        self.clipboard.store(false, Ordering::Release);
+    fn clipboard_write_text(&self, text: &str) {
+        self.rt()
+            .selections()
+            .write_text(crate::selection::Kind::Clipboard, text);
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
-        if !self.clipboard.load(Ordering::Acquire) {
-            on_done("");
-            return;
-        }
-        self.rt().clipboard().read_text_async(on_done);
+    fn primary_selection(&self) -> Option<&dyn jfn_platform_abi::PrimarySelection> {
+        self.rt()
+            .selections()
+            .primary_available()
+            .then_some(&self.primary as &dyn jfn_platform_abi::PrimarySelection)
+    }
+
+    /// jellyfin-web pastes by injection only where another client may read
+    /// this seat's clipboard without focus; elsewhere `frame.Paste()` is the
+    /// only path that reaches the page.
+    fn web_paste_reads_clipboard(&self) -> bool {
+        self.rt().selections().data_control_advertised()
     }
 
     fn open_external_url(&self, url: &str) {

@@ -17,6 +17,7 @@ pub(crate) mod paint;
 pub mod paint_override;
 pub(crate) mod registry;
 pub(crate) mod scale;
+pub(crate) mod selection;
 pub mod shm;
 pub mod surface;
 pub(crate) mod window_source;

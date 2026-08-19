@@ -99,21 +99,17 @@ pub(crate) fn win_is_fullscreen() -> bool {
     (style & WS_CAPTION.0) == 0 && (style & WS_THICKFRAME.0) == 0
 }
 
-/// The window's own DPI once it exists, the system DPI before it does.
-pub(crate) fn win_get_scale() -> f32 {
+/// `GetDpiForWindow`/96 once the window exists, `GetDpiForSystem`/96 before
+/// it does.
+pub(crate) fn win_get_scale() -> jfn_platform_abi::Scale {
     match crate::window::client_scale() {
-        Some(scale) => scale.or_one().0,
-        None => system_scale(),
+        Some(scale) => scale,
+        None => win_display_scale(),
     }
 }
 
-pub(crate) fn win_get_display_scale(_x: c_int, _y: c_int) -> f32 {
-    system_scale()
-}
-
-fn system_scale() -> f32 {
-    let dpi = unsafe { GetDpiForSystem() };
-    if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
+pub(crate) fn win_display_scale() -> jfn_platform_abi::Scale {
+    crate::scale::report_dpi("GetDpiForSystem", unsafe { GetDpiForSystem() })
 }
 
 pub(crate) fn win_set_fullscreen(fullscreen: bool) {

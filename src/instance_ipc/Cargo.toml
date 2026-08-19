@@ -17,6 +17,9 @@ tracing.workspace = true
 interprocess.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "macros"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile.workspace = true
