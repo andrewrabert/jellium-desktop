@@ -2938,6 +2938,7 @@ dependencies = [
  "jfn-input",
  "jfn-logging",
  "jfn-mailbox",
+ "jfn-mpv",
  "jfn-paths",
  "jfn-platform-abi",
  "jfn-playback",

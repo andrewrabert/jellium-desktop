@@ -34,6 +34,7 @@ pub(crate) enum NativeFunction {
     PlayerSetSubtitleDelay,
     PlayerSetAspectMode,
     PlayerOsdActive,
+    OpenClientSettings,
     OpenConfigDir,
     SaveServerUrl,
     NotifyMetadata,
@@ -69,6 +70,7 @@ impl NativeFunction {
             "playerSetSubtitleDelay" => Self::PlayerSetSubtitleDelay,
             "playerSetAspectMode" => Self::PlayerSetAspectMode,
             "playerOsdActive" => Self::PlayerOsdActive,
+            "openClientSettings" => Self::OpenClientSettings,
             "openConfigDir" => Self::OpenConfigDir,
             "saveServerUrl" => Self::SaveServerUrl,
             "notifyMetadata" => Self::NotifyMetadata,
@@ -105,6 +107,7 @@ impl NativeFunction {
             Self::PlayerSetSubtitleDelay => "playerSetSubtitleDelay",
             Self::PlayerSetAspectMode => "playerSetAspectMode",
             Self::PlayerOsdActive => "playerOsdActive",
+            Self::OpenClientSettings => "openClientSettings",
             Self::OpenConfigDir => "openConfigDir",
             Self::SaveServerUrl => "saveServerUrl",
             Self::NotifyMetadata => "notifyMetadata",
@@ -130,7 +133,6 @@ pub(crate) enum InjectedScript {
     MpvVideoPlayer,
     MpvAudioPlayer,
     InputPlugin,
-    ClientSettings,
     SelectMenu,
 }
 
@@ -142,7 +144,6 @@ impl InjectedScript {
             "mpv-video-player.js" => Self::MpvVideoPlayer,
             "mpv-audio-player.js" => Self::MpvAudioPlayer,
             "input-plugin.js" => Self::InputPlugin,
-            "client-settings.js" => Self::ClientSettings,
             "select-menu.js" => Self::SelectMenu,
             _ => return None,
         })
@@ -155,7 +156,6 @@ impl InjectedScript {
             Self::MpvVideoPlayer => "mpv-video-player.js",
             Self::MpvAudioPlayer => "mpv-audio-player.js",
             Self::InputPlugin => "input-plugin.js",
-            Self::ClientSettings => "client-settings.js",
             Self::SelectMenu => "select-menu.js",
         }
     }
@@ -184,6 +184,7 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::PlayerSetSubtitleDelay,
     NativeFunction::PlayerSetAspectMode,
     NativeFunction::PlayerOsdActive,
+    NativeFunction::OpenClientSettings,
     NativeFunction::OpenConfigDir,
     NativeFunction::SaveServerUrl,
     NativeFunction::NotifyMetadata,
@@ -206,7 +207,6 @@ const WEB_SCRIPTS: &[InjectedScript] = &[
     InjectedScript::MpvVideoPlayer,
     InjectedScript::MpvAudioPlayer,
     InjectedScript::InputPlugin,
-    InjectedScript::ClientSettings,
 ];
 const FUNCTIONS_KEY: &str = "functions";
 const SCRIPTS_KEY: &str = "scripts";
@@ -404,4 +404,21 @@ pub(crate) fn build_web(shared_textures_enabled: bool) -> ExtraInfo {
             .map(InjectedScript::from_menu),
     );
     extra_info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NativeFunction, WEB_FUNCTIONS};
+
+    #[test]
+    fn web_profile_has_native_settings_opener() {
+        assert!(WEB_FUNCTIONS.contains(&NativeFunction::OpenClientSettings));
+    }
+
+    #[test]
+    fn native_shell_calls_opener_and_retains_capabilities() {
+        let shim = include_str!("../../web/native-shim.js");
+        assert!(shim.contains("window.jmpNative.openClientSettings();"));
+        assert!(shim.contains("'exitmenu', 'clientsettings'"));
+    }
 }

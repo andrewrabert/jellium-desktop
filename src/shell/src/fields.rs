@@ -31,7 +31,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn of(id: Id, bounds: Rectangle, state: &State) -> Snapshot {
+    pub(crate) fn of(id: Id, bounds: Rectangle, state: &State) -> Snapshot {
         let origin = state.origin();
         let translation = iced_core::Vector::new(bounds.x + origin.x, bounds.y + origin.y);
         Snapshot {

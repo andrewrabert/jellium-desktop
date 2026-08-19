@@ -216,6 +216,11 @@ fn with_args(args: Option<&ListValue>, f: impl FnOnce(&ListValue)) -> bool {
 fn handle_message(message: BrowserMessage) -> bool {
     let args = message.args();
 
+    if message.name() == "openClientSettings" {
+        jfn_platform_abi::request_client_settings();
+        return true;
+    }
+
     // mpv handle not yet initialised — return false so CEF treats the message as unhandled.
     if jfn_mpv_handle_get().is_null() {
         return false;

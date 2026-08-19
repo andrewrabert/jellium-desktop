@@ -678,6 +678,7 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
     PLATFORM_INITED.store(true, std::sync::atomic::Ordering::Release);
 
     jfn_platform_abi::set_about_handler(jfn_shell::shell_open_about);
+    jfn_platform_abi::set_client_settings_handler(jfn_shell::shell_open_client_settings);
     if jfn_shell::shell_start().is_none() {
         tracing::warn!(target: "Main", "shell overlay unavailable; no connect screen");
     }

@@ -52,12 +52,13 @@ pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>
         "audioPassthrough" => jfn_config::set_audio_passthrough(value),
         "audioExclusive" => jfn_config::set_audio_exclusive(value == "true"),
         "audioChannels" => jfn_config::set_audio_channels(value),
+        "transparentTitlebar" => jfn_config::set_transparent_titlebar(value == "true"),
         "hideScrollbar" => jfn_config::set_hide_scrollbar(value == "true"),
         "logLevel" => jfn_config::set_log_level(value),
         "forceTranscoding" => jfn_config::set_force_transcoding(value == "true"),
-        // Pass empty platform_default — Rust setter clears when raw equals
-        // the empty string. Neither caller has the live hostname handy here.
-        "deviceName" => jfn_config::set_device_name(value, ""),
+        "deviceName" => {
+            jfn_config::set_device_name(value, &jfn_config::default_device_name());
+        }
         _ => jfn_logging::log(
             jfn_logging::CATEGORY_CEF,
             jfn_logging::LEVEL_WARN,

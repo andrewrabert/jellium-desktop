@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use iced_core::mouse::{self, Cursor};
-use iced_core::widget::Id;
+use iced_core::widget::{Id, Operation as _};
 use iced_core::{Element, Event, Point, Size, clipboard, renderer, shell, window};
 use iced_runtime::user_interface::{self, UserInterface};
 use jfn_gpu_paint::{Acquired, Presented};
@@ -18,11 +18,12 @@ use jfn_platform_abi::{
     FrameSource, LogicalPoint, LogicalSize, SurfaceHandle, Visibility, WindowExtent,
 };
 
+use crate::controls::{self, Direction};
 use crate::field::Act;
 use crate::fields::{Apply, Fields};
 
 use crate::chrome::Titlebar;
-use crate::modal::{Stack, Transition};
+use crate::modal::{Identity, Stack, Transition};
 use crate::paint::Painter;
 use crate::state::{self, ChromeInputs};
 use crate::theme::Theme;
@@ -39,6 +40,7 @@ pub enum Work {
     },
     Redraw,
     OpenAbout,
+    OpenClientSettings,
     Chrome(ChromeInputs),
     /// The buffered theme colour changed; the titlebar and backdrop repaint.
     ChromeBackground(iced_core::Color),
@@ -227,19 +229,49 @@ impl Actor {
     }
 }
 
-/// Whether an event iced reported as ignored would change the model, asked
-/// before the pass has let go of the widget tree that borrows it.
-/// [`iced_core::keyboard::key::Named::Escape`] reaches the occupant as
-/// [`Transition::Escape`]; everything else is dropped.
-fn handles(model: &Model, event: &Event) -> bool {
+/// A key ignored by the focused widget that the modal layer handles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IgnoredKey {
+    Escape,
+    Focus(Direction),
+}
+
+/// Escape reaches any occupied modal. Tab and Shift-Tab cycle through the
+/// combined overlay's tabs and the active tab's controls.
+fn ignored_key(model: &Model, event: &Event) -> Option<IgnoredKey> {
     use iced_core::keyboard::{self, Key, key::Named};
-    matches!(
-        event,
-        Event::Keyboard(keyboard::Event::KeyPressed {
-            key: Key::Named(Named::Escape),
-            ..
-        })
-    ) && model.stack.occupied()
+    let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
+        return None;
+    };
+    match key.as_ref() {
+        Key::Named(Named::Escape) if model.stack.occupied() => Some(IgnoredKey::Escape),
+        Key::Named(Named::Tab) if model.stack.identity() == Some(Identity::SettingsOverlay) => {
+            Some(IgnoredKey::Focus(if modifiers.shift() {
+                Direction::Backward
+            } else {
+                Direction::Forward
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn focus_after_rebuild(
+    previous_identity: Option<Identity>,
+    identity: Option<Identity>,
+    previous_tab: Option<crate::settings_overlay::Tab>,
+    tab: Option<crate::settings_overlay::Tab>,
+    initial: Option<Id>,
+    prior: Option<Id>,
+    cache_lost: bool,
+) -> Option<Id> {
+    if previous_identity != identity || previous_tab != tab {
+        initial
+    } else if cache_lost {
+        prior
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -283,6 +315,12 @@ impl Model {
         }
     }
 
+    fn apply_message_batch(&mut self, messages: Vec<Message>) {
+        for message in settings_overlay_dismiss_last(messages) {
+            self.update(message);
+        }
+    }
+
     /// The open modal's backdrop; fully transparent when none is open, so
     /// jellyfin-web shows through everywhere no widget draws.
     fn backdrop(&self) -> iced_core::Color {
@@ -302,6 +340,22 @@ impl Model {
             self.titlebar_shown(),
         ))
     }
+}
+
+fn settings_overlay_dismiss_last(messages: Vec<Message>) -> Vec<Message> {
+    let (mut ordinary, dismissals): (Vec<_>, Vec<_>) = messages.into_iter().partition(|message| {
+        !matches!(
+            message,
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Dismiss
+                    | crate::settings_overlay::Message::Settings(
+                        crate::settings::Message::ResetSavedServer
+                    )
+            ))
+        )
+    });
+    ordinary.extend(dismissals);
+    ordinary
 }
 
 fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
@@ -355,9 +409,14 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
     });
     let redraw = Redraw(wake_tx.clone());
     let mut current = extent;
-    // Every pass that discarded the widget cache re-applies focus, so the URL
-    // field keeps the caret across a window resize.
-    let mut refocus = true;
+    // A changed modal gets its own initial target. A discarded widget cache
+    // restores the exact prior target instead of resetting Settings focus.
+    let mut modal_identity = None;
+    let mut modal_tab = None;
+    let mut prior_focus = None;
+    let mut cache_lost = true;
+    let mut focus_move = None;
+    let mut settings_focus: Option<Box<dyn iced_core::widget::Operation>> = None;
     publish(&model, current);
     apply_visibility(surface, &model);
 
@@ -424,10 +483,19 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
                     painter.resize(extent);
                     current = extent;
                     cache = user_interface::Cache::new();
-                    refocus = true;
+                    cache_lost = true;
                 }
                 Work::Redraw => {}
-                Work::OpenAbout => model.advance(Transition::OpenAbout),
+                Work::OpenAbout => {
+                    model.advance(Transition::OpenAbout);
+                    cache = user_interface::Cache::new();
+                    cache_lost = true;
+                }
+                Work::OpenClientSettings => {
+                    model.advance(Transition::OpenClientSettings);
+                    cache = user_interface::Cache::new();
+                    cache_lost = true;
+                }
                 Work::Chrome(inputs) => model.inputs = inputs,
                 Work::ChromeBackground(color) => model.theme.chrome_background = color,
                 Work::SelectionText { reader, text } => match (reader, text) {
@@ -458,20 +526,67 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
         pending = pending.merge(jfn_bringup::deadline().map_or_else(Deadline::none, Deadline::at));
 
         model.theme.backdrop = model.backdrop();
-        let focus_target = model.stack.focus_target(&model.screen);
+        let identity = model.stack.identity();
+        let cache_was_lost = cache_lost;
+        let restoration = model.stack.settings_overlay_mut().and_then(|overlay| {
+            if overlay.active() != crate::settings_overlay::Tab::Settings {
+                None
+            } else {
+                overlay
+                    .take_restoration()
+                    .or_else(|| cache_was_lost.then(|| overlay.restoration()))
+            }
+        });
+        let tab = model.stack.active_settings_tab();
+        let focus_target = focus_after_rebuild(
+            modal_identity,
+            identity,
+            modal_tab,
+            tab,
+            model.stack.initial_focus(&model.screen),
+            prior_focus.clone(),
+            cache_lost,
+        );
+        modal_identity = identity;
+        modal_tab = tab;
+        cache_lost = false;
         let mut ui = UserInterface::build(
             model.view(),
             Size::new(current.logical().w as f32, current.logical().h as f32),
             std::mem::replace(&mut cache, user_interface::Cache::new()),
             painter.renderer(),
         );
-        if refocus {
-            refocus = false;
-            if let Some(id) = focus_target {
+        if let Some(id) = focus_target {
+            ui.operate(
+                painter.renderer(),
+                &mut iced_core::widget::operation::focusable::focus::<()>(id),
+            );
+        }
+        if identity == Some(Identity::SettingsOverlay)
+            && let Some(mut operation) = settings_focus.take()
+        {
+            operate_all(&mut ui, painter.renderer(), &mut *operation);
+        } else if identity != Some(Identity::SettingsOverlay) {
+            settings_focus = None;
+        }
+        if let Some(restoration) = restoration {
+            if let Some(focus) = restoration.focus {
                 ui.operate(
                     painter.renderer(),
-                    &mut iced_core::widget::operation::focusable::focus::<()>(id),
+                    &mut iced_core::widget::operation::focusable::focus::<()>(focus),
                 );
+            }
+            ui.operate(
+                painter.renderer(),
+                &mut controls::restore_scroll(crate::settings::SETTINGS_SCROLL, restoration.scroll),
+            );
+        }
+        if let Some(direction) = focus_move.take() {
+            let mut movement = controls::move_focus(crate::settings::SETTINGS_SCROLL, direction);
+            ui.operate(painter.renderer(), &mut movement);
+            if let iced_core::widget::operation::Outcome::Chain(operation) = movement.finish() {
+                settings_focus = Some(operation);
+                immediate = true;
             }
         }
         let fields = Fields::collect(&mut ui, painter.renderer());
@@ -479,7 +594,12 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
         for request in deferred.drain(..) {
             match request {
                 Deferred::ContextMenu(p) => {
-                    menu_anchor = menu_anchor.or(raise_menu(&fields, p, &mut queued));
+                    menu_anchor = menu_anchor.or(raise_menu(
+                        &fields,
+                        p,
+                        &mut queued,
+                        model.stack.identity() == Some(Identity::SettingsOverlay),
+                    ));
                 }
                 Deferred::EditMenuAtCaret => {
                     menu_anchor = menu_anchor.or_else(|| fields.focused().map(caret_anchor));
@@ -503,6 +623,17 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
                 crate::menu::open_edit(field, anchor, crate::lang::strings());
             }
         }
+
+        let retained_settings =
+            if model.stack.active_settings_tab() == Some(crate::settings_overlay::Tab::Settings) {
+                let mut focused = controls::focused_id();
+                ui.operate(painter.renderer(), &mut focused);
+                let mut offset = controls::scroll_offset(crate::settings::SETTINGS_SCROLL);
+                ui.operate(painter.renderer(), &mut offset);
+                offset.get().map(|offset| (focused.get(), offset))
+            } else {
+                None
+            };
 
         // The event widgets commit hover, press, focus and caret state on.
         events.push(Event::Window(
@@ -550,6 +681,9 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
             }
         }
         let settled_fields = Fields::collect(&mut ui, painter.renderer());
+        let mut focused = controls::focused_id();
+        ui.operate(painter.renderer(), &mut focused);
+        prior_focus = focused.get();
         publish_primary(&settled_fields, &mut last_primary);
         jfn_input::publish_field_edit(
             settled_fields
@@ -561,7 +695,9 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
         // Asked while the widget tree still borrows the model, because applying
         // any of it has to wait until the tree is gone.
         let settled = messages.is_empty()
-            && !ignored.iter().any(|event| handles(&model, event))
+            && !ignored
+                .iter()
+                .any(|event| ignored_key(&model, event).is_some())
             && !matches!(state, user_interface::State::Outdated);
 
         if settled {
@@ -576,22 +712,29 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
                 Painted::Deferred(retry_at) => pending = pending.merge(Deadline::at(retry_at)),
             }
             cache = ui.into_cache();
+            if let Some((focus, offset)) = retained_settings
+                && let Some(overlay) = model.stack.settings_overlay_mut()
+            {
+                overlay.retain_settings_state(focus, offset);
+            }
             publish(&model, current);
             continue;
         }
 
         cache = ui.into_cache();
-        for message in messages {
-            model.update(message);
+        if let Some((focus, offset)) = retained_settings
+            && let Some(overlay) = model.stack.settings_overlay_mut()
+        {
+            overlay.retain_settings_state(focus, offset);
         }
+        model.apply_message_batch(messages);
         for event in &ignored {
-            if handles(&model, event) {
-                model.advance(Transition::Escape);
+            match ignored_key(&model, event) {
+                Some(IgnoredKey::Escape) => model.advance(Transition::Escape),
+                Some(IgnoredKey::Focus(direction)) => focus_move = Some(direction),
+                None => {}
             }
         }
-        // The tree the next pass builds is a new one; focus is applied to it
-        // rather than inherited.
-        refocus = true;
         immediate = true;
         publish(&model, current);
         apply_visibility(surface, &model);
@@ -666,6 +809,20 @@ enum Deferred {
     EditMenuAtCaret,
     PrimaryPaste(LogicalPoint),
     Edit(Target, jfn_input::EditCommand),
+}
+
+/// Applies every pass of a chained widget operation.
+fn operate_all<Message>(
+    ui: &mut UserInterface<'_, Message, Theme, iced_wgpu::Renderer>,
+    renderer: &iced_wgpu::Renderer,
+    operation: &mut dyn iced_core::widget::Operation,
+) {
+    ui.operate(renderer, operation);
+    let mut outcome = operation.finish();
+    while let iced_core::widget::operation::Outcome::Chain(mut next) = outcome {
+        ui.operate(renderer, &mut *next);
+        outcome = next.finish();
+    }
 }
 
 /// Applies every queued [`Apply`] and returns what `Cut` and `Copy` produced,
@@ -790,10 +947,19 @@ fn caret_anchor(field: &crate::fields::Snapshot) -> LogicalPoint {
 /// The field takes focus on Windows and macOS whether or not the press landed
 /// inside its selection, so the keys typed after the menu closes reach it and
 /// macOS's own Edit menu resolves [`Target::Focused`] to it.
-fn raise_menu(fields: &Fields, p: LogicalPoint, queued: &mut Vec<Apply>) -> Option<LogicalPoint> {
+fn raise_menu(
+    fields: &Fields,
+    p: LogicalPoint,
+    queued: &mut Vec<Apply>,
+    restricted: bool,
+) -> Option<LogicalPoint> {
     let at = point(p.x, p.y);
     let Some(field) = fields.at(at) else {
-        jfn_cef::app_menu::open_at(p.x, p.y);
+        if restricted {
+            jfn_cef::app_menu::open_restricted_at(p.x, p.y);
+        } else {
+            jfn_cef::app_menu::open_at(p.x, p.y);
+        }
         return None;
     };
     let backend = jfn_platform_abi::get().display();
@@ -853,4 +1019,320 @@ fn initial_extent() -> Option<WindowExtent> {
 /// The pointer position an iced event carries, for the sink's convenience.
 pub(crate) fn point(x: i32, y: i32) -> Point {
     Point::new(x as f32, y as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_core::keyboard::key::{NativeCode, Physical};
+    use iced_core::keyboard::{Location, Modifiers};
+
+    fn key(name: iced_core::keyboard::key::Named, modifiers: Modifiers) -> Event {
+        let key = iced_core::keyboard::Key::Named(name);
+        Event::Keyboard(iced_core::keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: Physical::Unidentified(NativeCode::Unidentified),
+            location: Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    fn settings_message(message: crate::settings::Message) -> Message {
+        Message::Modal(crate::modal::Message::SettingsOverlay(
+            crate::settings_overlay::Message::Settings(message),
+        ))
+    }
+
+    #[test]
+    fn settings_dismiss_is_applied_after_final_edits_without_reordering_ordinary_messages() {
+        let messages = vec![
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Dismiss,
+            )),
+            settings_message(crate::settings::Message::DeviceNameEdited(
+                "final device".to_owned(),
+            )),
+            settings_message(crate::settings::Message::CommitDeviceName),
+            settings_message(crate::settings::Message::AudioPassthroughEdited(
+                "first audio".to_owned(),
+            )),
+            settings_message(crate::settings::Message::AudioPassthroughEdited(
+                "final audio".to_owned(),
+            )),
+        ];
+
+        let ordered = settings_overlay_dismiss_last(messages.clone());
+        assert!(matches!(
+            &ordered[0],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Settings(
+                    crate::settings::Message::DeviceNameEdited(value)
+                )
+            )) if value == "final device"
+        ));
+        assert!(matches!(
+            &ordered[1],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Settings(
+                    crate::settings::Message::CommitDeviceName
+                )
+            ))
+        ));
+        assert!(matches!(
+            &ordered[2],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Settings(
+                    crate::settings::Message::AudioPassthroughEdited(value)
+                )
+            )) if value == "first audio"
+        ));
+        assert!(matches!(
+            &ordered[3],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Settings(
+                    crate::settings::Message::AudioPassthroughEdited(value)
+                )
+            )) if value == "final audio"
+        ));
+        assert!(matches!(
+            &ordered[4],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Dismiss
+            ))
+        ));
+
+        let mut model = Model {
+            stack: Stack::testing_settings(),
+            screen: jfn_bringup::Screen::Gone,
+            titlebar: Titlebar::new(),
+            inputs: ChromeInputs::default(),
+            theme: Theme::default(),
+        };
+        model.apply_message_batch(messages);
+
+        assert!(!model.stack.occupied());
+    }
+
+    #[test]
+    fn settings_reset_is_applied_after_final_edits_without_reordering_ordinary_messages() {
+        let messages = vec![
+            settings_message(crate::settings::Message::ResetSavedServer),
+            settings_message(crate::settings::Message::DeviceNameEdited(
+                "first device".to_owned(),
+            )),
+            settings_message(crate::settings::Message::AudioPassthroughEdited(
+                "first audio".to_owned(),
+            )),
+            settings_message(crate::settings::Message::DeviceNameEdited(
+                "final device".to_owned(),
+            )),
+            settings_message(crate::settings::Message::AudioPassthroughEdited(
+                "final audio".to_owned(),
+            )),
+        ];
+
+        let ordered = settings_overlay_dismiss_last(messages);
+        assert!(matches!(
+            &ordered[0],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Settings(
+                    crate::settings::Message::DeviceNameEdited(value)
+                )
+            )) if value == "first device"
+        ));
+        assert!(matches!(
+            &ordered[1],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Settings(
+                    crate::settings::Message::AudioPassthroughEdited(value)
+                )
+            )) if value == "first audio"
+        ));
+        assert!(matches!(
+            &ordered[2],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Settings(
+                    crate::settings::Message::DeviceNameEdited(value)
+                )
+            )) if value == "final device"
+        ));
+        assert!(matches!(
+            &ordered[3],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Settings(
+                    crate::settings::Message::AudioPassthroughEdited(value)
+                )
+            )) if value == "final audio"
+        ));
+        assert!(matches!(
+            &ordered[4],
+            Message::Modal(crate::modal::Message::SettingsOverlay(
+                crate::settings_overlay::Message::Settings(
+                    crate::settings::Message::ResetSavedServer
+                )
+            ))
+        ));
+
+        let mut model = Model {
+            stack: Stack::testing_settings(),
+            screen: jfn_bringup::Screen::Gone,
+            titlebar: Titlebar::new(),
+            inputs: ChromeInputs::default(),
+            theme: Theme::default(),
+        };
+        for message in ordered[..4].iter().cloned() {
+            model.update(message);
+        }
+
+        let settings = model
+            .stack
+            .settings_overlay_mut()
+            .expect("reset must remain pending")
+            .settings();
+        assert_eq!(settings.device_name, "final device");
+        assert_eq!(settings.audio_passthrough, "final audio");
+
+        model.update(ordered[4].clone());
+        assert!(!model.stack.occupied());
+    }
+
+    #[test]
+    fn about_selection_retains_pre_event_settings_focus_and_scroll() {
+        let mut model = Model {
+            stack: Stack::testing_settings(),
+            screen: jfn_bringup::Screen::Gone,
+            titlebar: Titlebar::new(),
+            inputs: ChromeInputs::default(),
+            theme: Theme::default(),
+        };
+        let pre_event_focus = Some(crate::settings::DEVICE_NAME_FIELD);
+        let pre_event_scroll =
+            iced_core::widget::operation::scrollable::AbsoluteOffset { x: 3.0, y: 142.0 };
+        let settled_focus: Option<Id> = None;
+
+        assert!(
+            model
+                .stack
+                .settings_overlay_mut()
+                .map(|overlay| {
+                    overlay.retain_settings_state(pre_event_focus.clone(), pre_event_scroll);
+                })
+                .is_some()
+        );
+        model.apply_message_batch(vec![Message::Modal(
+            crate::modal::Message::SettingsOverlay(crate::settings_overlay::Message::Select(
+                crate::settings_overlay::Tab::About,
+            )),
+        )]);
+        model.advance(Transition::OpenClientSettings);
+
+        assert_eq!(settled_focus, None);
+        assert_eq!(
+            model
+                .stack
+                .settings_overlay_mut()
+                .and_then(crate::settings_overlay::SettingsOverlay::take_restoration),
+            Some(crate::settings_overlay::Restoration {
+                focus: pre_event_focus,
+                scroll: pre_event_scroll,
+            })
+        );
+    }
+
+    #[test]
+    fn settings_messages_preserve_the_current_focus_target() {
+        let focused = Id::new("focused-setting");
+        assert_eq!(
+            focus_after_rebuild(
+                Some(Identity::SettingsOverlay),
+                Some(Identity::SettingsOverlay),
+                Some(crate::settings_overlay::Tab::Settings),
+                Some(crate::settings_overlay::Tab::Settings),
+                Some(Id::new("initial")),
+                Some(focused),
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tab_changes_choose_the_active_tabs_initial_target() {
+        let initial = Id::new("new-initial");
+        assert_eq!(
+            focus_after_rebuild(
+                Some(Identity::SettingsOverlay),
+                Some(Identity::SettingsOverlay),
+                Some(crate::settings_overlay::Tab::About),
+                Some(crate::settings_overlay::Tab::Settings),
+                Some(initial.clone()),
+                Some(Id::new("old-focus")),
+                true,
+            ),
+            Some(initial)
+        );
+    }
+
+    #[test]
+    fn resize_or_cache_loss_restores_the_prior_target() {
+        let prior = Id::new("prior-focus");
+        assert_eq!(
+            focus_after_rebuild(
+                Some(Identity::SettingsOverlay),
+                Some(Identity::SettingsOverlay),
+                Some(crate::settings_overlay::Tab::Settings),
+                Some(crate::settings_overlay::Tab::Settings),
+                Some(Id::new("initial")),
+                Some(prior.clone()),
+                true,
+            ),
+            Some(prior)
+        );
+    }
+
+    #[test]
+    fn fresh_overlay_uses_the_active_tabs_initial_target() {
+        let initial = Id::new("fresh-initial");
+        assert_eq!(
+            focus_after_rebuild(
+                None,
+                Some(Identity::SettingsOverlay),
+                None,
+                Some(crate::settings_overlay::Tab::Settings),
+                Some(initial.clone()),
+                None,
+                true,
+            ),
+            Some(initial)
+        );
+    }
+
+    #[test]
+    fn tab_directions_are_forward_and_backward_in_settings() {
+        let model = Model {
+            stack: Stack::testing_settings(),
+            screen: jfn_bringup::Screen::Gone,
+            titlebar: Titlebar::new(),
+            inputs: ChromeInputs::default(),
+            theme: Theme::default(),
+        };
+
+        assert_eq!(
+            ignored_key(
+                &model,
+                &key(iced_core::keyboard::key::Named::Tab, Modifiers::empty())
+            ),
+            Some(IgnoredKey::Focus(Direction::Forward))
+        );
+        assert_eq!(
+            ignored_key(
+                &model,
+                &key(iced_core::keyboard::key::Named::Tab, Modifiers::SHIFT)
+            ),
+            Some(IgnoredKey::Focus(Direction::Backward))
+        );
+    }
 }
