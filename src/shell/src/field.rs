@@ -19,6 +19,7 @@ use iced_core::text::editor::{self, Action, Binding, Cursor, Edit, Editor as _, 
 use iced_core::text::paragraph::Plain;
 use iced_core::text::{self, LineHeight, Renderer as _, Text, Wrapping};
 use iced_core::widget::Id;
+use iced_core::widget::operation::Focusable;
 use iced_core::widget::{self, Widget};
 use iced_core::{
     Background, Border, Color, Element, Event, Length, Padding, Pixels, Point, Rectangle, Shell,
@@ -87,12 +88,15 @@ pub struct State {
     selection_generation: u64,
     /// The editor holds a value the model has not been told about.
     dirty: bool,
+    /// An operation removed focus; its update is delivered on the next event
+    /// pass, when the widget has a shell to publish through.
+    operation_unfocus: bool,
 }
 
 impl Default for State {
     fn default() -> Self {
         State {
-            editor: TextEditor::default(),
+            editor: TextEditor::with_text(""),
             focus: editor::State::new(),
             placeholder: Plain::default(),
             bounds: Rectangle::default(),
@@ -101,6 +105,7 @@ impl Default for State {
             redo: Vec::new(),
             selection_generation: 0,
             dirty: false,
+            operation_unfocus: false,
         }
     }
 }
@@ -153,6 +158,10 @@ impl State {
     /// taking the mark with it.
     fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
+    }
+
+    fn take_operation_unfocus(&mut self) -> bool {
+        std::mem::take(&mut self.operation_unfocus)
     }
 
     /// The editor's origin within the widget's layout bounds.
@@ -336,6 +345,7 @@ pub struct Field<'a, Message> {
     value: &'a str,
     on_input: Option<Box<dyn Fn(String) -> Message + 'a>>,
     on_submit: Option<Message>,
+    on_unfocus: Option<Message>,
     padding: Padding,
     size: Option<Pixels>,
     width: Length,
@@ -349,6 +359,7 @@ pub fn field<'a, Message>(id: Id, placeholder: &'a str, value: &'a str) -> Field
         value,
         on_input: None,
         on_submit: None,
+        on_unfocus: None,
         padding: Padding::new(0.0),
         size: None,
         width: Length::Fill,
@@ -363,6 +374,12 @@ impl<'a, Message: Clone + 'a> Field<'a, Message> {
 
     pub fn on_submit(mut self, message: Message) -> Field<'a, Message> {
         self.on_submit = Some(message);
+        self
+    }
+
+    /// Publishes `message` after this field loses keyboard focus.
+    pub fn on_unfocus(mut self, message: Message) -> Field<'a, Message> {
+        self.on_unfocus = Some(message);
         self
     }
 
@@ -465,10 +482,37 @@ impl<'a, Message: Clone + 'a> Field<'a, Message> {
                     self.apply_update(state, update, shell);
                 }
             }
-            editor::Update::Focus | editor::Update::Unfocus | editor::Update::InputMethod => {
+            editor::Update::Focus | editor::Update::InputMethod => shell.request_redraw(),
+            editor::Update::Unfocus => {
+                self.commit(state, shell);
                 shell.request_redraw();
+                if let Some(message) = self.on_unfocus.clone() {
+                    shell.publish(message);
+                }
             }
             editor::Update::Release => {}
+        }
+    }
+}
+
+struct OperationFocus<'a> {
+    state: &'a mut editor::State,
+    operation_unfocus: &'a mut bool,
+}
+
+impl Focusable for OperationFocus<'_> {
+    fn is_focused(&self) -> bool {
+        self.state.is_focused()
+    }
+
+    fn focus(&mut self) {
+        self.state.focus();
+    }
+
+    fn unfocus(&mut self) {
+        if self.state.is_focused() {
+            self.state.unfocus();
+            *self.operation_unfocus = true;
         }
     }
 }
@@ -540,6 +584,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
         let backend = jfn_platform_abi::get().display();
         let state = tree.state.downcast_mut::<State>();
         state.bounds = layout.bounds();
+        if state.take_operation_unfocus() {
+            self.apply_update(state, editor::Update::Unfocus, shell);
+        }
         if self.on_input.is_none() {
             return;
         }
@@ -632,7 +679,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
     ) {
         let state = tree.state.downcast_mut::<State>();
         state.bounds = layout.bounds();
-        operation.focusable(Some(&self.id), layout.bounds(), &mut state.focus);
+        {
+            let mut focus = OperationFocus {
+                state: &mut state.focus,
+                operation_unfocus: &mut state.operation_unfocus,
+            };
+            operation.focusable(Some(&self.id), layout.bounds(), &mut focus);
+        }
         operation.custom(Some(&self.id), layout.bounds(), state as &mut dyn Any);
     }
 }
@@ -649,6 +702,8 @@ mod tests {
     use iced_core::keyboard::key::{Code, Named, NativeCode, Physical};
     use iced_core::keyboard::{Key, Modifiers};
     use iced_core::text::editor::Motion;
+
+    use crate::fields::Snapshot;
 
     /// The modifier the platform's own shortcuts are held with, as iced
     /// resolves it: Command on macOS, Ctrl everywhere else.
@@ -682,6 +737,80 @@ mod tests {
 
     fn bind(backend: DisplayBackend, key_press: KeyPress) -> Option<Binding<()>> {
         binding(backend, key_press)
+    }
+
+    fn layout_empty(state: &mut State) {
+        state.editor.update(
+            Size::new(200.0, 20.0),
+            Font::DEFAULT,
+            Pixels(16.0),
+            LineHeight::default(),
+            Wrapping::None,
+            text::Alignment::Default,
+            Some(1.0),
+            &mut text::highlighter::PlainText,
+        );
+    }
+
+    #[derive(Clone, PartialEq, Debug)]
+    enum Message {
+        Input(String),
+        Unfocus,
+    }
+
+    fn operation_unfocus_messages() -> Vec<Message> {
+        let field = field(Id::unique(), "", "")
+            .on_input(Message::Input)
+            .on_unfocus(Message::Unfocus);
+        let mut state = State::default();
+        state.focus.focus();
+        state.edit(Edit::Insert('x'));
+        let mut operation_focus = OperationFocus {
+            state: &mut state.focus,
+            operation_unfocus: &mut state.operation_unfocus,
+        };
+        operation_focus.unfocus();
+        assert!(state.take_operation_unfocus());
+
+        let mut messages = iced_core::shell::Bus::new();
+        let waker = iced_core::shell::Waker::new(|| {});
+        let mut shell = Shell::new(&window::Headless, waker, &mut messages);
+        field.apply_update(&mut state, editor::Update::Unfocus, &mut shell);
+        drop(shell);
+        messages.drain().collect()
+    }
+
+    #[test]
+    fn operation_unfocus_commits_input_before_the_configured_unfocus_message() {
+        assert_eq!(
+            operation_unfocus_messages(),
+            vec![Message::Input("x".into()), Message::Unfocus]
+        );
+    }
+
+    #[test]
+    fn an_empty_default_state_has_layout_caret_and_selection_state() {
+        let mut state = State::default();
+        layout_empty(&mut state);
+
+        assert_eq!(state.caret(), Point::ORIGIN);
+        assert!(state.selection_bounds().is_empty());
+        assert_eq!(state.selection(), None);
+    }
+
+    #[test]
+    fn an_empty_laid_out_state_can_be_snapshotted_focused() {
+        let mut state = State::default();
+        layout_empty(&mut state);
+        state.focus.focus();
+
+        let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(200.0, 20.0));
+        let snapshot = Snapshot::of(Id::unique(), bounds, &state);
+
+        assert!(snapshot.focused);
+        assert!(snapshot.empty);
+        assert_eq!(snapshot.caret, bounds.position());
+        assert!(snapshot.selection_bounds.is_empty());
     }
 
     #[test]

@@ -237,7 +237,8 @@ fn attach_cef_app_protocol(cls: &AnyClass) {
 }
 
 // =====================================================================
-// JellyfinAppMenuTarget — wires the App menu's "About" item.
+// JellyfinAppMenuTarget — selects the combined overlay's About tab from the
+// native App menu's "About" item.
 // =====================================================================
 
 define_class!(
@@ -248,6 +249,8 @@ define_class!(
     impl JellyfinAppMenuTarget {
         #[unsafe(method(showAbout:))]
         unsafe fn show_about(&self, _sender: *mut AnyObject) {
+            // The installed shell handler retargets the persistent overlay to
+            // About without replacing its Settings state.
             jfn_platform_abi::request_about();
         }
     }

@@ -109,6 +109,16 @@ pub fn field_style(focused: bool) -> crate::field::Style {
     }
 }
 
+/// The focus indicator shared by Settings actions, checkboxes, and selects.
+/// It overlays their existing state without replacing its fill or text style.
+pub fn control_focus_border() -> iced_core::Border {
+    iced_core::Border {
+        color: ACCENT,
+        width: 2.0,
+        radius: 3.0.into(),
+    }
+}
+
 impl iced_widget::button::Catalog for Theme {
     type Class<'a> = ButtonClass;
 
@@ -166,11 +176,143 @@ impl iced_widget::button::Catalog for Theme {
                 border: iced_core::Border::default(),
                 ..base
             },
-            (ButtonClass::Chrome | ButtonClass::Close, _) => iced_widget::button::Style {
-                background: None,
+            (ButtonClass::TabSelected, _) => iced_widget::button::Style {
+                background: Some(iced_core::Background::Color(ACCENT)),
+                text_color: Color::WHITE,
+                border: iced_core::Border::default(),
+                ..base
+            },
+            (ButtonClass::Tab, Status::Hovered | Status::Pressed) => iced_widget::button::Style {
+                background: Some(iced_core::Background::Color(FIELD)),
                 text_color: CHROME_TEXT,
                 border: iced_core::Border::default(),
                 ..base
+            },
+            (ButtonClass::Chrome | ButtonClass::Close | ButtonClass::Tab, _) => {
+                iced_widget::button::Style {
+                    background: None,
+                    text_color: CHROME_TEXT,
+                    border: iced_core::Border::default(),
+                    ..base
+                }
+            }
+        }
+    }
+}
+
+impl iced_widget::checkbox::Catalog for Theme {
+    type Class<'a> = ();
+
+    fn default<'a>() -> Self::Class<'a> {}
+
+    fn style(
+        &self,
+        _class: &Self::Class<'_>,
+        status: iced_widget::checkbox::Status,
+    ) -> iced_widget::checkbox::Style {
+        use iced_widget::checkbox::Status;
+        let (checked, highlighted) = match status {
+            Status::Active { is_checked } => (is_checked, false),
+            Status::Hovered { is_checked } => (is_checked, true),
+            Status::Disabled { is_checked } => (is_checked, false),
+        };
+        iced_widget::checkbox::Style {
+            background: iced_core::Background::Color(if checked { ACCENT } else { FIELD }),
+            icon_color: Color::WHITE,
+            border: iced_core::Border {
+                color: if highlighted { ACCENT } else { CARD_BORDER },
+                width: 2.0,
+                radius: 3.0.into(),
+            },
+            text_color: Some(TEXT),
+        }
+    }
+}
+
+impl iced_widget::scrollable::Catalog for Theme {
+    type Class<'a> = ();
+
+    fn default<'a>() -> Self::Class<'a> {}
+
+    fn style(
+        &self,
+        _class: &Self::Class<'_>,
+        _status: iced_widget::scrollable::Status,
+    ) -> iced_widget::scrollable::Style {
+        let rail = iced_widget::scrollable::Rail {
+            background: Some(iced_core::Background::Color(FIELD)),
+            border: iced_core::Border::default(),
+            scroller: iced_widget::scrollable::Scroller {
+                background: iced_core::Background::Color(CARD_BORDER),
+                border: iced_core::Border {
+                    radius: 3.0.into(),
+                    ..iced_core::Border::default()
+                },
+            },
+        };
+        iced_widget::scrollable::Style {
+            container: iced_widget::container::Style::default(),
+            vertical_rail: rail,
+            horizontal_rail: rail,
+            gap: None,
+            auto_scroll: iced_widget::scrollable::AutoScroll {
+                background: iced_core::Background::Color(CARD),
+                border: iced_core::Border::default(),
+                shadow: iced_core::Shadow::default(),
+                icon: TEXT,
+            },
+        }
+    }
+}
+
+impl iced_widget::overlay::menu::Catalog for Theme {
+    type Class<'a> = ();
+
+    fn default<'a>() -> <Self as iced_widget::overlay::menu::Catalog>::Class<'a> {}
+
+    fn style(
+        &self,
+        _class: &<Self as iced_widget::overlay::menu::Catalog>::Class<'_>,
+    ) -> iced_widget::overlay::menu::Style {
+        iced_widget::overlay::menu::Style {
+            background: iced_core::Background::Color(FIELD),
+            border: iced_core::Border {
+                color: CARD_BORDER,
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            text_color: TEXT,
+            selected_text_color: Color::WHITE,
+            selected_background: iced_core::Background::Color(ACCENT),
+            shadow: iced_core::Shadow::default(),
+        }
+    }
+}
+
+impl iced_widget::pick_list::Catalog for Theme {
+    type Class<'a> = ();
+
+    fn default<'a>() -> <Self as iced_widget::pick_list::Catalog>::Class<'a> {}
+
+    fn style(
+        &self,
+        _class: &<Self as iced_widget::pick_list::Catalog>::Class<'_>,
+        status: iced_widget::pick_list::Status,
+    ) -> iced_widget::pick_list::Style {
+        use iced_widget::pick_list::Status;
+        let highlighted = matches!(status, Status::Hovered | Status::Opened { .. });
+        iced_widget::pick_list::Style {
+            text_color: TEXT,
+            placeholder_color: Color {
+                a: 0.3,
+                ..Color::WHITE
+            },
+            handle_color: TEXT,
+            background: iced_core::Background::Color(FIELD),
+            border: iced_core::Border {
+                color: if highlighted { ACCENT } else { FIELD },
+                width: 2.0,
+                radius: 3.0.into(),
             },
         }
     }
@@ -223,6 +365,8 @@ pub enum ButtonClass {
     Primary,
     Chrome,
     Close,
+    Tab,
+    TabSelected,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

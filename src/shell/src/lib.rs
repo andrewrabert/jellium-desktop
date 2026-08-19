@@ -11,6 +11,7 @@ pub mod about;
 pub mod actor;
 pub mod chrome;
 pub mod connect;
+mod controls;
 pub mod field;
 pub mod fields;
 pub mod key;
@@ -20,6 +21,8 @@ pub mod menu;
 pub mod modal;
 pub mod paint;
 pub mod router_sink;
+pub mod settings;
+pub mod settings_overlay;
 pub mod spinner;
 pub mod state;
 pub mod theme;
@@ -194,9 +197,16 @@ fn signal_fonts_ready() {
     ready.notify_all();
 }
 
-/// Opens the about panel. Installed as [`jfn_platform_abi::set_about_handler`].
+/// Opens the combined overlay on its About tab. Installed as
+/// [`jfn_platform_abi::set_about_handler`].
 pub fn shell_open_about() {
     post(Work::OpenAbout);
+}
+
+/// Opens client settings. Work posted before the render thread starts remains
+/// queued in the process-wide shell channel.
+pub fn shell_open_client_settings() {
+    post(Work::OpenClientSettings);
 }
 
 const FONT: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
@@ -204,9 +214,7 @@ const FONT: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
 /// Posts `work` to the render actor. Never drops it: an actor that has not
 /// started yet finds it queued in the channel it takes at spawn.
 pub(crate) fn post(work: Work) {
-    if let Some(channel) = CHANNEL.get() {
-        channel.post(work);
-    }
+    CHANNEL.get_or_init(Channel::new).post(work);
 }
 
 /// Subscribed into bring-up at [`shell_start`]; wakes the pass that re-reads

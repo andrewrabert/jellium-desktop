@@ -750,6 +750,20 @@ mod tests {
     }
 
     #[test]
+    fn transparent_titlebar_false_round_trips_and_true_is_omitted() {
+        let false_data = loaded(r#"{"transparentTitlebar":false}"#);
+        assert!(!false_data.transparent_titlebar);
+        let false_json = serde_json::to_string(&false_data.to_file()).expect("serializes");
+        assert!(false_json.contains(r#""transparentTitlebar":false"#));
+        assert!(!loaded(&false_json).transparent_titlebar);
+
+        let true_json =
+            serde_json::to_string(&SettingsData::default().to_file()).expect("serializes");
+        assert!(!true_json.contains("transparentTitlebar"));
+        assert!(loaded(&true_json).transparent_titlebar);
+    }
+
+    #[test]
     fn wrong_typed_key_is_ignored_and_rest_of_file_loads() {
         let data = loaded(r#"{"windowWidth":"wide","serverUrl":"http://host","hideScrollbar":7}"#);
         assert_eq!(data.window.width, 0);

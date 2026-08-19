@@ -385,7 +385,7 @@
             window.api.system.openExternalUrl(info.url);
         },
         openClientSettings() {
-            window._openClientSettings();
+            window.jmpNative.openClientSettings();
         },
         getPlugins() {
             return plugins;

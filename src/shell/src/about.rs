@@ -3,16 +3,21 @@
 use std::path::{Path, PathBuf};
 
 use iced_core::text::{IntoFragment, Wrapping};
+use iced_core::widget::Id;
 use iced_core::{Alignment, Element, Length, Padding};
-use iced_widget::{Text, button, column, container, image, mouse_area, row, stack, text};
+use iced_widget::{Text, button, column, container, image, row, text};
 
+use crate::controls;
 use crate::theme::{self, Theme};
+
+pub const CONFIG_DIRECTORY_CONTROL: Id = Id::new("shell-about-config-directory");
+pub const CURRENT_LOG_CONTROL: Id = Id::new("shell-about-current-log");
+
+const VERSION_LABEL: &str = "Version";
+const CEF_LABEL: &str = "CEF";
 
 #[derive(Clone, Debug)]
 pub enum Message {
-    Dismiss,
-    /// A press inside the panel, absorbed so the backdrop does not dismiss.
-    Swallow,
     OpenPath(PathBuf),
 }
 
@@ -42,102 +47,85 @@ impl About {
         }
     }
 
-    /// `rgba(0, 0, 0, 0.5)`: jellyfin-web stays visible and dimmed behind the
-    /// panel, as it was when the panel lived in the page.
-    pub fn backdrop(&self) -> iced_core::Color {
-        iced_core::Color {
-            a: 0.5,
-            ..iced_core::Color::BLACK
-        }
-    }
-
     pub fn view(&self) -> Element<'_, Message, Theme, iced_wgpu::Renderer> {
         let mut rows = column![
-            self.row("App version", &self.app_version, None),
-            self.row("CEF version", &self.cef_version, None),
-            self.row(
-                "Config directory",
-                &self.config_dir.to_string_lossy(),
-                Some(self.config_dir.clone()),
-            ),
+            self.row(VERSION_LABEL, &self.app_version, None),
+            self.row(CEF_LABEL, &self.cef_version, None),
         ]
         .spacing(8);
-        if let Some(log) = &self.log_file {
-            rows = rows.push(self.row(
-                "Current log file",
-                &log.to_string_lossy(),
-                Some(log.clone()),
-            ));
+        for (label, id, path) in self.path_actions() {
+            rows = rows.push(self.row(label, &path.to_string_lossy(), Some((id, path.clone()))));
         }
 
-        let panel = column![
+        about_layout(
             image(crate::logo::handle()).width(Length::Fixed(crate::logo::ABOUT_WIDTH)),
             rows,
-        ]
-        .spacing(16)
-        .width(Length::Fixed(460.0));
-
-        // The card is the bubble: it fixes the panel's width, so no content
-        // length widens it, and clips its content, so no glyph reaches past its
-        // fill.
-        let card = container(panel)
-            .padding(Padding::from([18, 24]))
-            .clip(true)
-            .class(theme::ContainerClass::Card);
-
-        // The upper stack layer is the card's own size, so aligning the button
-        // right and top puts it in the card's corner.
-        let close = container(
-            button(text("\u{00d7}").size(18))
-                .on_press(Message::Dismiss)
-                .class(theme::ButtonClass::Chrome),
         )
-        .align_right(Length::Fill)
-        .align_top(Length::Fill);
+    }
 
-        // The backdrop is a window-filling interactive region that publishes
-        // `Dismiss` on press; the panel body captures presses first, so a click
-        // inside never dismisses.
-        let body = mouse_area(stack![card, close]).on_press(Message::Swallow);
-
-        mouse_area(
-            container(body)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::Center)
-                .align_y(Alignment::Center)
-                .class(theme::ContainerClass::Backdrop),
-        )
-        .on_press(Message::Dismiss)
-        .into()
+    fn path_actions(&self) -> Vec<(&'static str, Id, &PathBuf)> {
+        let mut actions = vec![(
+            "Config directory",
+            CONFIG_DIRECTORY_CONTROL,
+            &self.config_dir,
+        )];
+        if let Some(log) = &self.log_file {
+            actions.push(("Current log file", CURRENT_LOG_CONTROL, log));
+        }
+        actions
     }
 
     fn row<'a>(
         &self,
         label: &'a str,
         value: &str,
-        path: Option<PathBuf>,
+        action: Option<(Id, PathBuf)>,
     ) -> Element<'a, Message, Theme, iced_wgpu::Renderer> {
         let value = value.to_owned();
-        let value: Element<'a, Message, Theme, iced_wgpu::Renderer> = match path {
-            Some(p) => button(wrapped(value).class(Some(theme::LINK)))
-                .on_press(Message::OpenPath(p))
-                .class(theme::ButtonClass::Chrome)
-                .padding(0)
-                .into(),
+        let value: Element<'a, Message, Theme, iced_wgpu::Renderer> = match action {
+            Some((id, path)) => {
+                let message = Message::OpenPath(path);
+                controls::action(
+                    id,
+                    button(wrapped(value).class(Some(theme::LINK)))
+                        .on_press(message.clone())
+                        .class(theme::ButtonClass::Chrome)
+                        .padding(0),
+                    message,
+                )
+            }
             None => wrapped(value).into(),
         };
-        row![
-            container(wrapped(label).class(Some(theme::MUTED))).width(Length::Fixed(140.0)),
-            value,
-        ]
-        .into()
+        metadata_row(wrapped(label).class(Some(theme::MUTED)), value)
     }
 
     /// Opens the row's path through `Platform::open_path`.
     pub fn open(&self, path: &Path) {
         jfn_platform_abi::get().open_path(path);
     }
+}
+
+fn about_layout<'a, Message: 'a, Renderer: iced_core::Renderer + 'a>(
+    logo: impl Into<Element<'a, Message, Theme, Renderer>>,
+    rows: impl Into<Element<'a, Message, Theme, Renderer>>,
+) -> Element<'a, Message, Theme, Renderer> {
+    column![container(logo).padding(Padding::from([8, 0])), rows.into()]
+        .spacing(16)
+        .width(Length::Fill)
+        .align_x(Alignment::Center)
+        .into()
+}
+
+fn metadata_row<'a, Message: 'a, Renderer: iced_core::Renderer + 'a>(
+    label: impl Into<Element<'a, Message, Theme, Renderer>>,
+    value: impl Into<Element<'a, Message, Theme, Renderer>>,
+) -> Element<'a, Message, Theme, Renderer> {
+    row![
+        container(label).width(Length::Fixed(140.0)),
+        container(value).width(Length::Fill),
+    ]
+    .width(Length::Fill)
+    .into()
 }
 
 /// Panel text that wraps on a word where it can and inside a token where it
@@ -154,5 +142,91 @@ fn absolute(path: PathBuf) -> PathBuf {
     match std::env::current_dir() {
         Ok(cwd) => cwd.join(path),
         Err(_) => path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn about(log_file: Option<PathBuf>) -> About {
+        About {
+            app_version: "app".to_owned(),
+            cef_version: "cef".to_owned(),
+            config_dir: PathBuf::from("/config"),
+            log_file,
+        }
+    }
+
+    #[test]
+    fn version_labels_are_exact() {
+        assert_eq!([VERSION_LABEL, CEF_LABEL], ["Version", "CEF"]);
+    }
+
+    #[test]
+    fn about_layout_fills_rows_and_centers_the_logo() {
+        use iced_core::layout::Limits;
+        use iced_core::widget::Tree;
+        use iced_widget::Space;
+
+        let rows = iced_widget::column![
+            metadata_row(Space::new(), Space::new()),
+            metadata_row(Space::new(), Space::new()),
+        ];
+        let mut content: Element<'_, (), Theme, ()> = about_layout(
+            Space::new()
+                .width(Length::Fixed(crate::logo::ABOUT_WIDTH))
+                .height(Length::Fixed(1.0)),
+            rows,
+        );
+        let mut tree = Tree::new(content.as_widget());
+        let parent = iced_core::Size::new(632.0, 400.0);
+        let node = content.as_widget_mut().layout(
+            &mut tree,
+            &(),
+            &Limits::new(iced_core::Size::ZERO, parent),
+        );
+        let children = node.children();
+        let logo = children[0].bounds();
+        let rows = &children[1];
+        let first_row = &rows.children()[0];
+        let row_children = first_row.children();
+        let value = row_children[1].bounds();
+
+        assert_eq!(node.bounds().width, parent.width);
+        assert_eq!(rows.bounds().width, parent.width);
+        assert_eq!(first_row.bounds().width, parent.width);
+        assert_eq!(row_children[0].bounds().width, 140.0);
+        assert_eq!(value.x, 140.0);
+        assert_eq!(value.x + value.width, first_row.bounds().width);
+        assert_eq!(logo.x, (parent.width - crate::logo::ABOUT_WIDTH) / 2.0);
+    }
+
+    #[test]
+    fn rendered_actions_expose_config_directory_first_without_a_log() {
+        let about = about(None);
+
+        assert_eq!(
+            about
+                .path_actions()
+                .into_iter()
+                .map(|(_, id, _)| id)
+                .collect::<Vec<_>>(),
+            [CONFIG_DIRECTORY_CONTROL]
+        );
+    }
+
+    #[test]
+    fn rendered_actions_expose_config_then_current_log_in_visual_tab_order() {
+        let about = about(Some(PathBuf::from("/current.log")));
+
+        assert_eq!(
+            about
+                .path_actions()
+                .into_iter()
+                .map(|(_, id, _)| id)
+                .collect::<Vec<_>>(),
+            [CONFIG_DIRECTORY_CONTROL, CURRENT_LOG_CONTROL]
+        );
     }
 }

@@ -670,6 +670,20 @@ pub fn request_about() {
     }
 }
 
+static CLIENT_SETTINGS_HANDLER: OnceLock<fn()> = OnceLock::new();
+
+/// Register the callback that raises client settings. Single listener,
+/// installed once at boot.
+pub fn set_client_settings_handler(f: fn()) {
+    let _ = CLIENT_SETTINGS_HANDLER.set(f);
+}
+
+pub fn request_client_settings() {
+    if let Some(f) = CLIENT_SETTINGS_HANDLER.get() {
+        f();
+    }
+}
+
 static DECORATIONS_LISTENER: OnceLock<fn()> = OnceLock::new();
 
 /// Register the callback fired when [`Platform::effective_decorations`]

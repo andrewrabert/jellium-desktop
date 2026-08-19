@@ -27,7 +27,6 @@ macro_rules! embedded {
 
 // URL key is the path after the `app://` scheme (no leading slash).
 static RESOURCES: &[(&str, Embedded)] = &[
-    embedded!("client-settings.js", "application/javascript"),
     embedded!("input-plugin.js", "application/javascript"),
     embedded!("mpv-audio-player.js", "application/javascript"),
     embedded!("mpv-player-base.js", "application/javascript"),
