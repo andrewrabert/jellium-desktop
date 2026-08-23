@@ -2,25 +2,8 @@
 
 use cef::{ImplBrowser, ImplBrowserHost, KeyEvent, MouseButtonType, MouseEvent, sys};
 use std::os::raw::c_int;
-use std::sync::atomic::Ordering;
 
-use super::{DEFAULT_FRAME_RATE, Inner, PAINT_MODE};
-use crate::paint_scheduler::PaintMode;
-
-/// Process-wide default frame rate, set once by `WebOverlay::start`. Consumed
-/// by `Inner::cef_create_browser` when building
-/// `CefBrowserSettings.windowless_frame_rate`. Zero values are ignored.
-pub(crate) fn set_default_frame_rate(hz: c_int) {
-    if hz > 0 {
-        DEFAULT_FRAME_RATE.store(hz, Ordering::Release);
-    }
-}
-
-pub(crate) fn set_use_shared_textures(enable: bool) {
-    if PAINT_MODE.set(PaintMode::new(enable)).is_err() {
-        eprintln!("[cef] paint mode already initialized; ignoring re-init");
-    }
-}
+use super::Inner;
 
 impl Inner {
     pub(crate) fn can_go_back(&self) -> bool {

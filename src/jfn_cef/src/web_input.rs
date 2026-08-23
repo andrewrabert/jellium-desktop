@@ -1,17 +1,13 @@
 //! jellyfin-web's half of the input router.
 //!
-//! The router hands it points already in the overlay's own space, so it
-//! reports no inset of its own.
+//! Every command upgrades the process registry's weak client reference at the
+//! point of use. Commands remain no-ops while no browser client is available.
 
 use std::os::raw::c_int;
 
 use jfn_input::WebInput;
 
-use crate::web_overlay::WebOverlay;
-
-struct WebSink {
-    overlay: WebOverlay,
-}
+struct WebSink;
 
 impl WebInput for WebSink {
     fn send_key_event(
@@ -24,15 +20,17 @@ impl WebInput for WebSink {
         character: u16,
         unmodified_character: u16,
     ) {
-        self.overlay.client().send_key_event(
-            type_,
-            modifiers,
-            windows_key_code,
-            native_key_code,
-            is_system_key,
-            character,
-            unmodified_character,
-        );
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.send_key_event(
+                type_,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                is_system_key,
+                character,
+                unmodified_character,
+            );
+        }
     }
 
     fn send_mouse_click(
@@ -44,29 +42,33 @@ impl WebInput for WebSink {
         mouse_up: bool,
         click_count: c_int,
     ) {
-        self.overlay
-            .client()
-            .send_mouse_click(x, y, modifiers, button, mouse_up, click_count);
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.send_mouse_click(x, y, modifiers, button, mouse_up, click_count);
+        }
     }
 
     fn send_mouse_move(&self, x: c_int, y: c_int, modifiers: u32, leave: bool) {
-        self.overlay
-            .client()
-            .send_mouse_move(x, y, modifiers, leave);
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.send_mouse_move(x, y, modifiers, leave);
+        }
     }
 
     fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int) {
-        self.overlay
-            .client()
-            .send_mouse_wheel(x, y, modifiers, delta_x, delta_y);
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.send_mouse_wheel(x, y, modifiers, delta_x, delta_y);
+        }
     }
 
     fn set_focus(&self, focus: bool) {
-        self.overlay.client().set_focus(focus);
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.set_focus(focus);
+        }
     }
 
     fn navigate_history(&self, forward: bool) {
-        let client = self.overlay.client();
+        let Some(client) = crate::web_overlay::current_client() else {
+            return;
+        };
         if forward {
             if client.can_go_forward() {
                 client.go_forward();
@@ -77,34 +79,46 @@ impl WebInput for WebSink {
     }
 
     fn undo(&self) {
-        self.overlay.client().frame_undo();
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.frame_undo();
+        }
     }
 
     fn redo(&self) {
-        self.overlay.client().frame_redo();
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.frame_redo();
+        }
     }
 
     fn cut(&self) {
-        self.overlay.client().frame_cut();
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.frame_cut();
+        }
     }
 
     fn copy(&self) {
-        self.overlay.client().frame_copy();
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.frame_copy();
+        }
     }
 
     fn paste(&self) {
-        self.overlay.client().frame_paste();
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.frame_paste();
+        }
     }
 
     fn select_all(&self) {
-        self.overlay.client().frame_select_all();
+        if let Some(client) = crate::web_overlay::current_client() {
+            client.frame_select_all();
+        }
     }
 
     fn is_alive(&self) -> bool {
-        self.overlay.client().browser_alive()
+        crate::web_overlay::current_client().is_some_and(|client| client.browser_alive())
     }
 }
 
-pub(crate) fn install(overlay: WebOverlay) {
-    jfn_input::install_web(Box::new(WebSink { overlay }));
+pub(crate) fn install() {
+    jfn_input::install_web(Box::new(WebSink));
 }

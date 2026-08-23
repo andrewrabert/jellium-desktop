@@ -36,6 +36,7 @@ jfn-shell = { path = "../shell" }
 jfn-instance-ipc = { path = "../instance_ipc" }
 jfn-wake-event = { path = "../wake_event" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+thiserror.workspace = true
 
 
 [target.'cfg(target_os = "macos")'.dependencies]

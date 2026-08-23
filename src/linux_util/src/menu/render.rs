@@ -348,10 +348,9 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Pat
 /// Writes premultiplied BGRA (wl_shm ARGB8888 little-endian, X11 ARGB32), and
 /// copies `min(dst.len(), pm.width() * pm.height() * 4)` bytes.
 pub fn blit_bgra(pm: &Pixmap, dst: &mut [u8]) {
-    for (out, src) in dst.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
-        out[0] = src[2];
-        out[1] = src[1];
-        out[2] = src[0];
-        out[3] = src[3];
+    let (out, _) = dst.as_chunks_mut::<4>();
+    let (src, _) = pm.data().as_chunks::<4>();
+    for (out, src) in out.iter_mut().zip(src) {
+        *out = [src[2], src[1], src[0], src[3]];
     }
 }

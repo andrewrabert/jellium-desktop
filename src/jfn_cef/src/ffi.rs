@@ -64,14 +64,15 @@ pub fn jfn_cef_set_remote_debugging_port(port: c_int) {
 }
 
 pub fn jfn_cef_set_disable_gpu_compositing(disable: bool) {
-    if disable {
-        state::with_config(|c| {
-            c.pending_switches.push(state::PendingSwitch {
+    state::with_config(|config| {
+        config.gpu_compositing_disabled = disable;
+        if disable {
+            config.pending_switches.push(state::PendingSwitch {
                 name: "disable-gpu-compositing".to_string(),
                 value: None,
             });
-        });
-    }
+        }
+    });
 }
 
 pub fn jfn_cef_set_platform_switches(backend: DisplayBackend) {

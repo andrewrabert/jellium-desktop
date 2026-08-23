@@ -4,11 +4,9 @@ use cef::{
     process_message_create, sys,
 };
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
-use crate::paint_scheduler::PaintMode;
-
-use super::{DEFAULT_FRAME_RATE, Inner, PAINT_MODE};
+use super::Inner;
+use crate::frame_rate::FrameRate;
 
 impl Inner {
     pub(super) fn browser_clone(&self) -> Option<Browser> {
@@ -90,10 +88,8 @@ impl Inner {
         );
     }
 
-    pub(super) fn cef_create_browser(self: &Arc<Self>, url: &str) {
-        let shared = PAINT_MODE
-            .get_or_init(|| PaintMode::new(false))
-            .shared_textures();
+    pub(super) fn cef_create_browser(self: &Arc<Self>, url: &str) -> bool {
+        let shared = self.paint_mode.shared_textures();
         let parent: sys::cef_window_handle_t = unsafe { std::mem::zeroed() };
         let mut wi = WindowInfo::default().set_as_windowless(parent);
         wi.shared_texture_enabled = if shared { 1 } else { 0 };
@@ -102,37 +98,32 @@ impl Inner {
             .is_some_and(|h| h.external_begin_frame());
         wi.external_begin_frame_enabled = if external_bf { 1 } else { 0 };
 
-        let fr_layer = self.frame_rate.load(Ordering::Acquire);
-        let fr_default = DEFAULT_FRAME_RATE.load(Ordering::Acquire);
-        let fr = if fr_layer > 0 { fr_layer } else { fr_default };
-        // Left at CEF's own default where no display has reported a refresh.
+        // Zero is CEF's own default.
+        let fr = self.frame_rate.load().map_or(0, FrameRate::get);
         let bs = BrowserSettings {
             background_color: 0,
-            windowless_frame_rate: fr.max(0),
+            windowless_frame_rate: fr,
             ..BrowserSettings::default()
         };
+        jfn_logging::log(
+            jfn_logging::CATEGORY_CEF,
+            jfn_logging::LEVEL_DEBUG,
+            &format!("create browser windowless_frame_rate={fr} shared_textures={shared}"),
+        );
 
         let extra = crate::injection::build_web(shared);
 
         let mut client = crate::client_impl::make_client(Arc::clone(self));
         let url_cef = CefString::from(url);
         let mut extra_opt = extra.into_dictionary();
-        let _ = browser_host_create_browser(
+        browser_host_create_browser(
             Some(&wi),
             Some(&mut client),
             Some(&url_cef),
             Some(&bs),
             extra_opt.as_mut(),
             None,
-        );
-    }
-
-    pub(super) fn cef_load_url(&self, url: &str) {
-        let Some(b) = self.browser_clone() else {
-            return;
-        };
-        let Some(f) = b.main_frame() else { return };
-        f.load_url(Some(&CefString::from(url)));
+        ) != 0
     }
 
     pub(super) fn exec_js_focused(&self, js: &str) {
@@ -182,6 +173,6 @@ impl Inner {
     }
 
     pub(crate) fn browser_alive(&self) -> bool {
-        self.browser.lock().browser.is_some() && !self.closed.load(Ordering::Acquire)
+        self.browser.lock().browser.is_some()
     }
 }

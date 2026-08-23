@@ -48,6 +48,11 @@ impl RefreshRate {
         NonZeroU64::new(u64::try_from(mhz).ok()?).map(RefreshRate)
     }
 
+    /// This rate in exact millihertz.
+    pub fn millihertz(self) -> u64 {
+        self.0.get()
+    }
+
     /// The frame period this rate names: one second divided by the rate,
     /// integer round-half-up in nanoseconds. The only place a period is
     /// derived from a rate.
@@ -76,6 +81,8 @@ impl RefreshSource {
     }
 }
 
+/// Millihertz of the published rate; zero while none has been reported.
+static RATE_MILLIHERTZ: AtomicU64 = AtomicU64::new(0);
 /// Nanoseconds of the published interval; zero while none has been reported.
 static INTERVAL_NANOS: AtomicU64 = AtomicU64::new(0);
 /// The rank of the source that published it; zero while none has.
@@ -108,6 +115,7 @@ pub fn report_refresh(source: RefreshSource, rate: RefreshRate) {
         }
         let nanos = nanos as u64;
         let changed = INTERVAL_NANOS.swap(nanos, Ordering::Relaxed) != nanos;
+        RATE_MILLIHERTZ.store(rate.millihertz(), Ordering::Relaxed);
         SOURCE_RANK.store(source.rank(), Ordering::Relaxed);
         changed
     };
@@ -123,6 +131,12 @@ fn notify() {
     for on_change in subscribers {
         on_change();
     }
+}
+
+/// The highest-ranked refresh rate published so far, or `None` while no
+/// accepted source has reported one.
+pub fn current_refresh_rate() -> Option<RefreshRate> {
+    NonZeroU64::new(RATE_MILLIHERTZ.load(Ordering::Relaxed)).map(RefreshRate)
 }
 
 /// The display's reported refresh interval, or `None` while no platform has

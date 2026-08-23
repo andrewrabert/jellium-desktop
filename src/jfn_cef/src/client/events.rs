@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use jfn_platform_abi::cursor::CursorShape;
 
-use super::{Inner, platform_ops, tasks};
+use super::{Inner, tasks};
+use crate::platform_ops;
 
 /// CEF's `ERR_ABORTED`, taken from the generated bindings rather than its
 /// value.

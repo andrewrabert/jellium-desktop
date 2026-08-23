@@ -180,6 +180,7 @@ mod tests {
             rows,
         );
         let mut tree = Tree::new(content.as_widget());
+        tree.diff(content.as_widget_mut());
         let parent = iced_core::Size::new(632.0, 400.0);
         let node = content.as_widget_mut().layout(
             &mut tree,

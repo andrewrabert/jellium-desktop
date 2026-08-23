@@ -10,8 +10,8 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::business_common::{apply_setting_value, js_cstr_or_warn};
+use crate::client::Inner;
 use crate::ipc::{BrowserMessage, list_int, list_opt_string, list_string};
-use crate::web_overlay::WebOverlay;
 use jfn_color::jfn_cef_parse_color;
 use jfn_color::theme::{jfn_theme_color_on_color, jfn_theme_color_set_video_mode};
 use jfn_mpv::api::{
@@ -47,10 +47,8 @@ struct MediaMetadata {
 /// OSD, so dismissing the OSD only leaves fullscreen if the OSD put us there.
 static WAS_FULLSCREEN_BEFORE_OSD: Mutex<bool> = Mutex::new(false);
 
-/// Install jellyfin-web's handlers on `overlay`'s browser.
-pub(crate) fn install(overlay: &WebOverlay) {
-    let client = overlay.client();
-
+/// Install jellyfin-web's handlers before its client is submitted to CEF.
+pub(crate) fn install(client: &Arc<Inner>) {
     client.set_created_callback(Some(Arc::new(|| {
         // The router owns this browser's CEF focus: it is live here, and a
         // focus published before it existed reached nothing.

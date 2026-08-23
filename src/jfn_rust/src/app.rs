@@ -3,6 +3,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::ptr;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use clap::Parser;
@@ -22,6 +23,14 @@ fn plat() -> &'static dyn Platform {
 /// The started web overlay, for the C handler thunks the playback coordinator
 /// still calls through.
 static WEB_OVERLAY: parking_lot::Mutex<Option<jfn_cef::WebOverlay>> = parking_lot::Mutex::new(None);
+
+#[derive(Debug, thiserror::Error)]
+enum RuntimeShutdownError {
+    #[error(transparent)]
+    Manager(#[from] crate::manager::ManagerError),
+    #[error("the shutdown manager thread could not be joined")]
+    ManagerJoinFailed,
+}
 
 // Read once by `jfn_app_main` after CEF boot to seed the theme rotator.
 static VIDEO_BG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -405,14 +414,20 @@ fn start_playback_coordination(instance: &Instance) -> bool {
     true
 }
 
-fn shutdown_runtime(manager_thread: std::thread::JoinHandle<()>, overlay: jfn_cef::WebOverlay) {
-    // Persist before the joins below: they can block on a VO-teardown
+fn shutdown_runtime(
+    manager_thread: JoinHandle<Result<(), crate::manager::ManagerError>>,
+    overlay: jfn_cef::WebOverlay,
+) -> Result<(), RuntimeShutdownError> {
+    // Persist before the join below: it can block on a VO-teardown
     // roundtrip, and a hang there must not cost the window geometry.
     crate::window_geometry::controller().persist();
     jfn_config::settings_save();
 
     // Join before any teardown so no posted task outlives the layer free below.
-    let _ = manager_thread.join();
+    let manager = manager_thread
+        .join()
+        .map_err(|_| RuntimeShutdownError::ManagerJoinFailed)
+        .and_then(|r| r.map_err(RuntimeShutdownError::from));
 
     // Sever host↔mpv links that could deadlock the teardown below once
     // CEF threads start dying.
@@ -427,7 +442,7 @@ fn shutdown_runtime(manager_thread: std::thread::JoinHandle<()>, overlay: jfn_ce
 
     jfn_shell::shell_shutdown();
     WEB_OVERLAY.lock().take();
-    overlay.shutdown();
+    drop(overlay);
     jfn_cef::ffi::jfn_cef_shutdown();
     CEF_INITED.store(false, std::sync::atomic::Ordering::Release);
 
@@ -438,14 +453,17 @@ fn shutdown_runtime(manager_thread: std::thread::JoinHandle<()>, overlay: jfn_ce
 
     jfn_playback::ffi::jfn_playback_shutdown();
     COORD_INITED.store(false, std::sync::atomic::Ordering::Release);
+
+    manager
 }
 
 /// Boot-time mpv size reconcile (saved scale vs the scale the platform
 /// reports); seeds the display-hz cache and returns it for browser init.
-fn boot_mpv_reconcile() -> f64 {
+fn boot_mpv_reconcile() -> Option<jfn_gpu_paint::RefreshRate> {
     jfn_playback::ingest_driver::jfn_playback_seed_display_hz_sync();
     let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
-    if let Some(rate) = jfn_gpu_paint::RefreshRate::from_hz(hz) {
+    let rate = jfn_gpu_paint::RefreshRate::from_hz(hz);
+    if let Some(rate) = rate {
         jfn_gpu_paint::report_refresh(jfn_gpu_paint::RefreshSource::MpvDisplayFps, rate);
     }
     let saved = jfn_config::window_geometry();
@@ -480,13 +498,16 @@ fn boot_mpv_reconcile() -> f64 {
         unsafe { jfn_mpv::api::jfn_mpv_set_geometry(g_c.as_ptr()) };
     }
 
-    hz
+    rate
 }
 
 fn start_web_overlay(
-    hz: f64,
+    rate: Option<jfn_gpu_paint::RefreshRate>,
     use_shared_textures: bool,
-) -> (std::thread::JoinHandle<()>, jfn_cef::WebOverlay) {
+) -> (
+    JoinHandle<Result<(), crate::manager::ManagerError>>,
+    jfn_cef::WebOverlay,
+) {
     // Must run before the browser is created: the pre-loaded page fires its
     // initial theme-color IPC at DOMContentLoaded.
     let titlebar_themed = jfn_config::titlebar_theme_color();
@@ -505,7 +526,7 @@ fn start_web_overlay(
     // The overlay creates its browser itself, at the first size the window
     // snapshot and the shell overlay's reserved strip yield.
     let overlay = jfn_cef::WebOverlay::start(jfn_cef::WebOverlayConfig {
-        frame_rate: hz,
+        frame_rate: rate,
         shared_textures: use_shared_textures,
     });
     let manager_thread = crate::manager::jfn_manager_start(overlay.clone());
@@ -860,11 +881,12 @@ extern "C" fn h_web_exec_js(js: *const c_char) {
 }
 extern "C" fn h_browsers_set_refresh_rate(hz: f64) {
     tracing::info!(target: "Main", "Display refresh rate changed: {hz} Hz");
-    if let Some(rate) = jfn_gpu_paint::RefreshRate::from_hz(hz) {
-        jfn_gpu_paint::report_refresh(jfn_gpu_paint::RefreshSource::MpvDisplayFps, rate);
-    }
+    let Some(rate) = jfn_gpu_paint::RefreshRate::from_hz(hz) else {
+        return;
+    };
+    jfn_gpu_paint::report_refresh(jfn_gpu_paint::RefreshSource::MpvDisplayFps, rate);
     if let Some(overlay) = WEB_OVERLAY.lock().clone() {
-        overlay.set_refresh_rate(hz);
+        overlay.set_refresh_rate(rate);
     }
 }
 extern "C" fn h_theme_set_titlebar(rgb: u32) {
@@ -904,9 +926,9 @@ unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
         return 1;
     }
 
-    let hz = boot_mpv_reconcile();
+    let rate = boot_mpv_reconcile();
 
-    let (manager_thread, overlay) = start_web_overlay(hz, shared_textures());
+    let (manager_thread, overlay) = start_web_overlay(rate, shared_textures());
     WEB_OVERLAY.lock().replace(overlay.clone());
 
     if !start_playback_coordination(instance) {
@@ -925,7 +947,10 @@ unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
     plat().run_main_loop();
     tracing::info!(target: "Main", "[FLOW] run_main_loop returned — browsers drained, running teardown");
 
-    shutdown_runtime(manager_thread, overlay);
+    if let Err(e) = shutdown_runtime(manager_thread, overlay) {
+        tracing::error!(target: "Main", "shutdown: {e}");
+        return 1;
+    }
 
     0
 }

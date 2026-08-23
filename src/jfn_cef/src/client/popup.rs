@@ -3,7 +3,6 @@ use cef::{
     ImplBrowserHost, ImplTask, KeyEvent, Task, ThreadId, WrapTask, post_task, sys, wrap_task,
 };
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use crate::platform_ops::{MenuDelivery, MenuItem, MenuRequest, MenuSelection};
 
@@ -45,10 +44,7 @@ impl Inner {
             Self::reset_popup_state(&mut p);
         }
         if !show {
-            let surface = self.surface_handle();
-            if !surface.is_none() {
-                self.hide_dropdown(surface);
-            }
+            self.hide_dropdown();
             return;
         }
         self.send_process_message_named("getPopupOptions");
@@ -104,10 +100,6 @@ impl Inner {
             )
         };
 
-        let surface = self.surface_handle();
-        if surface.is_none() {
-            return;
-        }
         let inner = Arc::clone(self);
         let on_selected = MenuSelection::new(move |idx| {
             let mut task = DispatchPopupTask::new(inner, idx, selected, selectable.clone());
@@ -122,19 +114,15 @@ impl Inner {
                 initial: selected,
                 on_selected,
             }),
-            MenuDelivery::Composited => {
-                jfn_platform_abi::get()
-                    .osr_popup_surface()
-                    .show(surface, x, y, w, h);
-            }
+            MenuDelivery::Composited => self.surface().popup_show(x, y, w, h),
             MenuDelivery::Page => {}
         }
     }
 
-    fn hide_dropdown(&self, surface: crate::platform_ops::SurfaceHandle) {
+    fn hide_dropdown(&self) {
         match self.dropdown {
             MenuDelivery::Host(host) => host.hide(),
-            MenuDelivery::Composited => jfn_platform_abi::get().osr_popup_surface().hide(surface),
+            MenuDelivery::Composited => self.surface().popup_hide(),
             MenuDelivery::Page => {}
         }
     }
@@ -152,11 +140,7 @@ impl Inner {
         if !was_visible {
             return;
         }
-        let surface = self.surface_handle();
-        if surface.is_none() {
-            return;
-        }
-        self.hide_dropdown(surface);
+        self.hide_dropdown();
     }
 
     pub(super) fn popup_rect(&self) -> (i32, i32) {
@@ -170,9 +154,6 @@ impl Inner {
     // ourselves, then replay the user's pick into CEF's still-open popup —
     // arrow-key to the chosen row + Enter to commit, or Escape to cancel.
     fn dispatch_popup_selection(&self, idx: i32, current: i32, selectable: &[i32]) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
         // Blink already closed the popup: a replayed Escape or arrow would land
         // on the page instead.
         if !self.popup.lock().visible {

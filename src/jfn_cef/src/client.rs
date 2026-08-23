@@ -10,8 +10,10 @@
 //! the overlay's own drop.
 
 use cef::{Browser, RunContextMenuCallback};
+use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::atomic::AtomicCell;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
+use std::convert::Infallible;
 use std::os::raw::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64};
 use std::sync::{Arc, OnceLock};
@@ -19,8 +21,9 @@ use std::time::Instant;
 
 use crate::ipc::BrowserMessage;
 use crate::menu_ownership::{MenuOwnership, Session};
-use crate::platform_ops;
+use crate::web_overlay::WebOverlaySurface;
 
+use crate::frame_rate::FrameRate;
 use crate::paint_scheduler::{PaintMode, PaintScheduler};
 
 mod accel;
@@ -33,26 +36,62 @@ mod paint;
 mod popup;
 mod resize;
 mod tasks;
-pub(crate) use ops::{set_default_frame_rate, set_use_shared_textures};
-pub(crate) use tasks::{post_close_and_collect, post_set_hidden};
-
-// A word-sized handle must never fall back to AtomicCell's global-lock
-// path: it is read on every paint.
-const _: () = assert!(AtomicCell::<platform_ops::SurfaceHandle>::is_lock_free());
+pub(crate) use tasks::{post_close_and_wait, post_set_hidden};
 
 /// The document a browser is left showing once its navigation is abandoned.
 const BLANK: &str = "about:blank";
 
-const STATE_NORMAL: i32 = 0;
-const STATE_PENDING_RESET: i32 = 1;
-const STATE_RECREATING: i32 = 2;
+enum PendingNavigation {
+    Page {
+        navigation: jfn_bringup::Navigation,
+        url: String,
+    },
+    Blank,
+}
 
-// Process-wide defaults set once at startup by `WebOverlay::start`; consumed
-// by Inner::cef_create_browser when building WindowInfo + BrowserSettings.
-/// Zero until a display reports a refresh; CEF then runs at its own default
-/// rather than at a rate this process invented.
-static DEFAULT_FRAME_RATE: AtomicI32 = AtomicI32::new(0);
-static PAINT_MODE: OnceLock<PaintMode> = OnceLock::new();
+pub(crate) struct DeferredNavigation {
+    /// The newest effective navigation not yet submitted to a real main frame;
+    /// an empty vector is absence and the vector contains at most one typed load.
+    pending: Mutex<Vec<PendingNavigation>>,
+}
+
+impl DeferredNavigation {
+    pub(crate) fn new() -> Arc<DeferredNavigation> {
+        Arc::new(Self {
+            pending: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn navigate(&self, navigation: jfn_bringup::Navigation, url: &str) {
+        let mut pending = self.pending.lock();
+        pending.clear();
+        pending.push(PendingNavigation::Page {
+            navigation,
+            url: url.to_owned(),
+        });
+    }
+
+    pub(crate) fn abandon(&self, navigation: jfn_bringup::Navigation) {
+        let mut pending = self.pending.lock();
+        if matches!(
+            pending.as_slice(),
+            [PendingNavigation::Page {
+                navigation: pending_navigation,
+                ..
+            }] if *pending_navigation == navigation
+        ) {
+            pending.clear();
+            pending.push(PendingNavigation::Blank);
+        }
+    }
+
+    fn blank_if_absent(&self) {
+        let mut pending = self.pending.lock();
+        if pending.is_empty() {
+            pending.push(PendingNavigation::Blank);
+        }
+    }
+}
 
 /// Which navigation this browser's pixels belong to.
 enum Painting {
@@ -129,9 +168,8 @@ pub(crate) struct BrowserState {
 pub(crate) struct Inner {
     // identity / state queries (slice 1)
     name: Mutex<String>,
-    closed: AtomicBool,
-    close_mtx: Mutex<()>,
-    close_cv: Condvar,
+    _owner_connected: Sender<Infallible>,
+    owner_disconnected: Receiver<Infallible>,
     /// Which navigation this browser's pixels belong to, written on TID_UI
     /// alone — by the requests bring-up produces and by the main-frame load
     /// callback — and read on every paint.
@@ -145,9 +183,9 @@ pub(crate) struct Inner {
     pending_menu_callback: Mutex<Option<RunContextMenuCallback>>,
     // The one context-menu session slot for this browser.
     menu: Mutex<MenuOwnership>,
-    // Opaque per-layer surface handle (PlatformSurface*); passed back to the
-    // C++ platform vtable for surface_resize / present / popup.
-    surface: AtomicCell<platform_ops::SurfaceHandle>,
+    // The surface owner is shared through CEF's client ownership; its opaque
+    // handle is never copied into this client.
+    surface: Arc<WebOverlaySurface>,
 
     // logical dims + the scale CEF is told about (slice 3)
     width: AtomicI32,
@@ -156,11 +194,12 @@ pub(crate) struct Inner {
     /// before any size has been applied.
     scale: AtomicCell<Option<jfn_platform_abi::Scale>>,
 
+    /// How the browser's pixels reach the surface; fixed for the process.
+    pub(super) paint_mode: PaintMode,
     paint_scheduler: PaintScheduler,
 
-    // frame rate (slice 3): configured and last applied
-    pub(crate) frame_rate: AtomicI32,
-    current_frame_rate: AtomicI32,
+    /// The rate the browser is asked to paint at; `None` leaves CEF's default.
+    pub(crate) frame_rate: AtomicCell<Option<FrameRate>>,
 
     // resize-debounce (slice 3)
     resize_scheduled: AtomicBool,
@@ -173,16 +212,13 @@ pub(crate) struct Inner {
     popup: Mutex<PopupState>,
     dropdown: jfn_platform_abi::MenuDelivery,
 
-    // lifecycle / reset state machine (slice 5)
-    state: AtomicI32,
-    pending_url: Mutex<String>,
-    has_browser: AtomicBool,
-    pending_internal_reset: AtomicBool,
+    /// The newest effective navigation not yet submitted to a real main frame;
+    /// an empty vector is absence and the vector contains at most one typed load.
+    deferred_navigation: Arc<DeferredNavigation>,
 
     // app-level callback slots, stored as boxed closures.
     message_handler: Mutex<Option<Box<MessageFn>>>,
     created_callback: Mutex<Option<Arc<CreatedFn>>>,
-    before_close_callback: Mutex<Option<Box<BeforeCloseFn>>>,
     context_menu_builder: Mutex<Option<Box<ContextBuilderFn>>>,
     context_menu_dispatcher: Mutex<Option<Box<ContextDispatcherFn>>>,
 }
@@ -192,7 +228,6 @@ pub(crate) struct Inner {
 // CefRefPtr objects depending on which side installed the handler.
 pub(crate) type MessageFn = dyn Fn(BrowserMessage) -> bool + Send + Sync;
 pub type CreatedFn = dyn Fn() + Send + Sync;
-pub type BeforeCloseFn = dyn Fn() + Send + Sync;
 pub type ContextBuilderFn = dyn Fn(*mut c_void) + Send + Sync;
 pub type ContextDispatcherFn = dyn Fn(c_int) -> bool + Send + Sync;
 
@@ -221,15 +256,18 @@ unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
 impl Inner {
-    pub(crate) fn new() -> Arc<Self> {
-        let paint_scheduler = PAINT_MODE
-            .get_or_init(|| PaintMode::new(false))
-            .make_scheduler();
+    pub(crate) fn new(
+        surface: Arc<WebOverlaySurface>,
+        deferred_navigation: Arc<DeferredNavigation>,
+        paint_mode: PaintMode,
+        frame_rate: Option<FrameRate>,
+    ) -> Arc<Self> {
+        let paint_scheduler = paint_mode.make_scheduler();
+        let (owner_connected, owner_disconnected) = crossbeam_channel::unbounded();
         Arc::new(Self {
             name: Mutex::new(String::new()),
-            closed: AtomicBool::new(false),
-            close_mtx: Mutex::new(()),
-            close_cv: Condvar::new(),
+            _owner_connected: owner_connected,
+            owner_disconnected,
             painting: Mutex::new(Painting::None),
             browser: Mutex::new(BrowserState {
                 browser: None,
@@ -237,13 +275,13 @@ impl Inner {
             }),
             pending_menu_callback: Mutex::new(None),
             menu: Mutex::new(MenuOwnership::default()),
-            surface: AtomicCell::new(platform_ops::SurfaceHandle::NONE),
+            surface,
             width: AtomicI32::new(0),
             height: AtomicI32::new(0),
             scale: AtomicCell::new(None),
+            paint_mode,
             paint_scheduler,
-            frame_rate: AtomicI32::new(0),
-            current_frame_rate: AtomicI32::new(0),
+            frame_rate: AtomicCell::new(frame_rate),
             resize_scheduled: AtomicBool::new(false),
             last_was_resized_ns: AtomicI64::new(0),
             popup: Mutex::new(PopupState {
@@ -251,13 +289,9 @@ impl Inner {
                 ..PopupState::default()
             }),
             dropdown: jfn_platform_abi::menu_delivery(jfn_platform_abi::MenuKind::Dropdown),
-            state: AtomicI32::new(STATE_NORMAL),
-            pending_url: Mutex::new(String::new()),
-            has_browser: AtomicBool::new(false),
-            pending_internal_reset: AtomicBool::new(false),
+            deferred_navigation,
             message_handler: Mutex::new(None),
             created_callback: Mutex::new(None),
-            before_close_callback: Mutex::new(None),
             context_menu_builder: Mutex::new(None),
             context_menu_dispatcher: Mutex::new(None),
         })
@@ -271,12 +305,12 @@ impl Inner {
         self.name.lock().clone()
     }
 
-    pub(crate) fn set_surface(&self, surface: platform_ops::SurfaceHandle) {
-        self.surface.store(surface);
+    pub(crate) fn owner_disconnection(&self) -> Receiver<Infallible> {
+        self.owner_disconnected.clone()
     }
 
-    fn surface_handle(&self) -> platform_ops::SurfaceHandle {
-        self.surface.load()
+    pub(crate) fn surface(&self) -> &WebOverlaySurface {
+        &self.surface
     }
 
     /// The strip this browser's view was sized below, logical pixels. Zero
@@ -335,14 +369,15 @@ impl Inner {
 /// one this asks for: the view is invalidated, and where the host drives
 /// frames, the next one is requested.
 impl Inner {
-    /// Bring-up issued `navigation` for `base`, which is stored verbatim: it is
-    /// already the canonical base, and reducing it again drops the path a
-    /// subpath-hosted server lives under. TID_UI only.
-    pub(crate) fn set_navigation(&self, navigation: jfn_bringup::Navigation, base: &str) {
+    /// Records the newest effective page, removes the previous navigation's
+    /// witness immediately, and attempts delivery to the current main frame.
+    pub(crate) fn navigate(&self, navigation: jfn_bringup::Navigation, url: &str) {
+        self.deferred_navigation.navigate(navigation, url);
         *self.painting.lock() = Painting::Awaiting {
             navigation,
-            base: base.to_owned(),
+            base: url.to_owned(),
         };
+        self.deliver_deferred_navigation();
     }
 
     /// A main-frame load of `url` finished. It names the navigation only when
@@ -355,19 +390,23 @@ impl Inner {
         *painting = previous.loaded(url);
     }
 
-    /// Bring-up abandoned `navigation`: this browser stops stamping frames with
-    /// it and is left showing [`BLANK`]. Identity while this browser is painting
-    /// a different navigation. TID_UI only, so the load this decides cannot land
-    /// after a later navigation's.
+    /// Immediately removes a matching navigation from frames and failures and
+    /// records an intentional blank load until a main frame accepts it.
     pub(crate) fn abandon_navigation(&self, navigation: jfn_bringup::Navigation) {
-        {
+        self.deferred_navigation.abandon(navigation);
+        let matched_live_navigation = {
             let mut painting = self.painting.lock();
-            if !painting.names(navigation) {
-                return;
+            if painting.names(navigation) {
+                *painting = Painting::None;
+                true
+            } else {
+                false
             }
-            *painting = Painting::None;
+        };
+        if matched_live_navigation {
+            self.deferred_navigation.blank_if_absent();
         }
-        self.load_url(BLANK);
+        self.deliver_deferred_navigation();
     }
 
     /// The navigation a frame produced now can witness, and `None` until a

@@ -30,6 +30,7 @@ pub struct Config {
     pub log_severity: i32,
     pub remote_debugging_port: i32,
     pub pending_switches: Vec<PendingSwitch>,
+    pub gpu_compositing_disabled: bool,
     pub on_context_initialized: Option<extern "C" fn()>,
 }
 
@@ -37,6 +38,7 @@ static CONFIG: Mutex<Config> = Mutex::new(Config {
     log_severity: 0,
     remote_debugging_port: 0,
     pending_switches: Vec::new(),
+    gpu_compositing_disabled: false,
     on_context_initialized: None,
 });
 

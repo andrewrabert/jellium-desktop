@@ -1,15 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::{Inner, platform_ops};
+use super::Inner;
 use crate::paint_scheduler::Verdict;
 use crate::platform_ops::{PaintFrame, PhysicalSize, Superseded};
 
 /// Borrow CEF's `OnPaint` buffer as pixels. `None` when the frame is unusable.
-///
-/// The buffer is the last raw thing on this path: CEF hands over a pointer with
-/// no length, and the size is only knowable from `w`/`h` — it is tightly packed
-/// BGRA.
 fn software_pixels<'a>(buffer: *const u8, w: i32, h: i32) -> Option<&'a [u8]> {
     if buffer.is_null() || w <= 0 || h <= 0 {
         return None;
@@ -52,15 +48,11 @@ impl Inner {
     pub(crate) fn on_paint(
         self: &Arc<Self>,
         is_popup: bool,
-        dirty: &[platform_ops::JfnRect],
+        dirty: &[jfn_platform_abi::JfnRect],
         buffer: *const u8,
         w: i32,
         h: i32,
     ) {
-        let surface = self.surface_handle();
-        if surface.is_none() {
-            return;
-        }
         let Some(pixels) = software_pixels(buffer, w, h) else {
             return;
         };
@@ -69,23 +61,22 @@ impl Inner {
             if !matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
                 return;
             }
-            let (pw, ph) = self.popup_rect();
+            let (popup_width, popup_height) = self.popup_rect();
             let frame = PaintFrame::software(self.frame_source(), size, pixels, &[]);
-            let _: Superseded = match jfn_platform_abi::get()
-                .osr_popup_surface()
-                .present(surface, frame, pw, ph)
+            let _: Superseded = match self
+                .surface()
+                .popup_present(frame, popup_width, popup_height)
             {
                 Ok(_presented) => return,
                 Err(frame) => frame.supersede(),
             };
             return;
         }
-        let Some(p) = platform_ops::ops() else { return };
         let navigation = self.witness_navigation();
         let frame = PaintFrame::software(self.frame_source(), size, pixels, dirty);
         let _: Superseded = match self.paint_scheduler.verdict(self) {
             Verdict::Supersede => frame.supersede(),
-            Verdict::Present => match p.surface_present(surface, frame) {
+            Verdict::Present => match self.surface().present(frame) {
                 Ok(presented) => {
                     witness(navigation, presented);
                     return;
@@ -100,41 +91,36 @@ impl Inner {
         is_popup: bool,
         info: &cef::AcceleratedPaintInfo,
     ) {
-        let surface = self.surface_handle();
-        if surface.is_none() {
-            return;
-        }
         if is_popup {
             if !matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
                 return;
             }
-            let (pw, ph) = self.popup_rect();
+            let (popup_width, popup_height) = self.popup_rect();
             // Acquire last: this dups a fd per plane, and every gate above drops
             // frames.
-            let Some(tex) = super::accel::acquire(info) else {
+            let Some(texture) = super::accel::acquire(info) else {
                 return;
             };
-            let frame = PaintFrame::accelerated(self.frame_source(), tex);
-            let _: Superseded = match jfn_platform_abi::get()
-                .osr_popup_surface()
-                .present(surface, frame, pw, ph)
+            let frame = PaintFrame::accelerated(self.frame_source(), texture);
+            let _: Superseded = match self
+                .surface()
+                .popup_present(frame, popup_width, popup_height)
             {
                 Ok(_presented) => return,
                 Err(frame) => frame.supersede(),
             };
             return;
         }
-        let Some(p) = platform_ops::ops() else { return };
         // Acquire last: this dups a fd per plane, and every gate above drops
         // frames.
-        let Some(tex) = super::accel::acquire(info) else {
+        let Some(texture) = super::accel::acquire(info) else {
             return;
         };
         let navigation = self.witness_navigation();
-        let frame = PaintFrame::accelerated(self.frame_source(), tex);
+        let frame = PaintFrame::accelerated(self.frame_source(), texture);
         let _: Superseded = match self.paint_scheduler.verdict(self) {
             Verdict::Supersede => frame.supersede(),
-            Verdict::Present => match p.surface_present(surface, frame) {
+            Verdict::Present => match self.surface().present(frame) {
                 Ok(presented) => {
                     witness(navigation, presented);
                     return;
