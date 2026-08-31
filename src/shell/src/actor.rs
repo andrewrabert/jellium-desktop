@@ -31,7 +31,6 @@ use crate::theme::Theme;
 /// How long the actor waits for a surface target before giving up: the
 /// backend creates the window on its own thread, moments after `alloc_surface`.
 const TARGET_WAIT: Duration = Duration::from_secs(5);
-const TARGET_POLL: Duration = Duration::from_millis(10);
 
 pub enum Work {
     Event(Event),
@@ -217,15 +216,29 @@ impl Actor {
     #[must_use]
     pub fn join(self) -> bool {
         drop(self.tx.send(Work::Shutdown));
-        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-        while !self.thread.is_finished() {
-            if Instant::now() >= deadline {
-                tracing::warn!("shell: render thread did not stop within the shutdown bound");
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        join_bounded(self.thread, SHUTDOWN_TIMEOUT)
+    }
+}
+
+/// A separate joiner signals actual thread exit, including unwinding and TLS
+/// destructors. Signalling from inside the render closure would let its caller
+/// block indefinitely in `join` after receiving an early completion notice.
+fn join_bounded(thread: JoinHandle<()>, timeout: Duration) -> bool {
+    let (tx, rx) = channel();
+    if std::thread::Builder::new()
+        .name("jfn-shell-join".to_owned())
+        .spawn(move || tx.send(thread.join().is_ok()).unwrap_or_default())
+        .is_err()
+    {
+        tracing::warn!("shell: could not start render thread joiner");
+        return false;
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(joined) => joined,
+        Err(_) => {
+            tracing::warn!("shell: render thread did not stop within the shutdown bound");
+            false
         }
-        self.thread.join().is_ok()
     }
 }
 
@@ -358,176 +371,40 @@ fn settings_overlay_dismiss_last(messages: Vec<Message>) -> Vec<Message> {
     ordinary
 }
 
-fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
-    let Some(gpu) = jfn_gpu_paint::surfaces() else {
-        tracing::info!("shell: no GPU device; overlay stays hidden");
-        crate::publish_no_overlay();
-        return;
-    };
-    let Some(target) = wait_for_target(surface) else {
-        tracing::error!("shell: no window target for the overlay surface");
-        crate::publish_no_overlay();
-        return;
-    };
+type Ui<'a> = UserInterface<'a, Message, Theme, iced_wgpu::Renderer>;
 
-    let Some(extent) = initial_extent() else {
-        tracing::error!("shell: no extent to start the overlay at");
-        crate::publish_no_overlay();
-        return;
-    };
-    let wake = {
-        let tx = wake_tx.clone();
-        Arc::new(move || {
-            drop(tx.send(Work::Redraw));
-        }) as Arc<dyn Fn() + Send + Sync>
-    };
-    let mut painter = match Painter::new(gpu, target, extent, Arc::clone(&wake)) {
-        Ok(painter) => painter,
-        Err(e) => {
-            tracing::error!("shell: swapchain creation failed: {e}");
-            crate::publish_no_overlay();
-            return;
-        }
-    };
+/// Whether the loop goes on after a piece of work.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Stop,
+}
 
-    let mut model = Model {
-        stack: Stack::empty(),
-        screen: jfn_bringup::screen(),
-        titlebar: Titlebar::new(),
-        inputs: crate::chrome::inputs(),
-        theme: Theme {
-            chrome_background: crate::theme::chrome_background(),
-            ..Theme::default()
-        },
-    };
-    let mut cache = user_interface::Cache::new();
-    let mut events: Vec<Event> = Vec::new();
-    let mut cursor = Cursor::Unavailable;
-    let waker = shell::Waker::new({
-        let wake = Arc::clone(&wake);
-        move || wake()
-    });
-    let redraw = Redraw(wake_tx.clone());
-    let mut current = extent;
-    // A changed modal gets its own initial target. A discarded widget cache
-    // restores the exact prior target instead of resetting Settings focus.
-    let mut modal_identity = None;
-    let mut modal_tab = None;
-    let mut prior_focus = None;
-    let mut cache_lost = true;
-    let mut focus_move = None;
-    let mut settings_focus: Option<Box<dyn iced_core::widget::Operation>> = None;
-    publish(&model, current);
-    apply_visibility(surface, &model);
+/// Focus bookkeeping that outlives a rebuilt widget tree. A changed modal gets
+/// its own initial target; a discarded widget cache restores the exact prior
+/// target instead of resetting Settings focus.
+#[derive(Default)]
+struct FocusMemory {
+    modal_identity: Option<Identity>,
+    modal_tab: Option<crate::settings_overlay::Tab>,
+    prior: Option<Id>,
+    cache_lost: bool,
+    pending_move: Option<Direction>,
+    settings_chain: Option<Box<dyn iced_core::widget::Operation>>,
+}
 
-    let mut pending = Deadline::none();
-    // Set by a pass that left the model unsettled: the next one starts without
-    // waiting and draws nothing until it does settle.
-    let mut immediate = false;
-    let mut batch: Vec<Work> = Vec::new();
-    // Edits waiting for a widget tree to apply them to, and the requests that
-    // need one to resolve against.
-    let mut queued: Vec<Apply> = Vec::new();
-    let mut deferred: Vec<Deferred> = Vec::new();
-    // The primary selection this process last published, so an unchanged
-    // selection does not re-take the selection every pass.
-    let mut last_primary: Option<(Id, u64)> = None;
-    // The first draw waits for the bundled font; every later one does not.
-    let mut drew_nothing_yet = true;
+/// What a rebuilt tree has to be told about focus before it takes events.
+struct FocusPlan {
+    target: Option<Id>,
+    restoration: Option<crate::settings_overlay::Restoration>,
+}
 
-    'pass: loop {
-        if !immediate {
-            // A deadline already in the past yields one immediate pass rather
-            // than a zero-length wait the loop would spin on.
-            let deadline = pending.merge(model.deadline());
-            let now = Instant::now();
-            if !deadline.elapsed(now) {
-                let blocked = match deadline.wait_for(now) {
-                    Some(timeout) => match rx.recv_timeout(timeout) {
-                        Ok(work) => Some(work),
-                        Err(RecvTimeoutError::Timeout) => None,
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    },
-                    None => match rx.recv() {
-                        Ok(work) => Some(work),
-                        Err(_) => break,
-                    },
-                };
-                batch.extend(blocked);
-            }
-        }
-        pending = Deadline::none();
-        immediate = false;
-        // The whole queue, so a pointer stream faster than the refresh rate
-        // collapses into one pass instead of backing up.
-        loop {
-            match rx.try_recv() {
-                Ok(work) => batch.push(work),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break 'pass,
-            }
-        }
-
-        for work in batch.drain(..) {
-            match work {
-                Work::Event(event) => {
-                    if let Event::Mouse(mouse::Event::CursorMoved { position }) = event {
-                        cursor = Cursor::Available(position);
-                    }
-                    if matches!(event, Event::Mouse(mouse::Event::CursorLeft)) {
-                        cursor = Cursor::Unavailable;
-                    }
-                    events.push(event);
-                }
-                Work::Resize { extent } => {
-                    painter.resize(extent);
-                    current = extent;
-                    cache = user_interface::Cache::new();
-                    cache_lost = true;
-                }
-                Work::Redraw => {}
-                Work::OpenAbout => {
-                    model.advance(Transition::OpenAbout);
-                    cache = user_interface::Cache::new();
-                    cache_lost = true;
-                }
-                Work::OpenClientSettings => {
-                    model.advance(Transition::OpenClientSettings);
-                    cache = user_interface::Cache::new();
-                    cache_lost = true;
-                }
-                Work::Chrome(inputs) => model.inputs = inputs,
-                Work::ChromeBackground(color) => model.theme.chrome_background = color,
-                Work::SelectionText { reader, text } => match (reader, text) {
-                    (Reader::Iced, Some(text)) => {
-                        events.push(Event::Clipboard(clipboard::Event::Read(Ok(Arc::new(
-                            clipboard::Content::Text(text),
-                        )))));
-                    }
-                    (Reader::Field(id), Some(text)) => {
-                        queued.push(Apply::act(id, Act::Paste(text)))
-                    }
-                    (_, None) => {}
-                },
-                Work::ContextMenu(p) => deferred.push(Deferred::ContextMenu(p)),
-                Work::EditMenuAtCaret => deferred.push(Deferred::EditMenuAtCaret),
-                Work::PrimaryPaste(p) => deferred.push(Deferred::PrimaryPaste(p)),
-                Work::EditAt { field, command } => deferred.push(Deferred::Edit(field, command)),
-                Work::BringUpChanged => {}
-                Work::Shutdown => break 'pass,
-            }
-        }
-
-        model.advance(Transition::Tick(Instant::now()));
-        // Every pass re-reads bring-up: it is the authority for what the shell
-        // overlay shows, and the stack holds none of it.
-        model.screen = jfn_bringup::screen();
-        model.stack.reconcile(&model.screen);
-        pending = pending.merge(jfn_bringup::deadline().map_or_else(Deadline::none, Deadline::at));
-
-        model.theme.backdrop = model.backdrop();
+impl FocusMemory {
+    /// Decides the focus for the tree about to be built and records the modal
+    /// it was decided for.
+    fn plan(&mut self, model: &mut Model) -> FocusPlan {
         let identity = model.stack.identity();
-        let cache_was_lost = cache_lost;
+        let cache_was_lost = self.cache_lost;
         let restoration = model.stack.settings_overlay_mut().and_then(|overlay| {
             if overlay.active() != crate::settings_overlay::Tab::Settings {
                 None
@@ -538,206 +415,554 @@ fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
             }
         });
         let tab = model.stack.active_settings_tab();
-        let focus_target = focus_after_rebuild(
-            modal_identity,
+        let target = focus_after_rebuild(
+            self.modal_identity,
             identity,
-            modal_tab,
+            self.modal_tab,
             tab,
             model.stack.initial_focus(&model.screen),
-            prior_focus.clone(),
-            cache_lost,
+            self.prior.clone(),
+            self.cache_lost,
         );
-        modal_identity = identity;
-        modal_tab = tab;
-        cache_lost = false;
-        let mut ui = UserInterface::build(
-            model.view(),
-            Size::new(current.logical().w as f32, current.logical().h as f32),
-            std::mem::replace(&mut cache, user_interface::Cache::new()),
-            painter.renderer(),
-        );
-        if let Some(id) = focus_target {
+        self.modal_identity = identity;
+        self.modal_tab = tab;
+        self.cache_lost = false;
+        FocusPlan {
+            target,
+            restoration,
+        }
+    }
+
+    /// Applies the plan, the settings focus chain a previous pass left, and a
+    /// pending focus move. Returns true when the move left a chain to finish
+    /// on the next pass.
+    fn apply(&mut self, ui: &mut Ui<'_>, renderer: &iced_wgpu::Renderer, plan: FocusPlan) -> bool {
+        if let Some(id) = plan.target {
             ui.operate(
-                painter.renderer(),
+                renderer,
                 &mut iced_core::widget::operation::focusable::focus::<()>(id),
             );
         }
-        if identity == Some(Identity::SettingsOverlay)
-            && let Some(mut operation) = settings_focus.take()
+        if self.modal_identity == Some(Identity::SettingsOverlay)
+            && let Some(mut operation) = self.settings_chain.take()
         {
-            operate_all(&mut ui, painter.renderer(), &mut *operation);
-        } else if identity != Some(Identity::SettingsOverlay) {
-            settings_focus = None;
+            operate_all(ui, renderer, &mut *operation);
+        } else if self.modal_identity != Some(Identity::SettingsOverlay) {
+            self.settings_chain = None;
         }
-        if let Some(restoration) = restoration {
+        if let Some(restoration) = plan.restoration {
             if let Some(focus) = restoration.focus {
                 ui.operate(
-                    painter.renderer(),
+                    renderer,
                     &mut iced_core::widget::operation::focusable::focus::<()>(focus),
                 );
             }
             ui.operate(
-                painter.renderer(),
+                renderer,
                 &mut controls::restore_scroll(crate::settings::SETTINGS_SCROLL, restoration.scroll),
             );
         }
-        if let Some(direction) = focus_move.take() {
+        let mut chained = false;
+        if let Some(direction) = self.pending_move.take() {
             let mut movement = controls::move_focus(crate::settings::SETTINGS_SCROLL, direction);
-            ui.operate(painter.renderer(), &mut movement);
+            ui.operate(renderer, &mut movement);
             if let iced_core::widget::operation::Outcome::Chain(operation) = movement.finish() {
-                settings_focus = Some(operation);
-                immediate = true;
+                self.settings_chain = Some(operation);
+                chained = true;
             }
         }
-        let fields = Fields::collect(&mut ui, painter.renderer());
-        let mut menu_anchor = None;
-        for request in deferred.drain(..) {
-            match request {
-                Deferred::ContextMenu(p) => {
-                    menu_anchor = menu_anchor.or(raise_menu(
-                        &fields,
-                        p,
-                        &mut queued,
-                        model.stack.identity() == Some(Identity::SettingsOverlay),
-                    ));
-                }
-                Deferred::EditMenuAtCaret => {
-                    menu_anchor = menu_anchor.or_else(|| fields.focused().map(caret_anchor));
-                }
-                Deferred::PrimaryPaste(p) => {
-                    if let Some(field) = fields.at(point(p.x, p.y)) {
-                        read_primary(wake_tx.clone(), Reader::Field(field.id.clone()));
-                    }
-                }
-                Deferred::Edit(target, command) => {
-                    queue_edit(&fields, &target, command, &mut queued, wake_tx);
-                }
-            }
-        }
-        for text in apply_queued(&mut ui, painter.renderer(), &mut queued) {
-            jfn_platform_abi::get().clipboard_write_text(&text);
-        }
-        if let Some(anchor) = menu_anchor {
-            let raised = Fields::collect(&mut ui, painter.renderer());
-            if let Some(field) = raised.at(point(anchor.x, anchor.y)) {
-                crate::menu::open_edit(field, anchor, crate::lang::strings());
-            }
-        }
+        chained
+    }
+}
 
-        let retained_settings =
-            if model.stack.active_settings_tab() == Some(crate::settings_overlay::Tab::Settings) {
-                let mut focused = controls::focused_id();
-                ui.operate(painter.renderer(), &mut focused);
-                let mut offset = controls::scroll_offset(crate::settings::SETTINGS_SCROLL);
-                ui.operate(painter.renderer(), &mut offset);
-                offset.get().map(|offset| (focused.get(), offset))
-            } else {
-                None
-            };
+/// What `update` left behind for the rest of the pass.
+struct Updated {
+    messages: Vec<Message>,
+    /// Events the focused widget ignored, offered to the open modal.
+    ignored: Vec<Event>,
+    outdated: bool,
+    interaction: mouse::Interaction,
+    redraw: Deadline,
+}
 
-        // The event widgets commit hover, press, focus and caret state on.
-        events.push(Event::Window(
-            window::Event::RedrawRequested(Instant::now()),
-        ));
-        let mut bus = shell::Bus::new();
-        let (state, statuses) = ui.update(
-            &window::Headless,
-            &waker,
-            &events,
-            cursor,
-            painter.renderer(),
-            &mut bus,
-        );
-        // The focused widget sees every event first; only what iced ignored is
-        // offered to the open modal.
-        let ignored: Vec<Event> = events
-            .iter()
-            .zip(statuses)
-            .filter(|(_, status)| *status == iced_core::event::Status::Ignored)
-            .map(|(event, _)| event.clone())
-            .collect();
-        events.clear();
+/// The render loop's state between passes.
+struct Loop {
+    surface: SurfaceHandle,
+    wake_tx: Sender<Work>,
+    painter: Painter,
+    model: Model,
+    cache: user_interface::Cache,
+    events: Vec<Event>,
+    cursor: Cursor,
+    waker: shell::Waker,
+    redraw: Redraw,
+    current: WindowExtent,
+    focus: FocusMemory,
+    pending: Deadline,
+    /// Set by a pass that left the model unsettled: the next one starts
+    /// without waiting and draws nothing until it does settle.
+    immediate: bool,
+    batch: Vec<Work>,
+    /// Edits waiting for a widget tree to apply them to, and the requests
+    /// that need one to resolve against.
+    queued: Vec<Apply>,
+    deferred: Vec<Deferred>,
+    /// The primary selection this process last published, so an unchanged
+    /// selection does not re-take the selection every pass.
+    last_primary: Option<(Id, u64)>,
+    /// The first draw waits for the bundled font; every later one does not.
+    drew_nothing_yet: bool,
+}
 
-        let messages: Vec<Message> = bus.drain().collect();
-        let interaction = match &state {
-            user_interface::State::Updated {
-                mouse_interaction,
-                redraw_request,
-                ..
-            } => {
-                pending = pending.merge(match redraw_request {
-                    window::RedrawRequest::NextFrame => Deadline::at(Instant::now()),
-                    window::RedrawRequest::At(at) => Deadline::at(*at),
-                    window::RedrawRequest::Wait => Deadline::none(),
-                });
-                *mouse_interaction
-            }
-            user_interface::State::Outdated => mouse::Interaction::None,
+fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
+    let mut pending = Vec::new();
+    let Some(target) = wait_for_target(surface, rx, wake_tx, &mut pending) else {
+        crate::publish_no_overlay();
+        return;
+    };
+    let Some(mut state) = Loop::start(surface, wake_tx, target) else {
+        crate::publish_no_overlay();
+        return;
+    };
+    state.batch = pending;
+    state.immediate = true;
+    state.run(rx);
+}
+
+impl Loop {
+    /// Brings the swapchain up at the window's current extent; `None` when
+    /// the overlay cannot exist.
+    fn start(
+        surface: SurfaceHandle,
+        wake_tx: &Sender<Work>,
+        target: jfn_gpu_paint::WindowTarget,
+    ) -> Option<Loop> {
+        let Some(gpu) = jfn_gpu_paint::surfaces() else {
+            tracing::info!("shell: no GPU device; overlay stays hidden");
+            return None;
         };
-        if let user_interface::State::Updated { clipboard, .. } = &state {
-            write_clipboard(clipboard);
-            if clipboard.reads.contains(&clipboard::Kind::Text) {
-                read_clipboard(wake_tx.clone(), Reader::Iced);
+        let Some(extent) = initial_extent() else {
+            tracing::error!("shell: no extent to start the overlay at");
+            return None;
+        };
+        let wake = {
+            let tx = wake_tx.clone();
+            Arc::new(move || {
+                drop(tx.send(Work::Redraw));
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        let painter = match Painter::new(gpu, target, extent, Arc::clone(&wake)) {
+            Ok(painter) => painter,
+            Err(e) => {
+                tracing::error!("shell: swapchain creation failed: {e}");
+                return None;
+            }
+        };
+        let model = Model {
+            stack: Stack::empty(),
+            screen: jfn_bringup::screen(),
+            titlebar: Titlebar::new(),
+            inputs: crate::chrome::inputs(),
+            theme: Theme {
+                chrome_background: crate::theme::chrome_background(),
+                ..Theme::default()
+            },
+        };
+        let waker = shell::Waker::new({
+            let wake = Arc::clone(&wake);
+            move || wake()
+        });
+        publish(&model, extent);
+        apply_visibility(surface, &model);
+        Some(Loop {
+            surface,
+            wake_tx: wake_tx.clone(),
+            painter,
+            model,
+            cache: user_interface::Cache::new(),
+            events: Vec::new(),
+            cursor: Cursor::Unavailable,
+            waker,
+            redraw: Redraw(wake_tx.clone()),
+            current: extent,
+            focus: FocusMemory {
+                cache_lost: true,
+                ..FocusMemory::default()
+            },
+            pending: Deadline::none(),
+            immediate: false,
+            batch: Vec::new(),
+            queued: Vec::new(),
+            deferred: Vec::new(),
+            last_primary: None,
+            drew_nothing_yet: true,
+        })
+    }
+
+    fn run(mut self, rx: &Receiver<Work>) {
+        loop {
+            if !self.immediate && self.wait(rx) == Flow::Stop {
+                break;
+            }
+            self.pending = Deadline::none();
+            self.immediate = false;
+            if self.drain(rx) == Flow::Stop {
+                break;
+            }
+            if self.absorb_batch() == Flow::Stop {
+                break;
+            }
+            self.pass();
+        }
+    }
+
+    /// Blocks until work arrives or the nearest deadline is due. A deadline
+    /// already in the past yields one immediate pass rather than a
+    /// zero-length wait the loop would spin on.
+    fn wait(&mut self, rx: &Receiver<Work>) -> Flow {
+        let deadline = self.pending.merge(self.model.deadline());
+        let now = Instant::now();
+        if deadline.elapsed(now) {
+            return Flow::Continue;
+        }
+        let blocked = match deadline.wait_for(now) {
+            Some(timeout) => match rx.recv_timeout(timeout) {
+                Ok(work) => Some(work),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return Flow::Stop,
+            },
+            None => match rx.recv() {
+                Ok(work) => Some(work),
+                Err(_) => return Flow::Stop,
+            },
+        };
+        self.batch.extend(blocked);
+        Flow::Continue
+    }
+
+    /// Takes the whole queue, so a pointer stream faster than the refresh
+    /// rate collapses into one pass instead of backing up.
+    fn drain(&mut self, rx: &Receiver<Work>) -> Flow {
+        loop {
+            match rx.try_recv() {
+                Ok(work) => self.batch.push(work),
+                Err(TryRecvError::Empty) => return Flow::Continue,
+                Err(TryRecvError::Disconnected) => return Flow::Stop,
             }
         }
+    }
+
+    fn absorb_batch(&mut self) -> Flow {
+        let batch = std::mem::take(&mut self.batch);
+        for work in batch {
+            if self.absorb(work) == Flow::Stop {
+                return Flow::Stop;
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Folds one piece of work into the state the next pass builds from.
+    fn absorb(&mut self, work: Work) -> Flow {
+        match work {
+            Work::Event(event) => {
+                if let Event::Mouse(mouse::Event::CursorMoved { position }) = event {
+                    self.cursor = Cursor::Available(position);
+                }
+                if matches!(event, Event::Mouse(mouse::Event::CursorLeft)) {
+                    self.cursor = Cursor::Unavailable;
+                }
+                self.events.push(event);
+            }
+            Work::Resize { extent } => {
+                self.painter.resize(extent);
+                self.current = extent;
+                self.discard_cache();
+            }
+            Work::Redraw => {}
+            Work::OpenAbout => {
+                self.model.advance(Transition::OpenAbout);
+                self.discard_cache();
+            }
+            Work::OpenClientSettings => {
+                self.model.advance(Transition::OpenClientSettings);
+                self.discard_cache();
+            }
+            Work::Chrome(inputs) => self.model.inputs = inputs,
+            Work::ChromeBackground(color) => self.model.theme.chrome_background = color,
+            Work::SelectionText { reader, text } => match (reader, text) {
+                (Reader::Iced, Some(text)) => {
+                    self.events
+                        .push(Event::Clipboard(clipboard::Event::Read(Ok(Arc::new(
+                            clipboard::Content::Text(text),
+                        )))));
+                }
+                (Reader::Field(id), Some(text)) => {
+                    self.queued.push(Apply::act(id, Act::Paste(text)));
+                }
+                (_, None) => {}
+            },
+            Work::ContextMenu(p) => self.deferred.push(Deferred::ContextMenu(p)),
+            Work::EditMenuAtCaret => self.deferred.push(Deferred::EditMenuAtCaret),
+            Work::PrimaryPaste(p) => self.deferred.push(Deferred::PrimaryPaste(p)),
+            Work::EditAt { field, command } => {
+                self.deferred.push(Deferred::Edit(field, command));
+            }
+            Work::BringUpChanged => {}
+            Work::Shutdown => return Flow::Stop,
+        }
+        Flow::Continue
+    }
+
+    fn discard_cache(&mut self) {
+        self.cache = user_interface::Cache::new();
+        self.focus.cache_lost = true;
+    }
+
+    /// One pass: rebuild the tree, update it with the drained events, and
+    /// either draw the settled result or fold the changes back into the model
+    /// for an immediate next pass.
+    fn pass(&mut self) {
+        self.model.advance(Transition::Tick(Instant::now()));
+        // Every pass re-reads bring-up: it is the authority for what the shell
+        // overlay shows, and the stack holds none of it.
+        self.model.screen = jfn_bringup::screen();
+        self.model.stack.reconcile(&self.model.screen);
+        self.pending = self
+            .pending
+            .merge(jfn_bringup::deadline().map_or_else(Deadline::none, Deadline::at));
+        self.model.theme.backdrop = self.model.backdrop();
+        let plan = self.focus.plan(&mut self.model);
+
+        let this = &mut *self;
+        let model = &this.model;
+        let painter = &mut this.painter;
+        let mut ui = UserInterface::build(
+            model.view(),
+            Size::new(
+                this.current.logical().w as f32,
+                this.current.logical().h as f32,
+            ),
+            std::mem::replace(&mut this.cache, user_interface::Cache::new()),
+            painter.renderer(),
+        );
+        if this.focus.apply(&mut ui, painter.renderer(), plan) {
+            this.immediate = true;
+        }
+        resolve_deferred(
+            &mut ui,
+            painter,
+            model,
+            &mut this.deferred,
+            &mut this.queued,
+            &this.wake_tx,
+        );
+        let retained_settings = retained_settings(&mut ui, painter, model);
+
+        let updated = update_ui(
+            &mut ui,
+            painter,
+            &mut this.events,
+            this.cursor,
+            &this.waker,
+            &this.wake_tx,
+        );
+        this.pending = this.pending.merge(updated.redraw);
         let settled_fields = Fields::collect(&mut ui, painter.renderer());
         let mut focused = controls::focused_id();
         ui.operate(painter.renderer(), &mut focused);
-        prior_focus = focused.get();
-        publish_primary(&settled_fields, &mut last_primary);
+        this.focus.prior = focused.get();
+        publish_primary(&settled_fields, &mut this.last_primary);
         jfn_input::publish_field_edit(
             settled_fields
                 .focused()
                 .map(crate::fields::Snapshot::edit_state),
         );
-        crate::router_sink::set_interaction(interaction);
+        crate::router_sink::set_interaction(updated.interaction);
 
         // Asked while the widget tree still borrows the model, because applying
         // any of it has to wait until the tree is gone.
-        let settled = messages.is_empty()
-            && !ignored
+        let settled = updated.messages.is_empty()
+            && !updated
+                .ignored
                 .iter()
-                .any(|event| ignored_key(&model, event).is_some())
-            && !matches!(state, user_interface::State::Outdated);
+                .any(|event| ignored_key(model, event).is_some())
+            && !updated.outdated;
 
         if settled {
-            if drew_nothing_yet {
-                drew_nothing_yet = false;
+            if this.drew_nothing_yet {
+                this.drew_nothing_yet = false;
                 // The fontdb scan is paid on the warm-up thread, not here, and
                 // no paragraph caches against a fallback family.
                 crate::wait_fonts_ready();
             }
-            match paint(&mut painter, surface, &mut ui, &model, cursor, &redraw) {
+            match paint(
+                painter,
+                this.surface,
+                &mut ui,
+                model,
+                this.cursor,
+                &this.redraw,
+            ) {
                 Painted::Shown(_) | Painted::Hidden | Painted::Requested => {}
-                Painted::Deferred(retry_at) => pending = pending.merge(Deadline::at(retry_at)),
+                Painted::Deferred(retry_at) => {
+                    this.pending = this.pending.merge(Deadline::at(retry_at));
+                }
             }
-            cache = ui.into_cache();
-            if let Some((focus, offset)) = retained_settings
-                && let Some(overlay) = model.stack.settings_overlay_mut()
-            {
-                overlay.retain_settings_state(focus, offset);
-            }
-            publish(&model, current);
-            continue;
         }
-
-        cache = ui.into_cache();
+        this.cache = ui.into_cache();
         if let Some((focus, offset)) = retained_settings
-            && let Some(overlay) = model.stack.settings_overlay_mut()
+            && let Some(overlay) = this.model.stack.settings_overlay_mut()
         {
             overlay.retain_settings_state(focus, offset);
         }
-        model.apply_message_batch(messages);
-        for event in &ignored {
-            match ignored_key(&model, event) {
-                Some(IgnoredKey::Escape) => model.advance(Transition::Escape),
-                Some(IgnoredKey::Focus(direction)) => focus_move = Some(direction),
+        if settled {
+            publish(&this.model, this.current);
+            return;
+        }
+
+        this.model.apply_message_batch(updated.messages);
+        for event in &updated.ignored {
+            match ignored_key(&this.model, event) {
+                Some(IgnoredKey::Escape) => this.model.advance(Transition::Escape),
+                Some(IgnoredKey::Focus(direction)) => this.focus.pending_move = Some(direction),
                 None => {}
             }
         }
-        immediate = true;
-        publish(&model, current);
-        apply_visibility(surface, &model);
+        this.immediate = true;
+        publish(&this.model, this.current);
+        apply_visibility(this.surface, &this.model);
+    }
+}
+
+/// Resolves every request that waited for a widget tree, applies the edits
+/// they and earlier passes queued, and opens the edit menu one of them asked
+/// for.
+fn resolve_deferred(
+    ui: &mut Ui<'_>,
+    painter: &mut Painter,
+    model: &Model,
+    deferred: &mut Vec<Deferred>,
+    queued: &mut Vec<Apply>,
+    wake_tx: &Sender<Work>,
+) {
+    let fields = Fields::collect(ui, painter.renderer());
+    let mut menu_anchor = None;
+    for request in deferred.drain(..) {
+        match request {
+            Deferred::ContextMenu(p) => {
+                menu_anchor = menu_anchor.or(raise_menu(
+                    &fields,
+                    p,
+                    queued,
+                    model.stack.identity() == Some(Identity::SettingsOverlay),
+                ));
+            }
+            Deferred::EditMenuAtCaret => {
+                menu_anchor = menu_anchor.or_else(|| fields.focused().map(caret_anchor));
+            }
+            Deferred::PrimaryPaste(p) => {
+                if let Some(field) = fields.at(point(p.x, p.y)) {
+                    read_primary(wake_tx.clone(), Reader::Field(field.id.clone()));
+                }
+            }
+            Deferred::Edit(target, command) => {
+                queue_edit(&fields, &target, command, queued, wake_tx);
+            }
+        }
+    }
+    for text in apply_queued(ui, painter.renderer(), queued) {
+        jfn_platform_abi::get().clipboard_write_text(&text);
+    }
+    if let Some(anchor) = menu_anchor {
+        let raised = Fields::collect(ui, painter.renderer());
+        if let Some(field) = raised.at(point(anchor.x, anchor.y)) {
+            crate::menu::open_edit(field, anchor, crate::lang::strings());
+        }
+    }
+}
+
+/// The Settings tab's focus and scroll offset, read before `update` so the
+/// overlay can keep them across a rebuild.
+fn retained_settings(
+    ui: &mut Ui<'_>,
+    painter: &mut Painter,
+    model: &Model,
+) -> Option<(
+    Option<Id>,
+    iced_core::widget::operation::scrollable::AbsoluteOffset,
+)> {
+    if model.stack.active_settings_tab() != Some(crate::settings_overlay::Tab::Settings) {
+        return None;
+    }
+    let mut focused = controls::focused_id();
+    ui.operate(painter.renderer(), &mut focused);
+    let mut offset = controls::scroll_offset(crate::settings::SETTINGS_SCROLL);
+    ui.operate(painter.renderer(), &mut offset);
+    offset.get().map(|offset| (focused.get(), offset))
+}
+
+/// Runs `update` with the drained events followed by a `RedrawRequested` —
+/// the event widgets commit hover, press, focus and caret state on — and
+/// services the clipboard traffic it produced.
+fn update_ui(
+    ui: &mut Ui<'_>,
+    painter: &mut Painter,
+    events: &mut Vec<Event>,
+    cursor: Cursor,
+    waker: &shell::Waker,
+    wake_tx: &Sender<Work>,
+) -> Updated {
+    events.push(Event::Window(
+        window::Event::RedrawRequested(Instant::now()),
+    ));
+    let mut bus = shell::Bus::new();
+    let (state, statuses) = ui.update(
+        &window::Headless,
+        waker,
+        events,
+        cursor,
+        painter.renderer(),
+        &mut bus,
+    );
+    // The focused widget sees every event first; only what iced ignored is
+    // offered to the open modal.
+    let ignored: Vec<Event> = events
+        .iter()
+        .zip(statuses)
+        .filter(|(_, status)| *status == iced_core::event::Status::Ignored)
+        .map(|(event, _)| event.clone())
+        .collect();
+    events.clear();
+
+    let messages: Vec<Message> = bus.drain().collect();
+    let (interaction, redraw) = match &state {
+        user_interface::State::Updated {
+            mouse_interaction,
+            redraw_request,
+            ..
+        } => (
+            *mouse_interaction,
+            match redraw_request {
+                window::RedrawRequest::NextFrame => Deadline::at(Instant::now()),
+                window::RedrawRequest::At(at) => Deadline::at(*at),
+                window::RedrawRequest::Wait => Deadline::none(),
+            },
+        ),
+        user_interface::State::Outdated => (mouse::Interaction::None, Deadline::none()),
+    };
+    if let user_interface::State::Updated { clipboard, .. } = &state {
+        write_clipboard(clipboard);
+        if clipboard.reads.contains(&clipboard::Kind::Text) {
+            read_clipboard(wake_tx.clone(), Reader::Iced);
+        }
+    }
+    Updated {
+        messages,
+        ignored,
+        outdated: matches!(state, user_interface::State::Outdated),
+        interaction,
+        redraw,
     }
 }
 
@@ -990,17 +1215,47 @@ fn apply_visibility(surface: SurfaceHandle, model: &Model) -> Visibility {
         .acknowledged()
 }
 
-fn wait_for_target(surface: SurfaceHandle) -> Option<jfn_gpu_paint::WindowTarget> {
+fn wait_for_target(
+    surface: SurfaceHandle,
+    rx: &Receiver<Work>,
+    wake_tx: &Sender<Work>,
+    pending: &mut Vec<Work>,
+) -> Option<jfn_gpu_paint::WindowTarget> {
     let plat = jfn_platform_abi::get();
-    let deadline = Instant::now() + TARGET_WAIT;
+    let tx = wake_tx.clone();
+    plat.on_surface_target_ready(
+        surface,
+        Box::new(move || {
+            drop(tx.send(Work::Redraw));
+        }),
+    );
+    await_target(rx, pending, Instant::now() + TARGET_WAIT, || {
+        plat.surface_window_target(surface)
+    })
+}
+
+fn await_target<T>(
+    rx: &Receiver<Work>,
+    pending: &mut Vec<Work>,
+    deadline: Instant,
+    mut query: impl FnMut() -> Option<T>,
+) -> Option<T> {
     loop {
-        if let Some(target) = plat.surface_window_target(surface) {
+        if let Some(target) = query() {
             return Some(target);
         }
         if Instant::now() >= deadline {
+            tracing::error!("shell: no window target for the overlay surface");
             return None;
         }
-        std::thread::sleep(TARGET_POLL);
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Work::Shutdown) | Err(RecvTimeoutError::Disconnected) => return None,
+            Ok(work) => pending.push(work),
+            Err(RecvTimeoutError::Timeout) => {
+                tracing::error!("shell: no window target for the overlay surface");
+                return None;
+            }
+        }
     }
 }
 
@@ -1023,6 +1278,71 @@ pub(crate) fn point(x: i32, y: i32) -> Point {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_join_observes_exit_and_panic() {
+        assert!(super::join_bounded(
+            std::thread::spawn(|| {}),
+            super::SHUTDOWN_TIMEOUT
+        ));
+        assert!(!super::join_bounded(
+            std::thread::spawn(|| std::panic::resume_unwind(Box::new("test panic"))),
+            super::SHUTDOWN_TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn bounded_join_does_not_wait_for_a_blocked_worker() {
+        let (tx, rx) = super::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            rx.recv().unwrap_or_default();
+        });
+        assert!(!super::join_bounded(thread, super::Duration::ZERO));
+        // Release the worker and its joiner after the bounded wait returns.
+        drop(tx);
+    }
+
+    #[test]
+    fn target_wait_preserves_work_and_observes_readiness() {
+        let (tx, rx) = super::channel();
+        tx.send(super::Work::OpenAbout).unwrap();
+        let mut pending = Vec::new();
+        let mut queries = 0;
+        let target = super::await_target(
+            &rx,
+            &mut pending,
+            super::Instant::now() + super::TARGET_WAIT,
+            || {
+                queries += 1;
+                (queries == 2).then_some(42)
+            },
+        );
+        assert_eq!(target, Some(42));
+        assert!(matches!(pending.as_slice(), [super::Work::OpenAbout]));
+    }
+
+    #[test]
+    fn target_wait_stops_on_shutdown_or_deadline() {
+        let (tx, rx) = super::channel();
+        tx.send(super::Work::Shutdown).unwrap();
+        let mut pending = Vec::new();
+        assert_eq!(
+            super::await_target(
+                &rx,
+                &mut pending,
+                super::Instant::now() + super::TARGET_WAIT,
+                || None::<()>
+            ),
+            None
+        );
+        // A continuous work stream must not extend the deadline.
+        tx.send(super::Work::Redraw).unwrap();
+        assert_eq!(
+            super::await_target(&rx, &mut pending, super::Instant::now(), || None::<()>),
+            None
+        );
+        assert!(pending.is_empty());
+    }
+
     use super::*;
     use iced_core::keyboard::key::{NativeCode, Physical};
     use iced_core::keyboard::{Location, Modifiers};

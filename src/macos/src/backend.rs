@@ -284,6 +284,14 @@ pub fn macos_pump_block(seconds: f64) {
     let _ = CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, seconds, true);
 }
 
+/// Wait without a polling deadline. The caller must drain native events
+/// before checking its readiness predicate, and must not drain them again
+/// between that check and this wait. Queued main-thread wake blocks then
+/// remain pending until this run-loop call services them.
+pub(crate) fn macos_wait_for_source() {
+    let _ = CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, f64::MAX, true);
+}
+
 /// `-stop:` the shared application plus a sentinel applicationDefined NSEvent
 /// so the run loop wakes and exits on its next iteration.
 ///

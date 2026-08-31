@@ -25,6 +25,7 @@ pub fn alloc_surface(initial: Visibility) -> SurfaceId {
         actor,
         external: false,
         window: None,
+        target_ready: Vec::new(),
         top_physical: 0,
     });
     let _ = enqueue(GeometryCommand::Create { id, initial });
@@ -140,6 +141,20 @@ pub fn window_target(id: SurfaceId) -> Option<jfn_gpu_paint::WindowTarget> {
         screen: crate::x11_state::host().map_or(0, |h| h.screen_num),
         visual: paint.argb_visual,
     })
+}
+
+/// Registers under the same lock used to publish the native window.
+pub fn on_target_ready(id: SurfaceId, ready: Box<dyn FnOnce() + Send>) {
+    {
+        let mut g = registry().lock();
+        if let Some(record) = g.get_mut(id)
+            && record.window.is_none()
+        {
+            record.target_ready.push(ready);
+            return;
+        }
+    }
+    ready();
 }
 
 /// Enqueue the map/unmap; the returned commit blocks until the geometry thread

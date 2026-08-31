@@ -3,9 +3,8 @@
 //! serviced while mpv brings its window up.
 
 use std::ffi::c_int;
-use std::time::Duration;
 
-use jfn_platform_abi::{MpvHost, VO_WAIT_TICK, WindowDecorations};
+use jfn_platform_abi::{MpvHost, VoWait, WindowDecorations};
 use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily};
 
 /// Whether the system's Metal device advertises the Mac2 GPU family.
@@ -64,7 +63,7 @@ impl MpvHost for MacosMpvHost {
         }
     }
 
-    fn run_vo_wait(&self, pump: &mut dyn FnMut(Duration) -> bool) {
+    fn run_vo_wait(&self, pump: &mut dyn FnMut(VoWait) -> bool) {
         unsafe {
             jfn_mpv::api::jfn_mpv_set_wakeup_callback(
                 crate::macos_mpv_wakeup_cb,
@@ -74,8 +73,14 @@ impl MpvHost for MacosMpvHost {
         // Block until the main run loop services a source — e.g. the
         // dispatch block posted by the wakeup callback — never inside
         // mpv's own blocking wait, which would starve the run loop.
-        while pump(Duration::ZERO) {
-            crate::macos_pump_block(VO_WAIT_TICK.as_secs_f64());
+        loop {
+            // Drain AppKit before testing readiness: draining it after the
+            // check could consume the last queued wake and then park forever.
+            crate::macos_pump();
+            if !pump(VoWait::Drain) {
+                break;
+            }
+            crate::backend::macos_wait_for_source();
         }
         jfn_mpv::api::jfn_mpv_clear_wakeup_callback();
     }

@@ -151,6 +151,7 @@ pub(crate) struct SurfaceRecord {
     /// on it, and its actor drops every present.
     pub(crate) external: bool,
     pub(crate) window: Option<Window>,
+    pub(crate) target_ready: Vec<Box<dyn FnOnce() + Send>>,
     pub(crate) top_physical: i32,
 }
 

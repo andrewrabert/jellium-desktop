@@ -4,12 +4,16 @@
 //! No mpv types appear here — shared code owns all mpv event handling via
 //! the `pump` closure, and the platform owns only the wait strategy.
 
-use std::time::Duration;
-
 use crate::WindowDecorations;
 
-/// Longest a VO wait may park before it re-reads the readiness gate.
-pub const VO_WAIT_TICK: Duration = Duration::from_millis(250);
+/// Whether the boot event pump may block after checking readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoWait {
+    /// Service queued events without blocking a native run loop.
+    Drain,
+    /// Wait for an mpv event or an explicit host-readiness wakeup.
+    Event,
+}
 
 /// Platform side of mpv's lifecycle. Defaults cover backends where mpv
 /// needs no host preparation and the generic blocking wait suffices.
@@ -36,14 +40,13 @@ pub trait MpvHost: Send + Sync {
         None
     }
 
-    /// Own the VO wait loop. `pump(budget)` drains every queued mpv event,
-    /// re-reads the readiness gate, and returns `false` once the wait is
-    /// over. A non-zero `budget` parks inside mpv for at most that long
-    /// after the drain; [`Duration::ZERO`] drains and returns. Platforms
-    /// holding a native run loop pass `Duration::ZERO` and block on their
-    /// own loop for at most [`VO_WAIT_TICK`].
-    fn run_vo_wait(&self, pump: &mut dyn FnMut(Duration) -> bool) {
-        while pump(VO_WAIT_TICK) {}
+    /// Own the VO wait loop. The pump drains queued mpv events, checks all
+    /// readiness gates, and returns false when startup is finished. `Event`
+    /// waits without a timer; host state changes must wake mpv after publishing
+    /// their state. Native run-loop owners use `Drain` and wait on their own
+    /// event source instead.
+    fn run_vo_wait(&self, pump: &mut dyn FnMut(VoWait) -> bool) {
+        while pump(VoWait::Event) {}
     }
 
     /// The host window's logical content size, or `None` when mpv's

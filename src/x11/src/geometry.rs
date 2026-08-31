@@ -391,14 +391,14 @@ fn handle_create(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId, initi
         let _ = conn.flush();
         return;
     };
-    let external = {
+    let (external, target_ready) = {
         let mut g = registry().lock();
         match g.get_mut(id) {
             Some(record) => {
                 record.window = Some(win);
-                record.external
+                (record.external, std::mem::take(&mut record.target_ready))
             }
-            None => false,
+            None => (false, Vec::new()),
         }
     };
     if external {
@@ -424,6 +424,9 @@ fn handle_create(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId, initi
     }
     if let Some(record) = registry().lock().get(id) {
         record.actor.attach_content(content);
+    }
+    for ready in target_ready {
+        ready();
     }
 }
 

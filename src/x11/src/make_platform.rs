@@ -78,6 +78,10 @@ impl Platform for X11Platform {
         surface::window_target(SurfaceId::from_handle(s))
     }
 
+    fn on_surface_target_ready(&self, s: SurfaceHandle, ready: Box<dyn FnOnce() + Send>) {
+        surface::on_target_ready(SurfaceId::from_handle(s), ready);
+    }
+
     fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
         surface::set_visibility(SurfaceId::from_handle(s), visibility)
     }

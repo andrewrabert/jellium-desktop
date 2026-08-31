@@ -50,7 +50,7 @@ pub use menu::{
     MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface, menu_delivery,
     menu_has_selectable, menu_initial_row, menu_scripts,
 };
-pub use mpv_host::{DefaultMpvHost, MpvHost, VO_WAIT_TICK};
+pub use mpv_host::{DefaultMpvHost, MpvHost, VoWait};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};
 pub use paint::{Content, FrameRetry, FrameSource, PaintFrame, Presented, Superseded};
 pub use selection::{OnText, PrimarySelection};
@@ -484,6 +484,14 @@ pub trait Platform: Send + Sync {
     /// [`Platform::surface_present`] on it, grabs no input on it, and gives it
     /// an empty input region.
     fn surface_window_target(&self, s: SurfaceHandle) -> Option<WindowTarget>;
+
+    /// Notify once the native target can be queried. Synchronous backends
+    /// already have their target when allocation returns. Register before
+    /// querying to avoid losing a concurrent creation notification.
+    fn on_surface_target_ready(&self, _s: SurfaceHandle, ready: Box<dyn FnOnce() + Send>) {
+        ready();
+    }
+
     /// Issues the commit carrying `visibility` before returning.
     fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit;
 
