@@ -1,7 +1,7 @@
 //! Coordinator: owns the single mutable state machine, worker thread, and
 //! sink fanout. Producers post inputs from any thread; the worker drains
-//! them in batches, runs transitions, publishes the canonical snapshot,
-//! and hands events to registered sinks via the FFI vtable.
+//! a finite batch of queued inputs, runs transitions, publishes the canonical
+//! snapshot, and invokes a stable set of sink callbacks without holding locks.
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
@@ -49,10 +49,20 @@ struct Shared {
     /// even while handles remain alive.
     tx: Mutex<Option<Sender<Input>>>,
     snapshot: Mutex<PlaybackSnapshot>,
-    event_sinks: Mutex<Vec<EventSink>>,
-    action_sinks: Mutex<Vec<ActionSink>>,
-    builtin_event_sinks: Mutex<Vec<EventSink>>,
-    builtin_action_sinks: Mutex<Vec<ActionSink>>,
+    sinks: Mutex<Sinks>,
+}
+
+type SharedEventSink = Arc<dyn Fn(&PlaybackEvent) + Send + Sync>;
+type SharedActionSink = Arc<dyn Fn(&PlaybackAction) + Send + Sync>;
+
+/// All registrations share one boundary: changes during dispatch take effect
+/// on the next batch. Shared ownership lets callbacks run without this lock.
+#[derive(Clone, Default)]
+struct Sinks {
+    events: Vec<SharedEventSink>,
+    actions: Vec<SharedActionSink>,
+    builtin_events: Vec<SharedEventSink>,
+    builtin_actions: Vec<SharedActionSink>,
 }
 
 pub struct PlaybackCoordinator {
@@ -86,10 +96,7 @@ impl PlaybackCoordinator {
             shared: Arc::new(Shared {
                 tx: Mutex::new(Some(tx)),
                 snapshot: Mutex::new(PlaybackSnapshot::fresh()),
-                event_sinks: Mutex::new(Vec::new()),
-                action_sinks: Mutex::new(Vec::new()),
-                builtin_event_sinks: Mutex::new(Vec::new()),
-                builtin_action_sinks: Mutex::new(Vec::new()),
+                sinks: Mutex::new(Sinks::default()),
             }),
             rx: Some(rx),
             join: None,
@@ -126,19 +133,27 @@ impl PlaybackCoordinator {
     }
 
     pub fn add_event_sink(&self, sink: EventSink) {
-        self.shared.event_sinks.lock().push(sink);
+        self.shared.sinks.lock().events.push(Arc::from(sink));
     }
 
     pub fn add_action_sink(&self, sink: ActionSink) {
-        self.shared.action_sinks.lock().push(sink);
+        self.shared.sinks.lock().actions.push(Arc::from(sink));
     }
 
     pub fn add_builtin_event_sink(&self, sink: EventSink) {
-        self.shared.builtin_event_sinks.lock().push(sink);
+        self.shared
+            .sinks
+            .lock()
+            .builtin_events
+            .push(Arc::from(sink));
     }
 
     pub fn add_builtin_action_sink(&self, sink: ActionSink) {
-        self.shared.builtin_action_sinks.lock().push(sink);
+        self.shared
+            .sinks
+            .lock()
+            .builtin_actions
+            .push(Arc::from(sink));
     }
 }
 
@@ -159,7 +174,7 @@ fn worker(rx: Receiver<Input>, shared: Arc<Shared>) {
     while let Ok(first) = rx.recv() {
         let mut events: Vec<PlaybackEvent> = Vec::new();
         let mut actions: Vec<PlaybackAction> = Vec::new();
-        for input in std::iter::once(first).chain(rx.try_iter()) {
+        for input in pending_batch(&rx, first) {
             apply(&mut sm, input, &mut events);
             actions.extend(sm.consume_actions());
         }
@@ -173,31 +188,38 @@ fn worker(rx: Receiver<Input>, shared: Arc<Shared>) {
             *s = snap;
         }
 
-        // Sinks: dispatched in registration order. Each closure must
-        // not block; sinks own their own queue + consumer thread.
-        let event_sinks = shared.event_sinks.lock();
-        for sink in event_sinks.iter() {
-            for e in &events {
-                sink(e);
-            }
+        dispatch(&shared, &events, &actions);
+    }
+}
+
+/// Capture the queued count once so producers cannot extend this batch
+/// indefinitely and starve snapshot publication and sink delivery.
+fn pending_batch(rx: &Receiver<Input>, first: Input) -> impl Iterator<Item = Input> + '_ {
+    std::iter::once(first).chain(rx.try_iter().take(rx.len()))
+}
+
+fn dispatch(shared: &Shared, events: &[PlaybackEvent], actions: &[PlaybackAction]) {
+    let sinks = shared.sinks.lock().clone();
+    // Preserve registration order and external-before-builtin delivery.
+    // Callbacks must not block; sinks own their own queue + consumer thread.
+    for sink in &sinks.events {
+        for event in events {
+            sink(event);
         }
-        let action_sinks = shared.action_sinks.lock();
-        for sink in action_sinks.iter() {
-            for a in &actions {
-                sink(a);
-            }
+    }
+    for sink in &sinks.actions {
+        for action in actions {
+            sink(action);
         }
-        let builtin_event_sinks = shared.builtin_event_sinks.lock();
-        for sink in builtin_event_sinks.iter() {
-            for e in &events {
-                sink(e);
-            }
+    }
+    for sink in &sinks.builtin_events {
+        for event in events {
+            sink(event);
         }
-        let builtin_action_sinks = shared.builtin_action_sinks.lock();
-        for sink in builtin_action_sinks.iter() {
-            for a in &actions {
-                sink(a);
-            }
+    }
+    for sink in &sinks.builtin_actions {
+        for action in actions {
+            sink(action);
         }
     }
 }
@@ -261,6 +283,95 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn batch_leaves_new_arrivals_for_the_next_dispatch() {
+        let (tx, rx) = unbounded();
+        tx.send(Input::Position(1)).expect("receiver alive");
+        let first = rx.recv().expect("first input");
+        tx.send(Input::Position(2)).expect("receiver alive");
+        let batch = pending_batch(&rx, first);
+        tx.send(Input::Position(3)).expect("receiver alive");
+
+        let positions: Vec<_> = batch
+            .map(|input| match input {
+                Input::Position(position) => position,
+                _ => unreachable!("only positions queued"),
+            })
+            .collect();
+        assert_eq!(positions, [1, 2]);
+        assert!(matches!(rx.try_recv(), Ok(Input::Position(3))));
+    }
+
+    #[test]
+    fn dispatch_allows_registration_for_the_next_batch_and_preserves_order() {
+        let coord = Arc::new(PlaybackCoordinator::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let weak = Arc::downgrade(&coord);
+        let registered = std::sync::atomic::AtomicBool::new(false);
+        let recorded = Arc::clone(&calls);
+        coord.add_event_sink(Box::new(move |_| {
+            recorded.lock().push("event");
+            let coord = weak.upgrade().expect("coordinator alive");
+            // Fail instead of deadlocking if dispatch retains the registry lock.
+            assert!(coord.shared.sinks.try_lock().is_some());
+            if !registered.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let recorded = Arc::clone(&recorded);
+                coord.add_builtin_action_sink(Box::new(move |_| {
+                    recorded.lock().push("late action");
+                }));
+            }
+            // Callbacks can also read the published state and enqueue work.
+            let _ = coord.snapshot();
+            coord.enqueue(Input::Position(7));
+        }));
+        let recorded = Arc::clone(&calls);
+        coord.add_action_sink(Box::new(move |_| recorded.lock().push("action")));
+        let recorded = Arc::clone(&calls);
+        coord.add_builtin_event_sink(Box::new(move |_| recorded.lock().push("builtin event")));
+        let recorded = Arc::clone(&calls);
+        coord.add_builtin_action_sink(Box::new(move |_| recorded.lock().push("builtin action")));
+
+        let events = [PlaybackEvent::new(PlaybackEventKind::Seeked)];
+        let actions = [PlaybackAction {
+            kind: PlaybackActionKind::ApplyPendingTrackSelectionAndPlay,
+        }];
+        dispatch(&coord.shared, &events, &actions);
+        assert_eq!(
+            *calls.lock(),
+            ["event", "action", "builtin event", "builtin action"]
+        );
+        calls.lock().clear();
+        dispatch(&coord.shared, &events, &actions);
+        assert_eq!(
+            *calls.lock(),
+            [
+                "event",
+                "action",
+                "builtin event",
+                "builtin action",
+                "late action"
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_drains_accepted_inputs_with_live_producer_handles() {
+        let mut coord = PlaybackCoordinator::new();
+        let handle = coord.handle();
+        handle.enqueue(Input::FileLoaded);
+        handle.enqueue(Input::Position(42));
+        coord.start();
+        coord.stop();
+        assert_eq!(coord.snapshot().presence, PlayerPresence::Present);
+        assert_eq!(coord.snapshot().position_us, 42);
+        assert!(coord.shared.tx.lock().is_none());
+        handle.enqueue(Input::EndFile {
+            reason: EndReason::Eof,
+            error_message: String::new(),
+        });
+        assert_eq!(coord.snapshot().presence, PlayerPresence::Present);
+    }
 
     #[test]
     fn snapshot_starts_fresh() {

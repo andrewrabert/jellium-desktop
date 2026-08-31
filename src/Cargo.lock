@@ -2830,7 +2830,6 @@ name = "jfn-mpris"
 version = "0.1.0-dev"
 dependencies = [
  "async-io",
- "crossbeam-channel",
  "jfn-mpv",
  "jfn-platform-abi",
  "jfn-playback",

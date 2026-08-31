@@ -60,15 +60,8 @@ fn status_for(phase: PlaybackPhase) -> MprisStatus {
     }
 }
 
-fn is_active(phase: PlaybackPhase) -> bool {
-    matches!(
-        phase,
-        PlaybackPhase::Playing | PlaybackPhase::Paused | PlaybackPhase::Starting
-    )
-}
-
 pub fn project(input: &ProjectInput) -> MprisDerived {
-    let active = is_active(input.phase);
+    let active = input.phase.is_active();
     // CanPause is true while committed to playing — Playing or Starting (user
     // already pressed play). Paused exposes Play, not Pause; Stopped exposes
     // neither.
