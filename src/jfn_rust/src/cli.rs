@@ -331,7 +331,7 @@ mod tests {
     // links them to the consts, so guard the drift here.
     #[test]
     fn const_defaults_match_help_text() {
-        assert_eq!(jfn_mpv::HWDEC_DEFAULT, "no");
+        assert_eq!(jfn_config::HWDEC_DEFAULT, "no");
         assert_eq!(crate::app::DEFAULT_LOG_FILTER, "info");
     }
 }

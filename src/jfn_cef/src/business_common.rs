@@ -48,7 +48,14 @@ pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>
         return;
     };
     match key {
-        "hwdec" => jfn_config::set_hwdec(value),
+        "hwdec" => match value.parse() {
+            Ok(hwdec) => jfn_config::set_hwdec(hwdec),
+            Err(e) => jfn_logging::log(
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Warn,
+                &format!("Ignoring setting {_section}.{key}: {e}"),
+            ),
+        },
         "audioPassthrough" => jfn_config::set_audio_passthrough(value),
         "audioExclusive" => jfn_config::set_audio_exclusive(value == "true"),
         "audioChannels" => jfn_config::set_audio_channels(value),

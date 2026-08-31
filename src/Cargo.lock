@@ -2671,6 +2671,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

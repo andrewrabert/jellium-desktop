@@ -612,11 +612,7 @@ fn run_user_scripts(profile: &ExtraInfo, frame: &Frame) {
         }
     }
     replace_first(&mut code, "__SERVER_URL__", &jfn_config::server_url());
-    replace_first(
-        &mut code,
-        "__SETTINGS_JSON__",
-        &jfn_config::cli_json(jfn_mpv::hwdec_options()),
-    );
+    replace_first(&mut code, "__SETTINGS_JSON__", &jfn_config::cli_json());
     replace_first(&mut code, "__APP_VERSION__", crate::APP_VERSION);
     let decoration_options = profile
         .window_decoration_options()

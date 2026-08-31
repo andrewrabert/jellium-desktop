@@ -17,8 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
+mod hardware_decode;
+pub use hardware_decode::{HWDEC_DEFAULT, Hwdec, UnknownHwdec, hwdec_options};
+
 const DEVICE_NAME_MAX: usize = 64;
-const HWDEC_DEFAULT: &str = "no";
 
 #[derive(Clone, Copy, Debug)]
 pub struct JfnWindowGeometry {
@@ -48,7 +50,7 @@ impl Default for JfnWindowGeometry {
 #[derive(Clone, Debug)]
 struct SettingsData {
     server_url: String,
-    hwdec: String,
+    hwdec: Hwdec,
     audio_passthrough: String,
     audio_channels: String,
     log_level: String,
@@ -66,7 +68,7 @@ impl Default for SettingsData {
     fn default() -> Self {
         Self {
             server_url: String::new(),
-            hwdec: String::new(),
+            hwdec: Hwdec::default(),
             audio_passthrough: String::new(),
             audio_channels: String::new(),
             log_level: String::new(),
@@ -112,7 +114,7 @@ struct SettingsFile {
     window_maximized: Option<bool>,
 
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
-    hwdec: Option<String>,
+    hwdec: Option<Hwdec>,
 
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     audio_passthrough: Option<String>,
@@ -190,8 +192,7 @@ where
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CliSettings<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hwdec: Option<&'a str>,
+    hwdec: Hwdec,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     audio_passthrough: Option<&'a str>,
@@ -220,7 +221,7 @@ struct CliSettings<'a> {
 
     device_name_default: String,
 
-    hwdec_options: &'a [&'a str],
+    hwdec_options: &'static [&'static str],
 }
 
 impl SettingsData {
@@ -298,8 +299,7 @@ impl SettingsData {
             window_x: position.then_some(self.window.x),
             window_y: position.then_some(self.window.y),
             window_maximized: Some(self.window.maximized),
-            hwdec: (!self.hwdec.is_empty() && self.hwdec != HWDEC_DEFAULT)
-                .then(|| self.hwdec.clone()),
+            hwdec: (self.hwdec != Hwdec::default()).then_some(self.hwdec),
             audio_passthrough: (!self.audio_passthrough.is_empty())
                 .then(|| self.audio_passthrough.clone()),
             audio_exclusive: self.audio_exclusive.then_some(true),
@@ -314,9 +314,9 @@ impl SettingsData {
         }
     }
 
-    fn cli_json(&self, hwdec_opts: &[&str]) -> String {
+    fn cli_json(&self) -> String {
         let view = CliSettings {
-            hwdec: (!self.hwdec.is_empty()).then_some(self.hwdec.as_str()),
+            hwdec: self.hwdec,
             audio_passthrough: (!self.audio_passthrough.is_empty())
                 .then_some(self.audio_passthrough.as_str()),
             audio_exclusive: self.audio_exclusive.then_some(true),
@@ -329,7 +329,7 @@ impl SettingsData {
             hide_scrollbar: self.hide_scrollbar,
             device_name: (!self.device_name.is_empty()).then_some(self.device_name.as_str()),
             device_name_default: default_device_name(),
-            hwdec_options: hwdec_opts,
+            hwdec_options: hwdec_options(),
         };
         serde_json::to_string(&view).unwrap_or_default()
     }
@@ -508,7 +508,14 @@ macro_rules! bool_accessors {
 }
 
 string_accessors!(server_url, set_server_url, server_url);
-string_accessors!(hwdec, set_hwdec, hwdec);
+
+pub fn hwdec() -> Hwdec {
+    state().lock().data.hwdec
+}
+
+pub fn set_hwdec(v: Hwdec) {
+    state().lock().data.hwdec = v;
+}
 string_accessors!(audio_passthrough, set_audio_passthrough, audio_passthrough);
 string_accessors!(audio_channels, set_audio_channels, audio_channels);
 string_accessors!(log_level, set_log_level, log_level);
@@ -601,9 +608,9 @@ pub fn set_window_geometry(g: JfnWindowGeometry) {
     state().lock().data.window = g;
 }
 
-pub fn cli_json(hwdec_opts: &[&str]) -> String {
+pub fn cli_json() -> String {
     let snap = state().lock().data.clone();
-    snap.cli_json(hwdec_opts)
+    snap.cli_json()
 }
 
 fn normalize_device_name(raw: &str, platform_default: &str) -> String {
@@ -691,7 +698,7 @@ mod tests {
     fn every_key_writes_in_schema_order() {
         let data = SettingsData {
             server_url: "http://host".into(),
-            hwdec: "vaapi".into(),
+            hwdec: "auto".parse().expect("auto is offered everywhere"),
             audio_passthrough: "eac3".into(),
             audio_channels: "stereo".into(),
             log_level: "debug".into(),
@@ -793,12 +800,11 @@ mod tests {
     #[test]
     fn cli_json_emits_the_web_ui_contract() {
         let data = SettingsData {
-            hwdec: "vaapi".into(),
             transparent_titlebar: false,
             device_name: "box".into(),
             ..SettingsData::default()
         };
-        let text = data.cli_json(&["no", "auto"]);
+        let text = data.cli_json();
         assert_eq!(
             keys(&text),
             [
@@ -811,7 +817,8 @@ mod tests {
                 "hwdecOptions",
             ]
         );
-        assert!(text.contains(r#""hwdecOptions":["no","auto"]"#));
+        let options = serde_json::to_string(super::hwdec_options()).expect("serializes");
+        assert!(text.contains(&format!(r#""hwdecOptions":{options}"#)));
         assert!(text.contains(&format!(
             r#""deviceNameDefault":"{}""#,
             default_device_name()

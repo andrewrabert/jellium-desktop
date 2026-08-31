@@ -91,12 +91,7 @@ impl Settings {
     }
 
     pub fn view(&self) -> Element<'_, Message, Theme, iced_wgpu::Renderer> {
-        let hwdec = jfn_config::hwdec();
-        let hwdec_selected = if hwdec.is_empty() {
-            "auto".to_owned()
-        } else {
-            hwdec
-        };
+        let hwdec_selected = Self::selected_hwdec(jfn_config::hwdec());
         let audio_channels = jfn_config::audio_channels();
         let log_level = jfn_config::log_level();
 
@@ -234,8 +229,14 @@ impl Settings {
             .into()
     }
 
+    /// The mode the Hardware Decoding control shows: the stored value itself,
+    /// so an unset setting shows the mode mpv is given, not a guess.
+    fn selected_hwdec(hwdec: jfn_config::Hwdec) -> String {
+        hwdec.as_str().to_owned()
+    }
+
     pub fn hardware_decoding_choices() -> Vec<String> {
-        jfn_mpv::hwdec_options()
+        jfn_config::hwdec_options()
             .iter()
             .map(|value| (*value).to_owned())
             .collect()
@@ -264,7 +265,11 @@ impl Settings {
 
     pub fn update(&mut self, message: Message) -> Outcome {
         match message {
-            Message::HardwareDecodingChanged(value) => jfn_config::set_hwdec(&value),
+            Message::HardwareDecodingChanged(value) => {
+                if let Ok(hwdec) = value.parse() {
+                    jfn_config::set_hwdec(hwdec);
+                }
+            }
             Message::AudioPassthroughEdited(value) => {
                 self.audio_passthrough = value;
                 return Outcome::None;
@@ -465,10 +470,18 @@ mod tests {
     use jfn_platform_abi::{DisplayBackend, WindowDecorations};
 
     #[test]
+    fn unset_hwdec_shows_the_mode_mpv_is_given() {
+        assert_eq!(
+            Settings::selected_hwdec(jfn_config::Hwdec::default()),
+            jfn_config::HWDEC_DEFAULT
+        );
+    }
+
+    #[test]
     fn hardware_choices_are_the_mpv_authority() {
         assert_eq!(
             Settings::hardware_decoding_choices(),
-            jfn_mpv::hwdec_options()
+            jfn_config::hwdec_options()
         );
     }
 

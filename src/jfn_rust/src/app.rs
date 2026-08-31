@@ -160,7 +160,7 @@ fn setup_mpv_environment() {
 }
 
 struct StartupOptions {
-    hwdec: String,
+    hwdec: jfn_config::Hwdec,
     audio_passthrough: String,
     audio_exclusive: bool,
     audio_channels: String,
@@ -178,12 +178,10 @@ fn resolve_startup_options(cli: &cli::Cli) -> StartupOptions {
     let saved_log_level = jfn_config::log_level();
     let saved_audio_exclusive = jfn_config::audio_exclusive();
 
-    let mpv_hwdec_default = jfn_mpv::HWDEC_DEFAULT.to_string();
-
-    let mut hwdec = if saved_hwdec.is_empty() {
-        mpv_hwdec_default.clone()
-    } else {
-        saved_hwdec
+    // An unknown CLI value falls back to the mpv default.
+    let hwdec = match cli.hwdec.as_deref() {
+        Some(value) => value.parse::<jfn_config::Hwdec>().unwrap_or_default(),
+        None => saved_hwdec,
     };
     let mut audio_passthrough = saved_pass;
     let mut audio_exclusive = saved_audio_exclusive;
@@ -198,9 +196,6 @@ fn resolve_startup_options(cli: &cli::Cli) -> StartupOptions {
     let mut disable_gpu_compositing = false;
     let mut remote_debugging_port: c_int = 0;
 
-    if let Some(v) = cli.hwdec.clone() {
-        hwdec = v;
-    }
     if let Some(v) = cli.audio_passthrough.clone() {
         audio_passthrough = v;
     }
@@ -218,10 +213,6 @@ fn resolve_startup_options(cli: &cli::Cli) -> StartupOptions {
     }
     if let Some(p) = cli.remote_debug_port {
         remote_debugging_port = p;
-    }
-
-    if !jfn_mpv::is_valid_hwdec(&hwdec) {
-        hwdec = mpv_hwdec_default;
     }
 
     if !audio_passthrough.is_empty() {
@@ -246,7 +237,7 @@ struct MpvInitOptions<'a> {
     boot_force_position: bool,
     boot_window_max: bool,
     embed_wid: Option<i64>,
-    hwdec: &'a str,
+    hwdec: jfn_config::Hwdec,
     audio_passthrough: &'a str,
     audio_exclusive: bool,
     audio_channels: &'a str,
@@ -255,7 +246,7 @@ struct MpvInitOptions<'a> {
 
 fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
     let geometry_c = opts.boot_geometry.map(cs);
-    let hwdec_c = cs(opts.hwdec);
+    let hwdec_c = cs(opts.hwdec.as_str());
     let user_agent_c = cs(&format!("JelliumDesktop/{}", APP_VERSION_FULL));
     let passthrough_c = cs(opts.audio_passthrough);
     let channels_c = cs(opts.audio_channels);
@@ -658,7 +649,7 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
         boot_force_position: mpv_boot.as_ref().is_some_and(|w| w.force_position),
         boot_window_max: mpv_boot.as_ref().is_some_and(|w| w.maximized),
         embed_wid: plat().mpv_host().embed_wid(),
-        hwdec: &opts.hwdec,
+        hwdec: opts.hwdec,
         audio_passthrough: &opts.audio_passthrough,
         audio_exclusive: opts.audio_exclusive,
         audio_channels: &opts.audio_channels,
