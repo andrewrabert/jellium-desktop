@@ -154,8 +154,8 @@ fn handle_player_load(args: &ListValue) {
         false
     };
     jfn_logging::log(
-        jfn_logging::CATEGORY_CEF,
-        jfn_logging::LEVEL_INFO,
+        jfn_logging::Category::Cef,
+        jfn_logging::Level::Info,
         &format!(
             "playerLoad: video={video_idx} audio={audio_idx} sub={sub_idx} \
              start={start_ms}ms infinite={is_infinite_stream} \
@@ -253,8 +253,8 @@ fn handle_message(message: BrowserMessage) -> bool {
         "playerSetSubtitle" => with_args(args, |a| {
             let id = list_int(a, 0) as i64;
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_INFO,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Info,
                 &format!("playerSetSubtitle: {id}"),
             );
             jfn_mpv_set_subtitle_track(id);
@@ -262,8 +262,8 @@ fn handle_message(message: BrowserMessage) -> bool {
         "playerAddSubtitle" => with_args(args, |a| {
             let url = list_string(a, 0);
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_INFO,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Info,
                 &format!("playerAddSubtitle: {url}"),
             );
             if let Some(c) = js_cstr_or_warn("playerAddSubtitle url", &url) {
@@ -276,8 +276,8 @@ fn handle_message(message: BrowserMessage) -> bool {
         "playerAddAudio" => with_args(args, |a| {
             let url = list_string(a, 0);
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_INFO,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Info,
                 &format!("playerAddAudio: {url}"),
             );
             if let Some(c) = js_cstr_or_warn("playerAddAudio url", &url) {
@@ -318,8 +318,8 @@ fn handle_message(message: BrowserMessage) -> bool {
         "themeColor" => with_args(args, |a| {
             let color = list_string(a, 0);
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_DEBUG,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Debug,
                 &format!("themeColor IPC: {color}"),
             );
             if let Some(c) = js_cstr_or_warn("themeColor", &color) {
@@ -358,8 +358,8 @@ fn handle_message(message: BrowserMessage) -> bool {
         }
         "openConfigDir" => {
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_INFO,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Info,
                 "Opening mpv home directory",
             );
             if let Some(p) = crate::platform_ops::ops() {

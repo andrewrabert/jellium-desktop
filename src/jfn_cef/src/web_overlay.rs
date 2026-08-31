@@ -140,8 +140,8 @@ impl WebOverlay {
         crate::business_web::install(&client);
         let _ = self.inner.client.set(Arc::downgrade(&client));
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_INFO,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Info,
             &format!(
                 "CreateBrowser(web) logical={}x{}+{} physical={}x{}+{} scale={}",
                 size.extent.logical().w,

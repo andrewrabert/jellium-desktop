@@ -97,8 +97,8 @@ fn start_on_ui(state: &Arc<Mutex<ProbeState>>) {
         Some(r) => st.active = Some(r),
         None => {
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_WARN,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Warn,
                 "server probe: CefURLRequest::Create returned null",
             );
             if let Some(f) = st.callback.take() {

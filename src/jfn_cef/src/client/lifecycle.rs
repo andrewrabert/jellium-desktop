@@ -46,8 +46,8 @@ impl Inner {
     pub(crate) fn handle_on_after_created(self: &Arc<Self>, browser: Browser) {
         let formatted = format!("CefLayer::OnAfterCreated name={}", self.name_str());
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_DEBUG,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Debug,
             &formatted,
         );
         self.browser.lock().browser = Some(browser.clone());
@@ -82,8 +82,8 @@ impl Inner {
         }
         self.paint_scheduler.before_close();
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_DEBUG,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Debug,
             &format!("OnBeforeClose name={}", self.name_str()),
         );
         // A browser dying mid-menu must not strand the session slot.

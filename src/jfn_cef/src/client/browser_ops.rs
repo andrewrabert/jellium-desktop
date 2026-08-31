@@ -106,8 +106,8 @@ impl Inner {
             ..BrowserSettings::default()
         };
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_DEBUG,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Debug,
             &format!("create browser windowless_frame_rate={fr} shared_textures={shared}"),
         );
 

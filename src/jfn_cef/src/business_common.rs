@@ -19,8 +19,8 @@ pub(crate) fn js_cstr_or_warn(label: &str, s: &str) -> Option<CString> {
         Ok(c) => Some(c),
         Err(_) => {
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_WARN,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Warn,
                 &format!("{label}: interior NUL in JS string; dropping IPC"),
             );
             None
@@ -41,8 +41,8 @@ pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>
     }
     let Some(value) = value else {
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_WARN,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Warn,
             &format!("Null value for setting key: {_section}.{key}"),
         );
         return;
@@ -60,8 +60,8 @@ pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>
             jfn_config::set_device_name(value, &jfn_config::default_device_name());
         }
         _ => jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_WARN,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Warn,
             &format!("Unknown setting key: {_section}.{key}"),
         ),
     }

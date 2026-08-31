@@ -63,10 +63,10 @@ fn signal_work_source() {
 
 fn pump_drain(trigger: &str) {
     if PUMP_SHUTDOWN.load(Ordering::Acquire) {
-        if jfn_logging::log_enabled(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_DEBUG) {
+        if jfn_logging::log_enabled(jfn_logging::Category::Cef, jfn_logging::Level::Debug) {
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_DEBUG,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Debug,
                 &format!("[PUMP] drain({trigger}) skipped (shutdown)"),
             );
         }
@@ -100,15 +100,15 @@ unsafe extern "C-unwind" fn delayed_timer_fire(_timer: *mut CFRunLoopTimer, _inf
 
 pub(crate) fn init() {
     jfn_logging::log(
-        jfn_logging::CATEGORY_CEF,
-        jfn_logging::LEVEL_INFO,
+        jfn_logging::Category::Cef,
+        jfn_logging::Level::Info,
         "[PUMP] init: installing CFRunLoopSource + CFRunLoopTimer",
     );
 
     let Some(main) = CFRunLoop::main() else {
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_INFO,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Info,
             "[PUMP] init: no main run loop",
         );
         return;
@@ -153,10 +153,10 @@ pub(crate) fn init() {
 
 pub(crate) fn on_schedule(delay_ms: i64) {
     if PUMP_SHUTDOWN.load(Ordering::Acquire) {
-        if jfn_logging::log_enabled(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_DEBUG) {
+        if jfn_logging::log_enabled(jfn_logging::Category::Cef, jfn_logging::Level::Debug) {
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_DEBUG,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Debug,
                 &format!("[PUMP] on_schedule({delay_ms}) SKIP(shutdown)"),
             );
         }
@@ -177,8 +177,8 @@ pub(crate) fn on_schedule(delay_ms: i64) {
 
 pub(crate) fn shutdown() {
     jfn_logging::log(
-        jfn_logging::CATEGORY_CEF,
-        jfn_logging::LEVEL_INFO,
+        jfn_logging::Category::Cef,
+        jfn_logging::Level::Info,
         &format!(
             "[PUMP] shutdown: sched_imm={} sched_delayed={} source_fired={} timer_fired={} dmlw_calls={}",
             SCHED_IMM_CALLS.load(Ordering::Relaxed),

@@ -2,6 +2,7 @@
 //! returns the exit code.
 
 use std::ffi::{CStr, CString, c_char, c_int};
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use clap::Parser;
 use jfn_cef::{APP_VERSION_FULL, cef_version};
 use jfn_instance_ipc::jfn::{Request, Response};
 use jfn_instance_ipc::{Listener, Start, Stream};
+use jfn_logging::{Category, Level};
 use jfn_platform_abi::{IdleInhibitLevel, Instance, Platform, WindowGeometry};
 
 use crate::cli;
@@ -93,12 +95,10 @@ fn print_version() {
     jfn_mpv::probe::jfn_mpv_print_version_info();
 }
 
-fn init_logging(log_file: Option<String>, log_level: &str) {
-    let log_path = log_file.unwrap_or_else(|| {
-        jfn_paths::default_log_file()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
+fn init_logging(log_file: Option<&Path>, log_level: &str) {
+    let log_path = log_file
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
     let filter = if log_level.is_empty() {
         DEFAULT_LOG_FILTER.to_string()
@@ -165,7 +165,8 @@ struct StartupOptions {
     audio_exclusive: bool,
     audio_channels: String,
     log_level: String,
-    log_file: Option<String>,
+    /// The file logs are written to; `None` disables file logging.
+    log_file: Option<PathBuf>,
     disable_gpu_compositing: bool,
     remote_debugging_port: c_int,
 }
@@ -189,7 +190,11 @@ fn resolve_startup_options(cli: &cli::Cli) -> StartupOptions {
     let mut audio_channels = saved_chans;
     let mut log_level = saved_log_level;
 
-    let log_file = cli.log_file.clone();
+    let log_file = match cli.log_file.as_deref() {
+        Some("") => None,
+        Some(path) => Some(PathBuf::from(path)),
+        None => jfn_paths::default_log_file(),
+    };
     let mut disable_gpu_compositing = false;
     let mut remote_debugging_port: c_int = 0;
 
@@ -570,7 +575,7 @@ pub fn jfn_app_main() -> c_int {
 
     let opts = resolve_startup_options(&cli);
 
-    init_logging(opts.log_file.clone(), &opts.log_level);
+    init_logging(opts.log_file.as_deref(), &opts.log_level);
 
     crate::platform_install::install_from_cli(&cli);
 
@@ -738,24 +743,17 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
 // mpv boot helpers + VO wait loop
 // =====================================================================
 
-const LOG_MPV: u8 = 1;
-const LEVEL_TRACE: u8 = 0;
-const LEVEL_DEBUG: u8 = 1;
-const LEVEL_INFO: u8 = 2;
-const LEVEL_WARN: u8 = 3;
-const LEVEL_ERROR: u8 = 4;
-
 fn mpv_log_level_from_filter() -> &'static str {
-    let e = jfn_logging::log_enabled;
-    if e(LOG_MPV, LEVEL_TRACE) {
+    let e = |level| jfn_logging::log_enabled(Category::Mpv, level);
+    if e(Level::Trace) {
         "debug"
-    } else if e(LOG_MPV, LEVEL_DEBUG) {
+    } else if e(Level::Debug) {
         "v"
-    } else if e(LOG_MPV, LEVEL_INFO) {
+    } else if e(Level::Info) {
         "info"
-    } else if e(LOG_MPV, LEVEL_WARN) {
+    } else if e(Level::Warn) {
         "warn"
-    } else if e(LOG_MPV, LEVEL_ERROR) {
+    } else if e(Level::Error) {
         "error"
     } else {
         "no"
@@ -831,7 +829,6 @@ fn boot_ready() -> bool {
 // run_with_cef body — Rust port
 // =====================================================================
 
-const LOG_CEF: u8 = 2;
 // cef_log_severity_t ABI: 1 VERBOSE, 2 INFO, 3 WARNING, 4 ERROR.
 // Must match `jfn_cef::ffi::log_severity_from_int` / `client/events.rs`.
 const LOG_SEVERITY_VERBOSE: c_int = 1;
@@ -840,14 +837,14 @@ const LOG_SEVERITY_WARNING: c_int = 3;
 const LOG_SEVERITY_ERROR: c_int = 4;
 
 fn cef_severity_for_cef_filter() -> c_int {
-    // Map LOG_CEF level to CEF severity:
+    // Map the CEF category level to CEF severity:
     //   Trace/Debug -> VERBOSE, Info -> INFO, Warn -> WARNING, Error -> ERROR.
-    let e = jfn_logging::log_enabled;
-    if e(LOG_CEF, LEVEL_TRACE) || e(LOG_CEF, LEVEL_DEBUG) {
+    let e = |level| jfn_logging::log_enabled(Category::Cef, level);
+    if e(Level::Trace) || e(Level::Debug) {
         LOG_SEVERITY_VERBOSE
-    } else if e(LOG_CEF, LEVEL_INFO) {
+    } else if e(Level::Info) {
         LOG_SEVERITY_INFO
-    } else if e(LOG_CEF, LEVEL_WARN) {
+    } else if e(Level::Warn) {
         LOG_SEVERITY_WARNING
     } else {
         LOG_SEVERITY_ERROR

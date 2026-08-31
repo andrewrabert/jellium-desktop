@@ -29,16 +29,16 @@ impl Inner {
         const LOGSEVERITY_DEFAULT: c_int = 0;
         let formatted = format!("{} ({}:{})", msg, src, line);
         let lvl = if level >= LOGSEVERITY_ERROR {
-            jfn_logging::LEVEL_ERROR
+            jfn_logging::Level::Error
         } else if level == LOGSEVERITY_WARNING {
-            jfn_logging::LEVEL_WARN
+            jfn_logging::Level::Warn
         } else if level == LOGSEVERITY_INFO || level == LOGSEVERITY_DEFAULT {
-            jfn_logging::LEVEL_INFO
+            jfn_logging::Level::Info
         } else {
             let _ = LOGSEVERITY_VERBOSE;
-            jfn_logging::LEVEL_DEBUG
+            jfn_logging::Level::Debug
         };
-        jfn_logging::log(jfn_logging::CATEGORY_JS, lvl, &formatted);
+        jfn_logging::log(jfn_logging::Category::Js, lvl, &formatted);
     }
 
     /// Marks which navigation's document is now producing pixels; a frame of
@@ -52,8 +52,8 @@ impl Inner {
             url,
         );
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_INFO,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Info,
             &formatted,
         );
         if is_main {
@@ -70,8 +70,8 @@ impl Inner {
             text,
         );
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_ERROR,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Error,
             &formatted,
         );
         // An aborted main-frame load is another navigation replacing this one,

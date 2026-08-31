@@ -76,8 +76,8 @@ wrap_scheme_handler_factory! {
                 (r.bytes.to_vec(), r.mime)
             } else {
                 jfn_logging::log(
-                    jfn_logging::CATEGORY_RESOURCE,
-                    jfn_logging::LEVEL_WARN,
+                    jfn_logging::Category::Resource,
+                    jfn_logging::Level::Warn,
                     &format!("EmbeddedScheme not found: {url_path}"),
                 );
                 return None;

@@ -24,39 +24,29 @@ use time::macros::format_description;
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, Registry, filter::LevelFilter, fmt, layer::SubscriberExt};
 
-const CATEGORY_COUNT: u8 = 7;
-const LEVEL_COUNT: u8 = 5;
-
-// Public category/level constants, and the u8 values accepted by `log` /
-// `log_enabled`.
-pub const CATEGORY_CEF: u8 = 2;
-pub const CATEGORY_JS: u8 = 5;
-pub const CATEGORY_RESOURCE: u8 = 6;
-pub const LEVEL_DEBUG: u8 = 1;
-pub const LEVEL_INFO: u8 = 2;
-pub const LEVEL_WARN: u8 = 3;
-pub const LEVEL_ERROR: u8 = 4;
-
-#[repr(u8)]
+/// Subsystem a record is attributed to; each maps to one tracing target so
+/// filter directives such as `CEF=off` or `mpv=trace` address it by name.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
-enum Level {
-    Trace = 0,
-    Debug = 1,
-    Info = 2,
-    Warn = 3,
-    Error = 4,
+pub enum Category {
+    Main,
+    Mpv,
+    Cef,
+    Media,
+    Platform,
+    Js,
+    Resource,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum Level {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
 }
 
 impl Level {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Level::Trace,
-            1 => Level::Debug,
-            2 => Level::Info,
-            3 => Level::Warn,
-            _ => Level::Error,
-        }
-    }
     fn label(self) -> &'static str {
         match self {
             Level::Trace => "TRACE",
@@ -143,7 +133,7 @@ impl Write for RotatingFile {
 
 #[cfg(unix)]
 mod imp {
-    use super::{CATEGORY_CEF, Level, emit};
+    use super::{Category, Level, emit};
     use nix::errno::Errno;
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use nix::unistd::{dup, dup2_stderr, isatty, pipe, read, write};
@@ -249,7 +239,7 @@ mod imp {
                     let line: Vec<u8> = partial.drain(..=pos).take(pos).collect();
                     if !line.is_empty() {
                         let msg = String::from_utf8_lossy(&line).into_owned();
-                        emit(CATEGORY_CEF, Level::Debug, &msg);
+                        emit(Category::Cef, Level::Debug, &msg);
                     }
                 }
             }
@@ -340,19 +330,18 @@ const CONSOLE_TRACE_FMT: &[FormatItem<'static>] =
 // Emit
 // =====================================================================
 
-// The one place a category number maps to a target string; `$mac` is
-// re-invoked with the target literal prepended to its arguments.
+// The one place a category maps to a target string; `$mac` is re-invoked
+// with the target literal prepended to its arguments.
 macro_rules! with_category_target {
     ($category:expr, $mac:ident $(, $arg:expr)*) => {
         match $category {
-            0 => $mac!("Main" $(, $arg)*),
-            1 => $mac!("mpv" $(, $arg)*),
-            2 => $mac!("CEF" $(, $arg)*),
-            3 => $mac!("Media" $(, $arg)*),
-            4 => $mac!("Platform" $(, $arg)*),
-            5 => $mac!("JS" $(, $arg)*),
-            6 => $mac!("Resource" $(, $arg)*),
-            _ => $mac!("Unknown" $(, $arg)*),
+            Category::Main => $mac!("Main" $(, $arg)*),
+            Category::Mpv => $mac!("mpv" $(, $arg)*),
+            Category::Cef => $mac!("CEF" $(, $arg)*),
+            Category::Media => $mac!("Media" $(, $arg)*),
+            Category::Platform => $mac!("Platform" $(, $arg)*),
+            Category::Js => $mac!("JS" $(, $arg)*),
+            Category::Resource => $mac!("Resource" $(, $arg)*),
         }
     };
 }
@@ -386,7 +375,7 @@ macro_rules! enabled_at {
     }};
 }
 
-fn emit(category: u8, level: Level, msg: &str) {
+fn emit(category: Category, level: Level, msg: &str) {
     let msg = msg.trim_end_matches(['\r', '\n']);
     with_category_target!(category, emit_at, level, msg);
 }
@@ -491,16 +480,12 @@ pub fn jfn_log_shutdown() {
     }
 }
 
-pub fn log_enabled(category: u8, level: u8) -> bool {
-    if category >= CATEGORY_COUNT || level >= LEVEL_COUNT {
-        return false;
-    }
-    let level = Level::from_u8(level);
+pub fn log_enabled(category: Category, level: Level) -> bool {
     with_category_target!(category, enabled_at, level)
 }
 
-pub fn log(category: u8, level: u8, msg: &str) {
-    emit(category, Level::from_u8(level), msg);
+pub fn log(category: Category, level: Level, msg: &str) {
+    emit(category, level, msg);
 }
 
 pub fn active_path() -> String {
@@ -747,7 +732,7 @@ mod tests {
         }
     }
 
-    fn enabled_under(directive: &str, category: u8, level: u8) -> bool {
+    fn enabled_under(directive: &str, category: Category, level: Level) -> bool {
         let dispatch = tracing::Dispatch::new(Registry::default().with(EnvFilter::new(directive)));
         tracing::dispatcher::with_default(&dispatch, || log_enabled(category, level))
     }
@@ -755,37 +740,27 @@ mod tests {
     #[test]
     fn log_enabled_respects_global_filter() {
         // "warn" → Info disabled, Warn/Error enabled for any category.
-        assert!(!enabled_under("warn", 0 /* Main */, 2 /* Info */));
-        assert!(enabled_under("warn", 0, 3 /* Warn */));
-        assert!(enabled_under("warn", 0, 4 /* Error */));
+        assert!(!enabled_under("warn", Category::Main, Level::Info));
+        assert!(enabled_under("warn", Category::Main, Level::Warn));
+        assert!(enabled_under("warn", Category::Main, Level::Error));
     }
 
     #[test]
     fn log_enabled_respects_target_override() {
         // Global warn, but mpv=trace → mpv Trace enabled, Main Trace not.
-        assert!(enabled_under(
+        assert!(enabled_under("warn,mpv=trace", Category::Mpv, Level::Trace));
+        assert!(!enabled_under(
             "warn,mpv=trace",
-            1, /* mpv */
-            0  /* Trace */
+            Category::Main,
+            Level::Trace
         ));
-        assert!(!enabled_under("warn,mpv=trace", 0 /* Main */, 0));
     }
 
     #[test]
     fn log_enabled_respects_off_directive() {
         // Global info, CEF=off → CEF Error disabled, Main Error enabled.
-        assert!(!enabled_under(
-            "info,CEF=off",
-            2, /* CEF */
-            4  /* Error */
-        ));
-        assert!(enabled_under("info,CEF=off", 0 /* Main */, 4));
-    }
-
-    #[test]
-    fn log_enabled_rejects_out_of_range_category_and_level() {
-        assert!(!enabled_under("trace", CATEGORY_COUNT, 4));
-        assert!(!enabled_under("trace", 0, LEVEL_COUNT));
+        assert!(!enabled_under("info,CEF=off", Category::Cef, Level::Error));
+        assert!(enabled_under("info,CEF=off", Category::Main, Level::Error));
     }
 
     #[test]

@@ -200,7 +200,7 @@ wrap_browser_process_handler! {
 
     impl BrowserProcessHandler {
         fn on_context_initialized(&self) {
-            jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_INFO, "CEF context initialized");
+            jfn_logging::log(jfn_logging::Category::Cef, jfn_logging::Level::Info, "CEF context initialized");
             crate::resource::register();
             // Optional C-side callback (kept for any future C++ context-init
             // hooks; currently unused now that scheme registration is in Rust).
