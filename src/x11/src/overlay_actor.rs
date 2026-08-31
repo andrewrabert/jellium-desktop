@@ -17,7 +17,7 @@ use jfn_gpu_paint::{
     FrameSize as PhysicalSize, Pixels, PresentFailed, SharedTexture, WindowTarget,
 };
 use jfn_mailbox::Mailbox;
-use jfn_platform_abi::{FrameSource, JfnRect};
+use jfn_platform_abi::{FrameRetry, FrameSource, JfnRect};
 use x11rb::connection::Connection;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xproto;
@@ -172,14 +172,6 @@ fn initial_backend() -> Backend {
     }
 }
 
-/// A frame the swapchain could not take yet, held until `at`, and the producer
-/// that owes its successor. A frame taken from the mailbox supersedes it.
-struct Retry {
-    frame: PendingFrame,
-    source: Arc<dyn FrameSource>,
-    at: Option<Instant>,
-}
-
 /// What one iteration did with the frame it took.
 enum Outcome {
     /// The frame reached the surface's commit stream.
@@ -194,7 +186,7 @@ enum Outcome {
 fn run_worker(mailbox: Mailbox<OverlayState>) {
     let mut backend = initial_backend();
     let content_conn = crate::x11_state::x11rb_conn();
-    let mut retry: Option<Retry> = None;
+    let mut retry = FrameRetry::default();
 
     loop {
         let ready = |s: &OverlayState| s.pending.is_some() || s.shutdown;
@@ -211,7 +203,7 @@ fn run_worker(mailbox: Mailbox<OverlayState>) {
                 s.shutdown,
             )
         };
-        let taken = match retry.as_ref().and_then(|pending| pending.at) {
+        let taken = match retry.due() {
             Some(at) => mailbox.wait_until(at, ready, take),
             None => Some(mailbox.wait(ready, take)),
         };
@@ -231,29 +223,12 @@ fn run_worker(mailbox: Mailbox<OverlayState>) {
         if shutdown {
             break;
         }
-        let frame = match frame {
-            // A frame taken from the mailbox supersedes the held one.
-            Some(fresh) => {
-                retry = None;
-                Some(fresh)
-            }
-            None => retry.take().map(|held| (held.frame, held.source)),
-        };
+        let frame = retry.take(frame);
         let (Some(window), Some(gc)) = (content_window, content_gc) else {
             // The geometry thread has not created the window yet; the frame
-            // stays owed until it has, or its producer is asked for the one
-            // that replaces it where no refresh interval spaces the retry.
+            // stays owed until it has.
             if let Some((frame, source)) = frame {
-                match jfn_gpu_paint::Deferred::new().retry_at() {
-                    Some(at) => {
-                        retry = Some(Retry {
-                            frame,
-                            source,
-                            at: Some(at),
-                        });
-                    }
-                    None => source.request_frame(),
-                }
+                retry.defer(frame, source, jfn_gpu_paint::Deferred::new().retry_at());
             }
             continue;
         };
@@ -270,16 +245,7 @@ fn run_worker(mailbox: Mailbox<OverlayState>) {
             frame,
         ) {
             Outcome::Committed => {}
-            Outcome::Deferred(frame, at) => match at {
-                Some(at) => {
-                    retry = Some(Retry {
-                        frame,
-                        source,
-                        at: Some(at),
-                    });
-                }
-                None => source.request_frame(),
-            },
+            Outcome::Deferred(frame, at) => retry.defer(frame, source, at),
             // The degraded backend is SHM now, so the frame it kept goes out
             // through it in the same iteration.
             Outcome::Degraded(frame) => {
@@ -461,7 +427,13 @@ fn present_shm(
     let dst_stride = (width as usize) * 4;
     let dst = buf.pixels_mut();
     for rect in &dirty {
-        let Some((rx, ry, rw, rh)) = clip_rect(rect, width, height) else {
+        let Some(JfnRect {
+            x: rx,
+            y: ry,
+            w: rw,
+            h: rh,
+        }) = rect.clamped(width, height)
+        else {
             continue;
         };
         for row in 0..rh {
@@ -498,31 +470,6 @@ fn present_shm(
     let _ = conn.flush();
 }
 
-fn clip_rect(rect: &JfnRect, width: i32, height: i32) -> Option<(i32, i32, i32, i32)> {
-    let mut rx = rect.x;
-    let mut ry = rect.y;
-    let mut rw = rect.w;
-    let mut rh = rect.h;
-    if rx < 0 {
-        rw += rx;
-        rx = 0;
-    }
-    if ry < 0 {
-        rh += ry;
-        ry = 0;
-    }
-    if rx + rw > width {
-        rw = width - rx;
-    }
-    if ry + rh > height {
-        rh = height - ry;
-    }
-    if rw <= 0 || rh <= 0 {
-        return None;
-    }
-    Some((rx, ry, rw, rh))
-}
-
 fn teardown(
     backend: Backend,
     content_conn: Option<&RustConnection>,
@@ -545,35 +492,5 @@ fn teardown(
             }
         });
         let _ = conn.flush();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn rect(x: i32, y: i32, w: i32, h: i32) -> JfnRect {
-        JfnRect { x, y, w, h }
-    }
-
-    #[test]
-    fn clip_rect_clamps_negative_origin() {
-        assert_eq!(clip_rect(&rect(-2, -2, 4, 4), 10, 10), Some((0, 0, 2, 2)));
-    }
-
-    #[test]
-    fn clip_rect_clamps_overflow() {
-        assert_eq!(clip_rect(&rect(8, 8, 10, 10), 10, 10), Some((8, 8, 2, 2)));
-    }
-
-    #[test]
-    fn clip_rect_rejects_zero_and_off_screen() {
-        assert_eq!(clip_rect(&rect(0, 0, 0, 5), 10, 10), None);
-        assert_eq!(clip_rect(&rect(10, 0, 4, 4), 10, 10), None);
-    }
-
-    #[test]
-    fn clip_rect_passes_through_in_bounds() {
-        assert_eq!(clip_rect(&rect(1, 2, 3, 4), 10, 10), Some((1, 2, 3, 4)));
     }
 }

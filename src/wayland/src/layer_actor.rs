@@ -2,7 +2,6 @@ use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
 
 use smithay_client_toolkit::shm::slot::SlotPool;
 use wayland_client::QueueHandle;
@@ -10,7 +9,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
 
 use jfn_gpu_paint::{FrameSize as PhysicalSize, Pixels, PresentFailed, SharedTexture, Surfaces};
 use jfn_mailbox::Mailbox;
-use jfn_platform_abi::{Ack, FrameSource, JfnRect, Visibility, VisibilityCommit};
+use jfn_platform_abi::{Ack, FrameRetry, FrameSource, JfnRect, Visibility, VisibilityCommit};
 
 use crate::layer::{Committed, FrameCommit, LayerSurface, PresentError, ViewportState};
 use crate::runtime::WlRuntime;
@@ -417,13 +416,6 @@ enum Backend {
     },
 }
 
-/// Only a lost surface degrades. Every other GPU failure names what its
-/// producer still owes — a deferred frame is presented again, a failed shared
-/// import has no CPU fallback to degrade to — and the backend stays put.
-fn is_degrading_error(err: &PresentError) -> bool {
-    matches!(err, PresentError::Gpu(PresentFailed::Lost(_)))
-}
-
 fn degrade(
     backend: &mut Backend,
     gpu_failed: &AtomicBool,
@@ -437,14 +429,6 @@ fn degrade(
     };
     gpu_failed.store(true, Ordering::Release);
     old
-}
-
-/// A frame the swapchain could not take yet, held until `at`, and the producer
-/// that owes its successor. A frame taken from the mailbox supersedes it.
-struct Retry {
-    frame: PendingFrame,
-    source: Arc<dyn FrameSource>,
-    at: Option<Instant>,
 }
 
 struct Runner {
@@ -499,7 +483,7 @@ fn run(
         current: None,
     };
     let mut visibility = initial;
-    let mut retry: Option<Retry> = None;
+    let mut retry = FrameRetry::default();
 
     loop {
         let ready = |s: &LayerState| {
@@ -515,7 +499,7 @@ fn run(
                 s.shutdown,
             )
         };
-        let taken = match retry.as_ref().and_then(|pending| pending.at) {
+        let taken = match retry.due() {
             Some(at) => mailbox.wait_until(at, ready, take),
             None => Some(mailbox.wait(ready, take)),
         };
@@ -531,29 +515,65 @@ fn run(
             visibility = requested;
         }
 
-        let pending = match pending {
-            // A frame taken from the mailbox supersedes the held one.
-            Some(fresh) => {
-                retry = None;
-                Some(fresh)
-            }
-            None => retry.take().map(|held| (held.frame, held.source)),
-        };
-        let (pending, source) = match pending {
+        let (pending, source) = match retry.take(pending) {
             Some((frame, source)) => (Some(frame), Some(source)),
             None => (None, None),
         };
+        let wake = Wake {
+            action: decide(pending, visibility, viewport_dirty),
+            source,
+            visibility,
+            viewport,
+            viewport_dirty,
+            request_seq: requested.map(|(_, seq)| seq),
+        };
+        if let Some(acked) = runner.service(&layer, wake, &mut retry) {
+            mailbox.update(|s| s.acked = Some(acked));
+        }
+    }
 
-        let action = decide(pending, visibility, viewport_dirty);
+    runner.shutdown();
+}
 
+/// One wake of the actor: the frame op it decided on and the state that op
+/// commits against.
+struct Wake {
+    action: Action<PendingFrame>,
+    /// The producer named by the pending frame, asked for its successor when
+    /// the frame is not presented.
+    source: Option<Arc<dyn FrameSource>>,
+    visibility: Visibility,
+    viewport: ViewportState,
+    viewport_dirty: bool,
+    /// The visibility request this wake carries, if any.
+    request_seq: Option<u64>,
+}
+
+impl Runner {
+    /// Issues this wake's commit stream and returns the acknowledgement of a
+    /// visibility request it carried.
+    fn service(
+        &mut self,
+        layer: &LayerSurface,
+        wake: Wake,
+        retry: &mut FrameRetry<PendingFrame>,
+    ) -> Option<(u64, Acked)> {
+        let Wake {
+            action,
+            source,
+            visibility,
+            viewport,
+            viewport_dirty,
+            request_seq,
+        } = wake;
         // Whether this wake's commit stream attached a buffer, which decides
         // which callback a visibility request's commit can be acknowledged by.
         let mut carries_buffer = false;
         let mut layer_committed = match action {
-            Action::Hide => runner.hide(&layer),
-            Action::Present(frame) => match runner.present(&frame, &layer, viewport) {
+            Action::Hide => self.hide(layer),
+            Action::Present(frame) => match self.present(&frame, layer, viewport) {
                 Ok(_committed) => {
-                    runner.present_failing = false;
+                    self.present_failing = false;
                     carries_buffer = true;
                     true
                 }
@@ -562,21 +582,12 @@ fn run(
                     // no named producer is not held, because nothing could be
                     // asked for its successor.
                     if let Some(source) = source {
-                        match deferred.retry_at() {
-                            Some(at) => {
-                                retry = Some(Retry {
-                                    frame,
-                                    source,
-                                    at: Some(at),
-                                });
-                            }
-                            None => source.request_frame(),
-                        }
+                        retry.defer(frame, source, deferred.retry_at());
                     }
                     false
                 }
                 Err(err) => {
-                    runner.on_present_error(err);
+                    self.on_present_error(err);
                     false
                 }
             },
@@ -603,10 +614,10 @@ fn run(
         // A request completes only on a commit carrying it, and that commit is
         // the last one this wake issues, so its acknowledgement stands for
         // everything before it.
-        let acked = requested.map(|(_, seq)| {
+        let acked = request_seq.map(|seq| {
             (
                 seq,
-                layer.commit_acked(rt.callbacks(), &runner.qh, carries_buffer),
+                layer.commit_acked(self.rt.callbacks(), &self.qh, carries_buffer),
             )
         });
         if acked.is_some() {
@@ -615,14 +626,10 @@ fn run(
 
         if layer_committed {
             layer.flush();
-            rt.root().request_present();
+            self.rt.root().request_present();
         }
-        if let Some(acked) = acked {
-            mailbox.update(|s| s.acked = Some(acked));
-        }
+        acked
     }
-
-    runner.shutdown();
 }
 
 impl Runner {
@@ -641,7 +648,7 @@ impl Runner {
     }
 
     fn on_present_error(&mut self, err: PresentError) {
-        let degraded = is_degrading_error(&err);
+        let degraded = err.is_degrading();
         if degraded {
             let old = degrade(&mut self.backend, &self.gpu_failed);
             if let Some(painter) = old {
@@ -940,18 +947,12 @@ fn copy_dirty_rect(
     height: i32,
     rect: &JfnRect,
 ) -> Option<ShmRect> {
-    // Clamp in i64 so a CEF-supplied `x + w` / `y + h` cannot overflow i32.
-    let x0 = i64::from(rect.x).max(0);
-    let y0 = i64::from(rect.y).max(0);
-    let x1 = (i64::from(rect.x) + i64::from(rect.w)).min(i64::from(width));
-    let y1 = (i64::from(rect.y) + i64::from(rect.h)).min(i64::from(height));
-    if x1 <= x0 || y1 <= y0 {
-        return None;
-    }
-    let rx = x0 as i32;
-    let ry = y0 as i32;
-    let rw = (x1 - x0) as i32;
-    let rh = (y1 - y0) as i32;
+    let JfnRect {
+        x: rx,
+        y: ry,
+        w: rw,
+        h: rh,
+    } = rect.clamped(width, height)?;
 
     let (Ok(rw_us), Ok(rx_us)) = (usize::try_from(rw), usize::try_from(rx)) else {
         return None;
@@ -1249,8 +1250,8 @@ mod tests {
 
     #[test]
     fn gpu_error_degrades_backend() {
-        assert!(!is_degrading_error(&PresentError::ShmAlloc));
-        assert!(!is_degrading_error(&PresentError::DmabufCreate));
+        assert!(!PresentError::ShmAlloc.is_degrading());
+        assert!(!PresentError::DmabufCreate.is_degrading());
 
         let mut backend = Backend::Gpu { painter: None };
         let flag = AtomicBool::new(false);

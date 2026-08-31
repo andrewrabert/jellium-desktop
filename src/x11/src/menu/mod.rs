@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use calloop::channel::{Channel, Sender};
 use calloop::timer::{TimeoutAction, Timer};
-use calloop::{EventLoop, LoopHandle, LoopSignal};
+use calloop::{EventLoop, LoopHandle, LoopSignal, RegistrationToken};
 use parking_lot::Mutex;
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::shm::ConnectionExt as ShmConnectionExt;
+use x11rb::protocol::xinput::{self, ConnectionExt as _, XIEventMask};
 use x11rb::protocol::xproto::{
     ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, CreateGCAux, CreateWindowAux,
     EventMask, GrabMode, GrabStatus, ImageFormat, StackMode, WindowClass,
@@ -29,8 +30,8 @@ use crate::x11_state::ShmBuffer;
 /// height with `BadValue`.
 const ARMED_SIZE: PhysicalSize = PhysicalSize { w: 1, h: 1 };
 
-const GRAB_RETRY: Duration = Duration::from_millis(5);
-const GRAB_ATTEMPTS: u32 = 40;
+// Preserve the former 40 × 5 ms failure bound, without periodic retries.
+const GRAB_WAIT: Duration = Duration::from_millis(200);
 
 static MENU: OnceLock<SoftwareMenu> = OnceLock::new();
 
@@ -98,7 +99,7 @@ impl PopupSurface for X11PopupSurface {
         }
     }
 
-    // the grab window is mapped and its grab retry running from `Op::Arm`;
+    // the grab window is mapped and acquisition started by `Op::Arm`;
     // there is no second mapping to do
     fn map_armed(&self, _generation: Generation) {}
 
@@ -147,7 +148,7 @@ fn spawn_popup(surface: &Arc<X11PopupSurface>) {
 }
 
 fn popup_thread(surface: &Arc<X11PopupSurface>, rx: Channel<Op>) {
-    let Ok((conn, _screen)) = x11rb::connect(None) else {
+    let Ok((conn, screen)) = x11rb::connect(None) else {
         tracing::error!(target: "x11::menu", "popup: X11 connect failed; menus disabled");
         surface.close(Some(rx));
         return;
@@ -172,10 +173,21 @@ fn popup_thread(surface: &Arc<X11PopupSurface>, rx: Channel<Op>) {
         surface.close(Some(e.inserted));
         return;
     }
+    // XI 2.1 delivers raw releases even while another client owns the grab.
+    // Select before the first attempt, so a release cannot be lost between a
+    // failed grab and arming its wakeup. Selection lasts only while waiting.
+    let raw_root = conn
+        .xinput_xi_query_version(2, 1)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .filter(|version| (version.major_version, version.minor_version) >= (2, 1))
+        .map(|_| conn.setup().roots[screen].root);
     let mut state = PopupLoop {
         keymap: Keymap::query(&conn),
         conn,
         phase: Phase::Idle,
+        raw_root,
+        grab_timeout: None,
         handle,
         signal: event_loop.get_signal(),
     };
@@ -189,7 +201,7 @@ fn popup_thread(surface: &Arc<X11PopupSurface>, rx: Channel<Op>) {
 
 enum Phase {
     Idle,
-    Grabbing { window: Window, attempts: u32 },
+    Grabbing(Window),
     Open(Window),
 }
 
@@ -197,7 +209,7 @@ impl Phase {
     fn window(&mut self) -> Option<&mut Window> {
         match self {
             Phase::Idle => None,
-            Phase::Grabbing { window, .. } | Phase::Open(window) => Some(window),
+            Phase::Grabbing(window) | Phase::Open(window) => Some(window),
         }
     }
 }
@@ -214,6 +226,8 @@ struct PopupLoop {
     keymap: Keymap,
     phase: Phase,
     handle: LoopHandle<'static, PopupLoop>,
+    raw_root: Option<u32>,
+    grab_timeout: Option<RegistrationToken>,
     signal: LoopSignal,
 }
 
@@ -247,29 +261,73 @@ impl PopupLoop {
             .is_some_and(|w| w.generation == generation)
     }
 
-    /// Puts up the grab window at `anchor`, sized [`ARMED_SIZE`], and starts
-    /// the grab retry.
+    /// Map the grab window and acquire modality, waking on releases if busy.
     fn arm(&mut self, generation: Generation, anchor: LogicalPoint) {
         self.tear_down();
         let Some(window) = self.build(generation, anchor, ARMED_SIZE) else {
             host().on_done(generation);
             return;
         };
-        self.phase = Phase::Grabbing {
-            window,
-            attempts: 0,
-        };
-        if self
-            .handle
-            .insert_source(Timer::from_duration(GRAB_RETRY), |_, _, st| {
-                st.on_grab_retry()
-            })
-            .is_err()
-        {
-            tracing::error!(target: "x11::menu", "arm: grab timer failed; dismissing");
-            self.tear_down();
-            host().on_done(generation);
+        self.phase = Phase::Grabbing(window);
+        self.watch_releases(true);
+        self.try_grab();
+        if !matches!(self.phase, Phase::Grabbing(_)) {
+            return;
         }
+        match self
+            .handle
+            .insert_source(Timer::from_duration(GRAB_WAIT), move |_, _, st| {
+                if st.owns(generation) && matches!(st.phase, Phase::Grabbing(_)) {
+                    st.grab_timeout = None;
+                    // One final attempt covers owners releasing an explicit grab
+                    // without a button/key event. This is a failure deadline, not
+                    // a recurring poll.
+                    st.try_grab();
+                    if matches!(st.phase, Phase::Grabbing(_)) {
+                        tracing::error!(target: "x11::menu", "grab: deadline expired; dismissing");
+                        st.tear_down();
+                        host().on_done(generation);
+                    }
+                }
+                TimeoutAction::Drop
+            }) {
+            Ok(token) => self.grab_timeout = Some(token),
+            Err(_) => {
+                tracing::error!(target: "x11::menu", "arm: grab deadline setup failed; dismissing");
+                self.tear_down();
+                host().on_done(generation);
+            }
+        }
+    }
+
+    fn watch_releases(&self, enabled: bool) {
+        let Some(root) = self.raw_root else {
+            return;
+        };
+        let mask = if enabled {
+            vec![XIEventMask::RAW_BUTTON_RELEASE | XIEventMask::RAW_KEY_RELEASE]
+        } else {
+            Vec::new()
+        };
+        let masks = [xinput::EventMask {
+            deviceid: xinput::Device::ALL_MASTER.into(),
+            mask,
+        }];
+        if let Err(e) = self
+            .conn
+            .xinput_xi_select_events(root, &masks)
+            .map_err(|e| e.to_string())
+            .and_then(|cookie| cookie.check().map_err(|e| e.to_string()))
+        {
+            tracing::debug!(target: "x11::menu", "raw release subscription failed: {e}");
+        }
+    }
+
+    fn finish_grab_wait(&mut self) {
+        if let Some(token) = self.grab_timeout.take() {
+            self.handle.remove(token);
+        }
+        self.watch_releases(false);
     }
 
     /// On `None`, nothing is left on the server for the caller to clean up.
@@ -422,39 +480,36 @@ impl PopupLoop {
         let _ = conn.flush();
     }
 
-    fn on_grab_retry(&mut self) -> TimeoutAction {
-        let Phase::Grabbing { window, attempts } = &mut self.phase else {
-            return TimeoutAction::Drop;
+    fn try_grab(&mut self) {
+        let Phase::Grabbing(window) = &self.phase else {
+            return;
         };
         let generation = window.generation;
-        if grab_pointer(&self.conn, window.win) {
-            let _ = self.conn.grab_keyboard(
-                false,
-                window.win,
-                x11rb::CURRENT_TIME,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            );
-            let Phase::Grabbing { window, .. } = std::mem::replace(&mut self.phase, Phase::Idle)
-            else {
-                return TimeoutAction::Drop;
-            };
-            self.phase = Phase::Open(window);
-            tracing::debug!(target: "x11::menu", "grab: menu is modal");
-            host().on_ready(generation);
-            return TimeoutAction::Drop;
+        match grab_modal(&self.conn, window.win) {
+            GrabAttempt::Ready => {
+                self.finish_grab_wait();
+                let Phase::Grabbing(window) = std::mem::replace(&mut self.phase, Phase::Idle)
+                else {
+                    return;
+                };
+                self.phase = Phase::Open(window);
+                tracing::debug!(target: "x11::menu", "grab: menu is modal");
+                host().on_ready(generation);
+            }
+            GrabAttempt::Busy => {}
+            GrabAttempt::Failed => {
+                tracing::error!(target: "x11::menu", "grab: non-retryable failure; dismissing");
+                self.tear_down();
+                host().on_done(generation);
+            }
         }
-        *attempts += 1;
-        if *attempts >= GRAB_ATTEMPTS {
-            tracing::error!(target: "x11::menu", "grab: pointer grab failed; dismissing");
-            self.tear_down();
-            host().on_done(generation);
-            return TimeoutAction::Drop;
-        }
-        TimeoutAction::ToDuration(GRAB_RETRY)
     }
 
     fn on_event(&mut self, ev: Event) {
+        if matches!(self.phase, Phase::Grabbing(_)) && grab_wakeup(&ev) {
+            self.try_grab();
+            return;
+        }
         if !matches!(self.phase, Phase::Open(_)) {
             return;
         }
@@ -474,7 +529,8 @@ impl PopupLoop {
     }
 
     fn tear_down(&mut self) {
-        let (Phase::Grabbing { mut window, .. } | Phase::Open(mut window)) =
+        self.finish_grab_wait();
+        let (Phase::Grabbing(mut window) | Phase::Open(mut window)) =
             std::mem::replace(&mut self.phase, Phase::Idle)
         else {
             return;
@@ -524,20 +580,63 @@ fn snapshot(conn: &RustConnection) -> Option<Snap> {
     })
 }
 
-fn grab_pointer(conn: &RustConnection, win: u32) -> bool {
-    conn.grab_pointer(
-        false,
-        win,
-        EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
-        GrabMode::ASYNC,
-        GrabMode::ASYNC,
-        x11rb::NONE,
-        x11rb::NONE,
-        x11rb::CURRENT_TIME,
+fn grab_wakeup(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::XinputRawButtonRelease(_) | Event::XinputRawKeyRelease(_)
     )
-    .ok()
-    .and_then(|c| c.reply().ok())
-    .is_some_and(|r| r.status == GrabStatus::SUCCESS)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GrabAttempt {
+    Ready,
+    Busy,
+    Failed,
+}
+
+fn grab_status(status: GrabStatus) -> GrabAttempt {
+    match status {
+        GrabStatus::SUCCESS => GrabAttempt::Ready,
+        GrabStatus::ALREADY_GRABBED | GrabStatus::FROZEN => GrabAttempt::Busy,
+        _ => GrabAttempt::Failed,
+    }
+}
+
+fn grab_modal(conn: &RustConnection, win: u32) -> GrabAttempt {
+    let pointer = conn
+        .grab_pointer(
+            false,
+            win,
+            EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        )
+        .ok()
+        .and_then(|cookie| cookie.reply().ok());
+    let pointer = pointer.map_or(GrabAttempt::Failed, |reply| grab_status(reply.status));
+    if pointer != GrabAttempt::Ready {
+        return pointer;
+    }
+    let keyboard = conn
+        .grab_keyboard(
+            false,
+            win,
+            x11rb::CURRENT_TIME,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .ok()
+        .and_then(|cookie| cookie.reply().ok());
+    let keyboard = keyboard.map_or(GrabAttempt::Failed, |reply| grab_status(reply.status));
+    if keyboard != GrabAttempt::Ready {
+        // Do not hold half a modal grab while waiting for another owner.
+        let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
+        let _ = conn.flush();
+    }
+    keyboard
 }
 
 struct Keymap {
@@ -571,5 +670,131 @@ impl Keymap {
         }
         let idx = (keycode - self.min_keycode) as usize * self.per as usize;
         self.syms.get(idx).copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod grab_tests {
+    use super::*;
+    use x11rb::protocol::xtest::ConnectionExt as _;
+
+    #[test]
+    #[ignore = "requires an isolated X11 server with XInput 2.1 and XTEST"]
+    fn contention_release_wakeup_and_partial_grab_cleanup() {
+        let (owner, screen) = x11rb::connect(None).unwrap();
+        let (popup, _) = x11rb::connect(None).unwrap();
+        let root = owner.setup().roots[screen].root;
+        let win = popup.generate_id().unwrap();
+        popup
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                win,
+                root,
+                0,
+                0,
+                20,
+                20,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new().override_redirect(1),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        popup.map_window(win).unwrap().check().unwrap();
+        let version = popup
+            .xinput_xi_query_version(2, 1)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert!((version.major_version, version.minor_version) >= (2, 1));
+        popup
+            .xinput_xi_select_events(
+                root,
+                &[xinput::EventMask {
+                    deviceid: xinput::Device::ALL_MASTER.into(),
+                    mask: vec![XIEventMask::RAW_BUTTON_RELEASE],
+                }],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+
+        assert_eq!(grab_modal(&owner, root), GrabAttempt::Ready);
+        assert_eq!(grab_modal(&popup, win), GrabAttempt::Busy);
+        // Raw release must reach the waiting client even while the other
+        // connection owns the pointer. A core ButtonRelease cannot do this.
+        owner
+            .xtest_fake_input(
+                x11rb::protocol::xproto::BUTTON_PRESS_EVENT,
+                1,
+                x11rb::CURRENT_TIME,
+                root,
+                0,
+                0,
+                0,
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        owner
+            .xtest_fake_input(
+                x11rb::protocol::xproto::BUTTON_RELEASE_EVENT,
+                1,
+                x11rb::CURRENT_TIME,
+                root,
+                0,
+                0,
+                0,
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            loop {
+                let event = popup.wait_for_event().unwrap();
+                if grab_wakeup(&event) {
+                    break;
+                }
+            }
+            tx.send(popup).unwrap();
+        });
+        let popup = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
+
+        owner
+            .ungrab_pointer(x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        // The keyboard is still held: a failed keyboard grab must release
+        // the pointer it just acquired, so another client can take it.
+        assert_eq!(grab_modal(&popup, win), GrabAttempt::Busy);
+        assert_eq!(grab_modal(&owner, root), GrabAttempt::Ready);
+        owner
+            .ungrab_pointer(x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        owner
+            .ungrab_keyboard(x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(grab_modal(&popup, win), GrabAttempt::Ready);
+        popup
+            .ungrab_pointer(x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        popup
+            .ungrab_keyboard(x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        popup.destroy_window(win).unwrap().check().unwrap();
     }
 }

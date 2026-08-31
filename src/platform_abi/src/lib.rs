@@ -52,7 +52,7 @@ pub use menu::{
 };
 pub use mpv_host::{DefaultMpvHost, MpvHost, VO_WAIT_TICK};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};
-pub use paint::{Content, FrameSource, PaintFrame, Presented, Superseded};
+pub use paint::{Content, FrameRetry, FrameSource, PaintFrame, Presented, Superseded};
 pub use selection::{OnText, PrimarySelection};
 pub use stack::Plane;
 pub use visibility::{Ack, Visibility, VisibilityCommit};

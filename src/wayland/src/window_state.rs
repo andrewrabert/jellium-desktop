@@ -227,8 +227,6 @@ impl WindowState {
         );
 
         let fullscreen = mode == WindowMode::Fullscreen;
-        rt.root()
-            .sync_maximized_command_state(mode == WindowMode::Maximized);
         if rt.try_core().is_some() {
             wl_ops::on_configure(rt, fullscreen);
         }

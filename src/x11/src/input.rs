@@ -28,7 +28,6 @@ use jfn_wake_event::{Drain, WakeEvent, WakeSource};
 
 use crate::conn_source::XcbSource;
 
-use cursor_icon::CursorIcon;
 use jfn_input::buttons;
 use jfn_linux_util::xkb::to_cef_mods;
 use jfn_platform_abi::cursor::CursorShape;
@@ -174,46 +173,6 @@ struct State {
 }
 
 unsafe impl Send for State {}
-
-fn cef_cursor_to_icon(shape: CursorShape) -> CursorIcon {
-    use CursorShape::*;
-    match shape {
-        Cross => CursorIcon::Crosshair,
-        Hand => CursorIcon::Pointer,
-        IBeam => CursorIcon::Text,
-        Wait => CursorIcon::Wait,
-        Help => CursorIcon::Help,
-        EastResize => CursorIcon::EResize,
-        NorthResize => CursorIcon::NResize,
-        NorthEastResize => CursorIcon::NeResize,
-        NorthWestResize => CursorIcon::NwResize,
-        SouthResize => CursorIcon::SResize,
-        SouthEastResize => CursorIcon::SeResize,
-        SouthWestResize => CursorIcon::SwResize,
-        WestResize => CursorIcon::WResize,
-        NorthSouthResize => CursorIcon::NsResize,
-        EastWestResize => CursorIcon::EwResize,
-        NorthEastSouthWestResize => CursorIcon::NeswResize,
-        NorthWestSouthEastResize => CursorIcon::NwseResize,
-        ColumnResize => CursorIcon::ColResize,
-        RowResize => CursorIcon::RowResize,
-        MiddlePanning | MiddlePanningVertical | MiddlePanningHorizontal => CursorIcon::AllScroll,
-        Move => CursorIcon::Move,
-        VerticalText => CursorIcon::VerticalText,
-        Cell => CursorIcon::Cell,
-        ContextMenu => CursorIcon::ContextMenu,
-        Alias => CursorIcon::Alias,
-        Progress => CursorIcon::Progress,
-        NoDrop => CursorIcon::NoDrop,
-        Copy => CursorIcon::Copy,
-        NotAllowed => CursorIcon::NotAllowed,
-        ZoomIn => CursorIcon::ZoomIn,
-        ZoomOut => CursorIcon::ZoomOut,
-        Grab => CursorIcon::Grab,
-        Grabbing => CursorIcon::Grabbing,
-        _ => CursorIcon::Default,
-    }
-}
 
 fn setup_xkb(conn: &xcb::Connection, st: &mut State) -> bool {
     let mut major = 0u16;
@@ -549,7 +508,7 @@ fn apply_cursor(st: &mut CursorState, shape: CursorShape) {
                 let Some(cursor_handle) = st.cursor_handle.as_ref() else {
                     return;
                 };
-                let name = cef_cursor_to_icon(shape).name();
+                let name = jfn_linux_util::cursor::icon_for(shape).name();
                 let Ok(id) = cursor_handle.load_cursor(&**conn, name) else {
                     return;
                 };

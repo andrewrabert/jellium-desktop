@@ -102,6 +102,27 @@ pub struct DamageRect {
     pub h: i32,
 }
 
+impl DamageRect {
+    /// The part of the rect inside a `width` x `height` buffer; `None` when
+    /// nothing is. Clamped in i64 so a producer-supplied `x + w` / `y + h`
+    /// cannot overflow i32.
+    pub fn clamped(self, width: i32, height: i32) -> Option<DamageRect> {
+        let x0 = i64::from(self.x).max(0);
+        let y0 = i64::from(self.y).max(0);
+        let x1 = (i64::from(self.x) + i64::from(self.w)).min(i64::from(width));
+        let y1 = (i64::from(self.y) + i64::from(self.h)).min(i64::from(height));
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(DamageRect {
+            x: x0 as i32,
+            y: y0 as i32,
+            w: (x1 - x0) as i32,
+            h: (y1 - y0) as i32,
+        })
+    }
+}
+
 /// `bgra` must cover every row: at least `(size.h - 1) * stride + size.w * 4`
 /// bytes, with `stride >= size.w * 4`. [`crate::Surface::present_pixels`]
 /// rejects a frame that does not (as an error, not a panic), so a producer
@@ -112,4 +133,42 @@ pub struct Pixels<'a> {
     pub stride: u32,
     pub bgra: &'a [u8],
     pub dirty: &'a [DamageRect],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DamageRect;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> DamageRect {
+        DamageRect { x, y, w, h }
+    }
+
+    #[test]
+    fn clamped_clamps_negative_origin() {
+        assert_eq!(rect(-2, -2, 4, 4).clamped(10, 10), Some(rect(0, 0, 2, 2)));
+    }
+
+    #[test]
+    fn clamped_clamps_overflow() {
+        assert_eq!(rect(8, 8, 10, 10).clamped(10, 10), Some(rect(8, 8, 2, 2)));
+    }
+
+    #[test]
+    fn clamped_rejects_zero_and_off_screen() {
+        assert_eq!(rect(0, 0, 0, 5).clamped(10, 10), None);
+        assert_eq!(rect(10, 0, 4, 4).clamped(10, 10), None);
+    }
+
+    #[test]
+    fn clamped_passes_through_in_bounds() {
+        assert_eq!(rect(1, 2, 3, 4).clamped(10, 10), Some(rect(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn clamped_survives_extreme_extent() {
+        assert_eq!(
+            rect(1, 1, i32::MAX, i32::MAX).clamped(10, 10),
+            Some(rect(1, 1, 9, 9))
+        );
+    }
 }

@@ -268,17 +268,15 @@ impl GeoWork {
 // ConfigureWindow / create is permitted)
 // ===================================================================
 
-#[allow(clippy::too_many_arguments)]
+/// `at` is the parent's root-relative geometry the overlay is born into.
 fn create_overlay_window(
     conn: &RustConnection,
     host: &HostServices,
     paint: &PaintServices,
     fullscreen: bool,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    at: Geom,
 ) -> Option<u32> {
+    let (x, y, w, h) = at;
     let win = conn.generate_id().ok()?;
     let aux = CreateWindowAux::new()
         .background_pixel(0)
@@ -379,10 +377,7 @@ fn handle_create(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId, initi
         host,
         paint,
         work.fullscreen,
-        work.parent_x,
-        work.parent_y,
-        work.pw,
-        work.ph,
+        (work.parent_x, work.parent_y, work.pw, work.ph),
     ) else {
         return;
     };
@@ -682,112 +677,114 @@ fn activate_parent(conn: &RustConnection, root: Window, parent: Window) {
 // Reconcile
 // ===================================================================
 
-/// Snapshot parent truth once, size the video host + every overlay from it in
-/// one flushed batch. `reassert_stack` re-raises an unmanaged overlay over mpv
-/// after events that can restack the parent.
-#[allow(clippy::too_many_arguments)]
-fn reconcile(
-    conn: &RustConnection,
-    work: &mut GeoWork,
-    parent: Window,
-    video_host: Window,
-    embed: Option<Window>,
-    root: Window,
-    parent_mapped: bool,
-    reassert_stack: bool,
-) {
-    let Some(parent_geom) = query_geometry(conn, parent, root) else {
-        return;
-    };
-    let (state_fs, parent_max) = read_wm_state(conn, parent);
-    let parent_fs = state_fs || geometric_fullscreen(conn, root, parent_geom);
-
-    // The video host is a child, so it fills the client area in local coords
-    // (0,0). Publish before the ConfigureWindow reaches the server so the proxy
-    // forwards mpv only the ConfigureNotify matching the published size.
-    let (fill_w, fill_h) = (parent_geom.2.max(1), parent_geom.3.max(1));
-    crate::mpv_proxy::publish_host_geometry(fill_w as u16, fill_h as u16);
-    let fill = ConfigureWindowAux::new()
-        .x(0)
-        .y(0)
-        .width(fill_w as u32)
-        .height(fill_h as u32);
-    let _ = conn.configure_window(video_host, &fill);
-    if let Some(embed) = embed {
-        let _ = conn.configure_window(embed, &fill);
-    }
-
-    let changed = (work.parent_x, work.parent_y, work.pw, work.ph)
-        != (parent_geom.0, parent_geom.1, parent_geom.2, parent_geom.3)
-        || work.fullscreen != parent_fs
-        || work.maximized != parent_max;
-    work.parent_x = parent_geom.0;
-    work.parent_y = parent_geom.1;
-    work.pw = parent_geom.2;
-    work.ph = parent_geom.3;
-    work.fullscreen = parent_fs;
-    work.maximized = parent_max;
-    work.publish();
-    if changed {
-        jfn_platform_abi::notify_window_changed();
-    }
-
-    let reg = registry();
-    let ids: Vec<SurfaceId> = work.order.clone();
-    for id in ids {
-        let Some(structure) = work.structures.get(&id) else {
-            continue;
+impl GeoLoop {
+    /// Snapshot parent truth once, size the video host + every overlay from it
+    /// in one flushed batch. A pending of `Restack` or above re-raises an
+    /// unmanaged overlay over mpv after events that can restack the parent.
+    fn reconcile(&mut self, pending: Pending) {
+        let reassert_stack = pending >= Pending::Restack;
+        let conn = &*self.conn;
+        let work = &mut self.work;
+        let (parent, video_host, embed, root, parent_mapped) = (
+            self.parent,
+            self.video_host,
+            self.embed,
+            self.root,
+            self.parent_mapped,
+        );
+        let Some(parent_geom) = query_geometry(conn, parent, root) else {
+            return;
         };
-        let window = structure.window();
-        let observed = query_geometry(conn, window, root);
-        if observed.is_some() {
-            watch_window(conn, window, EventMask::STRUCTURE_NOTIFY);
-        }
-        let observed_mapped = overlay_mapped(conn, window);
+        let (state_fs, parent_max) = read_wm_state(conn, parent);
+        let parent_fs = state_fs || geometric_fullscreen(conn, root, parent_geom);
 
-        let shown = work
-            .visibility
-            .get(&id)
-            .copied()
-            .unwrap_or(Visibility::Hidden)
-            .is_shown();
-        let (top_physical, external) = {
-            let g = reg.lock();
-            let Some(record) = g.get(id) else {
+        // The video host is a child, so it fills the client area in local coords
+        // (0,0). Publish before the ConfigureWindow reaches the server so the proxy
+        // forwards mpv only the ConfigureNotify matching the published size.
+        let (fill_w, fill_h) = (parent_geom.2.max(1), parent_geom.3.max(1));
+        crate::mpv_proxy::publish_host_geometry(fill_w as u16, fill_h as u16);
+        let fill = ConfigureWindowAux::new()
+            .x(0)
+            .y(0)
+            .width(fill_w as u32)
+            .height(fill_h as u32);
+        let _ = conn.configure_window(video_host, &fill);
+        if let Some(embed) = embed {
+            let _ = conn.configure_window(embed, &fill);
+        }
+
+        let changed = (work.parent_x, work.parent_y, work.pw, work.ph)
+            != (parent_geom.0, parent_geom.1, parent_geom.2, parent_geom.3)
+            || work.fullscreen != parent_fs
+            || work.maximized != parent_max;
+        work.parent_x = parent_geom.0;
+        work.parent_y = parent_geom.1;
+        work.pw = parent_geom.2;
+        work.ph = parent_geom.3;
+        work.fullscreen = parent_fs;
+        work.maximized = parent_max;
+        work.publish();
+        if changed {
+            jfn_platform_abi::notify_window_changed();
+        }
+
+        let reg = registry();
+        let ids: Vec<SurfaceId> = work.order.clone();
+        for id in ids {
+            let Some(structure) = work.structures.get(&id) else {
                 continue;
             };
-            let top = record.top_physical.max(0);
-            // Feed the actor the authoritative swapchain target in lockstep.
-            record.actor.resize(parent_geom.2, parent_geom.3 - top);
-            (top, record.external)
-        };
+            let window = structure.window();
+            let observed = query_geometry(conn, window, root);
+            if observed.is_some() {
+                watch_window(conn, window, EventMask::STRUCTURE_NOTIFY);
+            }
+            let observed_mapped = overlay_mapped(conn, window);
 
-        let mut state = work.fsm.get(&id).copied().unwrap_or(OverlayState {
-            mapped: false,
-            unmanaged: parent_fs,
-        });
-        let inputs = overlay_fsm::Inputs {
-            parent_geom,
-            parent_fullscreen: parent_fs,
-            want_visible: shown && parent_mapped,
-            observed,
-            observed_mapped,
-        };
-        let effects = overlay_fsm::step(&mut state, &inputs);
-        apply_overlay_effects(
-            conn,
-            structure,
-            &effects,
-            parent_geom,
-            top_physical,
-            external,
-        );
-        if reassert_stack && state.unmanaged && state.mapped {
-            structure.raise(conn);
+            let shown = work
+                .visibility
+                .get(&id)
+                .copied()
+                .unwrap_or(Visibility::Hidden)
+                .is_shown();
+            let (top_physical, external) = {
+                let g = reg.lock();
+                let Some(record) = g.get(id) else {
+                    continue;
+                };
+                let top = record.top_physical.max(0);
+                // Feed the actor the authoritative swapchain target in lockstep.
+                record.actor.resize(parent_geom.2, parent_geom.3 - top);
+                (top, record.external)
+            };
+
+            let mut state = work.fsm.get(&id).copied().unwrap_or(OverlayState {
+                mapped: false,
+                unmanaged: parent_fs,
+            });
+            let inputs = overlay_fsm::Inputs {
+                parent_geom,
+                parent_fullscreen: parent_fs,
+                want_visible: shown && parent_mapped,
+                observed,
+                observed_mapped,
+            };
+            let effects = overlay_fsm::step(&mut state, &inputs);
+            apply_overlay_effects(
+                conn,
+                structure,
+                &effects,
+                parent_geom,
+                top_physical,
+                external,
+            );
+            if reassert_stack && state.unmanaged && state.mapped {
+                structure.raise(conn);
+            }
+            work.fsm.insert(id, state);
         }
-        work.fsm.insert(id, state);
+        work.commit_resize(conn);
     }
-    work.commit_resize(conn);
 }
 
 fn is_wm_delete(e: &ClientMessageEvent) -> bool {
@@ -883,16 +880,7 @@ impl GeoLoop {
             return;
         }
         self.phase = Phase::Running(Pending::Idle);
-        reconcile(
-            &self.conn,
-            &mut self.work,
-            self.parent,
-            self.video_host,
-            self.embed,
-            self.root,
-            self.parent_mapped,
-            pending >= Pending::Restack,
-        );
+        self.reconcile(pending);
         if pending >= Pending::Refocus {
             activate_parent(&self.conn, self.root, self.parent);
         }

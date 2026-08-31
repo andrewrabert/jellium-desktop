@@ -2745,6 +2745,7 @@ name = "jfn-linux-util"
 version = "0.1.0-dev"
 dependencies = [
  "clap",
+ "cursor-icon",
  "drm-fourcc",
  "jfn-fonts",
  "jfn-input",
@@ -3028,7 +3029,6 @@ dependencies = [
  "calloop",
  "cef",
  "crossbeam-channel",
- "cursor-icon",
  "gethostname",
  "jfn-compositor-core",
  "jfn-gpu-paint",

@@ -29,6 +29,19 @@ pub(crate) enum PresentError {
     DmabufCreate,
 }
 
+impl PresentError {
+    /// Only a lost surface degrades. Every other GPU failure names what its
+    /// producer still owes — a deferred frame is presented again, a failed
+    /// shared import has no CPU fallback to degrade to — and the backend stays
+    /// put.
+    pub(crate) fn is_degrading(&self) -> bool {
+        matches!(
+            self,
+            PresentError::Gpu(jfn_gpu_paint::PresentFailed::Lost(_))
+        )
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) struct ViewportState {
     pub(crate) lw: i32,

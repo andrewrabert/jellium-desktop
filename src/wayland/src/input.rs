@@ -24,7 +24,7 @@ use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Keymap, Keysym, Modifiers, RawModifiers, RepeatInfo,
 };
 use smithay_client_toolkit::seat::pointer::{
-    CursorIcon, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer,
+    PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer,
 };
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
@@ -60,46 +60,6 @@ fn is_context_menu_key(sym: u32, mods: u32) -> bool {
 /// overlay raises its edit menu from the caret with the surface's own serial.
 fn web_owns_keys() -> bool {
     jfn_input::shell_state().map(jfn_input::route::route_key) == Some(jfn_input::Target::Web)
-}
-
-fn cef_to_cursor_icon(shape: CursorShape) -> CursorIcon {
-    use CursorShape::*;
-    match shape {
-        Cross => CursorIcon::Crosshair,
-        Hand => CursorIcon::Pointer,
-        IBeam => CursorIcon::Text,
-        Wait => CursorIcon::Wait,
-        Help => CursorIcon::Help,
-        EastResize => CursorIcon::EResize,
-        NorthResize => CursorIcon::NResize,
-        NorthEastResize => CursorIcon::NeResize,
-        NorthWestResize => CursorIcon::NwResize,
-        SouthResize => CursorIcon::SResize,
-        SouthEastResize => CursorIcon::SeResize,
-        SouthWestResize => CursorIcon::SwResize,
-        WestResize => CursorIcon::WResize,
-        NorthSouthResize => CursorIcon::NsResize,
-        EastWestResize => CursorIcon::EwResize,
-        NorthEastSouthWestResize => CursorIcon::NeswResize,
-        NorthWestSouthEastResize => CursorIcon::NwseResize,
-        ColumnResize => CursorIcon::ColResize,
-        RowResize => CursorIcon::RowResize,
-        Move => CursorIcon::Move,
-        VerticalText => CursorIcon::VerticalText,
-        Cell => CursorIcon::Cell,
-        ContextMenu => CursorIcon::ContextMenu,
-        Alias => CursorIcon::Alias,
-        Progress => CursorIcon::Progress,
-        NoDrop => CursorIcon::NoDrop,
-        Copy => CursorIcon::Copy,
-        NotAllowed => CursorIcon::NotAllowed,
-        ZoomIn => CursorIcon::ZoomIn,
-        ZoomOut => CursorIcon::ZoomOut,
-        Grab => CursorIcon::Grab,
-        Grabbing => CursorIcon::Grabbing,
-        MiddlePanning | MiddlePanningVertical | MiddlePanningHorizontal => CursorIcon::AllScroll,
-        _ => CursorIcon::Default,
-    }
 }
 
 /// Seat facts the input thread publishes for the root and CEF threads: the
@@ -267,7 +227,7 @@ impl State {
         let _ = if cef == CursorShape::None {
             pointer.hide_cursor()
         } else {
-            pointer.set_cursor(conn, cef_to_cursor_icon(cef))
+            pointer.set_cursor(conn, jfn_linux_util::cursor::icon_for(cef))
         };
     }
 

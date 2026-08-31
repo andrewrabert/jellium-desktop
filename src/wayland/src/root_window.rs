@@ -3,7 +3,7 @@ use std::num::NonZeroI32;
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{self, JoinHandle};
 
 use calloop::{EventLoop, LoopSignal, ping::PingSource};
@@ -90,15 +90,14 @@ impl DecorationRequest {
 /// The root window's cross-thread surface: everything the dispatch thread
 /// shares with its requesters. The thread's own `RootState` stays on its stack.
 pub(crate) struct RootShared {
-    decoration_request: AtomicU8,
+    decoration_request: Mutex<DecorationRequest>,
     effective: EffectiveState,
     boot: Mutex<BootGeometry>,
     started: AtomicBool,
     commands_tx: Sender<WindowCommand>,
     commands_rx: Receiver<WindowCommand>,
-    pending_fs: AtomicU8,
-    maximized: AtomicBool,
-    pending_bg: AtomicU32,
+    /// Coalesced request for one root commit; every producer that needs to
+    /// present latches it and the root thread drains it once per pass.
     pending_present: AtomicBool,
     /// Protocol id of the most recent menu popup `wl_surface`, overwritten by
     /// each create and never cleared: the keyboard-leave that follows a
@@ -125,8 +124,8 @@ impl RootShared {
     pub(crate) fn new() -> Self {
         let (commands_tx, commands_rx) = unbounded();
         Self {
-            decoration_request: AtomicU8::new(DecorationRequest::Auto as u8),
-            effective: EffectiveState(AtomicU8::new(0)),
+            decoration_request: Mutex::new(DecorationRequest::Auto),
+            effective: EffectiveState(Mutex::new(EffectiveDecorations::ClientSide)),
             boot: Mutex::new(BootGeometry {
                 w: DEFAULT_W,
                 h: DEFAULT_H,
@@ -135,9 +134,6 @@ impl RootShared {
             started: AtomicBool::new(false),
             commands_tx,
             commands_rx,
-            pending_fs: AtomicU8::new(FS_NONE),
-            maximized: AtomicBool::new(false),
-            pending_bg: AtomicU32::new(0),
             pending_present: AtomicBool::new(false),
             menu_surface_id: AtomicU32::new(0),
             root_surface: OnceLock::new(),
@@ -147,11 +143,7 @@ impl RootShared {
     }
 
     fn decoration_request(&self) -> DecorationRequest {
-        match self.decoration_request.load(Ordering::Acquire) {
-            v if v == DecorationRequest::ClientSide as u8 => DecorationRequest::ClientSide,
-            v if v == DecorationRequest::ServerSide as u8 => DecorationRequest::ServerSide,
-            _ => DecorationRequest::Auto,
-        }
+        *self.decoration_request.lock()
     }
 
     pub(crate) fn set_decorations(&self, configured: Option<WindowDecorations>) {
@@ -160,8 +152,7 @@ impl RootShared {
             Some(WindowDecorations::Csd) => DecorationRequest::ClientSide,
             Some(_) => DecorationRequest::ServerSide,
         };
-        self.decoration_request
-            .store(request as u8, Ordering::Release);
+        *self.decoration_request.lock() = request;
     }
 
     pub(crate) fn effective_decorations(&self) -> EffectiveDecorations {
@@ -217,28 +208,15 @@ impl RootShared {
     }
 
     pub(crate) fn set_fullscreen(&self, on: bool) {
-        self.pending_fs
-            .store(if on { FS_ON } else { FS_OFF }, Ordering::Release);
-        self.wake();
+        self.send(WindowCommand::Fullscreen(ModeRequest::Set(on)));
     }
 
     pub(crate) fn toggle_fullscreen(&self) {
-        self.pending_fs.store(FS_TOGGLE, Ordering::Release);
-        self.wake();
-    }
-
-    pub(crate) fn set_maximized(&self, on: bool) {
-        self.send(WindowCommand::SetMaximized(on));
+        self.send(WindowCommand::Fullscreen(ModeRequest::Toggle));
     }
 
     pub(crate) fn toggle_maximize(&self) {
-        let next = !self.maximized.load(Ordering::Relaxed);
-        self.maximized.store(next, Ordering::Relaxed);
-        self.set_maximized(next);
-    }
-
-    pub(crate) fn sync_maximized_command_state(&self, maximized: bool) {
-        self.maximized.store(maximized, Ordering::Relaxed);
+        self.send(WindowCommand::Maximized(ModeRequest::Toggle));
     }
 
     pub(crate) fn set_minimized(&self) {
@@ -246,14 +224,7 @@ impl RootShared {
     }
 
     pub(crate) fn set_background_color(&self, r: u8, g: u8, b: u8) {
-        let rgb = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
-        self.pending_bg.store(BG_SET | rgb, Ordering::Release);
-        self.wake();
-    }
-
-    fn pending_bg(&self) -> Option<[u8; 3]> {
-        let v = self.pending_bg.load(Ordering::Acquire);
-        (v & BG_SET != 0).then_some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+        self.send(WindowCommand::SetBackground([r, g, b]));
     }
 
     pub(crate) fn request_present(&self) {
@@ -272,27 +243,16 @@ impl RootShared {
 /// The decoration mode in effect. `ClientSide` until a decoration configure
 /// — or, absent the decoration protocol, an explicit server-side request —
 /// grants otherwise.
-struct EffectiveState(AtomicU8);
+struct EffectiveState(Mutex<EffectiveDecorations>);
 
 impl EffectiveState {
-    fn encode(mode: EffectiveDecorations) -> u8 {
-        match mode {
-            EffectiveDecorations::ClientSide => 0,
-            EffectiveDecorations::ServerSide => 1,
-        }
-    }
-
     fn load(&self) -> EffectiveDecorations {
-        if self.0.load(Ordering::Acquire) == Self::encode(EffectiveDecorations::ServerSide) {
-            EffectiveDecorations::ServerSide
-        } else {
-            EffectiveDecorations::ClientSide
-        }
+        *self.0.lock()
     }
 
     /// Returns true when the stored value changed.
     fn store(&self, mode: EffectiveDecorations) -> bool {
-        self.0.swap(Self::encode(mode), Ordering::AcqRel) != Self::encode(mode)
+        std::mem::replace(&mut *self.0.lock(), mode) != mode
     }
 }
 
@@ -576,7 +536,9 @@ impl RootSurfaceHandle {
 // `apply_command`. The toplevel/seat proxies are single-owner and live on that
 // thread, so requests cross this queue rather than caching proxy clones that
 // could be used after teardown. Move/resize carry the input serial captured at
-// request time.
+// request time. Mode toggles resolve against `RootState.mode` on that thread
+// — its sole mutator/reader — so a configure can't flip the mode between the
+// read and the protocol request.
 enum WindowCommand {
     Move {
         serial: u32,
@@ -585,8 +547,12 @@ enum WindowCommand {
         serial: u32,
         edge: u32,
     },
-    SetMaximized(bool),
+    Fullscreen(ModeRequest),
+    Maximized(ModeRequest),
     Minimize,
+    /// Applied on the root thread, which owns the surface, so the background
+    /// rebuild lands in the single owner commit.
+    SetBackground([u8; 3]),
     #[cfg(feature = "kde-palette")]
     SetTitlebarPalette(String),
     Popup(PopupCommand),
@@ -616,7 +582,24 @@ pub(crate) enum PopupCommand {
     },
 }
 
+/// A requested window mode: explicit, or the opposite of the current one.
+#[derive(Copy, Clone)]
+enum ModeRequest {
+    Set(bool),
+    Toggle,
+}
+
+impl ModeRequest {
+    fn resolve(self, current: bool) -> bool {
+        match self {
+            ModeRequest::Set(on) => on,
+            ModeRequest::Toggle => !current,
+        }
+    }
+}
+
 fn apply_command(state: &mut RootState, cmd: WindowCommand) {
+    use crate::window_state::WindowMode;
     match cmd {
         WindowCommand::Move { serial } => {
             if let Some(seat) = &state.seat {
@@ -639,14 +622,31 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
                 tracing::warn!(target: "Main", "interactive resize dropped: no seat");
             }
         }
-        WindowCommand::SetMaximized(on) => {
-            if on {
+        WindowCommand::Fullscreen(request) => {
+            let on = request.resolve(matches!(state.mode, WindowMode::Fullscreen));
+            apply_fullscreen(state, on);
+        }
+        WindowCommand::Maximized(request) => {
+            if request.resolve(matches!(state.mode, WindowMode::Maximized)) {
                 state.window.set_maximized();
             } else {
                 state.window.unset_maximized();
             }
         }
         WindowCommand::Minimize => state.window.set_minimized(),
+        WindowCommand::SetBackground(bg) => {
+            if bg != state.bg {
+                state.bg = bg;
+                // current_size is only set once presented, so the capability
+                // is present too; requiring it keeps the buffer attach behind
+                // an ack.
+                if let (Some(size), Some(present)) = (state.current_size, state.present) {
+                    state.rebuild_background(size.w(), size.h(), present);
+                    // Apply via the single owner commit, not a standalone one.
+                    state.rt.root().request_present();
+                }
+            }
+        }
         #[cfg(feature = "kde-palette")]
         WindowCommand::SetTitlebarPalette(path) => {
             if let Some(p) = &state.palette {
@@ -672,14 +672,6 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
     let _ = state.conn.flush();
 }
 
-// Fullscreen requests posted here and applied on the root thread by
-// `apply_fullscreen`. The mode read and the protocol request must stay on that
-// thread — the sole mutator/reader of `RootState.mode` — so a configure can't
-// flip the mode between them and make toggle send the wrong command.
-const FS_NONE: u8 = 0;
-const FS_TOGGLE: u8 = 1;
-const FS_ON: u8 = 2;
-const FS_OFF: u8 = 3;
 fn apply_fullscreen(state: &mut RootState, on: bool) {
     if on {
         // A fullscreen-enter received while already fullscreen must not overwrite
@@ -1065,10 +1057,6 @@ pub(crate) fn popup(rt: &WlRuntime, cmd: PopupCommand) {
     rt.root().send(WindowCommand::Popup(cmd));
 }
 
-// High bit marks "set"; the low 24 bits are RGB. Applied on the dispatch thread,
-// which owns the surface, so commits don't race the configure handler.
-const BG_SET: u32 = 1 << 24;
-
 // The root `wl_surface.commit` is issued by exactly one owner — this dispatch
 // thread. Every other producer (CEF paint paths, mpv) that needs to present
 // requests it here, so geometry, overlay and video always land in one
@@ -1191,43 +1179,11 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
 
     let viewport = viewporter.get_viewport(&surface, &qh, ());
 
-    let frac_mgr: Option<WpFractionalScaleManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
-    let frac_scale = frac_mgr
-        .as_ref()
-        .map(|m| m.get_fractional_scale(&surface, &qh, ()));
-    if frac_mgr.is_none() {
-        tracing::warn!(target: "Main", "root window: no wp_fractional_scale_manager_v1; no preferred_scale will arrive");
-    }
-    let probed = crate::scale_probe::probe_scale_bounded(
-        crate::scale_probe::ProbeTarget::FirstOutput,
-        SCALE_PROBE_TIMEOUT,
-    );
-    match (probed, frac_mgr.is_some()) {
-        (Ok(scale), _) => rt.window().seed_scale(scale),
-        (Err(e), true) => tracing::error!(
-            target: "Main",
-            "root window: no output stated a scale ({e}); waiting for preferred_scale"
-        ),
-        (Err(e), false) => {
-            tracing::error!(
-                target: "Main",
-                "root window: no output stated a scale ({e}) and no wp_fractional_scale_manager_v1 to send one"
-            );
-            rt.window().resolve_unstated_scale();
-        }
-    }
-
-    let decorations_negotiated = has_decoration_manager(&globals);
-    if !decorations_negotiated {
-        if decoration_request == DecorationRequest::ServerSide {
-            tracing::warn!(target: "Main", "root window: no zxdg_decoration_manager_v1; server-side requested, drawing no titlebar");
-            if rt.root().effective.store(EffectiveDecorations::ServerSide) {
-                jfn_platform_abi::notify_decorations_changed();
-            }
-        } else {
-            tracing::warn!(target: "Main", "root window: no zxdg_decoration_manager_v1; client-side decorations");
-        }
-    }
+    let FractionalScale {
+        manager: frac_mgr,
+        scale: frac_scale,
+    } = bind_fractional_scale(rt, &globals, &qh, &surface);
+    let decorations_negotiated = negotiate_decorations(rt, &globals, decoration_request);
 
     #[cfg(feature = "kde-palette")]
     let palette: Option<OrgKdeKwinServerDecorationPalette> = globals
@@ -1279,7 +1235,7 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
         armed_gen: 0,
         viewport,
         bg_buffer: None,
-        bg: rt.root().pending_bg().unwrap_or(BG),
+        bg: BG,
         frac_mgr,
         frac_scale,
         current_size: None,
@@ -1298,6 +1254,84 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
         stop: stop.clone(),
     };
 
+    spawn_root_thread(rt, conn, queue, state, stop, ping, stop_source);
+}
+
+/// The fractional-scale objects for the root surface, when the compositor
+/// offers the protocol.
+struct FractionalScale {
+    manager: Option<WpFractionalScaleManagerV1>,
+    scale: Option<WpFractionalScaleV1>,
+}
+
+/// Binds fractional scale for `surface` and seeds the window's scale from the
+/// first output that states one. Without a stated scale the window waits for
+/// `preferred_scale`, or, where nothing can send one, resolves it itself.
+fn bind_fractional_scale(
+    rt: &'static WlRuntime,
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<RootState>,
+    surface: &WlSurface,
+) -> FractionalScale {
+    let manager: Option<WpFractionalScaleManagerV1> = globals.bind(qh, 1..=1, ()).ok();
+    let scale = manager
+        .as_ref()
+        .map(|m| m.get_fractional_scale(surface, qh, ()));
+    if manager.is_none() {
+        tracing::warn!(target: "Main", "root window: no wp_fractional_scale_manager_v1; no preferred_scale will arrive");
+    }
+    let probed = crate::scale_probe::probe_scale_bounded(
+        crate::scale_probe::ProbeTarget::FirstOutput,
+        SCALE_PROBE_TIMEOUT,
+    );
+    match (probed, manager.is_some()) {
+        (Ok(scale), _) => rt.window().seed_scale(scale),
+        (Err(e), true) => tracing::error!(
+            target: "Main",
+            "root window: no output stated a scale ({e}); waiting for preferred_scale"
+        ),
+        (Err(e), false) => {
+            tracing::error!(
+                target: "Main",
+                "root window: no output stated a scale ({e}) and no wp_fractional_scale_manager_v1 to send one"
+            );
+            rt.window().resolve_unstated_scale();
+        }
+    }
+    FractionalScale { manager, scale }
+}
+
+/// Whether the decoration protocol will negotiate the mode. Without it a
+/// server-side request is honored blind — no titlebar is drawn — and anything
+/// else stays client-side.
+fn negotiate_decorations(
+    rt: &'static WlRuntime,
+    globals: &wayland_client::globals::GlobalList,
+    request: DecorationRequest,
+) -> bool {
+    let negotiated = has_decoration_manager(globals);
+    if !negotiated {
+        if request == DecorationRequest::ServerSide {
+            tracing::warn!(target: "Main", "root window: no zxdg_decoration_manager_v1; server-side requested, drawing no titlebar");
+            if rt.root().effective.store(EffectiveDecorations::ServerSide) {
+                jfn_platform_abi::notify_decorations_changed();
+            }
+        } else {
+            tracing::warn!(target: "Main", "root window: no zxdg_decoration_manager_v1; client-side decorations");
+        }
+    }
+    negotiated
+}
+
+fn spawn_root_thread(
+    rt: &'static WlRuntime,
+    conn: Connection,
+    queue: EventQueue<RootState>,
+    state: RootState,
+    stop: Arc<AtomicBool>,
+    ping: calloop::ping::Ping,
+    stop_source: PingSource,
+) {
     match thread::Builder::new()
         .name("wl-root".into())
         .spawn(move || root_loop(conn, queue, state, stop_source))
@@ -1315,51 +1349,17 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
     }
 }
 
-// Apply queued fullscreen / window-control / background-color requests. Runs on
-// the root thread each iteration before it blocks, so a request enqueued before
-// the wake fd could ring is still serviced without waiting for another event.
+// Apply queued window-control requests. Runs on the root thread each
+// iteration before it blocks, so a request enqueued before the wake fd could
+// ring is still serviced without waiting for another event.
 fn service_root_requests(state: &mut RootState) -> bool {
     let mut applied = false;
-    match state.rt.root().pending_fs.swap(FS_NONE, Ordering::Acquire) {
-        FS_ON => {
-            apply_fullscreen(state, true);
-            applied = true;
-        }
-        FS_OFF => {
-            apply_fullscreen(state, false);
-            applied = true;
-        }
-        FS_TOGGLE => {
-            let on = !matches!(state.mode, crate::window_state::WindowMode::Fullscreen);
-            apply_fullscreen(state, on);
-            applied = true;
-        }
-        _ => {}
-    }
     // Drained without a lock, so a command queued by an applied command's own
     // effects is serviced in this same pass.
     let root: &'static RootShared = state.rt.root();
     for cmd in root.commands_rx.try_iter() {
         applied = true;
         apply_command(state, cmd);
-    }
-    if let Some(bg) = state.rt.root().pending_bg()
-        && bg != state.bg
-    {
-        state.bg = bg;
-        applied = true;
-        // current_size is only set once presented, so the capability is present
-        // too; requiring it keeps the buffer attach behind an ack.
-        if let (Some(size), Some(present)) = (state.current_size, state.present) {
-            let (w, h) = (size.w(), size.h());
-            state.rebuild_background(w, h, present);
-            // Apply via the single owner commit, not a standalone one.
-            state
-                .rt
-                .root()
-                .pending_present
-                .store(true, Ordering::Release);
-        }
     }
     applied
 }
@@ -1700,6 +1700,7 @@ delegate_registry!(RootState);
 
 #[cfg(test)]
 mod tests {
+    use super::ModeRequest;
     use super::popup_place::Placed;
     use super::presentation::{Inputs, Step, plan};
     use super::resolve_logical_size;
@@ -1708,6 +1709,15 @@ mod tests {
         LogicalPoint, LogicalSize, MenuPlacement, PhysicalSize, Scale, WindowExtent,
     };
     use std::num::NonZeroI32;
+
+    #[test]
+    fn set_ignores_the_current_mode_and_toggle_negates_it() {
+        for current in [false, true] {
+            assert!(ModeRequest::Set(true).resolve(current));
+            assert!(!ModeRequest::Set(false).resolve(current));
+            assert_eq!(ModeRequest::Toggle.resolve(current), !current);
+        }
+    }
 
     fn place(x: i32) -> MenuPlacement {
         let physical = PhysicalSize { w: 10, h: 10 };

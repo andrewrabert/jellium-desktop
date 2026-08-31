@@ -5,6 +5,7 @@
 //! owes its successor and yields [`Superseded`]. Nothing releases one silently.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::{JfnRect, PhysicalSize};
 
@@ -17,6 +18,57 @@ pub trait FrameSource: Send + Sync {
     /// Invalidates the view and, where the host drives frames, requests the
     /// next one.
     fn request_frame(&self);
+}
+
+/// A frame a swapchain could not take yet, held until it comes due, and the
+/// producer that owes its successor. A frame taken from the mailbox
+/// supersedes it.
+pub struct FrameRetry<F> {
+    held: Option<Held<F>>,
+}
+
+struct Held<F> {
+    frame: F,
+    source: Arc<dyn FrameSource>,
+    at: Instant,
+}
+
+impl<F> Default for FrameRetry<F> {
+    fn default() -> Self {
+        FrameRetry { held: None }
+    }
+}
+
+impl<F> FrameRetry<F> {
+    /// When the held frame comes due, if one is held.
+    pub fn due(&self) -> Option<Instant> {
+        self.held.as_ref().map(|held| held.at)
+    }
+
+    /// The frame this wake presents: a fresh one supersedes the held one;
+    /// otherwise the held one, which is no longer held.
+    pub fn take(
+        &mut self,
+        fresh: Option<(F, Arc<dyn FrameSource>)>,
+    ) -> Option<(F, Arc<dyn FrameSource>)> {
+        match fresh {
+            Some(fresh) => {
+                self.held = None;
+                Some(fresh)
+            }
+            None => self.held.take().map(|held| (held.frame, held.source)),
+        }
+    }
+
+    /// Holds `frame` until `retry_at`. Where no refresh interval spaces the
+    /// retry there is nothing to hold it until, so its producer is asked for
+    /// the successor instead.
+    pub fn defer(&mut self, frame: F, source: Arc<dyn FrameSource>, retry_at: Option<Instant>) {
+        match retry_at {
+            Some(at) => self.held = Some(Held { frame, source, at }),
+            None => source.request_frame(),
+        }
+    }
 }
 
 /// A frame a producer handed to a surface, owed to the compositor.
