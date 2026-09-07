@@ -174,7 +174,7 @@ impl Platform for WaylandPlatform {
     }
 
     fn menu_delivery(&self, _kind: jfn_platform_abi::MenuKind) -> jfn_platform_abi::MenuDelivery {
-        jfn_platform_abi::MenuDelivery::Host(self.rt().menu())
+        jfn_platform_abi::MenuDelivery::Host(self.rt().menu_host())
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {

@@ -3,7 +3,7 @@ use std::num::NonZeroI32;
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use calloop::{EventLoop, LoopSignal, ping::PingSource};
@@ -11,16 +11,15 @@ use calloop_wayland_source::WaylandSource;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Surface};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::csd_frame::WindowState;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::shell::WaylandSurface;
-use smithay_client_toolkit::shell::xdg::popup::{Popup, PopupConfigure, PopupHandler};
 use smithay_client_toolkit::shell::xdg::window::{
     self as sctk_window, Window, WindowConfigure, WindowHandler,
 };
-use smithay_client_toolkit::shell::xdg::{XdgPositioner, XdgShell, XdgSurface as _};
+use smithay_client_toolkit::shell::xdg::{XdgShell, XdgSurface as _};
 use smithay_client_toolkit::shm::slot::{Buffer as SlotBuffer, SlotPool};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
@@ -38,20 +37,14 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
-use wayland_protocols::xdg::shell::client::{
-    xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
-    xdg_toplevel,
-};
+use wayland_protocols::xdg::shell::client::xdg_toplevel;
 #[cfg(feature = "kde-palette")]
 use wayland_protocols_plasma::server_decoration_palette::client::{
     org_kde_kwin_server_decoration_palette::OrgKdeKwinServerDecorationPalette,
     org_kde_kwin_server_decoration_palette_manager::OrgKdeKwinServerDecorationPaletteManager,
 };
 
-use jfn_platform_abi::{
-    EffectiveDecorations, Generation, LogicalPoint, LogicalSize, MenuPaint, MenuPlacement,
-    WindowDecorations,
-};
+use jfn_platform_abi::{EffectiveDecorations, WindowDecorations};
 
 use crate::input::SeatShared;
 use crate::runtime::WlRuntime;
@@ -99,11 +92,6 @@ pub(crate) struct RootShared {
     /// Coalesced request for one root commit; every producer that needs to
     /// present latches it and the root thread drains it once per pass.
     pending_present: AtomicBool,
-    /// Protocol id of the most recent menu popup `wl_surface`, overwritten by
-    /// each create and never cleared: the keyboard-leave that follows a
-    /// teardown names the surface that is already gone, and the input thread
-    /// must still read it as menu plumbing rather than real focus loss.
-    menu_surface_id: AtomicU32,
     root_surface: OnceLock<RootSurfaceHandle>,
     /// The toplevel, parked for the life of the process. SCTK's `Window`
     /// destroys the root `wl_surface` when its last handle drops, and the CEF
@@ -135,7 +123,6 @@ impl RootShared {
             commands_tx,
             commands_rx,
             pending_present: AtomicBool::new(false),
-            menu_surface_id: AtomicU32::new(0),
             root_surface: OnceLock::new(),
             window: OnceLock::new(),
             thread: OnceLock::new(),
@@ -172,8 +159,8 @@ impl RootShared {
         *self.boot.lock()
     }
 
-    pub(crate) fn menu_surface_id(&self) -> u32 {
-        self.menu_surface_id.load(Ordering::Acquire)
+    pub(crate) fn window(&self) -> Option<&Window> {
+        self.window.get()
     }
 
     pub(crate) fn root_surface_handle(&self) -> Option<RootSurfaceHandle> {
@@ -261,7 +248,6 @@ struct RootState {
     registry_state: RegistryState,
     output_state: OutputState,
     conn: Connection,
-    qh: QueueHandle<Self>,
     window: Window,
     decorations_negotiated: bool,
     // Single-owner protocol objects for window-control commands, owned by this
@@ -270,15 +256,6 @@ struct RootState {
     #[cfg(feature = "kde-palette")]
     palette: Option<OrgKdeKwinServerDecorationPalette>,
     shm_pool: Option<SlotPool>,
-    compositor: CompositorState,
-    xdg_shell: XdgShell,
-    viewporter: WpViewporter,
-    menu_pool: Option<SlotPool>,
-    menu: MenuPopup,
-    /// Highest menu generation ever created. Generations are handed out under
-    /// the core lock but the creates carrying them are posted after that lock
-    /// drops, so two menus racing can queue their creates out of order.
-    armed_gen: u64,
     viewport: WpViewport,
     bg_buffer: Option<SlotBuffer>,
     bg: [u8; 3],
@@ -555,31 +532,6 @@ enum WindowCommand {
     SetBackground([u8; 3]),
     #[cfg(feature = "kde-palette")]
     SetTitlebarPalette(String),
-    Popup(PopupCommand),
-}
-
-/// Menu-popup requests. Create, paint, reposition and destroy must reach the
-/// compositor in the order they were issued, so they share one queue.
-pub(crate) enum PopupCommand {
-    Arm {
-        generation: Generation,
-        anchor: LogicalPoint,
-        /// The press or key serial the grab cites. Captured on the input
-        /// thread at request time; by the time this is applied the seat's last
-        /// serial has moved on.
-        serial: u32,
-    },
-    MapArmed {
-        generation: Generation,
-    },
-    Reposition {
-        generation: Generation,
-        place: MenuPlacement,
-    },
-    Paint(MenuPaint),
-    Destroy {
-        generation: Generation,
-    },
 }
 
 /// A requested window mode: explicit, or the opposite of the current one.
@@ -655,19 +607,6 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
                 tracing::warn!(target: "Main", "titlebar palette dropped: no palette manager");
             }
         }
-        WindowCommand::Popup(cmd) => match cmd {
-            PopupCommand::Arm {
-                generation,
-                anchor,
-                serial,
-            } => state.arm_menu_popup(generation, anchor, serial),
-            PopupCommand::MapArmed { generation } => state.map_armed_menu_popup(generation),
-            PopupCommand::Reposition { generation, place } => {
-                state.reposition_menu_popup(generation, place);
-            }
-            PopupCommand::Paint(paint) => state.paint_menu_popup(paint),
-            PopupCommand::Destroy { generation } => state.destroy_menu_popup(generation),
-        },
     }
     let _ = state.conn.flush();
 }
@@ -691,370 +630,6 @@ fn apply_fullscreen(state: &mut RootState, on: bool) {
         }
     }
     let _ = state.conn.flush();
-}
-
-/// Placement bookkeeping for one menu popup, free of protocol objects: it owns
-/// what the compositor has been given and what it may still be sent, so "never
-/// reposition an unmapped popup" is decided here and nowhere else.
-mod popup_place {
-    use super::MenuPlacement;
-
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub(super) struct Placed {
-        sent: Option<MenuPlacement>,
-        held: Option<MenuPlacement>,
-    }
-
-    impl Placed {
-        /// A popup armed with no menu on it: the compositor holds no placement.
-        pub(super) fn armed() -> Placed {
-            Placed {
-                sent: None,
-                held: None,
-            }
-        }
-
-        #[cfg(test)]
-        pub(super) fn created(sent: MenuPlacement) -> Placed {
-            Placed {
-                sent: Some(sent),
-                held: None,
-            }
-        }
-
-        /// What an unmapped popup wants next. A want equal to `sent` clears the
-        /// hold, so a placement already on the wire is never re-sent.
-        pub(super) fn hold(&mut self, want: MenuPlacement) {
-            self.held = (Some(want) != self.sent).then_some(want);
-        }
-
-        /// The placement the mapping commit must be followed with, consumed as
-        /// it is read. `None` when the create-time placement still stands.
-        pub(super) fn on_map(&mut self) -> Option<MenuPlacement> {
-            let place = self.held.take()?;
-            self.sent = Some(place);
-            Some(place)
-        }
-
-        /// The placement to put on the wire now; `None` when the compositor
-        /// already holds it.
-        pub(super) fn send(&mut self, want: MenuPlacement) -> Option<MenuPlacement> {
-            (Some(want) != self.sent).then(|| {
-                self.sent = Some(want);
-                want
-            })
-        }
-    }
-}
-use popup_place::Placed;
-
-/// One live menu popup and everything that names its `wl_surface`.
-struct LivePopup {
-    generation: Generation,
-    popup: Popup,
-    viewport: WpViewport,
-    place: Placed,
-}
-
-impl LivePopup {
-    /// Crop, attach, damage and commit the menu buffer; the first one maps the
-    /// popup.
-    fn attach(&self, buffer: &crate::wl_state::AttachedBuffer, paint: &MenuPaint) {
-        let surface = self.popup.wl_surface();
-        self.viewport.set_source(
-            0.0,
-            f64::from(paint.scroll),
-            f64::from(paint.buffer.w),
-            f64::from(paint.view.physical().h),
-        );
-        self.viewport
-            .set_destination(paint.view.logical().w, paint.view.logical().h);
-        buffer.attach_to(surface);
-        surface.damage_buffer(0, 0, paint.buffer.w, paint.buffer.h);
-        surface.commit();
-    }
-
-    /// Attach [`ARMED_PIXEL`] and commit: the surface maps holding a grab and
-    /// showing no menu. The viewport crops the one pixel to [`ARMED_SIZE`],
-    /// the size the popup was configured at.
-    fn attach_armed(&self, buffer: &crate::wl_state::AttachedBuffer) {
-        let surface = self.popup.wl_surface();
-        self.viewport.set_source(0.0, 0.0, 1.0, 1.0);
-        self.viewport.set_destination(ARMED_SIZE.w, ARMED_SIZE.h);
-        buffer.attach_to(surface);
-        surface.damage_buffer(0, 0, 1, 1);
-        surface.commit();
-    }
-
-    /// `xdg_popup.reposition`; every caller stands in a mapped state.
-    fn reposition(&self, xdg_shell: &XdgShell, place: MenuPlacement) {
-        let Some(positioner) = menu_positioner(xdg_shell, place.anchor, place.view.logical())
-        else {
-            return;
-        };
-        self.popup.reposition(&positioner, 0);
-    }
-}
-
-// The viewport names the `wl_surface` that dropping the popup destroys, so it
-// goes first.
-impl Drop for LivePopup {
-    fn drop(&mut self) {
-        self.viewport.destroy();
-    }
-}
-
-/// The menu popup's mapping state: `Unmapped` has no path to
-/// [`LivePopup::reposition`], so a placement requested there is held until the
-/// commit that maps the popup applies it.
-#[derive(Default)]
-enum MenuPopup {
-    #[default]
-    None,
-    Unmapped {
-        live: LivePopup,
-    },
-    Mapped {
-        live: LivePopup,
-        buffer: crate::wl_state::AttachedBuffer,
-    },
-}
-
-impl MenuPopup {
-    fn generation(&self) -> Option<Generation> {
-        Some(self.live()?.generation)
-    }
-
-    fn live(&self) -> Option<&LivePopup> {
-        match self {
-            Self::None => None,
-            Self::Unmapped { live } | Self::Mapped { live, .. } => Some(live),
-        }
-    }
-
-    fn reposition(&mut self, xdg_shell: &XdgShell, want: MenuPlacement) {
-        match self {
-            Self::None => {}
-            Self::Unmapped { live } => live.place.hold(want),
-            Self::Mapped { live, .. } => {
-                if let Some(place) = live.place.send(want) {
-                    live.reposition(xdg_shell, place);
-                }
-            }
-        }
-    }
-
-    /// Commits the armed buffer, mapping the popup so its grab takes effect,
-    /// then sends whatever placement was held since the arm. A popup already
-    /// mapped keeps the buffer it has.
-    fn map_armed(&mut self, xdg_shell: &XdgShell, buffer: crate::wl_state::AttachedBuffer) {
-        let mut live = match std::mem::take(self) {
-            Self::None => return,
-            Self::Unmapped { live } => live,
-            Self::Mapped { live, buffer } => {
-                *self = Self::Mapped { live, buffer };
-                return;
-            }
-        };
-        live.attach_armed(&buffer);
-        if let Some(place) = live.place.on_map() {
-            live.reposition(xdg_shell, place);
-        }
-        *self = Self::Mapped { live, buffer };
-    }
-
-    /// Commits `buffer`, mapping an unmapped popup and then sending whatever
-    /// placement was held since the arm.
-    fn paint(
-        &mut self,
-        xdg_shell: &XdgShell,
-        buffer: crate::wl_state::AttachedBuffer,
-        paint: &MenuPaint,
-    ) {
-        let (mut live, retired) = match std::mem::take(self) {
-            Self::None => return,
-            Self::Unmapped { live } => (live, None),
-            Self::Mapped { live, buffer } => (live, Some(buffer)),
-        };
-        live.attach(&buffer, paint);
-        // Retired only once the replacement is committed, so the surface is
-        // never left naming a destroyed buffer.
-        drop(retired);
-        if let Some(place) = live.place.on_map() {
-            live.reposition(xdg_shell, place);
-        }
-        *self = Self::Mapped { live, buffer };
-    }
-}
-
-/// The smallest size `xdg_positioner.set_size` admits: it answers a width or
-/// height that is not positive with `invalid_input`.
-const ARMED_SIZE: LogicalSize = LogicalSize { w: 1, h: 1 };
-
-/// One transparent premultiplied BGRA pixel: the buffer whose commit maps the
-/// armed popup.
-const ARMED_PIXEL: [u8; 4] = [0, 0, 0, 0];
-
-/// The positioner for a surface of `size` logical px whose top-left sits at
-/// `anchor`. The anchor rect is one pixel because the anchor is a point.
-fn menu_positioner(
-    xdg_shell: &XdgShell,
-    anchor: LogicalPoint,
-    size: LogicalSize,
-) -> Option<XdgPositioner> {
-    let p = XdgPositioner::new(xdg_shell)
-        .inspect_err(|e| tracing::error!(target: "Main", "menu positioner: {e}"))
-        .ok()?;
-    p.set_size(size.w, size.h);
-    p.set_anchor_rect(anchor.x, anchor.y, 1, 1);
-    p.set_anchor(Anchor::TopLeft);
-    p.set_gravity(Gravity::BottomRight);
-    p.set_constraint_adjustment(
-        ConstraintAdjustment::FlipX
-            | ConstraintAdjustment::FlipY
-            | ConstraintAdjustment::SlideX
-            | ConstraintAdjustment::SlideY,
-    );
-    Some(p)
-}
-
-impl RootState {
-    /// Creates the popup that holds the grab, with no menu on it, sized
-    /// [`ARMED_SIZE`]. The grab cites the input thread's last press serial
-    /// (button or key) — valid here only because every app connection shares
-    /// one wl_client.
-    fn arm_menu_popup(&mut self, generation: Generation, anchor: LogicalPoint, serial: u32) {
-        // Each generation drives exactly one create, so `<=` (not `<`) also
-        // blocks resurrecting a just-destroyed popup: teardown leaves armed_gen
-        // at its peak.
-        if generation.get() <= self.armed_gen {
-            return;
-        }
-        self.armed_gen = generation.get();
-        self.menu = MenuPopup::None;
-        let Some(positioner) = menu_positioner(&self.xdg_shell, anchor, ARMED_SIZE) else {
-            return;
-        };
-        self.open_menu_popup(generation, &positioner, serial, Placed::armed());
-    }
-
-    /// Creates the popup against `positioner` and takes the grab; `place` is
-    /// what the compositor is thereafter considered to hold.
-    fn open_menu_popup(
-        &mut self,
-        generation: Generation,
-        positioner: &XdgPositioner,
-        serial: u32,
-        place: Placed,
-    ) {
-        let surface = match Surface::new(&self.compositor, &self.qh) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(target: "Main", "menu surface: {e}");
-                return;
-            }
-        };
-        let viewport = self
-            .viewporter
-            .get_viewport(surface.wl_surface(), &self.qh, ());
-        // xdg_popup.grab is only honored before the popup's first commit, so
-        // the grab and the commit below must stay in that order.
-        let popup = match Popup::from_surface(
-            Some(self.window.xdg_surface()),
-            positioner,
-            &self.qh,
-            surface,
-            &self.xdg_shell,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(target: "Main", "menu popup: {e}");
-                viewport.destroy();
-                return;
-            }
-        };
-        if let Some(seat) = &self.seat {
-            popup.xdg_popup().grab(seat, serial);
-        }
-        popup.wl_surface().commit();
-        self.rt
-            .root()
-            .menu_surface_id
-            .store(popup.wl_surface().id().protocol_id(), Ordering::Release);
-        self.menu = MenuPopup::Unmapped {
-            live: LivePopup {
-                generation,
-                popup,
-                viewport,
-                place,
-            },
-        };
-    }
-
-    /// Drops the request when `generation` no longer owns the popup.
-    fn map_armed_menu_popup(&mut self, generation: Generation) {
-        if self.menu.generation() != Some(generation) {
-            return;
-        }
-        let Some(buffer) = self
-            .menu_pool
-            .as_mut()
-            .and_then(|pool| crate::wl_state::draw_from_pixels(pool, &ARMED_PIXEL, 1, 1))
-            .map(crate::wl_state::AttachedBuffer::Shm)
-        else {
-            tracing::error!(target: "Main", "menu: no buffer to map the armed popup with");
-            return;
-        };
-        self.menu.map_armed(&self.xdg_shell, buffer);
-    }
-
-    fn reposition_menu_popup(&mut self, generation: Generation, place: MenuPlacement) {
-        if self.menu.generation() != Some(generation) {
-            return;
-        }
-        self.menu.reposition(&self.xdg_shell, place);
-    }
-
-    fn paint_menu_popup(&mut self, paint: MenuPaint) {
-        if self.menu.generation() != Some(paint.generation) {
-            return;
-        }
-        let Some(buffer) = self
-            .menu_pool
-            .as_mut()
-            .and_then(|pool| {
-                crate::wl_state::draw_from_pixels(
-                    pool,
-                    &paint.pixels,
-                    paint.buffer.w,
-                    paint.buffer.h,
-                )
-            })
-            .map(crate::wl_state::AttachedBuffer::Shm)
-        else {
-            return;
-        };
-        self.menu.paint(&self.xdg_shell, buffer, &paint);
-    }
-
-    /// Tear the popup down, but only if `generation` still owns it — a newer
-    /// menu may have taken the role in the gap between a stale teardown being
-    /// decided and this call, and must not be torn down by it.
-    fn destroy_menu_popup(&mut self, generation: Generation) {
-        if self.menu.generation() != Some(generation) {
-            return;
-        }
-        self.menu = MenuPopup::None;
-    }
-
-    fn menu_generation(&self, popup: &Popup) -> Option<Generation> {
-        let live = self.menu.live()?;
-        (&live.popup == popup).then_some(live.generation)
-    }
-}
-
-pub(crate) fn popup(rt: &WlRuntime, cmd: PopupCommand) {
-    rt.root().send(WindowCommand::Popup(cmd));
 }
 
 // The root `wl_surface.commit` is issued by exactly one owner — this dispatch
@@ -1220,19 +795,12 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         conn: conn.clone(),
-        qh: qh.clone(),
         window,
         decorations_negotiated,
         seat,
         #[cfg(feature = "kde-palette")]
         palette,
         shm_pool: new_slot_pool(&shm, "root window"),
-        compositor,
-        xdg_shell,
-        viewporter,
-        menu_pool: new_slot_pool(&shm, "menu"),
-        menu: MenuPopup::None,
-        armed_gen: 0,
         viewport,
         bg_buffer: None,
         bg: BG,
@@ -1615,30 +1183,6 @@ impl Dispatch<WpFractionalScaleV1, ()> for RootState {
     }
 }
 
-impl PopupHandler for RootState {
-    /// SCTK has already acked the serial.
-    fn configure(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        popup: &Popup,
-        _: PopupConfigure,
-    ) {
-        if let Some(generation) = self.menu_generation(popup) {
-            self.rt.menu().on_ready(generation);
-        }
-    }
-
-    fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
-        let Some(generation) = self.menu_generation(popup) else {
-            return;
-        };
-        // SCTK holds its own handle to `popup` for the length of this call, so
-        // the teardown the menu emits has to reach the queue, not the popup.
-        self.rt.menu().on_done(generation);
-    }
-}
-
 macro_rules! noop_dispatch {
     ($($ty:ty),+ $(,)?) => {
         $(impl Dispatch<$ty, ()> for RootState {
@@ -1701,9 +1245,9 @@ delegate_registry!(RootState);
 #[cfg(test)]
 mod tests {
     use super::ModeRequest;
-    use super::popup_place::Placed;
     use super::presentation::{Inputs, Step, plan};
     use super::resolve_logical_size;
+    use crate::popup_protocol::popup_place::Placed;
     use crate::window_state::{WindowMode, WindowSize};
     use jfn_platform_abi::{
         LogicalPoint, LogicalSize, MenuPlacement, PhysicalSize, Scale, WindowExtent,

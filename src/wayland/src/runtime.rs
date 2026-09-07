@@ -31,6 +31,7 @@ pub(crate) struct WlRuntime {
     seat: SeatShared,
     input: OnceLock<InputThread>,
     menu: OnceLock<SoftwareMenu>,
+    menu_host: OnceLock<crate::popup::WlMenuHost>,
     selections: Selections,
     app_conn: AppConn,
     #[cfg(feature = "kde-palette")]
@@ -51,6 +52,7 @@ impl WlRuntime {
             seat: SeatShared::new(),
             input: OnceLock::new(),
             menu: OnceLock::new(),
+            menu_host: OnceLock::new(),
             selections: Selections::new(),
             app_conn: AppConn::new(),
             #[cfg(feature = "kde-palette")]
@@ -104,6 +106,11 @@ impl WlRuntime {
                 rt: self,
             }))
         })
+    }
+
+    pub(crate) fn menu_host(&'static self) -> &'static crate::popup::WlMenuHost {
+        self.menu_host
+            .get_or_init(|| crate::popup::WlMenuHost { rt: self })
     }
 
     pub(crate) fn try_menu(&self) -> Option<&SoftwareMenu> {

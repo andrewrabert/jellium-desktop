@@ -43,6 +43,13 @@ pub enum MenuPoint {
     Logical { x: c_int, y: c_int },
 }
 
+/// Content input addressed to a particular menu lifetime.
+pub enum MenuInputEvent {
+    Pointer { at: MenuPoint, press: bool },
+    Key(u32),
+    Scroll(c_int),
+}
+
 pub struct SoftwareMenu {
     emitter: Arc<Emitter>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -70,6 +77,68 @@ impl SoftwareMenu {
         }
     }
 
+    /// Starts a requested menu and captures its input serial in the same
+    /// state transaction. The backend receives creation only after the menu
+    /// exists, so an immediate configure/dismissal cannot precede installation.
+    pub fn open_triggered(&self, req: MenuRequest, serial: u32) {
+        self.open_impl(req, Some(serial));
+    }
+
+    fn open_impl(&self, req: MenuRequest, trigger: Option<u32>) {
+        if !self.render_thread_alive() || !menu_has_selectable(&req.items) {
+            self.emitter
+                .update(|s| close_current(s, MenuClose::Speculative));
+            req.on_selected.resolve(MENU_DISMISSED);
+            return;
+        }
+        self.emitter.update(|s| {
+            let resolve = s
+                .menu
+                .as_mut()
+                .and_then(|m| m.on_selected.take())
+                .map(Resolve::dismissed);
+            if let Some(serial) = trigger {
+                s.active = false;
+                if let Some(generation) = s.generation {
+                    queue(
+                        s,
+                        SurfaceOp::Destroy {
+                            generation,
+                            reason: MenuClose::Finished,
+                        },
+                    );
+                }
+                let generation = next_generation(s);
+                s.generation = Some(generation);
+                s.phase = Phase::AwaitArmed;
+                queue(
+                    s,
+                    SurfaceOp::Arm {
+                        generation,
+                        anchor: LogicalPoint { x: req.x, y: req.y },
+                        serial,
+                    },
+                );
+            }
+            s.menu = Some(Menu {
+                fsm: FsmState {
+                    active: menu_initial_row(&req.items, req.initial),
+                },
+                items: Arc::new(req.items),
+                laid: None,
+                width: req.width,
+                on_selected: Some(req.on_selected),
+                anchor: LogicalPoint { x: req.x, y: req.y },
+            });
+            if s.phase == Phase::Idle {
+                let generation = next_generation(s);
+                s.generation = Some(generation);
+            }
+            s.job = Some(RenderJob::Shape);
+            resolve
+        });
+    }
+
     fn render_thread_alive(&self) -> bool {
         self.thread.lock().is_some()
     }
@@ -84,9 +153,6 @@ impl SoftwareMenu {
             let resolve = clear_menu(s).map(Resolve::dismissed);
             let generation = next_generation(s);
             s.generation = Some(generation);
-            // The grab can activate at the popup's initial commit, and the
-            // grab-induced focus loss must already observe `engaged`.
-            s.engaged = true;
             s.phase = Phase::AwaitArmed;
             queue(
                 s,
@@ -154,24 +220,56 @@ impl SoftwareMenu {
     }
 
     fn pointer(&self, at: MenuPoint, press: bool) {
-        self.emitter.update(|s| {
-            let (x, y) = s.menu.as_ref().and_then(|m| buffer_point(m, at))?;
-            let ev = if press {
-                MenuEvent::Press { x, y }
-            } else {
-                MenuEvent::Motion { x, y }
-            };
-            step(s, ev)
-        });
+        self.input_impl(None, MenuInputEvent::Pointer { at, press });
     }
 
-    /// Accepted whenever the menu is active, layout or not.
     pub fn key(&self, keysym: u32) {
+        self.input_impl(None, MenuInputEvent::Key(keysym));
+    }
+
+    /// Stale events from a retired native object cannot affect its successor.
+    pub fn input(&self, generation: Generation, event: MenuInputEvent) {
+        self.input_impl(Some(generation), event);
+    }
+
+    fn input_impl(&self, generation: Option<Generation>, event: MenuInputEvent) {
         self.emitter.update(|s| {
-            if !s.active {
+            if generation.is_some_and(|generation| s.generation != Some(generation)) {
                 return None;
             }
-            step(s, MenuEvent::Key(keysym))
+            match event {
+                MenuInputEvent::Pointer { at, press } => {
+                    let (x, y) = s.menu.as_ref().and_then(|m| buffer_point(m, at))?;
+                    step(
+                        s,
+                        if press {
+                            MenuEvent::Press { x, y }
+                        } else {
+                            MenuEvent::Motion { x, y }
+                        },
+                    )
+                }
+                MenuInputEvent::Key(keysym) => {
+                    if !s.active {
+                        return None;
+                    }
+                    step(s, MenuEvent::Key(keysym))
+                }
+                MenuInputEvent::Scroll(dy) => {
+                    let laid = s.menu.as_mut()?.laid.as_mut()?;
+                    if laid.view_ph >= laid.content.h {
+                        return None;
+                    }
+                    let max = (laid.content.h - laid.view_ph).max(0);
+                    let new = (laid.scroll - scroll_step(dy, row_height(laid))).clamp(0, max);
+                    if new == laid.scroll {
+                        return None;
+                    }
+                    laid.scroll = new;
+                    request_paint(s);
+                    None
+                }
+            }
         });
     }
 
@@ -196,20 +294,7 @@ impl SoftwareMenu {
 
     /// ±120 per detent, positive = wheel up.
     pub fn scroll(&self, dy: c_int) {
-        self.emitter.update(|s| {
-            let laid = s.menu.as_mut()?.laid.as_mut()?;
-            if laid.view_ph >= laid.content.h {
-                return None;
-            }
-            let max = (laid.content.h - laid.view_ph).max(0);
-            let new = (laid.scroll - scroll_step(dy, row_height(laid))).clamp(0, max);
-            if new == laid.scroll {
-                return None;
-            }
-            laid.scroll = new;
-            request_paint(s);
-            None
-        });
+        self.input_impl(None, MenuInputEvent::Scroll(dy));
     }
 
     pub fn is_active(&self) -> bool {
@@ -217,7 +302,7 @@ impl SoftwareMenu {
     }
 
     pub fn is_engaged(&self) -> bool {
-        self.emitter.mailbox.peek(|s| s.engaged)
+        self.emitter.mailbox.peek(|s| s.phase != Phase::Idle)
     }
 
     pub fn has_menu(&self) -> bool {
@@ -229,36 +314,7 @@ impl MenuHost for SoftwareMenu {
     fn warm(&self) {}
 
     fn open(&self, req: MenuRequest) {
-        if !self.render_thread_alive() || !menu_has_selectable(&req.items) {
-            self.emitter
-                .update(|s| close_current(s, MenuClose::Speculative));
-            req.on_selected.resolve(MENU_DISMISSED);
-            return;
-        }
-        self.emitter.update(|s| {
-            let resolve = s
-                .menu
-                .as_mut()
-                .and_then(|m| m.on_selected.take())
-                .map(Resolve::dismissed);
-            s.menu = Some(Menu {
-                fsm: FsmState {
-                    active: menu_initial_row(&req.items, req.initial),
-                },
-                items: Arc::new(req.items),
-                laid: None,
-                width: req.width,
-                on_selected: Some(req.on_selected),
-                anchor: LogicalPoint { x: req.x, y: req.y },
-            });
-            if s.phase == Phase::Idle {
-                let generation = next_generation(s);
-                s.generation = Some(generation);
-                s.engaged = true;
-            }
-            s.job = Some(RenderJob::Shape);
-            resolve
-        });
+        self.open_impl(req, None);
     }
 
     fn hide(&self) {
@@ -393,7 +449,6 @@ struct MenuState {
     generation: Option<Generation>,
     next_generation: u64,
     active: bool,
-    engaged: bool,
     menu: Option<Menu>,
     job: Option<RenderJob>,
     /// Surface ops in issue order, drained by [`Emitter::flush`]; independent of
@@ -659,7 +714,6 @@ fn begin_menu(state: &mut MenuState, configured: Configured) -> Option<Resolve> 
         return close_unplaceable(state, "presented size");
     };
     state.active = true;
-    state.engaged = true;
     state.phase = Phase::AwaitMenu;
     // Maps the armed surface, activating the grab before the menu has pixels.
     queue(state, SurfaceOp::MapArmed { generation });
@@ -713,7 +767,6 @@ fn close_current(state: &mut MenuState, reason: MenuClose) -> Option<Resolve> {
 
 fn clear_menu(state: &mut MenuState) -> Option<MenuSelection> {
     state.active = false;
-    state.engaged = false;
     state.phase = Phase::Idle;
     state.generation = None;
     state.job = None;

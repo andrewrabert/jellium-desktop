@@ -19,6 +19,8 @@ pub(crate) mod mpv_host;
 pub(crate) mod mpv_proxy;
 pub mod paint_override;
 pub(crate) mod popup;
+pub(crate) mod popup_protocol;
+pub(crate) mod protocol;
 pub(crate) mod root_window;
 pub(crate) mod runtime;
 pub(crate) mod scale;
