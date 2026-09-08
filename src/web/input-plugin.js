@@ -13,6 +13,7 @@
             this.playerHandlers = null;
             this.onPlaybackStart = null;
             this.onPlaybackStop = null;
+            this.lastQueueCaps = null;
 
             console.debug('[Media] inputPlugin constructed with playbackManager:', !!playbackManager);
 
@@ -212,6 +213,15 @@
             this.positionTracking = null;
         }
 
+        // Feeds the OS media session's next/previous capability. Two
+        // boundaries look alike from here and are handled differently:
+        // a real stop resets jellyfin-web's queue before `playbackstop`
+        // fires, so an empty playlist is a true state (nothing to step
+        // to) and is reported; the next item's `playing` arrives before
+        // `setPlaylist`, so the same empty queue shows up again and is
+        // deduplicated, and `playbackstart` right after carries the real
+        // one. A non-empty playlist with no current index is the only
+        // transient, and is skipped.
         updateQueueState() {
             try {
                 if (!window.jmpNative) return;
@@ -223,19 +233,24 @@
                 const playlist = qm?.getPlaylist();
                 const currentIndex = qm?.getCurrentPlaylistIndex();
 
-                if (!playlist || !Array.isArray(playlist) || playlist.length === 0 ||
-                    currentIndex === undefined || currentIndex === null || currentIndex < 0) {
-                    console.warn('[Media] updateQueueState: queue invalid (idx=' + currentIndex + ' len=' + (playlist?.length || 0) + '), keeping last state');
-                    return;
+                let canNext = false;
+                let canPrev = false;
+                if (Array.isArray(playlist) && playlist.length > 0) {
+                    if (typeof currentIndex !== 'number' || currentIndex < 0) {
+                        console.debug('[Media] updateQueueState: playlist set but no current item yet (len=' + playlist.length + ')');
+                        return;
+                    }
+                    canNext = currentIndex < playlist.length - 1;
+                    const state = this._playerState();
+                    const isMusic = state?.NowPlayingItem?.MediaType === 'Audio';
+                    canPrev = isMusic ? true : (currentIndex > 0);
                 }
 
-                const canNext = currentIndex < playlist.length - 1;
+                const last = this.lastQueueCaps;
+                if (last && last.canNext === canNext && last.canPrev === canPrev) return;
+                this.lastQueueCaps = { canNext, canPrev };
 
-                const state = this._playerState();
-                const isMusic = state?.NowPlayingItem?.MediaType === 'Audio';
-                const canPrev = isMusic ? true : (currentIndex > 0);
-
-                console.debug('[Media] updateQueueState: idx=' + currentIndex + ' len=' + playlist.length + ' canNext=' + canNext + ' canPrev=' + canPrev);
+                console.debug('[Media] updateQueueState: idx=' + currentIndex + ' len=' + (playlist?.length || 0) + ' canNext=' + canNext + ' canPrev=' + canPrev);
                 window.jmpNative.notifyQueueChange(canNext, canPrev);
             } catch (e) {
                 console.error('[Media] updateQueueState error:', e);
