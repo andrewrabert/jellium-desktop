@@ -1,19 +1,21 @@
-//! The shell overlay's modal stack, and the total function that advances it.
+//! The shell overlay's modal stack.
 
 use std::time::Instant;
 
 use iced_core::widget::Id;
 use iced_core::{Color, Element};
 
-use jfn_bringup::Screen;
+use crate::connection::{Connection, Screen};
 
-use crate::actor::Deadline;
-use crate::connect::Connect;
-use crate::settings_overlay::{Outcome as OverlayOutcome, SettingsOverlay, Tab};
-use crate::theme::Theme;
+use crate::shell::actor::Deadline;
+use crate::shell::connect::Connect;
+use crate::shell::settings_overlay::{Outcome as OverlayOutcome, SettingsOverlay, Tab};
+use crate::shell::theme::Theme;
 
 /// The shell overlay's modal views, bottom first. The top is drawn.
 pub struct Stack {
+    settings_factory: fn() -> crate::shell::settings::Settings,
+    metadata: crate::shell::metadata::ApplicationMetadata,
     views: Vec<View>,
 }
 
@@ -49,19 +51,20 @@ pub enum Transition {
 /// A message a modal view publishes.
 #[derive(Clone, Debug)]
 pub enum Message {
-    Connect(crate::connect::Message),
-    SettingsOverlay(crate::settings_overlay::Message),
-}
-
-impl Default for Stack {
-    fn default() -> Self {
-        Self::empty()
-    }
+    Connect(crate::shell::connect::Message),
+    SettingsOverlay(crate::shell::settings_overlay::Message),
 }
 
 impl Stack {
-    pub fn empty() -> Stack {
-        Stack { views: Vec::new() }
+    pub fn empty(
+        metadata: crate::shell::metadata::ApplicationMetadata,
+        settings_factory: fn() -> crate::shell::settings::Settings,
+    ) -> Stack {
+        Stack {
+            settings_factory,
+            metadata,
+            views: Vec::new(),
+        }
     }
 
     pub fn occupied(&self) -> bool {
@@ -71,6 +74,8 @@ impl Stack {
     #[cfg(test)]
     pub(crate) fn testing_settings() -> Stack {
         Stack {
+            settings_factory: crate::shell::settings::Settings::testing,
+            metadata: crate::shell::metadata::ApplicationMetadata::testing(),
             views: vec![View::SettingsOverlay(Box::new(SettingsOverlay::testing(
                 Tab::Settings,
             )))],
@@ -106,12 +111,12 @@ impl Stack {
     }
 
     /// Total over every (stack, transition) pair.
-    pub fn advance(&mut self, transition: Transition) {
+    pub(crate) fn update(&mut self, transition: Transition, connection: &mut Connection) {
         match transition {
             Transition::OpenAbout => self.open_overlay(Tab::About),
             Transition::OpenClientSettings => self.open_overlay(Tab::Settings),
             Transition::Escape => match self.top() {
-                Some(View::Connect(_)) => jfn_bringup::advance(jfn_bringup::Event::Cancel),
+                Some(View::Connect(_)) => connection.cancel(),
                 Some(View::SettingsOverlay(_)) => {
                     if let Some(View::SettingsOverlay(overlay)) = self.views.last_mut() {
                         overlay.dismiss();
@@ -120,8 +125,8 @@ impl Stack {
                 }
                 None => {}
             },
-            Transition::Message(message) => self.deliver(message),
-            Transition::Tick(now) => jfn_bringup::advance(jfn_bringup::Event::Tick(now)),
+            Transition::Message(message) => self.deliver(message, connection),
+            Transition::Tick(now) => connection.tick(now),
         }
     }
 
@@ -129,25 +134,24 @@ impl Stack {
         if let Some(overlay) = self.overlay_mut() {
             overlay.select(tab);
         } else {
-            #[cfg(test)]
-            let overlay = SettingsOverlay::testing(tab);
-            #[cfg(not(test))]
-            let overlay = SettingsOverlay::new(tab);
+            let overlay = SettingsOverlay::with_settings(
+                tab,
+                self.metadata.clone(),
+                (self.settings_factory)(),
+            );
             self.views.push(View::SettingsOverlay(Box::new(overlay)));
         }
     }
 
     /// The top view alone sees a message; one addressed to a view beneath it is
     /// dropped rather than acted on behind the one that has the screen.
-    fn deliver(&mut self, message: Message) {
+    fn deliver(&mut self, message: Message, connection: &mut Connection) {
         match (self.views.last_mut(), message) {
-            (Some(View::Connect(_)), Message::Connect(m)) => {
-                jfn_bringup::advance(match m {
-                    crate::connect::Message::UrlEdited(url) => jfn_bringup::Event::UrlEdited(url),
-                    crate::connect::Message::Submit => jfn_bringup::Event::Connect,
-                    crate::connect::Message::DismissFailure => jfn_bringup::Event::DismissFailure,
-                });
-            }
+            (Some(View::Connect(_)), Message::Connect(m)) => match m {
+                crate::shell::connect::Message::UrlEdited(url) => connection.edit_url(url),
+                crate::shell::connect::Message::Submit => connection.connect(),
+                crate::shell::connect::Message::DismissFailure => connection.dismiss_failure(),
+            },
             (Some(View::SettingsOverlay(overlay)), Message::SettingsOverlay(message)) => {
                 match overlay.update(message) {
                     OverlayOutcome::None => {}
@@ -155,7 +159,7 @@ impl Stack {
                         self.views.pop();
                     }
                     OverlayOutcome::ResetSavedServer => {
-                        jfn_bringup::advance(jfn_bringup::Event::UrlEdited(String::new()));
+                        connection.edit_url(String::new());
                         self.views.pop();
                     }
                 }
@@ -231,17 +235,31 @@ impl Stack {
 #[cfg(test)]
 mod tests {
     use super::{Identity, Message, Stack, Transition, View};
-    use crate::settings_overlay::{Message as OverlayMessage, SettingsOverlay, Tab};
+    impl Stack {
+        fn transition(&mut self, transition: Transition) {
+            self.update(
+                transition,
+                &mut crate::connection::Connection::new(String::new()),
+            );
+        }
+    }
+    use crate::shell::settings_overlay::{Message as OverlayMessage, SettingsOverlay, Tab};
 
     #[test]
     fn each_opener_selects_its_tab() {
-        let mut stack = Stack::empty();
-        stack.advance(Transition::OpenClientSettings);
+        let mut stack = Stack::empty(
+            crate::shell::metadata::ApplicationMetadata::testing(),
+            crate::shell::settings::Settings::testing,
+        );
+        stack.transition(Transition::OpenClientSettings);
         assert_eq!(stack.active_settings_tab(), Some(Tab::Settings));
         assert_eq!(stack.identity(), Some(Identity::SettingsOverlay));
 
-        let mut stack = Stack::empty();
-        stack.advance(Transition::OpenAbout);
+        let mut stack = Stack::empty(
+            crate::shell::metadata::ApplicationMetadata::testing(),
+            crate::shell::settings::Settings::testing,
+        );
+        stack.transition(Transition::OpenAbout);
         assert_eq!(stack.active_settings_tab(), Some(Tab::About));
         assert_eq!(stack.identity(), Some(Identity::SettingsOverlay));
     }
@@ -249,6 +267,8 @@ mod tests {
     #[test]
     fn retargeting_keeps_the_owned_settings() {
         let mut stack = Stack {
+            settings_factory: crate::shell::settings::Settings::testing,
+            metadata: crate::shell::metadata::ApplicationMetadata::testing(),
             views: vec![View::SettingsOverlay(Box::new(SettingsOverlay::testing(
                 Tab::Settings,
             )))],
@@ -259,8 +279,8 @@ mod tests {
             .settings_mut()
             .audio_passthrough = "draft".to_owned();
 
-        stack.advance(Transition::OpenAbout);
-        stack.advance(Transition::OpenClientSettings);
+        stack.transition(Transition::OpenAbout);
+        stack.transition(Transition::OpenClientSettings);
 
         let overlay = stack.settings_overlay_mut().expect("same overlay");
         assert_eq!(overlay.active(), Tab::Settings);
@@ -270,11 +290,13 @@ mod tests {
     #[test]
     fn escape_closes_the_single_overlay() {
         let mut stack = Stack {
+            settings_factory: crate::shell::settings::Settings::testing,
+            metadata: crate::shell::metadata::ApplicationMetadata::testing(),
             views: vec![View::SettingsOverlay(Box::new(SettingsOverlay::testing(
                 Tab::About,
             )))],
         };
-        stack.advance(Transition::Escape);
+        stack.transition(Transition::Escape);
         assert!(!stack.occupied());
     }
 
@@ -282,11 +304,13 @@ mod tests {
     fn backdrop_and_x_dismiss_messages_close_the_single_overlay() {
         for tab in [Tab::Settings, Tab::About] {
             let mut stack = Stack {
+                settings_factory: crate::shell::settings::Settings::testing,
+                metadata: crate::shell::metadata::ApplicationMetadata::testing(),
                 views: vec![View::SettingsOverlay(Box::new(SettingsOverlay::testing(
                     tab,
                 )))],
             };
-            stack.advance(Transition::Message(Message::SettingsOverlay(
+            stack.transition(Transition::Message(Message::SettingsOverlay(
                 OverlayMessage::Dismiss,
             )));
             assert!(!stack.occupied());

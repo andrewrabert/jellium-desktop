@@ -199,18 +199,31 @@ pub fn shell_state() -> Option<crate::route::ShellState> {
     *STATE.lock()
 }
 
-/// Runs `f` with the published state at registration and on every later
-/// publication.
-pub fn on_shell_state(f: StateListener) {
+/// Subscription ownership. A copied notification can race cancellation;
+/// recipients must gate their own native work before dropping this handle.
+pub struct ShellStateSubscription(Arc<StateListener>);
+impl Drop for ShellStateSubscription {
+    fn drop(&mut self) {
+        STATE_LISTENERS.lock().retain(|f| !Arc::ptr_eq(f, &self.0));
+    }
+}
+pub fn on_shell_state_scoped(f: StateListener) -> ShellStateSubscription {
+    register_shell_state(f)
+}
+fn register_shell_state(f: StateListener) -> ShellStateSubscription {
     let f = Arc::new(f);
     let seed = {
         let mut listeners = STATE_LISTENERS.lock();
         listeners.push(Arc::clone(&f));
         *STATE.lock()
     };
+    // Own registration before delivering the seed: a recipient may panic,
+    // and unwinding must remove the listener and release its captures.
+    let subscription = ShellStateSubscription(f);
     if let Some(state) = seed {
-        f(state);
+        (subscription.0)(state);
     }
+    subscription
 }
 
 /// The installed web sink while the browser behind it is live; `None` before
@@ -237,6 +250,38 @@ mod tests {
     use super::*;
     use crate::route::ShellState;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn dropping_subscription_releases_its_capture() {
+        let _serial = OWNED.lock();
+        let capture = Arc::new(());
+        let observer = Arc::downgrade(&capture);
+        let subscription = on_shell_state_scoped(Box::new(move |_| {
+            let _ = &capture;
+        }));
+        assert!(observer.upgrade().is_some());
+        drop(subscription);
+        assert!(observer.upgrade().is_none());
+    }
+
+    #[test]
+    fn a_panicking_seed_unregisters_and_releases_its_capture() {
+        let _serial = OWNED.lock();
+        let previous = STATE.lock().replace(ShellState::default());
+        let capture = Arc::new(());
+        let observer = Arc::downgrade(&capture);
+        let before = STATE_LISTENERS.lock().len();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _subscription = on_shell_state_scoped(Box::new(move |_| {
+                let _ = &capture;
+                panic!("injected seed failure");
+            }));
+        }));
+        *STATE.lock() = previous;
+        assert!(result.is_err());
+        assert_eq!(STATE_LISTENERS.lock().len(), before);
+        assert!(observer.upgrade().is_none());
+    }
 
     /// Whether the double's browser is live; the test owns it.
     static ALIVE: AtomicBool = AtomicBool::new(false);

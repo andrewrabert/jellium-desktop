@@ -6,7 +6,7 @@ use std::time::Instant;
 use iced_core::{Color, Element, Length, Point, Rectangle, Size, mouse};
 use iced_widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 
-use crate::theme::Theme;
+use crate::shell::theme::Theme;
 
 const DIAMETER: f32 = 80.0;
 const THICKNESS: f32 = 6.0;

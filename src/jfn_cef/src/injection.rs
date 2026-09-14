@@ -392,7 +392,7 @@ pub(crate) fn build_web(shared_textures_enabled: bool) -> ExtraInfo {
     {
         extra_info.device_profile_json = Some(json.clone());
     }
-    if let Some(p) = jfn_platform_abi::try_get()
+    if let Some(p) = jfn_platform_abi::try_lease()
         && p.window_decorations_supported()
     {
         extra_info.window_decoration_options = p.window_decoration_options().iter().collect();

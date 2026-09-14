@@ -216,17 +216,21 @@ impl Platform for WindowsPlatform {
         win_early_init();
     }
 
-    fn init(&self, mpv: *mut c_void) -> bool {
+    fn init(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+        mpv: *mut c_void,
+    ) -> Result<(), jfn_platform_abi::PlatformInitError> {
         win_init(mpv)
     }
 
-    fn cleanup(&self) {
+    fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
         win_cleanup();
     }
 
     // mpv's window is gone by the time this runs and the compositor devices
     // are already released
-    fn post_window_cleanup(&self) {}
+    fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {}
 
     fn window_decoration_options(&self) -> jfn_platform_abi::DecorationOptions {
         jfn_platform_abi::DecorationOptions::all()
@@ -289,7 +293,7 @@ impl Platform for WindowsPlatform {
         crate::render::apply_stack(ordered);
     }
 
-    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery {
+    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery<'_> {
         match kind {
             MenuKind::ContextMenu => MenuDelivery::Host(&crate::menu::WinMenuHost),
             MenuKind::Dropdown => MenuDelivery::Composited,

@@ -345,24 +345,38 @@ pub fn macos_wake_main_loop() {
 /// Run `f` on a side thread while the main thread pumps CFRunLoop until
 /// it completes. Work that does `DispatchQueue.main.sync` (e.g. mpv's VO
 /// uninit during TerminateDestroy) finishes without deadlocking main.
-pub fn macos_run_blocking(f: Box<dyn FnOnce() + Send>) {
+pub fn macos_run_blocking(
+    f: Box<dyn FnOnce() + Send>,
+) -> Result<(), jfn_platform_abi::BlockingError> {
     extern "C" fn sigalrm_noop(_: std::ffi::c_int) {}
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let d2 = done.clone();
-    let t = std::thread::spawn(move || {
-        use nix::sys::signal::{SigHandler, Signal, signal};
-        let _ = unsafe { signal(Signal::SIGALRM, SigHandler::Handler(sigalrm_noop)) };
-        f();
-        d2.store(true, Ordering::Release);
-        if let Some(rl) = CFRunLoop::main() {
-            rl.wake_up();
+    struct Completion(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            // Queue a persistent main-queue item; unlike CFRunLoopWakeUp alone,
+            // this survives completion between the condition check and sleep.
+            wake_main_queue();
         }
-    });
+    }
+    let completion = Completion(done.clone());
+    let t = jfn_platform_abi::blocking::spawn_preserving(f, |work| {
+        std::thread::Builder::new()
+            .name("jfn-blocking".into())
+            .spawn(move || {
+                let _completion = completion;
+                use nix::sys::signal::{SigHandler, Signal, signal};
+                let _ = unsafe { signal(Signal::SIGALRM, SigHandler::Handler(sigalrm_noop)) };
+                work();
+            })
+    })?;
     while !done.load(Ordering::Acquire) {
-        // SAFETY: reading the framework's run-loop mode constant.
         let _ = CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, f64::MAX, true);
     }
-    let _ = t.join();
+    if let Err(panic) = t.join() {
+        std::panic::resume_unwind(panic);
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -457,17 +471,21 @@ impl Platform for MacosPlatform {
         macos_early_init();
     }
 
-    fn init(&self, mpv: *mut c_void) -> bool {
+    fn init(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+        mpv: *mut c_void,
+    ) -> Result<(), jfn_platform_abi::PlatformInitError> {
         macos_init(mpv)
     }
 
-    fn cleanup(&self) {
+    fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
         macos_cleanup();
     }
 
     // mpv's window is gone by the time this runs and AppKit owns nothing past
     // cleanup
-    fn post_window_cleanup(&self) {}
+    fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {}
 
     fn window_decoration_options(&self) -> jfn_platform_abi::DecorationOptions {
         jfn_platform_abi::DecorationOptions::all()
@@ -547,7 +565,7 @@ impl Platform for MacosPlatform {
         macos_apply_stack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
-    fn menu_delivery(&self, _kind: MenuKind) -> MenuDelivery {
+    fn menu_delivery(&self, _kind: MenuKind) -> MenuDelivery<'_> {
         MenuDelivery::Host(&crate::menu::NsMenuHost)
     }
 
@@ -664,8 +682,11 @@ impl Platform for MacosPlatform {
         let _ = std::process::Command::new("open").arg(path).spawn();
     }
 
-    fn run_blocking(&self, f: Box<dyn FnOnce() + Send>) {
-        macos_run_blocking(f);
+    fn run_blocking(
+        &self,
+        f: Box<dyn FnOnce() + Send>,
+    ) -> Result<(), jfn_platform_abi::BlockingError> {
+        macos_run_blocking(f)
     }
 }
 

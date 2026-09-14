@@ -85,21 +85,27 @@ pub enum MenuScript {
 }
 
 pub fn menu_scripts(kind: MenuKind) -> &'static [MenuScript] {
-    match (menu_delivery(kind), kind) {
+    let Some(lease) = crate::try_lease() else {
+        return &[];
+    };
+    match (lease.menu_delivery(kind), kind) {
         (MenuDelivery::Page, MenuKind::Dropdown) => &[MenuScript::SelectMenu],
         _ => &[],
     }
 }
 
+/// Native menu access is borrowed from the platform lease.
+///
+/// ```compile_fail
+/// fn escape(lease: &jfn_platform_abi::PlatformLease) -> jfn_platform_abi::MenuDelivery<'static> {
+///     lease.menu_delivery(jfn_platform_abi::MenuKind::ContextMenu)
+/// }
+/// ```
 #[derive(Copy, Clone)]
-pub enum MenuDelivery {
-    Host(&'static dyn MenuHost),
+pub enum MenuDelivery<'a> {
+    Host(&'a dyn MenuHost),
     Composited,
     Page,
-}
-
-pub fn menu_delivery(kind: MenuKind) -> MenuDelivery {
-    crate::get().menu_delivery(kind)
 }
 
 pub trait MenuHost: Send + Sync {

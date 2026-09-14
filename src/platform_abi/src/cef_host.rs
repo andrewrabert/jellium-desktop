@@ -2,15 +2,10 @@
 //!
 //! Present (`Platform::cef_host` returns `Some`) only on backends where
 //! the platform must pump CEF itself (macOS: external message pump on the
-//! main CFRunLoop, CADisplayLink-driven BeginFrame, framework loader).
+//! main CFRunLoop, CADisplayLink-driven BeginFrame).
 //! Backends returning `None` run CEF's own multi-threaded message loop.
 
 pub trait CefHost: Send + Sync {
-    /// Runs before the FIRST CEF API call in any process — including
-    /// `CefExecuteProcess` — e.g. to load the CEF framework so calls
-    /// don't dispatch through a NULL thunk table.
-    fn before_start(&self);
-
     /// Install the pump's run-loop hooks. Runs before `CefInitialize` so
     /// the first `OnScheduleMessagePumpWork` (fired synchronously during
     /// init) finds them ready.
@@ -29,5 +24,8 @@ pub trait CefHost: Send + Sync {
 
     /// Stores `driver` and starts the platform's frame source. A tick never
     /// runs before the driver is stored.
+    /// Stop frame callbacks and release the stored driver before native shutdown.
+    fn stop_frame_driver(&self);
+
     fn start_frame_driver(&self, driver: std::sync::Arc<dyn Fn() + Send + Sync>);
 }

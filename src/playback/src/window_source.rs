@@ -12,7 +12,8 @@ impl WindowSource for MpvWindowSource {
     fn snapshot(&self) -> WindowSnapshot {
         WindowSnapshot {
             extent: crate::ingest_driver::jfn_playback_window_extent(),
-            position: jfn_platform_abi::get().query_window_position(),
+            position: jfn_platform_abi::try_lease()
+                .and_then(|lease| lease.platform().query_window_position()),
             maximized: crate::ingest_driver::jfn_playback_window_maximized(),
             fullscreen: crate::ingest_driver::jfn_playback_fullscreen(),
         }

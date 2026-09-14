@@ -7,7 +7,7 @@ use crate::client_impl::os_ffi::OsKeyEvent;
 use jfn_platform_abi::event_flags::{EVENTFLAG_ALT_DOWN, EVENTFLAG_CONTROL_DOWN};
 
 fn action_modifier() -> u32 {
-    jfn_platform_abi::try_get()
+    jfn_platform_abi::try_lease()
         .map(|p| p.display().action_modifier_flag())
         .unwrap_or(EVENTFLAG_CONTROL_DOWN)
 }

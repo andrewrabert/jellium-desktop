@@ -4,7 +4,11 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
+mod subscribers;
 use parking_lot::Mutex;
+use std::sync::LazyLock;
+use subscribers::Subscribers;
+pub use subscribers::Subscription;
 
 /// Nanoseconds per second, times millihertz per hertz: the numerator
 /// `period` divides by a rate in millihertz.
@@ -92,13 +96,13 @@ static SOURCE_RANK: AtomicU8 = AtomicU8::new(0);
 static PUBLISH: Mutex<()> = Mutex::new(());
 
 /// Subscribers woken after every report that changed the published interval.
-static SUBSCRIBERS: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
+static SUBSCRIBERS: LazyLock<Subscribers> = LazyLock::new(Subscribers::new);
 
 /// Registers `on_change`, called after every report that changed the published
 /// interval, so work that has no cadence until a refresh is known is woken when
 /// one arrives.
-pub fn subscribe(on_change: fn()) {
-    SUBSCRIBERS.lock().push(on_change);
+pub fn subscribe(on_change: fn()) -> Subscription {
+    SUBSCRIBERS.subscribe(on_change)
 }
 
 /// Publishes the period `rate` names as the display's refresh, keeping the
@@ -127,10 +131,7 @@ pub fn report_refresh(source: RefreshSource, rate: RefreshRate) {
 /// Runs every subscriber with the publish lock released: each one reads the
 /// interval back.
 fn notify() {
-    let subscribers: Vec<fn()> = SUBSCRIBERS.lock().clone();
-    for on_change in subscribers {
-        on_change();
-    }
+    SUBSCRIBERS.notify();
 }
 
 /// The highest-ranked refresh rate published so far, or `None` while no

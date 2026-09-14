@@ -80,7 +80,7 @@ wrap_context_menu_handler! {
                 return 1;
             }
             let MenuDelivery::Host(host) =
-                jfn_platform_abi::menu_delivery(MenuKind::ContextMenu)
+                self.inner.surface().platform().menu_delivery(MenuKind::ContextMenu)
             else {
                 callback.cancel();
                 return 1;

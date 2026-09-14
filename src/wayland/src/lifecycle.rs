@@ -63,10 +63,15 @@ fn dmabuf_available(native_display: *mut c_void) -> bool {
 // init / cleanup
 // =====================================================================
 
-pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
+pub(crate) fn init(
+    rt: &'static crate::runtime::WlRuntime,
+) -> Result<(), jfn_platform_abi::PlatformInitError> {
+    use jfn_platform_abi::PlatformInitError as Error;
     let Some(display) = crate::app_conn::app_display(rt) else {
-        tracing::error!("Failed to get app Wayland display");
-        return false;
+        return Err(Error::backend(
+            "Wayland display acquisition",
+            "app display unavailable",
+        ));
     };
     let display = display.as_ptr();
 
@@ -77,8 +82,7 @@ pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
     let mut core = match unsafe { crate::wl_state::init(rt, display) } {
         Ok(state) => state,
         Err(e) => {
-            tracing::error!("wayland core init failed: {e}");
-            return false;
+            return Err(Error::backend("Wayland core initialization", e));
         }
     };
 
@@ -96,11 +100,13 @@ pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
     match entry {
         Req::Shm => {
             tracing::info!("paint: using wl_shm");
-            jfn_platform_abi::get().set_shared_texture_unsupported();
+            // SAFETY: backend initialization owns native lifecycle authority.
+            unsafe { jfn_platform_abi::get() }.set_shared_texture_unsupported();
         }
         Req::Gpu => {
             tracing::info!("paint: Vulkan WSI pixel-upload");
-            jfn_platform_abi::get().set_shared_texture_unsupported();
+            // SAFETY: backend initialization owns native lifecycle authority.
+            unsafe { jfn_platform_abi::get() }.set_shared_texture_unsupported();
             want_gpu_paint = true;
             resolved = Req::Gpu;
         }
@@ -110,7 +116,8 @@ pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
                 resolved = Req::Dmabuf;
             } else {
                 tracing::info!("paint: EGL dmabuf unavailable; trying gpu");
-                jfn_platform_abi::get().set_shared_texture_unsupported();
+                // SAFETY: backend initialization owns native lifecycle authority.
+                unsafe { jfn_platform_abi::get() }.set_shared_texture_unsupported();
                 want_gpu_paint = true;
                 resolved = Req::Gpu;
             }
@@ -128,8 +135,10 @@ pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
     }
 
     if rt.set_core(core).is_err() {
-        tracing::error!("wayland core already initialised");
-        return false;
+        return Err(Error::backend(
+            "Wayland core installation",
+            "already initialized",
+        ));
     }
 
     if explicit
@@ -148,7 +157,7 @@ pub(crate) fn init(rt: &'static crate::runtime::WlRuntime) -> bool {
 
     jfn_platform_abi::MenuHost::warm(rt.menu());
 
-    true
+    Ok(())
 }
 
 pub(crate) fn cleanup(rt: &'static crate::runtime::WlRuntime) {

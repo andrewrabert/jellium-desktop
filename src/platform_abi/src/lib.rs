@@ -16,6 +16,8 @@ use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+pub mod blocking;
+pub use blocking::BlockingError;
 pub mod cef_host;
 pub mod geometry;
 pub mod instance;
@@ -32,6 +34,7 @@ pub mod selection;
 #[cfg_attr(not(unix), path = "signal_other.rs")]
 mod signal;
 pub mod stack;
+mod subscriptions;
 pub mod visibility;
 pub mod window_owner;
 pub mod window_source;
@@ -47,7 +50,7 @@ pub use jfn_gpu_paint::WindowTarget;
 pub use media_sink::MediaSink;
 pub use menu::{
     Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem, MenuKind, MenuMetrics,
-    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface, menu_delivery,
+    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface,
     menu_has_selectable, menu_initial_row, menu_scripts,
 };
 pub use mpv_host::{DefaultMpvHost, MpvHost, VoWait};
@@ -58,7 +61,8 @@ pub use stack::Plane;
 pub use visibility::{Ack, Visibility, VisibilityCommit};
 pub use window_owner::{AppCreatedWindow, MpvBootWindow, MpvCreatedWindow, WindowOwner};
 pub use window_source::{
-    WindowSnapshot, WindowSource, notify_window_changed, subscribe_window_changed,
+    WindowSnapshot, WindowSource, WindowSubscription, notify_window_changed,
+    subscribe_window_changed,
 };
 
 /// Preserves the process's SIGINT/SIGTERM dispositions across a scope.
@@ -445,6 +449,9 @@ pub trait Platform: Send + Sync {
     /// Decoration modes this backend can honor.
     fn window_decoration_options(&self) -> DecorationOptions;
 
+    /// Data-only policy, valid before native initialization and after cleanup.
+    /// Implementations may inspect owned configuration/capability snapshots,
+    /// but must not access native resources.
     fn resolve_window_decorations(
         &self,
         configured: Option<WindowDecorations>,
@@ -459,9 +466,9 @@ pub trait Platform: Send + Sync {
 
     fn early_init(&self);
     /// `mpv` is the opaque libmpv `mpv_handle` — a raw C handle, stays raw.
-    fn init(&self, mpv: *mut c_void) -> bool;
-    fn cleanup(&self);
-    fn post_window_cleanup(&self);
+    fn init(&self, access: &LifecycleAccess, mpv: *mut c_void) -> Result<(), PlatformInitError>;
+    fn cleanup(&self, access: &LifecycleAccess);
+    fn post_window_cleanup(&self, access: &LifecycleAccess);
 
     // Per-surface
     /// The surface starts in `initial`; no surface is born at a default.
@@ -501,7 +508,7 @@ pub trait Platform: Send + Sync {
 
     /// How this backend delivers `kind`; `Host` names the backend's own menu
     /// host.
-    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery;
+    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery<'_>;
 
     fn osr_popup_surface(&self) -> &dyn OsrPopupSurface {
         &NoOsrPopup
@@ -614,8 +621,9 @@ pub trait Platform: Send + Sync {
     /// main thread (e.g. mpv's VO uninit doing `DispatchQueue.main.sync`).
     /// Default runs `f` inline; macOS runs it on a side thread while main
     /// pumps its run loop.
-    fn run_blocking(&self, f: Box<dyn FnOnce() + Send>) {
+    fn run_blocking(&self, f: Box<dyn FnOnce() + Send>) -> Result<(), BlockingError> {
         f();
+        Ok(())
     }
 
     /// `on_shutdown` must be async-signal-safe.
@@ -646,9 +654,15 @@ pub fn install(p: Box<dyn Platform>) {
 }
 
 /// Returns the installed platform backend. Panics if [`install`] hasn't
-/// been called yet — every call site is post-boot.
+/// been called yet.
+///
+/// # Safety
+/// The caller must own the platform lifecycle phase or a live dependent lease
+/// for every native operation through this reference. It must not let the
+/// reference escape that authority. Native backends and boot wiring only;
+/// ordinary consumers acquire [`try_lease`] or use an injected lease.
 #[allow(clippy::expect_used)] // every call site is post-boot
-pub fn get() -> &'static dyn Platform {
+pub unsafe fn get() -> &'static dyn Platform {
     *PLATFORM
         .get()
         .expect("jfn_platform_abi::get() called before install()")
@@ -657,8 +671,42 @@ pub fn get() -> &'static dyn Platform {
 /// Like [`get`] but returns `None` before install. Used by jfn_cef's
 /// `OnConsoleMessage` and similar paths that may fire during early CEF
 /// helper-process boot when no platform is installed.
-pub fn try_get() -> Option<&'static dyn Platform> {
+///
+/// # Safety
+/// The caller must uphold the same phase/lease lifetime contract as [`get`].
+pub unsafe fn try_get() -> Option<&'static dyn Platform> {
     PLATFORM.get().copied()
+}
+
+// Publication and revocation share a lock: a callback cannot acquire a new
+// dependent after cleanup has checked that the runtime is the sole owner.
+static LIVE_PLATFORM: Mutex<Option<PlatformLeaseWeak>> = Mutex::new(None);
+struct PlatformLeaseWeak {
+    platform: &'static dyn Platform,
+    live: std::sync::Weak<LeaseState>,
+}
+
+/// Acquire native authority only while the initialized runtime remains live.
+/// A successful lease delays cleanup until its work finishes.
+pub fn try_lease() -> Option<PlatformLease> {
+    let published = LIVE_PLATFORM.lock();
+    let published = published.as_ref()?;
+    let live = published.live.upgrade()?;
+    *live.count.lock() += 1;
+    Some(PlatformLease {
+        platform: published.platform,
+        live,
+    })
+}
+
+/// Resolve configuration through the backend's data-only policy. This exposes
+/// no native handle and is valid during preparation, before runtime publication.
+#[allow(clippy::expect_used)]
+pub fn resolve_window_decorations(configured: Option<WindowDecorations>) -> WindowDecorations {
+    PLATFORM
+        .get()
+        .expect("platform policy requested before install")
+        .resolve_window_decorations(configured)
 }
 
 /// Titlebar height, logical pixels.
@@ -692,16 +740,348 @@ pub fn request_client_settings() {
     }
 }
 
-static DECORATIONS_LISTENER: OnceLock<fn()> = OnceLock::new();
+static DECORATIONS_LISTENERS: std::sync::LazyLock<subscriptions::Subscribers> =
+    std::sync::LazyLock::new(subscriptions::Subscribers::new);
+pub use subscriptions::Subscription as DecorationsSubscription;
 
-/// Register the callback fired when [`Platform::effective_decorations`]
-/// changes. Single listener, installed once alongside the browser bridge.
-pub fn set_decorations_listener(f: fn()) {
-    let _ = DECORATIONS_LISTENER.set(f);
+/// Listen while the returned subscription is alive.
+pub fn set_decorations_listener(f: fn()) -> DecorationsSubscription {
+    DECORATIONS_LISTENERS.subscribe(f)
 }
 
 pub fn notify_decorations_changed() {
-    if let Some(f) = DECORATIONS_LISTENER.get() {
-        f();
+    DECORATIONS_LISTENERS.notify();
+}
+
+/// Backend lifecycle authority. Only PlatformRuntime can construct this token.
+/// Ordinary platform references cannot initialize or destroy the backend.
+///
+/// ```compile_fail
+/// let access = jfn_platform_abi::LifecycleAccess { _private: () };
+/// ```
+pub struct LifecycleAccess {
+    _private: (),
+}
+
+#[derive(Debug)]
+pub enum PlatformInitError {
+    AlreadyClaimed,
+    WrongThread,
+    Panicked,
+    Backend {
+        operation: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl PlatformInitError {
+    pub fn backend(
+        operation: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self::Backend {
+            operation,
+            source: source.into(),
+        }
     }
 }
+
+impl std::fmt::Display for PlatformInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Panicked => f.write_str("platform initialization panicked; rollback required"),
+            Self::AlreadyClaimed => f.write_str("platform startup has already been claimed"),
+            Self::WrongThread => {
+                f.write_str("platform initialization requires the macOS main thread")
+            }
+            Self::Backend { operation, source } => write!(f, "{operation}: {source}"),
+        }
+    }
+}
+impl std::error::Error for PlatformInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend { source, .. } => Some(&**source),
+            _ => None,
+        }
+    }
+}
+
+struct LeaseState {
+    // Includes the runtime's own lease. Unlike Arc::strong_count, this count
+    // can be decremented before notifying waiters in PlatformLease::drop.
+    count: Mutex<usize>,
+    changed: Condvar,
+}
+impl LeaseState {
+    fn wait_for_dependents(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut count = self.count.lock();
+        while *count != 1 {
+            if self.changed.wait_until(&mut count, deadline).timed_out() {
+                return *count == 1;
+            }
+        }
+        true
+    }
+}
+
+/// A dependent keeps the backend alive until its native resources are released.
+pub struct PlatformLease {
+    platform: &'static dyn Platform,
+    live: std::sync::Arc<LeaseState>,
+}
+impl Clone for PlatformLease {
+    fn clone(&self) -> Self {
+        *self.live.count.lock() += 1;
+        Self {
+            platform: self.platform,
+            live: std::sync::Arc::clone(&self.live),
+        }
+    }
+}
+impl Drop for PlatformLease {
+    fn drop(&mut self) {
+        *self.live.count.lock() -= 1;
+        self.live.changed.notify_all();
+    }
+}
+impl PlatformLease {
+    /// Native access cannot outlive the lease that keeps its backend alive.
+    ///
+    /// ```compile_fail
+    /// fn escape(lease: &jfn_platform_abi::PlatformLease) -> &'static dyn jfn_platform_abi::Platform {
+    ///     lease.platform()
+    /// }
+    /// ```
+    pub fn platform(&self) -> &dyn Platform {
+        self.platform
+    }
+}
+
+impl std::ops::Deref for PlatformLease {
+    type Target = dyn Platform;
+    fn deref(&self) -> &Self::Target {
+        self.platform
+    }
+}
+
+#[derive(Debug)]
+pub struct PlatformBusy;
+impl std::fmt::Display for PlatformBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("platform dependents remain alive; cleanup deferred")
+    }
+}
+impl std::error::Error for PlatformBusy {}
+
+/// Thread-confined process owner. Call cleanup after releasing dependent leases.
+/// macOS construction checks the main thread; elsewhere the application chooses
+/// its initialization thread and the non-Send owner keeps teardown on that thread.
+/// Dropping without cleanup deliberately retains native state; the application
+/// startup owner is responsible for ordered rollback, including during unwinding.
+#[must_use = "the initialized platform requires ordered cleanup"]
+pub struct PlatformRuntime {
+    lease: PlatformLease,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+/// Owns early backend setup, including a host window created before mpv.
+/// Initialization failure returns this owner so the caller can terminate mpv
+/// between backend cleanup and post-window cleanup. No dependency lease exists
+/// until initialization succeeds.
+#[must_use = "early platform resources require ordered cleanup"]
+pub struct PreparedPlatform {
+    platform: &'static dyn Platform,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl PreparedPlatform {
+    pub fn claim(platform: &'static dyn Platform) -> Result<Self, PlatformInitError> {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn pthread_main_np() -> std::ffi::c_int;
+            }
+            // SAFETY: this query has no initialization requirements.
+            if unsafe { pthread_main_np() } == 0 {
+                return Err(PlatformInitError::WrongThread);
+            }
+        }
+        static CLAIMED: OnceLock<()> = OnceLock::new();
+        CLAIMED
+            .set(())
+            .map_err(|()| PlatformInitError::AlreadyClaimed)?;
+        Ok(Self {
+            platform,
+            _thread: std::marker::PhantomData,
+        })
+    }
+    pub fn initialize(
+        self,
+        mpv: *mut c_void,
+    ) -> Result<PlatformRuntime, (PlatformInitError, Self)> {
+        let access = LifecycleAccess { _private: () };
+        // Keep rollback authority even when a backend unwinds after acquiring
+        // resources. The application still owns mpv and must terminate it
+        // between backend detachment and post-window cleanup.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.platform.init(&access, mpv)
+        }));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err((error, self)),
+            Err(_) => return Err((PlatformInitError::Panicked, self)),
+        }
+        let lease = PlatformLease {
+            platform: self.platform,
+            live: std::sync::Arc::new(LeaseState {
+                count: Mutex::new(1),
+                changed: Condvar::new(),
+            }),
+        };
+        *LIVE_PLATFORM.lock() = Some(PlatformLeaseWeak {
+            platform: self.platform,
+            live: std::sync::Arc::downgrade(&lease.live),
+        });
+        Ok(PlatformRuntime {
+            lease,
+            _thread: std::marker::PhantomData,
+        })
+    }
+    pub fn cleanup<F, E>(self, terminate_window: F) -> Result<(), (E, PostWindowCleanup)>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let access = LifecycleAccess { _private: () };
+        self.platform.cleanup(&access);
+        PostWindowCleanup {
+            platform: self.platform,
+            _thread: std::marker::PhantomData,
+        }
+        .retry(terminate_window)
+    }
+}
+impl PlatformRuntime {
+    pub fn platform(&self) -> &dyn Platform {
+        self.lease.platform
+    }
+    pub fn lease(&self) -> PlatformLease {
+        self.lease.clone()
+    }
+    /// ```compile_fail
+    /// fn twice(runtime: jfn_platform_abi::PlatformRuntime) {
+    ///     let _ = runtime.cleanup(|| Ok::<(), std::convert::Infallible>(()));
+    ///     let _ = runtime.cleanup(|| Ok::<(), std::convert::Infallible>(()));
+    /// }
+    /// ```
+    ///
+    /// The callback terminates mpv after backend detachment/cleanup and before
+    /// post-window cleanup. It is never called while dependents remain alive.
+    /// A busy result returns both owners, including captures of the termination
+    /// callback, so callers can release dependencies and retry without destroying
+    /// the window prematurely. New global lease admission stops before a bounded
+    /// wait for existing callbacks; a busy result keeps admission retired.
+    pub fn cleanup<F, E>(self, terminate_window: F) -> Result<(), PlatformCleanupError<F, E>>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        self.cleanup_with_timeout(terminate_window, std::time::Duration::from_secs(2))
+    }
+
+    fn cleanup_with_timeout<F, E>(
+        self,
+        terminate_window: F,
+        timeout: std::time::Duration,
+    ) -> Result<(), PlatformCleanupError<F, E>>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        // Retire admission before waiting: native input threads may still be
+        // running until backend cleanup, but may no longer start new work.
+        *LIVE_PLATFORM.lock() = None;
+        if *self.lease.live.count.lock() != 1 {
+            let live = std::sync::Arc::clone(&self.lease.live);
+            let (done, result) = std::sync::mpsc::sync_channel(1);
+            if let Err(error) = self.platform().run_blocking(Box::new(move || {
+                let _ = done.send(live.wait_for_dependents(timeout));
+            })) {
+                tracing::error!("platform quiescence: {error}");
+                // This pending job owns only the wait state/channel, never a
+                // native resource. Dropping it leaves both native owners here.
+                drop(error);
+                return Err(PlatformCleanupError::Busy {
+                    runtime: self,
+                    terminate: terminate_window,
+                });
+            }
+            if !matches!(result.try_recv(), Ok(true)) {
+                return Err(PlatformCleanupError::Busy {
+                    runtime: self,
+                    terminate: terminate_window,
+                });
+            }
+        }
+        let access = LifecycleAccess { _private: () };
+        self.platform().cleanup(&access);
+        let remaining = PostWindowCleanup {
+            platform: self.lease.platform,
+            _thread: std::marker::PhantomData,
+        };
+        remaining
+            .retry(terminate_window)
+            .map_err(|(error, post_window)| PlatformCleanupError::Termination {
+                error,
+                post_window,
+            })
+    }
+}
+
+/// Failure retains exactly the phase that can still be retried. A termination
+/// failure must never repeat backend detachment or release the host window.
+pub enum PlatformCleanupError<F, E> {
+    Busy {
+        runtime: PlatformRuntime,
+        terminate: F,
+    },
+    Termination {
+        error: E,
+        post_window: PostWindowCleanup,
+    },
+}
+
+/// Backend detachment completed; the host must remain until window termination
+/// is confirmed. Dropping this token deliberately retains native host state.
+#[must_use = "post-window resources require confirmed window termination"]
+pub struct PostWindowCleanup {
+    platform: &'static dyn Platform,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl PostWindowCleanup {
+    /// Retry only the remaining termination, without detaching the backend a
+    /// second time. Host cleanup runs only on successful termination.
+    pub fn retry<E>(
+        self,
+        terminate_window: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), (E, Self)> {
+        match terminate_window() {
+            Ok(()) => {
+                self.finish();
+                Ok(())
+            }
+            Err(error) => Err((error, self)),
+        }
+    }
+    /// The owner calls this only after successfully running retained window
+    /// termination work. No other backend cleanup operation is repeated.
+    pub fn finish(self) {
+        self.platform
+            .post_window_cleanup(&LifecycleAccess { _private: () });
+    }
+    /// Retain the native host until process exit when termination is uncertain.
+    pub fn abandon(self) {}
+}
+
+#[cfg(test)]
+static TEST_PLATFORM: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod lifecycle_tests;

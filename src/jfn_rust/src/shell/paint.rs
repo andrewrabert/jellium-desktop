@@ -53,7 +53,7 @@ impl Painter {
         let mut renderer = Renderer::new(
             engine,
             iced_core::renderer::Settings {
-                default_font: crate::theme::FONT,
+                default_font: crate::shell::theme::FONT,
                 ..iced_core::renderer::Settings::default()
             },
         );

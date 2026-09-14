@@ -2,7 +2,7 @@
 
 use parking_lot::Mutex;
 
-use crate::state::ChromeInputs;
+use crate::shell::state::ChromeInputs;
 
 static INPUTS: Mutex<ChromeInputs> = Mutex::new(ChromeInputs {
     client_side_decorations: false,
@@ -60,7 +60,7 @@ use iced_core::{Alignment, Element, Length, Point, Rectangle, Size, mouse};
 use iced_widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced_widget::{button, container, row, space};
 
-use crate::theme::{self, Theme};
+use crate::shell::theme::{self, Theme};
 
 /// `csd.js`'s `button { width: 46px }`.
 const CONTROL_WIDTH: f32 = 46.0;
@@ -132,7 +132,10 @@ impl Titlebar {
             jfn_playback::shutdown::jfn_shutdown_initiate();
             return;
         }
-        let Some(controls) = jfn_platform_abi::get().titlebar_controls() else {
+        let Some(lease) = jfn_platform_abi::try_lease() else {
+            return;
+        };
+        let Some(controls) = lease.platform().titlebar_controls() else {
             return;
         };
         match message {

@@ -1,6 +1,6 @@
 //! The connect screen's view.
 //!
-//! It renders [`jfn_bringup::Screen`] and holds nothing else: no URL, no probe,
+//! It renders [`crate::connection::Screen`] and holds nothing else: no URL, no probe,
 //! no navigation, and no clock that retires it.
 //!
 //! Ported from the former `web/overlay.html`, `web/overlay.js` and
@@ -12,11 +12,11 @@ use iced_core::widget::Id;
 use iced_core::{Alignment, Color, Element, Length, Padding};
 use iced_widget::{button, column, container, image, text};
 
-use jfn_bringup::{FADE, Screen};
+use crate::connection::{FADE, Screen};
 
-use crate::actor::Deadline;
-use crate::lang::strings;
-use crate::theme::{self, Theme};
+use crate::shell::actor::Deadline;
+use crate::shell::lang::strings;
+use crate::shell::theme::{self, Theme};
 
 pub const URL_FIELD: Id = Id::new("shell-connect-url");
 
@@ -68,9 +68,10 @@ impl Connect {
     fn form_view<'a>(&'a self, url: &'a str) -> Element<'a, Message, Theme, iced_wgpu::Renderer> {
         let submit = (!url.trim().is_empty()).then_some(Message::Submit);
         column![
-            image(crate::logo::handle()).width(Length::Fixed(crate::logo::CONNECT_WIDTH)),
+            image(crate::shell::logo::handle())
+                .width(Length::Fixed(crate::shell::logo::CONNECT_WIDTH)),
             text(strings().server_host).size(24),
-            crate::field::field(URL_FIELD, strings().server_host_help, url)
+            crate::shell::field::field(URL_FIELD, strings().server_host_help, url)
                 .on_input(Message::UrlEdited)
                 .on_submit(Message::Submit)
                 .padding(Padding::from([10, 13]))
@@ -89,10 +90,10 @@ impl Connect {
     fn spinner_view(&self, screen: &Screen) -> Element<'_, Message, Theme, iced_wgpu::Renderer> {
         let o = opacity(screen);
         column![
-            image(crate::logo::handle())
-                .width(Length::Fixed(crate::logo::CONNECT_WIDTH))
+            image(crate::shell::logo::handle())
+                .width(Length::Fixed(crate::shell::logo::CONNECT_WIDTH))
                 .opacity(o),
-            crate::spinner::Spinner::new(
+            crate::shell::spinner::Spinner::new(
                 fade(theme::ACCENT, o),
                 fade(theme::FIELD, o),
                 self.spinner_started,
@@ -126,15 +127,13 @@ impl Connect {
         }
     }
 
-    /// The spinner's next frame one refresh interval away, merged with the
-    /// deadline bring-up named. No refresh reported yields neither.
+    /// The spinner's next frame, when a refresh interval is available.
     pub fn deadline(&self, screen: &Screen) -> Deadline {
         let spinning = matches!(screen, Screen::Working { .. } | Screen::Retiring { .. });
-        let spin = match (spinning, jfn_gpu_paint::refresh_interval()) {
+        match (spinning, jfn_gpu_paint::refresh_interval()) {
             (true, Some(interval)) => Deadline::at(Instant::now() + interval),
             _ => Deadline::none(),
-        };
-        spin.merge(jfn_bringup::deadline().map_or_else(Deadline::none, Deadline::at))
+        }
     }
 
     /// The URL field, for the caller to focus after every widget-tree rebuild.

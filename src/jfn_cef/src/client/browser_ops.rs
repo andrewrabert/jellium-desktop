@@ -93,9 +93,8 @@ impl Inner {
         let parent: sys::cef_window_handle_t = unsafe { std::mem::zeroed() };
         let mut wi = WindowInfo::default().set_as_windowless(parent);
         wi.shared_texture_enabled = if shared { 1 } else { 0 };
-        let external_bf = jfn_platform_abi::try_get()
-            .and_then(|p| p.cef_host())
-            .is_some_and(|h| h.external_begin_frame());
+        let external_bf = jfn_platform_abi::try_lease()
+            .is_some_and(|p| p.cef_host().is_some_and(|h| h.external_begin_frame()));
         wi.external_begin_frame_enabled = if external_bf { 1 } else { 0 };
 
         // Zero is CEF's own default.

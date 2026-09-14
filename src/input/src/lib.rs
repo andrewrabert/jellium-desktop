@@ -18,8 +18,9 @@ pub mod text;
 
 pub use route::{ShellHit, ShellState, Target};
 pub use sink::{
-    EditCommand, FieldEdit, ShellInput, WebInput, field_edit, install_shell, install_web,
-    on_shell_state, publish_field_edit, publish_shell_state, shell_state, web_became_live,
+    EditCommand, FieldEdit, ShellInput, ShellStateSubscription, WebInput, field_edit,
+    install_shell, install_web, on_shell_state_scoped, publish_field_edit, publish_shell_state,
+    shell_state, web_became_live,
 };
 
 use route::{is_text, route_key, route_pointer, to_web_point};
@@ -266,8 +267,8 @@ pub fn jfn_input_dispatch_key(report: key::KeyReport) {
                 return;
             }
             2 => {
-                if let Some(p) = jfn_platform_abi::try_get() {
-                    p.toggle_fullscreen();
+                if let Some(p) = jfn_platform_abi::try_lease() {
+                    p.platform().toggle_fullscreen();
                 }
                 return;
             }

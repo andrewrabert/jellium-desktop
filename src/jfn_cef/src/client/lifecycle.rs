@@ -1,14 +1,14 @@
 use cef::{Browser, CefString, ImplBrowser, ImplBrowserHost, ImplFrame};
 use std::sync::Arc;
 
-use jfn_playback::shutdown::jfn_shutting_down;
-
 use super::{BLANK, Inner, Painting, PendingNavigation};
 use crate::platform_ops;
 
 impl Inner {
     pub(crate) fn create(self: &Arc<Self>, url: &str) -> bool {
-        self.cef_create_browser(url)
+        self.session
+            .dispatch(|| self.cef_create_browser(url))
+            .unwrap_or(false)
     }
 
     /// Leaves the deferred load untouched without a browser or main frame,
@@ -51,7 +51,7 @@ impl Inner {
             &formatted,
         );
         self.browser.lock().browser = Some(browser.clone());
-        if jfn_shutting_down() {
+        if !self.session.is_active() {
             if let Some(host) = browser.host() {
                 host.close_browser(1);
             }
@@ -93,7 +93,7 @@ impl Inner {
         // The callback itself owns this Arc. A successful request transfers a
         // new client containing that same Arc back to CEF before the old
         // browser-to-client relationship is released.
-        if !jfn_shutting_down() {
+        if self.session.is_active() {
             let _ = self.create("");
         }
     }
@@ -147,10 +147,13 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_on_after_created_requests_close_without_recreation() {
-        let close_requests = 1;
-        let recreations = 0;
-        assert_eq!((close_requests, recreations), (1, 0));
+    fn session_rollback_revokes_browser_creation_without_global_shutdown() {
+        let session = crate::runtime::Session::new();
+        assert!(session.register_overlay());
+        assert_eq!(session.dispatch(|| "create"), Some("create"));
+        session.revoke();
+        assert!(!session.is_active());
+        assert_eq!(session.dispatch(|| "recreate"), None);
     }
 
     #[test]
@@ -189,7 +192,7 @@ mod tests {
     #[derive(Debug, Eq, PartialEq)]
     enum DeferredValue {
         Absent,
-        Page(jfn_bringup::Navigation, String),
+        Page(crate::Navigation, String),
         Blank,
     }
 
@@ -224,33 +227,33 @@ mod tests {
     fn absence_is_distinct_from_empty_and_about_blank_page_urls() {
         let deferred = crate::client::DeferredNavigation::new();
         assert_eq!(deferred_value(&deferred), DeferredValue::Absent);
-        deferred.navigate(jfn_bringup::Navigation::for_test(1), "");
+        deferred.navigate(crate::Navigation::new(1), "");
         assert_eq!(
             deferred_value(&deferred),
-            DeferredValue::Page(jfn_bringup::Navigation::for_test(1), String::new())
+            DeferredValue::Page(crate::Navigation::new(1), String::new())
         );
-        deferred.navigate(jfn_bringup::Navigation::for_test(2), BLANK);
+        deferred.navigate(crate::Navigation::new(2), BLANK);
         assert_eq!(
             deferred_value(&deferred),
-            DeferredValue::Page(jfn_bringup::Navigation::for_test(2), BLANK.to_owned())
+            DeferredValue::Page(crate::Navigation::new(2), BLANK.to_owned())
         );
     }
 
     #[test]
     fn newest_deferred_page_replaces_the_older_page() {
         let deferred = crate::client::DeferredNavigation::new();
-        deferred.navigate(jfn_bringup::Navigation::for_test(1), "old");
-        deferred.navigate(jfn_bringup::Navigation::for_test(2), "new");
+        deferred.navigate(crate::Navigation::new(1), "old");
+        deferred.navigate(crate::Navigation::new(2), "new");
         assert_eq!(
             deferred_value(&deferred),
-            DeferredValue::Page(jfn_bringup::Navigation::for_test(2), "new".to_owned())
+            DeferredValue::Page(crate::Navigation::new(2), "new".to_owned())
         );
     }
 
     #[test]
     fn matching_abandon_replaces_a_deferred_page_with_blank() {
         let deferred = crate::client::DeferredNavigation::new();
-        let navigation = jfn_bringup::Navigation::for_test(1);
+        let navigation = crate::Navigation::new(1);
         deferred.navigate(navigation, "page");
         deferred.abandon(navigation);
         assert_eq!(deferred_value(&deferred), DeferredValue::Blank);
@@ -259,18 +262,18 @@ mod tests {
     #[test]
     fn nonmatching_abandon_preserves_the_effective_deferred_page() {
         let deferred = crate::client::DeferredNavigation::new();
-        deferred.navigate(jfn_bringup::Navigation::for_test(1), "page");
-        deferred.abandon(jfn_bringup::Navigation::for_test(2));
+        deferred.navigate(crate::Navigation::new(1), "page");
+        deferred.abandon(crate::Navigation::new(2));
         assert_eq!(
             deferred_value(&deferred),
-            DeferredValue::Page(jfn_bringup::Navigation::for_test(1), "page".to_owned())
+            DeferredValue::Page(crate::Navigation::new(1), "page".to_owned())
         );
     }
 
     #[test]
     fn browser_without_a_main_frame_retains_the_deferred_load() {
         let deferred = crate::client::DeferredNavigation::new();
-        deferred.navigate(jfn_bringup::Navigation::for_test(1), "page");
+        deferred.navigate(crate::Navigation::new(1), "page");
         deliver_model(&deferred, true, false, &mut Vec::new());
         assert_ne!(deferred_value(&deferred), DeferredValue::Absent);
     }
@@ -278,7 +281,7 @@ mod tests {
     #[test]
     fn real_frame_delivery_consumes_the_deferred_load_once() {
         let deferred = crate::client::DeferredNavigation::new();
-        deferred.navigate(jfn_bringup::Navigation::for_test(1), "page");
+        deferred.navigate(crate::Navigation::new(1), "page");
         let mut delivered = Vec::new();
         deliver_model(&deferred, true, true, &mut delivered);
         deliver_model(&deferred, true, true, &mut delivered);
@@ -288,7 +291,7 @@ mod tests {
 
     #[test]
     fn abandon_clears_frame_and_failure_identity_before_blank_delivery() {
-        let navigation = jfn_bringup::Navigation::for_test(1);
+        let navigation = crate::Navigation::new(1);
         let mut painting = Painting::Awaiting {
             navigation,
             base: "page".to_owned(),
@@ -307,14 +310,14 @@ mod tests {
     #[test]
     fn navigation_deferred_before_client_creation_reaches_the_created_browser() {
         let deferred = crate::client::DeferredNavigation::new();
-        deferred.navigate(jfn_bringup::Navigation::for_test(1), "page");
+        deferred.navigate(crate::Navigation::new(1), "page");
         let client_slot = Arc::clone(&deferred);
         let mut delivered = Vec::new();
         deliver_model(&client_slot, true, true, &mut delivered);
         assert_eq!(
             delivered,
             vec![DeferredValue::Page(
-                jfn_bringup::Navigation::for_test(1),
+                crate::Navigation::new(1),
                 "page".to_owned()
             )]
         );

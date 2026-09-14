@@ -9,8 +9,8 @@ use iced_core::{Point, Rectangle};
 use iced_runtime::user_interface::UserInterface;
 use jfn_platform_abi::DisplayBackend;
 
-use crate::field::{Act, State};
-use crate::theme::Theme;
+use crate::shell::field::{Act, State};
+use crate::shell::theme::Theme;
 
 /// One shell field, as the current widget tree reports it. Window coordinates
 /// throughout.

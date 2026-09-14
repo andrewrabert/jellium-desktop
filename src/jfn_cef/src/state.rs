@@ -1,9 +1,7 @@
 //! Process-lifetime state for the browser process. The configuration
-//! setters (log_severity, platform_switches, etc.) write here between
-//! `Start()` and `Initialize()`; the App handlers read here.
+//! is published once before initialization; App handlers read the snapshot.
 
-use parking_lot::Mutex;
-
+#[derive(Clone)]
 pub struct PendingSwitch {
     pub name: String,
     pub value: Option<String>,
@@ -27,34 +25,18 @@ impl PendingSwitch {
 
 #[derive(Default)]
 pub struct Config {
-    pub log_severity: i32,
-    pub remote_debugging_port: i32,
     pub pending_switches: Vec<PendingSwitch>,
-    pub gpu_compositing_disabled: bool,
-    pub on_context_initialized: Option<extern "C" fn()>,
 }
+static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 
-static CONFIG: Mutex<Config> = Mutex::new(Config {
-    log_severity: 0,
-    remote_debugging_port: 0,
-    pending_switches: Vec::new(),
-    gpu_compositing_disabled: false,
-    on_context_initialized: None,
-});
-
-pub fn with_config<R>(f: impl FnOnce(&mut Config) -> R) -> R {
-    let mut g = CONFIG.lock();
-    f(&mut g)
+pub fn configure(config: Config) {
+    // BrowserCef is unique and initialize consumes it.
+    let _ = CONFIG.set(config);
 }
 
 pub fn snapshot_switches() -> Vec<PendingSwitch> {
-    with_config(|c| {
-        c.pending_switches
-            .iter()
-            .map(|s| PendingSwitch {
-                name: s.name.clone(),
-                value: s.value.clone(),
-            })
-            .collect()
-    })
+    CONFIG
+        .get()
+        .map(|c| c.pending_switches.clone())
+        .unwrap_or_default()
 }

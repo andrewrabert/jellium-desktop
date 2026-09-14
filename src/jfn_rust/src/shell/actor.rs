@@ -18,15 +18,15 @@ use jfn_platform_abi::{
     FrameSource, LogicalPoint, LogicalSize, SurfaceHandle, Visibility, WindowExtent,
 };
 
-use crate::controls::{self, Direction};
-use crate::field::Act;
-use crate::fields::{Apply, Fields};
+use crate::shell::controls::{self, Direction};
+use crate::shell::field::Act;
+use crate::shell::fields::{Apply, Fields};
 
-use crate::chrome::Titlebar;
-use crate::modal::{Identity, Stack, Transition};
-use crate::paint::Painter;
-use crate::state::{self, ChromeInputs};
-use crate::theme::Theme;
+use crate::shell::chrome::Titlebar;
+use crate::shell::modal::{Identity, Stack, Transition};
+use crate::shell::paint::Painter;
+use crate::shell::state::{self, ChromeInputs};
+use crate::shell::theme::Theme;
 
 /// How long the actor waits for a surface target before giving up: the
 /// backend creates the window on its own thread, moments after `alloc_surface`.
@@ -60,8 +60,9 @@ pub enum Work {
         field: Target,
         command: jfn_input::EditCommand,
     },
-    /// Bring-up advanced; the pass re-reads its screen.
-    BringUpChanged,
+    /// CEF is initialized; pending connection operations can now be submitted.
+    WebAttached(jfn_cef::WebOverlay),
+    WebEvent(jfn_cef::WebEvent),
     Shutdown,
 }
 
@@ -90,7 +91,7 @@ pub enum Reader {
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// When the next redraw is due, folded from every source: iced's
-/// `RedrawRequest`, the deadline bring-up names, the spinner's own animation
+/// `RedrawRequest`, the connection deadline, the spinner's own animation
 /// while the connect screen is working, and a model that changed during the
 /// pass. The caret's blink is not among
 /// them — a focused editor asks for its own next frame through the
@@ -191,55 +192,72 @@ impl Actor {
     /// caret across a window resize and across an Escape the editor consumed as
     /// an unfocus.
     ///
-    /// The thread calls [`crate::wait_fonts_ready`] before its first draw and
+    /// The thread calls [`crate::shell::wait_fonts_ready`] before its first draw and
     /// never again.
-    pub fn spawn(surface: SurfaceHandle, channel: &Channel) -> Option<Actor> {
-        let rx = channel.take_receiver()?;
+    pub fn spawn(
+        surface: SurfaceHandle,
+        channel: &Channel,
+        metadata: crate::shell::metadata::ApplicationMetadata,
+        actions: crate::shell::ApplicationActions,
+        platform: jfn_platform_abi::PlatformLease,
+        on_ready: std::sync::mpsc::SyncSender<Result<(), LoopStartError>>,
+    ) -> Result<Actor, crate::shell::StartError> {
+        let rx = channel
+            .take_receiver()
+            .ok_or(crate::shell::StartError::ReceiverUnavailable)?;
         let tx = channel.sender();
         let wake_tx = channel.sender();
         let thread = std::thread::Builder::new()
             .name("jfn-shell".to_owned())
-            .spawn(move || run(surface, &rx, &wake_tx))
-            .ok()?;
-        Some(Actor { tx, thread })
+            .spawn(move || {
+                let _platform = platform;
+                run(surface, &rx, &wake_tx, metadata, actions, on_ready);
+            })?;
+        Ok(Actor { tx, thread })
     }
 
     pub fn post(&self, work: Work) {
         drop(self.tx.send(work));
     }
 
-    /// Drains `Work::Shutdown` and joins the thread, bounded by
-    /// [`SHUTDOWN_TIMEOUT`]. `true` once the thread is gone and the swapchain
-    /// with it — the only condition under which the surface may be freed.
-    /// `false` leaves a wedged render thread owning both for the rest of the
-    /// process.
-    #[must_use]
-    pub fn join(self) -> bool {
+    /// Requests shutdown and confirms termination, including TLS destructors.
+    pub fn join(self) -> JoinOutcome {
         drop(self.tx.send(Work::Shutdown));
         join_bounded(self.thread, SHUTDOWN_TIMEOUT)
     }
 }
 
-/// A separate joiner signals actual thread exit, including unwinding and TLS
-/// destructors. Signalling from inside the render closure would let its caller
-/// block indefinitely in `join` after receiving an early completion notice.
-fn join_bounded(thread: JoinHandle<()>, timeout: Duration) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "unconfirmed termination must retain native dependencies"]
+pub enum JoinOutcome {
+    Terminated,
+    Panicked,
+    TimedOut,
+    JoinerUnavailable,
+}
+impl JoinOutcome {
+    pub fn terminated(self) -> bool {
+        matches!(self, Self::Terminated | Self::Panicked)
+    }
+}
+
+fn join_bounded(thread: JoinHandle<()>, timeout: Duration) -> JoinOutcome {
     let (tx, rx) = channel();
     if std::thread::Builder::new()
         .name("jfn-shell-join".to_owned())
-        .spawn(move || tx.send(thread.join().is_ok()).unwrap_or_default())
+        .spawn(move || {
+            let result = if thread.join().is_ok() {
+                JoinOutcome::Terminated
+            } else {
+                JoinOutcome::Panicked
+            };
+            tx.send(result).unwrap_or_default();
+        })
         .is_err()
     {
-        tracing::warn!("shell: could not start render thread joiner");
-        return false;
+        return JoinOutcome::JoinerUnavailable;
     }
-    match rx.recv_timeout(timeout) {
-        Ok(joined) => joined,
-        Err(_) => {
-            tracing::warn!("shell: render thread did not stop within the shutdown bound");
-            false
-        }
-    }
+    rx.recv_timeout(timeout).unwrap_or(JoinOutcome::TimedOut)
 }
 
 /// A key ignored by the focused widget that the modal layer handles.
@@ -272,8 +290,8 @@ fn ignored_key(model: &Model, event: &Event) -> Option<IgnoredKey> {
 fn focus_after_rebuild(
     previous_identity: Option<Identity>,
     identity: Option<Identity>,
-    previous_tab: Option<crate::settings_overlay::Tab>,
-    tab: Option<crate::settings_overlay::Tab>,
+    previous_tab: Option<crate::shell::settings_overlay::Tab>,
+    tab: Option<crate::shell::settings_overlay::Tab>,
     initial: Option<Id>,
     prior: Option<Id>,
     cache_lost: bool,
@@ -289,13 +307,14 @@ fn focus_after_rebuild(
 
 #[derive(Clone, Debug)]
 enum Message {
-    Modal(crate::modal::Message),
-    Chrome(crate::chrome::Message),
+    Modal(crate::shell::modal::Message),
+    Chrome(crate::shell::chrome::Message),
 }
 
 pub struct Model {
+    connection: crate::connection::Connection,
     stack: Stack,
-    screen: jfn_bringup::Screen,
+    screen: crate::connection::Screen,
     titlebar: Titlebar,
     inputs: ChromeInputs,
     theme: Theme,
@@ -317,13 +336,14 @@ impl Model {
         iced_widget::space::horizontal().into()
     }
 
-    fn advance(&mut self, transition: Transition) {
-        self.stack.advance(transition);
+    fn transition(&mut self, transition: Transition) {
+        self.stack.update(transition, &mut self.connection);
+        self.connection.flush_requests();
     }
 
     fn update(&mut self, message: Message) {
         match message {
-            Message::Modal(m) => self.advance(Transition::Message(m)),
+            Message::Modal(m) => self.transition(Transition::Message(m)),
             Message::Chrome(m) => self.titlebar.update(m),
         }
     }
@@ -359,10 +379,10 @@ fn settings_overlay_dismiss_last(messages: Vec<Message>) -> Vec<Message> {
     let (mut ordinary, dismissals): (Vec<_>, Vec<_>) = messages.into_iter().partition(|message| {
         !matches!(
             message,
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Dismiss
-                    | crate::settings_overlay::Message::Settings(
-                        crate::settings::Message::ResetSavedServer
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Dismiss
+                    | crate::shell::settings_overlay::Message::Settings(
+                        crate::shell::settings::Message::ResetSavedServer
                     )
             ))
         )
@@ -386,7 +406,7 @@ enum Flow {
 #[derive(Default)]
 struct FocusMemory {
     modal_identity: Option<Identity>,
-    modal_tab: Option<crate::settings_overlay::Tab>,
+    modal_tab: Option<crate::shell::settings_overlay::Tab>,
     prior: Option<Id>,
     cache_lost: bool,
     pending_move: Option<Direction>,
@@ -396,7 +416,7 @@ struct FocusMemory {
 /// What a rebuilt tree has to be told about focus before it takes events.
 struct FocusPlan {
     target: Option<Id>,
-    restoration: Option<crate::settings_overlay::Restoration>,
+    restoration: Option<crate::shell::settings_overlay::Restoration>,
 }
 
 impl FocusMemory {
@@ -406,7 +426,7 @@ impl FocusMemory {
         let identity = model.stack.identity();
         let cache_was_lost = self.cache_lost;
         let restoration = model.stack.settings_overlay_mut().and_then(|overlay| {
-            if overlay.active() != crate::settings_overlay::Tab::Settings {
+            if overlay.active() != crate::shell::settings_overlay::Tab::Settings {
                 None
             } else {
                 overlay
@@ -459,12 +479,16 @@ impl FocusMemory {
             }
             ui.operate(
                 renderer,
-                &mut controls::restore_scroll(crate::settings::SETTINGS_SCROLL, restoration.scroll),
+                &mut controls::restore_scroll(
+                    crate::shell::settings::SETTINGS_SCROLL,
+                    restoration.scroll,
+                ),
             );
         }
         let mut chained = false;
         if let Some(direction) = self.pending_move.take() {
-            let mut movement = controls::move_focus(crate::settings::SETTINGS_SCROLL, direction);
+            let mut movement =
+                controls::move_focus(crate::shell::settings::SETTINGS_SCROLL, direction);
             ui.operate(renderer, &mut movement);
             if let iced_core::widget::operation::Outcome::Chain(operation) = movement.finish() {
                 self.settings_chain = Some(operation);
@@ -487,6 +511,7 @@ struct Updated {
 
 /// The render loop's state between passes.
 struct Loop {
+    actions: crate::shell::ApplicationActions,
     surface: SurfaceHandle,
     wake_tx: Sender<Work>,
     painter: Painter,
@@ -514,57 +539,74 @@ struct Loop {
     drew_nothing_yet: bool,
 }
 
-fn run(surface: SurfaceHandle, rx: &Receiver<Work>, wake_tx: &Sender<Work>) {
+fn run(
+    surface: SurfaceHandle,
+    rx: &Receiver<Work>,
+    wake_tx: &Sender<Work>,
+    metadata: crate::shell::metadata::ApplicationMetadata,
+    actions: crate::shell::ApplicationActions,
+    on_ready: std::sync::mpsc::SyncSender<Result<(), LoopStartError>>,
+) {
     let mut pending = Vec::new();
     let Some(target) = wait_for_target(surface, rx, wake_tx, &mut pending) else {
-        crate::publish_no_overlay();
+        crate::shell::publish_no_overlay();
+        drop(on_ready.send(Err(LoopStartError::NoTarget)));
         return;
     };
-    let Some(mut state) = Loop::start(surface, wake_tx, target) else {
-        crate::publish_no_overlay();
-        return;
+    let mut state = match Loop::start(surface, wake_tx, target, metadata, actions) {
+        Ok(state) => state,
+        Err(error) => {
+            drop(on_ready.send(Err(error)));
+            crate::shell::publish_no_overlay();
+            return;
+        }
     };
+    drop(on_ready.send(Ok(())));
     state.batch = pending;
     state.immediate = true;
     state.run(rx);
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum LoopStartError {
+    #[error("window target unavailable or startup canceled")]
+    NoTarget,
+    #[error("GPU device unavailable")]
+    NoGpu,
+    #[error("window extent unavailable")]
+    NoExtent,
+    #[error("swapchain creation failed: {0}")]
+    Painter(#[source] jfn_gpu_paint::SurfaceLost),
+}
+
 impl Loop {
-    /// Brings the swapchain up at the window's current extent; `None` when
-    /// the overlay cannot exist.
+    /// Brings the swapchain up at the window's current extent.
     fn start(
         surface: SurfaceHandle,
         wake_tx: &Sender<Work>,
         target: jfn_gpu_paint::WindowTarget,
-    ) -> Option<Loop> {
-        let Some(gpu) = jfn_gpu_paint::surfaces() else {
-            tracing::info!("shell: no GPU device; overlay stays hidden");
-            return None;
-        };
-        let Some(extent) = initial_extent() else {
-            tracing::error!("shell: no extent to start the overlay at");
-            return None;
-        };
+        metadata: crate::shell::metadata::ApplicationMetadata,
+        actions: crate::shell::ApplicationActions,
+    ) -> Result<Loop, LoopStartError> {
+        let gpu = jfn_gpu_paint::surfaces().ok_or(LoopStartError::NoGpu)?;
+        let extent = initial_extent().ok_or(LoopStartError::NoExtent)?;
         let wake = {
             let tx = wake_tx.clone();
             Arc::new(move || {
                 drop(tx.send(Work::Redraw));
             }) as Arc<dyn Fn() + Send + Sync>
         };
-        let painter = match Painter::new(gpu, target, extent, Arc::clone(&wake)) {
-            Ok(painter) => painter,
-            Err(e) => {
-                tracing::error!("shell: swapchain creation failed: {e}");
-                return None;
-            }
-        };
+        let painter = Painter::new(gpu, target, extent, Arc::clone(&wake))
+            .map_err(LoopStartError::Painter)?;
+        let connection = crate::connection::Connection::new(jfn_config::server_url());
         let model = Model {
-            stack: Stack::empty(),
-            screen: jfn_bringup::screen(),
+            stack: Stack::empty(metadata, crate::shell::settings::Settings::new),
+            screen: connection.screen(),
+            connection,
             titlebar: Titlebar::new(),
-            inputs: crate::chrome::inputs(),
+            inputs: crate::shell::chrome::inputs(),
             theme: Theme {
-                chrome_background: crate::theme::chrome_background(),
+                chrome_background: crate::shell::theme::chrome_background(),
                 ..Theme::default()
             },
         };
@@ -574,7 +616,8 @@ impl Loop {
         });
         publish(&model, extent);
         apply_visibility(surface, &model);
-        Some(Loop {
+        Ok(Loop {
+            actions,
             surface,
             wake_tx: wake_tx.clone(),
             painter,
@@ -681,11 +724,11 @@ impl Loop {
             }
             Work::Redraw => {}
             Work::OpenAbout => {
-                self.model.advance(Transition::OpenAbout);
+                self.model.transition(Transition::OpenAbout);
                 self.discard_cache();
             }
             Work::OpenClientSettings => {
-                self.model.advance(Transition::OpenClientSettings);
+                self.model.transition(Transition::OpenClientSettings);
                 self.discard_cache();
             }
             Work::Chrome(inputs) => self.model.inputs = inputs,
@@ -708,7 +751,23 @@ impl Loop {
             Work::EditAt { field, command } => {
                 self.deferred.push(Deferred::Edit(field, command));
             }
-            Work::BringUpChanged => {}
+            Work::WebAttached(overlay) => self.model.connection.attach(overlay),
+            Work::WebEvent(event) => {
+                let connection = &mut self.model.connection;
+                match event {
+                    jfn_cef::WebEvent::ProbeFinished { cycle, base } => match base {
+                        Some(base) => connection.probe_resolved(cycle, base),
+                        None => connection.probe_failed(cycle),
+                    },
+                    jfn_cef::WebEvent::NavigationFailed(navigation) => {
+                        connection.navigation_failed(navigation)
+                    }
+                    jfn_cef::WebEvent::FramePresented(presented) => {
+                        connection.frame_presented(presented)
+                    }
+                }
+                connection.flush_requests();
+            }
             Work::Shutdown => return Flow::Stop,
         }
         Flow::Continue
@@ -723,14 +782,16 @@ impl Loop {
     /// either draw the settled result or fold the changes back into the model
     /// for an immediate next pass.
     fn pass(&mut self) {
-        self.model.advance(Transition::Tick(Instant::now()));
-        // Every pass re-reads bring-up: it is the authority for what the shell
-        // overlay shows, and the stack holds none of it.
-        self.model.screen = jfn_bringup::screen();
+        self.model.transition(Transition::Tick(Instant::now()));
+        // Derive the modal view from the actor-owned connection.
+        self.model.screen = self.model.connection.screen();
         self.model.stack.reconcile(&self.model.screen);
-        self.pending = self
-            .pending
-            .merge(jfn_bringup::deadline().map_or_else(Deadline::none, Deadline::at));
+        self.pending = self.pending.merge(
+            self.model
+                .connection
+                .deadline()
+                .map_or_else(Deadline::none, Deadline::at),
+        );
         self.model.theme.backdrop = self.model.backdrop();
         let plan = self.focus.plan(&mut self.model);
 
@@ -756,6 +817,7 @@ impl Loop {
             &mut this.deferred,
             &mut this.queued,
             &this.wake_tx,
+            this.actions,
         );
         let retained_settings = retained_settings(&mut ui, painter, model);
 
@@ -776,9 +838,9 @@ impl Loop {
         jfn_input::publish_field_edit(
             settled_fields
                 .focused()
-                .map(crate::fields::Snapshot::edit_state),
+                .map(crate::shell::fields::Snapshot::edit_state),
         );
-        crate::router_sink::set_interaction(updated.interaction);
+        crate::shell::router_sink::set_interaction(updated.interaction);
 
         // Asked while the widget tree still borrows the model, because applying
         // any of it has to wait until the tree is gone.
@@ -794,7 +856,10 @@ impl Loop {
                 this.drew_nothing_yet = false;
                 // The fontdb scan is paid on the warm-up thread, not here, and
                 // no paragraph caches against a fallback family.
-                crate::wait_fonts_ready();
+                if let Err(error) = crate::shell::wait_fonts_ready() {
+                    tracing::error!("shell cannot paint: {error}");
+                    return;
+                }
             }
             match paint(
                 painter,
@@ -824,7 +889,7 @@ impl Loop {
         this.model.apply_message_batch(updated.messages);
         for event in &updated.ignored {
             match ignored_key(&this.model, event) {
-                Some(IgnoredKey::Escape) => this.model.advance(Transition::Escape),
+                Some(IgnoredKey::Escape) => this.model.transition(Transition::Escape),
                 Some(IgnoredKey::Focus(direction)) => this.focus.pending_move = Some(direction),
                 None => {}
             }
@@ -845,6 +910,7 @@ fn resolve_deferred(
     deferred: &mut Vec<Deferred>,
     queued: &mut Vec<Apply>,
     wake_tx: &Sender<Work>,
+    actions: crate::shell::ApplicationActions,
 ) {
     let fields = Fields::collect(ui, painter.renderer());
     let mut menu_anchor = None;
@@ -856,6 +922,7 @@ fn resolve_deferred(
                     p,
                     queued,
                     model.stack.identity() == Some(Identity::SettingsOverlay),
+                    actions,
                 ));
             }
             Deferred::EditMenuAtCaret => {
@@ -872,12 +939,14 @@ fn resolve_deferred(
         }
     }
     for text in apply_queued(ui, painter.renderer(), queued) {
-        jfn_platform_abi::get().clipboard_write_text(&text);
+        if let Some(lease) = jfn_platform_abi::try_lease() {
+            lease.platform().clipboard_write_text(&text);
+        }
     }
     if let Some(anchor) = menu_anchor {
         let raised = Fields::collect(ui, painter.renderer());
         if let Some(field) = raised.at(point(anchor.x, anchor.y)) {
-            crate::menu::open_edit(field, anchor, crate::lang::strings());
+            crate::shell::menu::open_edit(field, anchor, crate::shell::lang::strings());
         }
     }
 }
@@ -892,12 +961,12 @@ fn retained_settings(
     Option<Id>,
     iced_core::widget::operation::scrollable::AbsoluteOffset,
 )> {
-    if model.stack.active_settings_tab() != Some(crate::settings_overlay::Tab::Settings) {
+    if model.stack.active_settings_tab() != Some(crate::shell::settings_overlay::Tab::Settings) {
         return None;
     }
     let mut focused = controls::focused_id();
     ui.operate(painter.renderer(), &mut focused);
-    let mut offset = controls::scroll_offset(crate::settings::SETTINGS_SCROLL);
+    let mut offset = controls::scroll_offset(crate::shell::settings::SETTINGS_SCROLL);
     ui.operate(painter.renderer(), &mut offset);
     offset.get().map(|offset| (focused.get(), offset))
 }
@@ -1103,18 +1172,26 @@ fn queue_edit(
 /// Requests the OS clipboard's text; the reply arrives as
 /// [`Work::SelectionText`].
 fn read_clipboard(tx: Sender<Work>, reader: Reader) {
-    jfn_platform_abi::get().clipboard_read_text_async(Box::new(move |text| {
-        drop(tx.send(Work::SelectionText {
-            reader,
-            text: text.map(str::to_owned),
+    let Some(lease) = jfn_platform_abi::try_lease() else {
+        return;
+    };
+    lease
+        .platform()
+        .clipboard_read_text_async(Box::new(move |text| {
+            drop(tx.send(Work::SelectionText {
+                reader,
+                text: text.map(str::to_owned),
+            }));
         }));
-    }));
 }
 
 /// Requests the primary selection's text, replying `None` on a backend that
 /// serves none.
 fn read_primary(tx: Sender<Work>, reader: Reader) {
-    let plat = jfn_platform_abi::get();
+    let Some(lease) = jfn_platform_abi::try_lease() else {
+        return;
+    };
+    let plat = lease.platform();
     let Some(primary) = plat.primary_selection() else {
         drop(tx.send(Work::SelectionText { reader, text: None }));
         return;
@@ -1129,8 +1206,10 @@ fn read_primary(tx: Sender<Work>, reader: Reader) {
 
 /// Writes iced's pending clipboard content, text alone.
 fn write_clipboard(clipboard: &clipboard::Clipboard) {
-    if let Some(clipboard::Content::Text(text)) = &clipboard.write {
-        jfn_platform_abi::get().clipboard_write_text(text);
+    if let Some(clipboard::Content::Text(text)) = &clipboard.write
+        && let Some(lease) = jfn_platform_abi::try_lease()
+    {
+        lease.platform().clipboard_write_text(text);
     }
 }
 
@@ -1138,7 +1217,10 @@ fn write_clipboard(clipboard: &clipboard::Clipboard) {
 /// selection changed and is not empty; a selection replaced by an identical
 /// one is a change, and a backend that serves none writes nothing.
 fn publish_primary(fields: &Fields, last: &mut Option<(Id, u64)>) {
-    let plat = jfn_platform_abi::get();
+    let Some(lease) = jfn_platform_abi::try_lease() else {
+        return;
+    };
+    let plat = lease.platform();
     let Some(primary) = plat.primary_selection() else {
         return;
     };
@@ -1158,7 +1240,7 @@ fn publish_primary(fields: &Fields, last: &mut Option<(Id, u64)>) {
 
 /// The window point an edit menu raised from the keyboard anchors at: the
 /// focused field's caret.
-fn caret_anchor(field: &crate::fields::Snapshot) -> LogicalPoint {
+fn caret_anchor(field: &crate::shell::fields::Snapshot) -> LogicalPoint {
     LogicalPoint {
         x: field.caret.x as i32,
         y: field.caret.y as i32,
@@ -1177,19 +1259,17 @@ fn raise_menu(
     p: LogicalPoint,
     queued: &mut Vec<Apply>,
     restricted: bool,
+    actions: crate::shell::ApplicationActions,
 ) -> Option<LogicalPoint> {
     let at = point(p.x, p.y);
     let Some(field) = fields.at(at) else {
-        if restricted {
-            jfn_cef::app_menu::open_restricted_at(p.x, p.y);
-        } else {
-            jfn_cef::app_menu::open_at(p.x, p.y);
-        }
+        (actions.open_menu)(p, restricted);
         return None;
     };
-    let backend = jfn_platform_abi::get().display();
-    let caret = crate::fields::press_caret(backend, field, at);
-    if crate::fields::press_focuses(backend) {
+    let lease = jfn_platform_abi::try_lease()?;
+    let backend = lease.platform().display();
+    let caret = crate::shell::fields::press_caret(backend, field, at);
+    if crate::shell::fields::press_focuses(backend) {
         queued.push(Apply::focus(field.id.clone(), caret));
     } else if let Some(act) = caret {
         queued.push(Apply::act(field.id.clone(), act));
@@ -1199,7 +1279,7 @@ fn raise_menu(
 
 /// Publishes the routing state at the extent's exact logical size.
 fn publish(model: &Model, extent: WindowExtent) {
-    jfn_input::publish_shell_state(crate::state::shell_state(
+    jfn_input::publish_shell_state(crate::shell::state::shell_state(
         Some(extent),
         model.inputs,
         model.stack.occupied(),
@@ -1210,7 +1290,11 @@ fn publish(model: &Model, extent: WindowExtent) {
 /// carrying it has landed. The surface's own backend holds the value; the model
 /// holds only what it asked for.
 fn apply_visibility(surface: SurfaceHandle, model: &Model) -> Visibility {
-    jfn_platform_abi::get()
+    let Some(lease) = jfn_platform_abi::try_lease() else {
+        return Visibility::Hidden;
+    };
+    lease
+        .platform()
         .set_surface_visibility(surface, model.visibility())
         .acknowledged()
 }
@@ -1221,7 +1305,8 @@ fn wait_for_target(
     wake_tx: &Sender<Work>,
     pending: &mut Vec<Work>,
 ) -> Option<jfn_gpu_paint::WindowTarget> {
-    let plat = jfn_platform_abi::get();
+    let lease = jfn_platform_abi::try_lease()?;
+    let plat = lease.platform();
     let tx = wake_tx.clone();
     plat.on_surface_target_ready(
         surface,
@@ -1262,7 +1347,8 @@ fn await_target<T>(
 /// The extent the overlay starts at: the window source's own when it has one,
 /// else 1280x720 logical at the platform's reported scale.
 fn initial_extent() -> Option<WindowExtent> {
-    let plat = jfn_platform_abi::get();
+    let lease = jfn_platform_abi::try_lease()?;
+    let plat = lease.platform();
     if let Some(extent) = plat.window_owner().source().snapshot().extent {
         return Some(extent);
     }
@@ -1280,14 +1366,17 @@ pub(crate) fn point(x: i32, y: i32) -> Point {
 mod tests {
     #[test]
     fn bounded_join_observes_exit_and_panic() {
-        assert!(super::join_bounded(
-            std::thread::spawn(|| {}),
-            super::SHUTDOWN_TIMEOUT
-        ));
-        assert!(!super::join_bounded(
-            std::thread::spawn(|| std::panic::resume_unwind(Box::new("test panic"))),
-            super::SHUTDOWN_TIMEOUT
-        ));
+        assert_eq!(
+            super::join_bounded(std::thread::spawn(|| {}), super::SHUTDOWN_TIMEOUT),
+            super::JoinOutcome::Terminated
+        );
+        assert_eq!(
+            super::join_bounded(
+                std::thread::spawn(|| std::panic::resume_unwind(Box::new("test panic"))),
+                super::SHUTDOWN_TIMEOUT
+            ),
+            super::JoinOutcome::Panicked
+        );
     }
 
     #[test]
@@ -1296,7 +1385,10 @@ mod tests {
         let thread = std::thread::spawn(move || {
             rx.recv().unwrap_or_default();
         });
-        assert!(!super::join_bounded(thread, super::Duration::ZERO));
+        assert_eq!(
+            super::join_bounded(thread, super::Duration::ZERO),
+            super::JoinOutcome::TimedOut
+        );
         // Release the worker and its joiner after the bounded wait returns.
         drop(tx);
     }
@@ -1360,26 +1452,26 @@ mod tests {
         })
     }
 
-    fn settings_message(message: crate::settings::Message) -> Message {
-        Message::Modal(crate::modal::Message::SettingsOverlay(
-            crate::settings_overlay::Message::Settings(message),
+    fn settings_message(message: crate::shell::settings::Message) -> Message {
+        Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+            crate::shell::settings_overlay::Message::Settings(message),
         ))
     }
 
     #[test]
     fn settings_dismiss_is_applied_after_final_edits_without_reordering_ordinary_messages() {
         let messages = vec![
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Dismiss,
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Dismiss,
             )),
-            settings_message(crate::settings::Message::DeviceNameEdited(
+            settings_message(crate::shell::settings::Message::DeviceNameEdited(
                 "final device".to_owned(),
             )),
-            settings_message(crate::settings::Message::CommitDeviceName),
-            settings_message(crate::settings::Message::AudioPassthroughEdited(
+            settings_message(crate::shell::settings::Message::CommitDeviceName),
+            settings_message(crate::shell::settings::Message::AudioPassthroughEdited(
                 "first audio".to_owned(),
             )),
-            settings_message(crate::settings::Message::AudioPassthroughEdited(
+            settings_message(crate::shell::settings::Message::AudioPassthroughEdited(
                 "final audio".to_owned(),
             )),
         ];
@@ -1387,46 +1479,47 @@ mod tests {
         let ordered = settings_overlay_dismiss_last(messages.clone());
         assert!(matches!(
             &ordered[0],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Settings(
-                    crate::settings::Message::DeviceNameEdited(value)
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Settings(
+                    crate::shell::settings::Message::DeviceNameEdited(value)
                 )
             )) if value == "final device"
         ));
         assert!(matches!(
             &ordered[1],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Settings(
-                    crate::settings::Message::CommitDeviceName
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Settings(
+                    crate::shell::settings::Message::CommitDeviceName
                 )
             ))
         ));
         assert!(matches!(
             &ordered[2],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Settings(
-                    crate::settings::Message::AudioPassthroughEdited(value)
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Settings(
+                    crate::shell::settings::Message::AudioPassthroughEdited(value)
                 )
             )) if value == "first audio"
         ));
         assert!(matches!(
             &ordered[3],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Settings(
-                    crate::settings::Message::AudioPassthroughEdited(value)
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Settings(
+                    crate::shell::settings::Message::AudioPassthroughEdited(value)
                 )
             )) if value == "final audio"
         ));
         assert!(matches!(
             &ordered[4],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Dismiss
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Dismiss
             ))
         ));
 
         let mut model = Model {
             stack: Stack::testing_settings(),
-            screen: jfn_bringup::Screen::Gone,
+            screen: crate::connection::Screen::Gone,
+            connection: crate::connection::Connection::new(String::new()),
             titlebar: Titlebar::new(),
             inputs: ChromeInputs::default(),
             theme: Theme::default(),
@@ -1439,17 +1532,17 @@ mod tests {
     #[test]
     fn settings_reset_is_applied_after_final_edits_without_reordering_ordinary_messages() {
         let messages = vec![
-            settings_message(crate::settings::Message::ResetSavedServer),
-            settings_message(crate::settings::Message::DeviceNameEdited(
+            settings_message(crate::shell::settings::Message::ResetSavedServer),
+            settings_message(crate::shell::settings::Message::DeviceNameEdited(
                 "first device".to_owned(),
             )),
-            settings_message(crate::settings::Message::AudioPassthroughEdited(
+            settings_message(crate::shell::settings::Message::AudioPassthroughEdited(
                 "first audio".to_owned(),
             )),
-            settings_message(crate::settings::Message::DeviceNameEdited(
+            settings_message(crate::shell::settings::Message::DeviceNameEdited(
                 "final device".to_owned(),
             )),
-            settings_message(crate::settings::Message::AudioPassthroughEdited(
+            settings_message(crate::shell::settings::Message::AudioPassthroughEdited(
                 "final audio".to_owned(),
             )),
         ];
@@ -1457,48 +1550,49 @@ mod tests {
         let ordered = settings_overlay_dismiss_last(messages);
         assert!(matches!(
             &ordered[0],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Settings(
-                    crate::settings::Message::DeviceNameEdited(value)
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Settings(
+                    crate::shell::settings::Message::DeviceNameEdited(value)
                 )
             )) if value == "first device"
         ));
         assert!(matches!(
             &ordered[1],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Settings(
-                    crate::settings::Message::AudioPassthroughEdited(value)
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Settings(
+                    crate::shell::settings::Message::AudioPassthroughEdited(value)
                 )
             )) if value == "first audio"
         ));
         assert!(matches!(
             &ordered[2],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Settings(
-                    crate::settings::Message::DeviceNameEdited(value)
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Settings(
+                    crate::shell::settings::Message::DeviceNameEdited(value)
                 )
             )) if value == "final device"
         ));
         assert!(matches!(
             &ordered[3],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Settings(
-                    crate::settings::Message::AudioPassthroughEdited(value)
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Settings(
+                    crate::shell::settings::Message::AudioPassthroughEdited(value)
                 )
             )) if value == "final audio"
         ));
         assert!(matches!(
             &ordered[4],
-            Message::Modal(crate::modal::Message::SettingsOverlay(
-                crate::settings_overlay::Message::Settings(
-                    crate::settings::Message::ResetSavedServer
+            Message::Modal(crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Settings(
+                    crate::shell::settings::Message::ResetSavedServer
                 )
             ))
         ));
 
         let mut model = Model {
             stack: Stack::testing_settings(),
-            screen: jfn_bringup::Screen::Gone,
+            screen: crate::connection::Screen::Gone,
+            connection: crate::connection::Connection::new(String::new()),
             titlebar: Titlebar::new(),
             inputs: ChromeInputs::default(),
             theme: Theme::default(),
@@ -1523,12 +1617,13 @@ mod tests {
     fn about_selection_retains_pre_event_settings_focus_and_scroll() {
         let mut model = Model {
             stack: Stack::testing_settings(),
-            screen: jfn_bringup::Screen::Gone,
+            screen: crate::connection::Screen::Gone,
+            connection: crate::connection::Connection::new(String::new()),
             titlebar: Titlebar::new(),
             inputs: ChromeInputs::default(),
             theme: Theme::default(),
         };
-        let pre_event_focus = Some(crate::settings::DEVICE_NAME_FIELD);
+        let pre_event_focus = Some(crate::shell::settings::DEVICE_NAME_FIELD);
         let pre_event_scroll =
             iced_core::widget::operation::scrollable::AbsoluteOffset { x: 3.0, y: 142.0 };
         let settled_focus: Option<Id> = None;
@@ -1543,19 +1638,21 @@ mod tests {
                 .is_some()
         );
         model.apply_message_batch(vec![Message::Modal(
-            crate::modal::Message::SettingsOverlay(crate::settings_overlay::Message::Select(
-                crate::settings_overlay::Tab::About,
-            )),
+            crate::shell::modal::Message::SettingsOverlay(
+                crate::shell::settings_overlay::Message::Select(
+                    crate::shell::settings_overlay::Tab::About,
+                ),
+            ),
         )]);
-        model.advance(Transition::OpenClientSettings);
+        model.transition(Transition::OpenClientSettings);
 
         assert_eq!(settled_focus, None);
         assert_eq!(
             model
                 .stack
                 .settings_overlay_mut()
-                .and_then(crate::settings_overlay::SettingsOverlay::take_restoration),
-            Some(crate::settings_overlay::Restoration {
+                .and_then(crate::shell::settings_overlay::SettingsOverlay::take_restoration),
+            Some(crate::shell::settings_overlay::Restoration {
                 focus: pre_event_focus,
                 scroll: pre_event_scroll,
             })
@@ -1569,8 +1666,8 @@ mod tests {
             focus_after_rebuild(
                 Some(Identity::SettingsOverlay),
                 Some(Identity::SettingsOverlay),
-                Some(crate::settings_overlay::Tab::Settings),
-                Some(crate::settings_overlay::Tab::Settings),
+                Some(crate::shell::settings_overlay::Tab::Settings),
+                Some(crate::shell::settings_overlay::Tab::Settings),
                 Some(Id::new("initial")),
                 Some(focused),
                 false,
@@ -1586,8 +1683,8 @@ mod tests {
             focus_after_rebuild(
                 Some(Identity::SettingsOverlay),
                 Some(Identity::SettingsOverlay),
-                Some(crate::settings_overlay::Tab::About),
-                Some(crate::settings_overlay::Tab::Settings),
+                Some(crate::shell::settings_overlay::Tab::About),
+                Some(crate::shell::settings_overlay::Tab::Settings),
                 Some(initial.clone()),
                 Some(Id::new("old-focus")),
                 true,
@@ -1603,8 +1700,8 @@ mod tests {
             focus_after_rebuild(
                 Some(Identity::SettingsOverlay),
                 Some(Identity::SettingsOverlay),
-                Some(crate::settings_overlay::Tab::Settings),
-                Some(crate::settings_overlay::Tab::Settings),
+                Some(crate::shell::settings_overlay::Tab::Settings),
+                Some(crate::shell::settings_overlay::Tab::Settings),
                 Some(Id::new("initial")),
                 Some(prior.clone()),
                 true,
@@ -1621,7 +1718,7 @@ mod tests {
                 None,
                 Some(Identity::SettingsOverlay),
                 None,
-                Some(crate::settings_overlay::Tab::Settings),
+                Some(crate::shell::settings_overlay::Tab::Settings),
                 Some(initial.clone()),
                 None,
                 true,
@@ -1634,7 +1731,8 @@ mod tests {
     fn tab_directions_are_forward_and_backward_in_settings() {
         let model = Model {
             stack: Stack::testing_settings(),
-            screen: jfn_bringup::Screen::Gone,
+            screen: crate::connection::Screen::Gone,
+            connection: crate::connection::Connection::new(String::new()),
             titlebar: Titlebar::new(),
             inputs: ChromeInputs::default(),
             theme: Theme::default(),

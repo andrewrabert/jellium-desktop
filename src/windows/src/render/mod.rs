@@ -143,28 +143,28 @@ unsafe impl Send for Registry {}
 
 static STATE: Mutex<Registry> = Mutex::new(Registry::new());
 
-/// Build the DComp device, its HWND target, and the root visual.
-/// False when no GPU adapter is usable or device creation failed; any
-/// partial state is dropped before returning.
-pub(crate) fn init(hwnd: HWND) -> bool {
+/// Build the DComp device, HWND target, and root visual. Partial device state
+/// is dropped on failure; errors retain the native operation's cause.
+pub(crate) fn init(hwnd: HWND) -> Result<(), jfn_platform_abi::PlatformInitError> {
+    use jfn_platform_abi::PlatformInitError as Error;
     if !jfn_gpu_paint::any_adapter() {
-        tracing::error!(target: "platform", "renderer init failed: no usable GPU adapter");
-        return false;
+        return Err(Error::backend(
+            "DirectComposition adapter selection",
+            "no usable GPU adapter",
+        ));
     }
     let mut st = STATE.lock();
     if st.devices.is_some() {
-        return true;
+        return Err(Error::backend(
+            "DirectComposition initialization",
+            "already initialized",
+        ));
     }
-    match Devices::create(hwnd) {
-        Ok(devices) => {
-            st.devices = Some(devices);
-            true
-        }
-        Err(e) => {
-            tracing::error!(target: "platform", "renderer init failed: {e:?}");
-            false
-        }
-    }
+    st.devices = Some(
+        Devices::create(hwnd)
+            .map_err(|e| Error::backend("DirectComposition device creation", e))?,
+    );
+    Ok(())
 }
 
 /// Drop every remaining surface, then the devices. Runs after the WndProc

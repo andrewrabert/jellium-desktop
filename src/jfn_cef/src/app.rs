@@ -202,15 +202,11 @@ wrap_browser_process_handler! {
         fn on_context_initialized(&self) {
             jfn_logging::log(jfn_logging::Category::Cef, jfn_logging::Level::Info, "CEF context initialized");
             crate::resource::register();
-            // Optional C-side callback (kept for any future C++ context-init
-            // hooks; currently unused now that scheme registration is in Rust).
-            if let Some(cb) = state::with_config(|c| c.on_context_initialized) {
-                cb();
-            }
         }
 
         fn on_schedule_message_pump_work(&self, delay_ms: i64) {
-            if let Some(host) = jfn_platform_abi::try_get().and_then(|p| p.cef_host()) {
+            if let Some(platform) = jfn_platform_abi::try_lease()
+                && let Some(host) = platform.cef_host() {
                 host.pump_schedule(delay_ms);
             }
         }

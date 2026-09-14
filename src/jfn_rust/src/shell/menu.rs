@@ -6,13 +6,12 @@ use jfn_platform_abi::{
     LogicalPoint, MenuDelivery, MenuItem, MenuKind, MenuRequest, MenuSelection,
 };
 
-use crate::actor::{Target, Work};
-use crate::fields::Snapshot;
-use crate::lang::Strings;
+use crate::shell::actor::{Target, Work};
+use crate::shell::fields::Snapshot;
+use crate::shell::lang::Strings;
 
-/// Command IDs numbered past the app menu's, so a host that dispatches by ID
-/// never confuses the two menus.
-const MENU_ID_EDIT_FIRST: c_int = jfn_cef::app_menu::MENU_ID_EXIT + 1;
+/// Edit commands are local to this request; zero is reserved for Windows menu cancellation.
+const MENU_ID_EDIT_FIRST: c_int = 1;
 
 /// The edit menu's items, in order.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -89,10 +88,13 @@ impl Item {
 }
 
 /// Raises the edit menu for `field` at `anchor`, in window coordinates. A
-/// selection posts [`crate::actor::Work::EditAt`] naming `field`; a dismissal
+/// selection posts [`crate::shell::actor::Work::EditAt`] naming `field`; a dismissal
 /// posts nothing. No accelerator text is drawn.
 pub fn open_edit(field: &Snapshot, anchor: LogicalPoint, strings: &Strings) {
-    let MenuDelivery::Host(host) = jfn_platform_abi::menu_delivery(MenuKind::ContextMenu) else {
+    let Some(lease) = jfn_platform_abi::try_lease() else {
+        return;
+    };
+    let MenuDelivery::Host(host) = lease.platform().menu_delivery(MenuKind::ContextMenu) else {
         return;
     };
     let items = Item::ALL
@@ -115,10 +117,24 @@ pub fn open_edit(field: &Snapshot, anchor: LogicalPoint, strings: &Strings) {
             let Some(item) = Item::from_id(selected) else {
                 return;
             };
-            crate::post(Work::EditAt {
+            crate::shell::post(Work::EditAt {
                 field: Target::Named(id),
                 command: item.command(),
             });
         }),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn edit_command_ids_round_trip_without_using_native_cancellation_ids() {
+        for item in Item::ALL {
+            assert!(item.id() > 0, "Windows reserves zero for cancellation");
+            assert_eq!(Item::from_id(item.id()), Some(item));
+        }
+        assert_eq!(Item::from_id(0), None);
+        assert_eq!(Item::from_id(jfn_platform_abi::MENU_DISMISSED), None);
+    }
 }

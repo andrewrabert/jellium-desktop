@@ -20,7 +20,7 @@ impl WebInput for WebSink {
         character: u16,
         unmodified_character: u16,
     ) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.send_key_event(
                 type_,
                 modifiers,
@@ -30,7 +30,7 @@ impl WebInput for WebSink {
                 character,
                 unmodified_character,
             );
-        }
+        });
     }
 
     fn send_mouse_click(
@@ -42,80 +42,79 @@ impl WebInput for WebSink {
         mouse_up: bool,
         click_count: c_int,
     ) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.send_mouse_click(x, y, modifiers, button, mouse_up, click_count);
-        }
+        });
     }
 
     fn send_mouse_move(&self, x: c_int, y: c_int, modifiers: u32, leave: bool) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.send_mouse_move(x, y, modifiers, leave);
-        }
+        });
     }
 
     fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.send_mouse_wheel(x, y, modifiers, delta_x, delta_y);
-        }
+        });
     }
 
     fn set_focus(&self, focus: bool) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.set_focus(focus);
-        }
+        });
     }
 
     fn navigate_history(&self, forward: bool) {
-        let Some(client) = crate::web_overlay::current_client() else {
-            return;
-        };
-        if forward {
-            if client.can_go_forward() {
-                client.go_forward();
+        crate::web_overlay::with_current_client(|client| {
+            if forward {
+                if client.can_go_forward() {
+                    client.go_forward();
+                }
+            } else if client.can_go_back() {
+                client.go_back();
             }
-        } else if client.can_go_back() {
-            client.go_back();
-        }
+        });
     }
 
     fn undo(&self) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.frame_undo();
-        }
+        });
     }
 
     fn redo(&self) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.frame_redo();
-        }
+        });
     }
 
     fn cut(&self) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.frame_cut();
-        }
+        });
     }
 
     fn copy(&self) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.frame_copy();
-        }
+        });
     }
 
     fn paste(&self) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.frame_paste();
-        }
+        });
     }
 
     fn select_all(&self) {
-        if let Some(client) = crate::web_overlay::current_client() {
+        crate::web_overlay::with_current_client(|client| {
             client.frame_select_all();
-        }
+        });
     }
 
     fn is_alive(&self) -> bool {
-        crate::web_overlay::current_client().is_some_and(|client| client.browser_alive())
+        crate::web_overlay::with_current_client(|client| client.browser_alive()).unwrap_or(false)
     }
 }
 

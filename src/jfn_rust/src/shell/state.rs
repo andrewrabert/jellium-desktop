@@ -47,7 +47,7 @@ pub fn shell_state(
         window_w: logical.map_or(0, |l| l.w),
         window_h: logical.map_or(0, |l| l.h),
         titlebar_h: TITLEBAR_LOGICAL_HEIGHT,
-        controls_w: crate::chrome::CONTROLS_LOGICAL_WIDTH,
+        controls_w: crate::shell::chrome::CONTROLS_LOGICAL_WIDTH,
         reserved_strip: reserved_strip(inputs),
     }
 }

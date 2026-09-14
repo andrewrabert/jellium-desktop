@@ -38,17 +38,21 @@ impl Platform for X11Platform {
     // the paint tier resolves in the mpv host's prepare, before init
     fn early_init(&self) {}
 
-    fn init(&self, _mpv: *mut c_void) -> bool {
+    fn init(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+        _mpv: *mut c_void,
+    ) -> Result<(), jfn_platform_abi::PlatformInitError> {
         crate::lifecycle::init()
     }
 
-    fn cleanup(&self) {
+    fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
         crate::lifecycle::cleanup();
     }
 
     // Runs after mpv_terminate_destroy: mpv's embedded window is gone, so the
     // top-level's connection can finally close.
-    fn post_window_cleanup(&self) {
+    fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
         crate::geometry::drop_toplevel_connection();
     }
 
@@ -91,7 +95,10 @@ impl Platform for X11Platform {
         surface::apply_stack(&ids);
     }
 
-    fn menu_delivery(&self, kind: jfn_platform_abi::MenuKind) -> jfn_platform_abi::MenuDelivery {
+    fn menu_delivery(
+        &self,
+        kind: jfn_platform_abi::MenuKind,
+    ) -> jfn_platform_abi::MenuDelivery<'_> {
         match kind {
             jfn_platform_abi::MenuKind::ContextMenu => {
                 jfn_platform_abi::MenuDelivery::Host(crate::menu::host())

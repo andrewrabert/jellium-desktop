@@ -27,6 +27,7 @@ enum LifecycleState {
 struct Manager {
     queue: Mutex<VecDeque<ManagerMsg>>,
     wake: WakeEvent,
+    boot_wake: WakeEvent,
 }
 
 #[allow(clippy::expect_used)] // boot invariant: wake eventfd alloc is fatal if it fails
@@ -36,6 +37,7 @@ fn manager() -> &'static Manager {
         Box::leak(Box::new(Manager {
             queue: Mutex::new(VecDeque::new()),
             wake: WakeEvent::new().expect("manager WakeEvent allocation failed"),
+            boot_wake: WakeEvent::new().expect("startup WakeEvent allocation failed"),
         }))
     })
 }
@@ -48,27 +50,116 @@ pub enum ManagerError {
     ThreadPanicked,
 }
 
-#[allow(clippy::expect_used)] // boot invariant: control-plane thread spawn is fatal if it fails
-pub fn jfn_manager_start(overlay: jfn_cef::WebOverlay) -> JoinHandle<Result<(), ManagerError>> {
+/// Prepare outside signal context, before producers or OS shutdown hooks exist.
+pub fn prepare_shutdown() {
     let _ = manager();
+    jfn_playback::jfn_shutdown_set_handler(Some(jfn_manager_notify_shutdown));
     jfn_playback::lifecycle::jfn_lifecycle_set_handlers(
         |visible| jfn_manager_send(ManagerMsg::SetVisible(visible)),
         || jfn_manager_send(ManagerMsg::Suspend),
         || jfn_manager_send(ManagerMsg::Resume),
     );
-    thread::Builder::new()
+}
+
+/// Acquires the worker before any browser exists. A failed thread spawn cannot
+/// leave an overlay needing the main loop to drain.
+pub struct PreparedManager {
+    sender: Option<std::sync::mpsc::SyncSender<jfn_cef::WebOverlay>>,
+    worker: Option<JoinHandle<Result<(), ManagerError>>>,
+}
+impl PreparedManager {
+    #[allow(clippy::expect_used)] // Each field is consumed exactly once here or in Drop.
+    pub fn activate(
+        mut self,
+        overlay: jfn_cef::WebOverlay,
+    ) -> JoinHandle<Result<(), ManagerError>> {
+        // The worker only waits for this value before entering application code.
+        self.sender
+            .take()
+            .expect("unactivated manager")
+            .send(overlay)
+            .unwrap_or_else(|_| {
+                unreachable!("prepared manager receiver cannot exit before activation")
+            });
+        self.worker.take().expect("unactivated manager")
+    }
+}
+impl Drop for PreparedManager {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+pub fn jfn_manager_prepare() -> std::io::Result<PreparedManager> {
+    let _ = manager();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
         .name("jfn-manager".into())
         .spawn(move || {
+            let Ok(overlay) = receiver.recv() else {
+                return Ok(());
+            };
             run_and_wake(
                 || manager_loop(&overlay),
-                || jfn_platform_abi::get().wake_main_loop(),
+                || {
+                    if let Some(lease) = jfn_platform_abi::try_lease() {
+                        lease.platform().wake_main_loop();
+                    }
+                },
             )
-        })
-        .expect("spawn jfn-manager thread")
+        })?;
+    Ok(PreparedManager {
+        sender: Some(sender),
+        worker: Some(worker),
+    })
 }
 
 pub fn jfn_manager_notify_shutdown() {
+    manager().boot_wake.signal();
     manager().wake.signal();
+}
+
+/// Forwards the signal-safe wake into mpv while startup owns event ingestion.
+/// The worker is joined before playback ingestion or native teardown can start.
+pub struct BootShutdownWake {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+impl BootShutdownWake {
+    pub fn start() -> std::io::Result<Self> {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::clone(&stop);
+        let manager = manager();
+        let worker = thread::Builder::new()
+            .name("jfn-startup-wake".into())
+            .spawn(move || {
+                loop {
+                    manager.boot_wake.wait();
+                    manager.boot_wake.drain();
+                    if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    if jfn_shutting_down() {
+                        jfn_mpv::api::jfn_mpv_wakeup();
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+impl Drop for BootShutdownWake {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        manager().boot_wake.signal();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 pub fn jfn_manager_send(msg: ManagerMsg) {
@@ -80,7 +171,6 @@ fn manager_loop(overlay: &jfn_cef::WebOverlay) -> Result<(), ManagerError> {
     let manager = manager();
     let mut state = LifecycleState::Running;
     loop {
-        manager.wake.wait();
         manager.wake.drain();
 
         let work: VecDeque<ManagerMsg> = {
@@ -96,6 +186,7 @@ fn manager_loop(overlay: &jfn_cef::WebOverlay) -> Result<(), ManagerError> {
                 return Ok(());
             }
         }
+        manager.wake.wait();
     }
 }
 
@@ -154,6 +245,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[test]
+    fn dropping_unactivated_manager_joins_without_entering_runtime() -> std::io::Result<()> {
+        let manager = jfn_manager_prepare()?;
+        // There is no installed platform or CEF session in this unit test.
+        // Entering manager_loop or its wake callback would violate that setup.
+        drop(manager);
+        Ok(())
+    }
 
     #[test]
     fn confirmed_close_wakes_main_and_returns_success() {

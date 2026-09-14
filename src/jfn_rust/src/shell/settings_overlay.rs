@@ -5,10 +5,10 @@ use iced_core::widget::operation::scrollable::AbsoluteOffset;
 use iced_core::{Alignment, Color, Element, Length, Padding};
 use iced_widget::{Container, button, column, container, mouse_area, row, text};
 
-use crate::about::About;
-use crate::controls;
-use crate::settings::{self, Settings};
-use crate::theme::{self, Theme};
+use crate::shell::about::About;
+use crate::shell::controls;
+use crate::shell::settings::{self, Settings};
+use crate::shell::theme::{self, Theme};
 
 pub const SETTINGS_TAB_CONTROL: Id = Id::new("shell-settings-tab");
 pub const ABOUT_TAB_CONTROL: Id = Id::new("shell-about-tab");
@@ -25,7 +25,7 @@ pub enum Message {
     Swallow,
     Select(Tab),
     Settings(settings::Message),
-    About(crate::about::Message),
+    About(crate::shell::about::Message),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,10 +51,18 @@ pub struct SettingsOverlay {
 }
 
 impl SettingsOverlay {
-    pub fn new(active: Tab) -> Self {
+    pub fn new(active: Tab, metadata: crate::shell::metadata::ApplicationMetadata) -> Self {
+        Self::with_settings(active, metadata, Settings::new())
+    }
+
+    pub(crate) fn with_settings(
+        active: Tab,
+        metadata: crate::shell::metadata::ApplicationMetadata,
+        settings: Settings,
+    ) -> Self {
         Self {
-            settings: Settings::new(),
-            about: About::new(),
+            settings,
+            about: About::new(metadata),
             active,
             settings_focus: None,
             settings_scroll: AbsoluteOffset::default(),
@@ -64,14 +72,18 @@ impl SettingsOverlay {
 
     #[cfg(test)]
     pub(crate) fn testing(active: Tab) -> Self {
-        Self {
-            settings: Settings::testing(),
-            about: About::new(),
+        Self::testing_with_metadata(
             active,
-            settings_focus: None,
-            settings_scroll: AbsoluteOffset::default(),
-            restore_settings: false,
-        }
+            crate::shell::metadata::ApplicationMetadata::testing(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_with_metadata(
+        active: Tab,
+        metadata: crate::shell::metadata::ApplicationMetadata,
+    ) -> Self {
+        Self::with_settings(active, metadata, Settings::testing())
     }
 
     pub fn active(&self) -> Tab {
@@ -130,7 +142,7 @@ impl SettingsOverlay {
                 settings::Outcome::Dismiss => Outcome::Dismiss,
                 settings::Outcome::ResetSavedServer => Outcome::ResetSavedServer,
             },
-            Message::About(crate::about::Message::OpenPath(path)) => {
+            Message::About(crate::shell::about::Message::OpenPath(path)) => {
                 self.about.open(&path);
                 Outcome::None
             }

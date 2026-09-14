@@ -380,91 +380,69 @@ pub(crate) fn query_parent_geometry_x11rb(
 /// into the state seeded by [`ensure_host_window`], and starts the input
 /// thread. mpv is already up and embedded in the video host by the time this
 /// runs.
-pub fn init() -> bool {
+pub fn init() -> Result<(), jfn_platform_abi::PlatformInitError> {
+    use jfn_platform_abi::PlatformInitError as Error;
     crate::mpv_proxy::restore_real_display();
-
-    let Some(toplevel) = host().map(|h| h.toplevel) else {
-        eprintln!("[x11] host window missing at init");
-        return false;
-    };
-
-    let (x11rb_conn, screen_num) = match RustConnection::connect(None) {
-        Ok((conn, screen_num)) => (std::sync::Arc::new(conn), screen_num as i32),
-        Err(e) => {
-            eprintln!("[x11] failed to connect x11rb control connection: {e:?}");
-            return false;
-        }
-    };
-    if let Err(e) = crate::x11_state::open_xcb_connection() {
-        eprintln!("[x11] failed to connect xcb interop/input connection: {e}");
-        return false;
-    }
-
+    let toplevel = host()
+        .map(|h| h.toplevel)
+        .ok_or_else(|| Error::backend("X11 host acquisition", "host window missing"))?;
+    let (connection, screen_num) =
+        RustConnection::connect(None).map_err(|e| Error::backend("X11 control connection", e))?;
+    let x11rb_conn = std::sync::Arc::new(connection);
+    crate::x11_state::open_xcb_connection()
+        .map_err(|e| Error::backend("X11 input connection", e))?;
     let setup = x11rb_conn.setup();
-    let Some(screen) = setup.roots.get(screen_num as usize) else {
-        eprintln!("[x11] no screen at index {screen_num}");
-        return false;
-    };
+    let screen = setup.roots.get(screen_num).ok_or_else(|| {
+        Error::backend(
+            "X11 screen selection",
+            format!("screen {screen_num} missing"),
+        )
+    })?;
     let root = screen.root;
-
-    if !compositor_present(&x11rb_conn, screen_num) {
+    if !compositor_present(&x11rb_conn, screen_num as i32) {
         tracing::error!(target: "Platform", "{COMPOSITOR_NOT_DETECTED_MSG}");
     }
-
-    let argb_depth: u8 = 32;
-    let Some(argb_visual) = find_argb_visual(screen) else {
-        eprintln!("[x11] no 32-bit ARGB visual found");
-        return false;
-    };
-
-    let Ok(colormap_id) = x11rb_conn.generate_id() else {
-        eprintln!("[x11] failed to allocate colormap id");
-        return false;
-    };
-    let colormap = colormap_id;
-    if x11rb_conn
+    let argb_depth = 32;
+    let argb_visual = find_argb_visual(screen)
+        .ok_or_else(|| Error::backend("X11 visual selection", "no 32-bit ARGB visual"))?;
+    let colormap = x11rb_conn
+        .generate_id()
+        .map_err(|e| Error::backend("X11 colormap ID allocation", e))?;
+    x11rb_conn
         .create_colormap(
             x11rb::protocol::xproto::ColormapAlloc::NONE,
-            colormap_id,
+            colormap,
             root,
             argb_visual,
         )
-        .is_err()
-    {
-        eprintln!("[x11] failed to create colormap");
-        return false;
-    }
-
-    // Verify MIT-SHM 1.2 (fd passing) is present.
-    let shm_ok = x11rb_conn
+        .map_err(|e| Error::backend("X11 colormap creation", e))?
+        .check()
+        .map_err(|e| Error::backend("X11 colormap creation", e))?;
+    let shm = x11rb_conn
         .shm_query_version()
-        .ok()
-        .and_then(|cookie| cookie.reply().ok())
-        .is_some_and(|v| (v.major_version, v.minor_version) >= (1, 2));
-    if !shm_ok {
-        tracing::error!("MIT-SHM 1.2 not available");
-        return false;
+        .map_err(|e| Error::backend("X11 MIT-SHM query", e))?
+        .reply()
+        .map_err(|e| Error::backend("X11 MIT-SHM reply", e))?;
+    if (shm.major_version, shm.minor_version) < (1, 2) {
+        return Err(Error::backend(
+            "X11 MIT-SHM version",
+            "version 1.2 required",
+        ));
     }
-
     if !set_paint_services(PaintServices {
         argb_visual,
         argb_depth,
         colormap,
     }) {
-        eprintln!("[x11] paint services already initialized");
-        return false;
+        return Err(Error::backend("X11 paint services", "already initialized"));
     }
-
-    if X11RB_CONN.set(x11rb_conn).is_err() {
-        eprintln!("[x11] x11rb connection already initialized");
-        return false;
-    }
-
+    X11RB_CONN.set(x11rb_conn).map_err(|_| {
+        Error::backend("X11 control connection installation", "already initialized")
+    })?;
     crate::input_lifecycle::start(toplevel);
     crate::menu::warm();
-
-    eprintln!("[x11] platform initialized (toplevel=0x{toplevel:x})");
-    true
+    tracing::info!("X11 platform initialized (toplevel=0x{toplevel:x})");
+    Ok(())
 }
 
 pub fn cleanup() {

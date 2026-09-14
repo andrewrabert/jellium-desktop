@@ -196,17 +196,17 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
 
 pub(crate) fn win_early_init() {}
 
-pub(crate) fn win_init(_mpv: *mut c_void) -> bool {
+pub(crate) fn win_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformInitError> {
     let Some(hwnd) = win_ensure_hwnd() else {
-        tracing::error!("mpv window handle unresolved; no observed window-id");
-        return false;
+        return Err(jfn_platform_abi::PlatformInitError::backend(
+            "Windows window acquisition",
+            "no observed mpv window-id",
+        ));
     };
     let hwnd_raw = hwnd.0 as usize;
     crate::window::republish();
 
-    if !crate::render::init(hwnd_from_raw(hwnd_raw)) {
-        return false;
-    }
+    crate::render::init(hwnd_from_raw(hwnd_raw))?;
 
     crate::window::start_notifier();
     let mpv_tid = unsafe { GetWindowThreadProcessId(hwnd_from_raw(hwnd_raw), None) };
@@ -215,20 +215,27 @@ pub(crate) fn win_init(_mpv: *mut c_void) -> bool {
     match hook {
         Ok(h) => STATE.lock().wndproc_hook_raw = h.0 as usize,
         Err(e) => {
-            tracing::error!("SetWindowsHookExW(WH_CALLWNDPROCRET) failed: {e:?}");
-            return false;
+            return Err(jfn_platform_abi::PlatformInitError::backend(
+                "SetWindowsHookExW(WH_CALLWNDPROCRET)",
+                e,
+            ));
         }
     }
 
     let mpv_hwnd_for_thread = hwnd_raw;
-    let join = std::thread::spawn(move || {
-        jfn_input_windows_run_input_thread(mpv_hwnd_for_thread as *mut c_void);
-    });
+    let join = std::thread::Builder::new()
+        .name("jfn-input".into())
+        .spawn(move || {
+            jfn_input_windows_run_input_thread(mpv_hwnd_for_thread as *mut c_void);
+        })
+        .map_err(|e| {
+            jfn_platform_abi::PlatformInitError::backend("Windows input thread spawn", e)
+        })?;
     STATE.lock().input_thread = Some(join);
 
     crate::window::republish();
     tracing::info!("Windows DirectComposition compositor initialized");
-    true
+    Ok(())
 }
 
 pub(crate) fn win_cleanup() {

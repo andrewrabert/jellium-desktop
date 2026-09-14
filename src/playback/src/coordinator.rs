@@ -66,6 +66,7 @@ struct Sinks {
 }
 
 pub struct PlaybackCoordinator {
+    pub(crate) window_subscription: Option<jfn_platform_abi::WindowSubscription>,
     shared: Arc<Shared>,
     /// Handed to the worker by `start`; `None` afterwards, which makes a
     /// second `start` a no-op.
@@ -93,6 +94,7 @@ impl PlaybackCoordinator {
     pub fn new() -> Self {
         let (tx, rx) = unbounded();
         Self {
+            window_subscription: None,
             shared: Arc::new(Shared {
                 tx: Mutex::new(Some(tx)),
                 snapshot: Mutex::new(PlaybackSnapshot::fresh()),
@@ -112,6 +114,7 @@ impl PlaybackCoordinator {
     }
 
     pub fn stop(&mut self) {
+        drop(self.window_subscription.take());
         drop(self.shared.tx.lock().take());
         if let Some(h) = self.join.take()
             && let Err(e) = h.join()

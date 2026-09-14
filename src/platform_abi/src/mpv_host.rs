@@ -40,13 +40,16 @@ pub trait MpvHost: Send + Sync {
         None
     }
 
-    /// Own the VO wait loop. The pump drains queued mpv events, checks all
-    /// readiness gates, and returns false when startup is finished. `Event`
-    /// waits without a timer; host state changes must wake mpv after publishing
-    /// their state. Native run-loop owners use `Drain` and wait on their own
-    /// event source instead.
-    fn run_vo_wait(&self, pump: &mut dyn FnMut(VoWait) -> bool) {
-        while pump(VoWait::Event) {}
+    /// Drain pending events and return Break when application startup ends.
+    /// Event may block in mpv; Drain must return promptly so native main-loop
+    /// sources can run. Publish readiness before waking this wait. Backends
+    /// must return only when the callback yields Break, preserving app results.
+    fn run_vo_wait(&self, pump: &mut dyn FnMut(VoWait) -> std::ops::ControlFlow<()>) {
+        loop {
+            if let std::ops::ControlFlow::Break(()) = pump(VoWait::Event) {
+                return;
+            }
+        }
     }
 
     /// The host window's logical content size, or `None` when mpv's

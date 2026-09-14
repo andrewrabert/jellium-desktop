@@ -100,15 +100,19 @@ impl Platform for WaylandPlatform {
         self.rt().probe_decorations();
     }
 
-    fn init(&self, _mpv: *mut c_void) -> bool {
+    fn init(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+        _mpv: *mut c_void,
+    ) -> Result<(), jfn_platform_abi::PlatformInitError> {
         crate::lifecycle::init(self.rt())
     }
 
-    fn cleanup(&self) {
+    fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
         crate::lifecycle::cleanup(self.rt());
     }
 
-    fn post_window_cleanup(&self) {
+    fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
         self.rt().proxy().stop();
         #[cfg(feature = "kde-palette")]
         crate::kde_palette::post_window_cleanup(self.rt());
@@ -173,7 +177,10 @@ impl Platform for WaylandPlatform {
         wl_ops::restack(self.rt(), typed);
     }
 
-    fn menu_delivery(&self, _kind: jfn_platform_abi::MenuKind) -> jfn_platform_abi::MenuDelivery {
+    fn menu_delivery(
+        &self,
+        _kind: jfn_platform_abi::MenuKind,
+    ) -> jfn_platform_abi::MenuDelivery<'_> {
         jfn_platform_abi::MenuDelivery::Host(self.rt().menu_host())
     }
 

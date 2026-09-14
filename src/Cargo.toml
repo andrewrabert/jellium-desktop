@@ -1,11 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-    "bringup",
     "color",
     "compositor_core",
     "config",
-    "fonts",
     "gpu_paint",
     "input",
     "jellyfin",
@@ -23,7 +21,6 @@ members = [
     "platform_abi",
     "playback",
     "instance_ipc",
-    "shell",
     "wake_event",
     "wayland",
     "windows",

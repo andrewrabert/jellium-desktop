@@ -237,8 +237,10 @@ fn start_invalidate_loop(scheduler: PaintScheduler, state: &PaintState, inner: &
         return;
     }
     let next = Arc::clone(inner);
-    let mut task = KickTask::new(scheduler, next);
-    let _ = post_task(ThreadId::UI, Some(&mut task));
+    inner.session.dispatch(|| {
+        let mut task = KickTask::new(scheduler, next);
+        let _ = post_task(ThreadId::UI, Some(&mut task));
+    });
 }
 
 fn active_kick_apply(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<Inner>) {
@@ -276,9 +278,8 @@ fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: 
     }
     if inner.browser_alive() {
         inner.invalidate_view();
-        let external_bf = jfn_platform_abi::try_get()
-            .and_then(|p| p.cef_host())
-            .is_some_and(|h| h.external_begin_frame());
+        let external_bf = jfn_platform_abi::try_lease()
+            .is_some_and(|p| p.cef_host().is_some_and(|h| h.external_begin_frame()));
         if external_bf {
             inner.send_external_begin_frame();
         }
@@ -292,8 +293,10 @@ fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: 
     };
     let delay_ms = (period.as_millis() as i64).max(1);
     let next = Arc::clone(inner);
-    let mut task = TickTask::new(scheduler, next);
-    let _ = post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
+    inner.session.dispatch(|| {
+        let mut task = TickTask::new(scheduler, next);
+        let _ = post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
+    });
 }
 
 /// What the scheduler decided about one produced frame.
@@ -350,7 +353,7 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.scheduler.kick_task(&self.inner);
+            self.inner.session.dispatch(|| self.scheduler.kick_task(&self.inner));
         }
     }
 }
@@ -362,7 +365,7 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.scheduler.tick_task(&self.inner);
+            self.inner.session.dispatch(|| self.scheduler.tick_task(&self.inner));
         }
     }
 }

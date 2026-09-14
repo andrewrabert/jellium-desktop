@@ -16,16 +16,6 @@ fn software_pixels<'a>(buffer: *const u8, w: i32, h: i32) -> Option<&'a [u8]> {
     Some(unsafe { std::slice::from_raw_parts(buffer, len) })
 }
 
-/// A presented frame of the requested document is bring-up's witness. A frame
-/// produced before that document finished loading witnesses nothing.
-fn witness(navigation: Option<jfn_bringup::Navigation>, presented: jfn_bringup::Presented) {
-    if let Some(navigation) = navigation {
-        jfn_bringup::advance(jfn_bringup::Event::Operational(
-            jfn_bringup::Operational::witnessed(navigation, presented),
-        ));
-    }
-}
-
 impl Inner {
     pub(crate) fn view_size(&self) -> (i32, i32) {
         (
@@ -58,7 +48,10 @@ impl Inner {
         };
         let size = PhysicalSize { w, h };
         if is_popup {
-            if !matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
+            if !matches!(
+                self.dropdown(),
+                crate::platform_ops::MenuDelivery::Composited
+            ) {
                 return;
             }
             let (popup_width, popup_height) = self.popup_rect();
@@ -78,7 +71,9 @@ impl Inner {
             Verdict::Supersede => frame.supersede(),
             Verdict::Present => match self.surface().present(frame) {
                 Ok(presented) => {
-                    witness(navigation, presented);
+                    if let Some(navigation) = navigation {
+                        self.report_presented(navigation, presented);
+                    }
                     return;
                 }
                 Err(frame) => frame.supersede(),
@@ -92,7 +87,10 @@ impl Inner {
         info: &cef::AcceleratedPaintInfo,
     ) {
         if is_popup {
-            if !matches!(self.dropdown, crate::platform_ops::MenuDelivery::Composited) {
+            if !matches!(
+                self.dropdown(),
+                crate::platform_ops::MenuDelivery::Composited
+            ) {
                 return;
             }
             let (popup_width, popup_height) = self.popup_rect();
@@ -122,7 +120,9 @@ impl Inner {
             Verdict::Supersede => frame.supersede(),
             Verdict::Present => match self.surface().present(frame) {
                 Ok(presented) => {
-                    witness(navigation, presented);
+                    if let Some(navigation) = navigation {
+                        self.report_presented(navigation, presented);
+                    }
                     return;
                 }
                 Err(frame) => frame.supersede(),

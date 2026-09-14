@@ -30,15 +30,15 @@ pub const INGEST_FLAG_SHUTDOWN: u8 = 1;
 
 /// The installed platform: the scale it reports, and the logical content size
 /// the OS holds where the OS is the authority for it.
-struct PlatformCtx;
+struct PlatformCtx<'a>(&'a dyn jfn_platform_abi::Platform);
 
-impl IngestCtx for PlatformCtx {
+impl IngestCtx for PlatformCtx<'_> {
     fn scale(&self) -> Scale {
-        jfn_platform_abi::get().scale()
+        self.0.scale()
     }
 
     fn os_logical_size(&self) -> Option<LogicalSize> {
-        jfn_platform_abi::get().mpv_host().logical_content_size()
+        self.0.mpv_host().logical_content_size()
     }
 }
 
@@ -76,8 +76,11 @@ pub fn jfn_playback_window_id() -> Option<i64> {
 }
 
 /// Returns flag bits — see [`INGEST_FLAG_SHUTDOWN`].
-pub fn jfn_playback_ingest_mpv_event_owned(event: &Event) -> u8 {
-    let outs = ingest_event_for_ffi(event, state(), &PlatformCtx);
+pub fn jfn_playback_ingest_mpv_event_owned(
+    event: &Event,
+    platform: &dyn jfn_platform_abi::Platform,
+) -> u8 {
+    let outs = ingest_event_for_ffi(event, state(), &PlatformCtx(platform));
     dispatch(outs)
 }
 
@@ -85,7 +88,10 @@ pub fn jfn_playback_ingest_mpv_event_owned(event: &Event) -> u8 {
 /// Idempotent — the state machine dedupes, so an unchanged mode emits
 /// nothing.
 pub fn jfn_playback_reconcile_window_mode() {
-    let snap = jfn_platform_abi::get().window_owner().source().snapshot();
+    let Some(lease) = jfn_platform_abi::try_lease() else {
+        return;
+    };
+    let snap = lease.platform().window_owner().source().snapshot();
     post_window_state(snap.fullscreen, snap.maximized);
 }
 
@@ -98,7 +104,10 @@ pub fn jfn_playback_reconcile_window_mode() {
 /// clobber that flag before it is read.
 fn post_window_state(fullscreen: bool, maximized: bool) {
     use crate::ingest::observe_id::{FULLSCREEN, WINDOW_MAX};
-    let ctx = PlatformCtx;
+    let Some(lease) = jfn_platform_abi::try_lease() else {
+        return;
+    };
+    let ctx = PlatformCtx(lease.platform());
     let outs = ingest_property_for_ffi(FULLSCREEN, &PropertyValue::Flag(fullscreen), state(), &ctx);
     dispatch(outs);
     let outs = ingest_property_for_ffi(WINDOW_MAX, &PropertyValue::Flag(maximized), state(), &ctx);
@@ -122,7 +131,10 @@ pub fn jfn_playback_window_maximized() -> bool {
 /// subscribers. `false` when neither a logical content size nor a stored
 /// extent is available.
 pub fn jfn_playback_rescale_window_extent() -> bool {
-    let plat = jfn_platform_abi::get();
+    let Some(lease) = jfn_platform_abi::try_lease() else {
+        return false;
+    };
+    let plat = lease.platform();
     let logical = match plat.mpv_host().logical_content_size() {
         Some(logical) => logical,
         None => match state().window_extent() {
@@ -347,7 +359,10 @@ fn ingest_events(rx: Receiver<Event>) {
         {
             invoke_fullscreen_handler(*f);
         }
-        let outs = ingest_event_for_ffi(&event, state(), &PlatformCtx);
+        let Some(lease) = jfn_platform_abi::try_lease() else {
+            return;
+        };
+        let outs = ingest_event_for_ffi(&event, state(), &PlatformCtx(lease.platform()));
         if dispatch(outs) & INGEST_FLAG_SHUTDOWN != 0 {
             invoke_shutdown_handler();
             return;

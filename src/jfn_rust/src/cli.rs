@@ -62,9 +62,9 @@ pub struct Cli {
     #[arg(long)]
     pub audio_channels: Option<String>,
 
-    /// Chrome remote debugging port.
+    /// Chrome remote debugging port: 1024..=65535, or 0 to disable.
     #[arg(long)]
-    pub remote_debug_port: Option<i32>,
+    pub remote_debug_port: Option<jfn_cef::DebuggingPort>,
 
     /// Disable CEF GPU compositing.
     #[arg(long, action = ArgAction::SetTrue)]
@@ -180,7 +180,10 @@ mod tests {
     fn equals_form() {
         let a = ok(&["app", "--hwdec=vaapi", "--remote-debug-port=9222"]);
         assert_eq!(a.hwdec.as_deref(), Some("vaapi"));
-        assert_eq!(a.remote_debug_port, Some(9222));
+        assert_eq!(
+            a.remote_debug_port,
+            "9222".parse::<jfn_cef::DebuggingPort>().ok()
+        );
     }
 
     #[test]
@@ -230,6 +233,17 @@ mod tests {
     }
 
     #[test]
+    fn remote_debug_port_range_is_validated() {
+        for value in ["1", "1023", "65536", "-1"] {
+            assert!(try_parse(&["app", &format!("--remote-debug-port={value}")]).is_err());
+        }
+        assert_eq!(
+            ok(&["app", "--remote-debug-port=0"]).remote_debug_port,
+            Some(jfn_cef::DebuggingPort::Disabled)
+        );
+    }
+
+    #[test]
     fn remote_debug_port_non_numeric_error() {
         assert!(try_parse(&["app", "--remote-debug-port=bogus"]).is_err());
     }
@@ -262,7 +276,10 @@ mod tests {
         assert_eq!(a.cache_dir.as_deref(), Some("/tmp/cache"));
         assert_eq!(a.audio_passthrough.as_deref(), Some("ac3,dts-hd"));
         assert_eq!(a.audio_channels.as_deref(), Some("5.1"));
-        assert_eq!(a.remote_debug_port, Some(9222));
+        assert_eq!(
+            a.remote_debug_port,
+            "9222".parse::<jfn_cef::DebuggingPort>().ok()
+        );
     }
 
     #[test]

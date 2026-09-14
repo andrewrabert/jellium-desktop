@@ -48,7 +48,7 @@ struct MediaMetadata {
 static WAS_FULLSCREEN_BEFORE_OSD: Mutex<bool> = Mutex::new(false);
 
 /// Install jellyfin-web's handlers before its client is submitted to CEF.
-pub(crate) fn install(client: &Arc<Inner>) {
+pub(crate) fn install(client: &Arc<Inner>, application_menu: crate::ApplicationMenu) {
     client.set_created_callback(Some(Arc::new(|| {
         // The router owns this browser's CEF focus: it is live here, and a
         // focus published before it existed reached nothing.
@@ -57,8 +57,10 @@ pub(crate) fn install(client: &Arc<Inner>) {
 
     client.set_message_handler(Some(Box::new(handle_message)));
 
-    client.set_context_menu_builder(Some(crate::app_menu::build_closure()));
-    client.set_context_menu_dispatcher(Some(crate::app_menu::dispatch_closure()));
+    client.set_context_menu_builder(Some(crate::app_menu::build_closure(application_menu.items)));
+    client.set_context_menu_dispatcher(Some(crate::app_menu::dispatch_closure(
+        application_menu.on_selected,
+    )));
 }
 
 fn parse_metadata_json(json: &str) -> MediaMetadata {
@@ -297,12 +299,14 @@ fn handle_message(message: BrowserMessage) -> bool {
             let mut was_fullscreen = WAS_FULLSCREEN_BEFORE_OSD.lock();
             if active {
                 *was_fullscreen = jfn_playback_fullscreen();
-            } else if !*was_fullscreen {
-                jfn_platform_abi::get().set_fullscreen(false);
+            } else if !*was_fullscreen && let Some(platform) = jfn_platform_abi::try_lease() {
+                platform.set_fullscreen(false);
             }
         }),
         "toggleFullscreen" => {
-            jfn_platform_abi::get().toggle_fullscreen();
+            if let Some(platform) = jfn_platform_abi::try_lease() {
+                platform.toggle_fullscreen();
+            }
             true
         }
         "saveServerUrl" => with_args(args, |a| {

@@ -22,6 +22,7 @@ enum Phase {
 }
 
 struct ProbeState {
+    _owner: crossbeam_channel::Sender<std::convert::Infallible>,
     url: String,
     phase: Phase,
     base: String,
@@ -29,9 +30,10 @@ struct ProbeState {
     callback: Option<ProbeCallback>,
     active: Option<Urlrequest>,
     cancelled: bool,
+    session: Arc<crate::runtime::Session>,
 }
 
-pub struct Probe {
+pub(crate) struct Probe {
     state: Arc<Mutex<ProbeState>>,
 }
 
@@ -44,8 +46,14 @@ impl Probe {
     /// under a multi-threaded message loop, so the request is built inside a
     /// posted TID_UI task and its handle is published back into the returned
     /// `Probe`.
-    pub fn start(url: &str, on_done: ProbeCallback) -> Probe {
+    pub(crate) fn start(
+        session: Arc<crate::runtime::Session>,
+        url: &str,
+        on_done: ProbeCallback,
+    ) -> Probe {
+        let (owner, disconnected) = crossbeam_channel::unbounded();
         let state = Arc::new(Mutex::new(ProbeState {
+            _owner: owner,
             url: normalize_input(url),
             phase: Phase::Head,
             base: String::new(),
@@ -53,25 +61,35 @@ impl Probe {
             callback: Some(on_done),
             active: None,
             cancelled: false,
+            session: Arc::clone(&session),
         }));
-        let mut task = StartTask::new(Arc::clone(&state));
-        let _ = post_task(ThreadId::UI, Some(&mut task));
+        let accepted = session
+            .dispatch(|| {
+                session.track_producer(disconnected);
+                let mut task = StartTask::new(Arc::clone(&state));
+                post_task(ThreadId::UI, Some(&mut task)) == 1
+            })
+            .unwrap_or(false);
+        if !accepted {
+            state.lock().cancelled = true;
+            let callback = state.lock().callback.take();
+            if let Some(callback) = callback {
+                session.dispatch(|| callback(None));
+            }
+        }
         Probe { state }
     }
 
     /// Aborts the in-flight request on TID_UI; `on_done` never fires
     /// afterwards, including when the request had not been built yet.
-    pub fn cancel(self) {
-        // The callback is dropped here rather than on TID_UI: the contract is
-        // that no outcome reaches the caller once `cancel` returns, and the
-        // posted task may not run for another message loop turn.
+    /// Called by the session's UI drain barrier, before releasing native CEF.
+    pub(crate) fn cancel_on_ui(self) {
         {
-            let mut st = self.state.lock();
-            st.cancelled = true;
-            st.callback = None;
+            let mut state = self.state.lock();
+            state.cancelled = true;
+            state.callback = None;
         }
-        let mut task = CancelTask::new(self.state);
-        let _ = post_task(ThreadId::UI, Some(&mut task));
+        cancel_on_ui(&self.state);
     }
 }
 
@@ -79,7 +97,7 @@ impl Probe {
 fn start_on_ui(state: &Arc<Mutex<ProbeState>>) {
     let head_url = {
         let st = state.lock();
-        if st.cancelled {
+        if st.cancelled || !st.session.is_active() {
             return;
         }
         st.url.clone()
@@ -87,7 +105,7 @@ fn start_on_ui(state: &Arc<Mutex<ProbeState>>) {
     let client = JfnServerProbeClient::new(Arc::clone(state));
     let request = make_request("HEAD", &head_url, client);
     let mut st = state.lock();
-    if st.cancelled {
+    if st.cancelled || !st.session.is_active() {
         if let Some(r) = request {
             r.cancel();
         }
@@ -122,23 +140,17 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            start_on_ui(&self.state);
-        }
-    }
-}
-
-wrap_task! {
-    struct CancelTask {
-        state: Arc<Mutex<ProbeState>>,
-    }
-    impl Task {
-        fn execute(&self) {
-            cancel_on_ui(&self.state);
+            let session = Arc::clone(&self.state.lock().session);
+            session.dispatch(|| start_on_ui(&self.state));
         }
     }
 }
 
 fn on_complete(state: &Arc<Mutex<ProbeState>>, request: &Urlrequest) {
+    if !state.lock().session.is_active() {
+        cancel_on_ui(state);
+        return;
+    }
     // HEAD phase: extract resolved base URL, post GET on /System/Info/Public.
     let next_request = {
         let mut st = state.lock();
@@ -208,7 +220,8 @@ cef::wrap_urlrequest_client! {
     impl UrlrequestClient {
         fn on_request_complete(&self, request: Option<&mut Urlrequest>) {
             let Some(req) = request else { return };
-            on_complete(&self.state, req);
+            let session = Arc::clone(&self.state.lock().session);
+            session.dispatch(|| on_complete(&self.state, req));
         }
         fn on_download_data(
             &self,

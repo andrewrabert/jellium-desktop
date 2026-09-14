@@ -1,7 +1,7 @@
 //! Page-derived chrome inputs.
 //!
 //! Held below both jfn-cef, which writes them from jellyfin-web's bindings,
-//! and jfn-shell, which draws the titlebar from them.
+//! and the application shell, which draws the titlebar from them.
 
 use parking_lot::Mutex;
 

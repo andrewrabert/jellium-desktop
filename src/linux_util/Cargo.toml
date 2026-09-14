@@ -17,7 +17,7 @@ parking_lot.workspace = true
 cursor-icon = "1"
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
 drm-fourcc = "2"
-jfn-fonts = { path = "../fonts" }
+iced_graphics.workspace = true
 jfn-input = { path = "../input" }
 jfn-mailbox = { path = "../mailbox" }
 jfn-platform-abi = { path = "../platform_abi" }

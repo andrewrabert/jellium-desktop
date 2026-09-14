@@ -51,13 +51,13 @@ pub fn jfn_playback_init() {
         let mut c = PlaybackCoordinator::new();
         register_builtin_sinks(&c);
         c.start();
+        c.window_subscription = Some(jfn_platform_abi::subscribe_window_changed(
+            crate::ingest_driver::jfn_playback_reconcile_window_mode,
+        ));
         *guard = Some(c);
     }
     // The immediate reconcile is load-bearing: mode posts made before the
     // coordinator existed were dropped by `post`, and no wakeup replays them.
-    jfn_platform_abi::subscribe_window_changed(
-        crate::ingest_driver::jfn_playback_reconcile_window_mode,
-    );
     crate::ingest_driver::jfn_playback_reconcile_window_mode();
 }
 

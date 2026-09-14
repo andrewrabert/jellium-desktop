@@ -1,4 +1,6 @@
-use jfn_fonts::cosmic_text::{Attrs, Buffer, Color, Family, Metrics, Shaping, SwashCache};
+use iced_graphics::text::cosmic_text::{
+    Attrs, Buffer, Color, Family, Metrics, Shaping, SwashCache,
+};
 use tiny_skia::{Color as SkColor, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
 
 use jfn_platform_abi::{MenuItem, Scale};
@@ -91,6 +93,16 @@ impl Layout {
     }
 }
 
+fn with_font_system<R>(
+    f: impl FnOnce(&mut iced_graphics::text::cosmic_text::FontSystem) -> R,
+) -> R {
+    let mut guard = match iced_graphics::text::font_system().write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(guard.raw())
+}
+
 /// The menu's glyph cache. The font system it shapes through is the process's
 /// one, so the menu thread never runs a font scan of its own.
 pub struct Fonts {
@@ -105,7 +117,7 @@ impl Fonts {
     }
 
     fn shape(&mut self, text: &str, font_px: f32) -> Buffer {
-        jfn_fonts::with_font_system(|system| {
+        with_font_system(|system| {
             let mut buf = Buffer::new(system, Metrics::new(font_px, font_px * 1.3));
             buf.set_size(None, None);
             buf.set_text(
@@ -260,9 +272,8 @@ fn draw_text(
         let glyphs: Vec<_> = run.glyphs.to_vec();
         for glyph in &glyphs {
             let phys = glyph.physical((ox, oy + run.line_y), 1.0);
-            let img = jfn_fonts::with_font_system(|system| {
-                fonts.cache.get_image(system, phys.cache_key).clone()
-            });
+            let img =
+                with_font_system(|system| fonts.cache.get_image(system, phys.cache_key).clone());
             let Some(img) = img.as_ref() else {
                 continue;
             };

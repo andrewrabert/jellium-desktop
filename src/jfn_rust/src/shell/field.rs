@@ -28,7 +28,7 @@ use iced_core::{
 
 use jfn_platform_abi::DisplayBackend;
 
-use crate::theme::Theme;
+use crate::shell::theme::Theme;
 
 type Renderer = iced_wgpu::Renderer;
 type TextEditor = <Renderer as text::Renderer>::Editor;
@@ -581,7 +581,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        let backend = jfn_platform_abi::get().display();
+        let Some(lease) = jfn_platform_abi::try_lease() else {
+            return;
+        };
+        let backend = lease.platform().display();
         let state = tree.state.downcast_mut::<State>();
         state.bounds = layout.bounds();
         if state.take_operation_unfocus() {
@@ -622,7 +625,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<State>();
-        let style = crate::theme::field_style(state.focus.is_focused());
+        let style = crate::shell::theme::field_style(state.focus.is_focused());
         let bounds = layout.bounds();
 
         renderer.fill_quad(
@@ -703,7 +706,7 @@ mod tests {
     use iced_core::keyboard::{Key, Modifiers};
     use iced_core::text::editor::Motion;
 
-    use crate::fields::Snapshot;
+    use crate::shell::fields::Snapshot;
 
     /// The modifier the platform's own shortcuts are held with, as iced
     /// resolves it: Command on macOS, Ctrl everywhere else.

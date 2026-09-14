@@ -43,7 +43,7 @@ const BLANK: &str = "about:blank";
 
 enum PendingNavigation {
     Page {
-        navigation: jfn_bringup::Navigation,
+        navigation: crate::Navigation,
         url: String,
     },
     Blank,
@@ -53,16 +53,18 @@ pub(crate) struct DeferredNavigation {
     /// The newest effective navigation not yet submitted to a real main frame;
     /// an empty vector is absence and the vector contains at most one typed load.
     pending: Mutex<Vec<PendingNavigation>>,
+    pub(crate) on_event: std::sync::OnceLock<crate::WebEventHandler>,
 }
 
 impl DeferredNavigation {
     pub(crate) fn new() -> Arc<DeferredNavigation> {
         Arc::new(Self {
             pending: Mutex::new(Vec::new()),
+            on_event: std::sync::OnceLock::new(),
         })
     }
 
-    pub(crate) fn navigate(&self, navigation: jfn_bringup::Navigation, url: &str) {
+    pub(crate) fn navigate(&self, navigation: crate::Navigation, url: &str) {
         let mut pending = self.pending.lock();
         pending.clear();
         pending.push(PendingNavigation::Page {
@@ -71,7 +73,7 @@ impl DeferredNavigation {
         });
     }
 
-    pub(crate) fn abandon(&self, navigation: jfn_bringup::Navigation) {
+    pub(crate) fn abandon(&self, navigation: crate::Navigation) {
         let mut pending = self.pending.lock();
         if matches!(
             pending.as_slice(),
@@ -100,14 +102,15 @@ enum Painting {
     /// `navigation` was issued for `base`, and no main-frame load under `base`
     /// has finished; the pixels this browser produces are another document's.
     Awaiting {
-        navigation: jfn_bringup::Navigation,
+        navigation: crate::Navigation,
         base: String,
     },
     /// A main-frame load under `base` finished; every frame produced from here
     /// on is that navigation's document.
     Loaded {
-        navigation: jfn_bringup::Navigation,
+        navigation: crate::Navigation,
         base: String,
+        presented: bool,
     },
 }
 
@@ -118,26 +121,29 @@ impl Painting {
     fn loaded(self, url: &str) -> Painting {
         match self {
             Painting::Awaiting { navigation, base } if jfn_jellyfin::is_page_of(&base, url) => {
-                Painting::Loaded { navigation, base }
+                Painting::Loaded {
+                    navigation,
+                    base,
+                    presented: false,
+                }
             }
             other => other,
         }
     }
 
     /// The navigation a main-frame load of `url` belongs to.
-    fn navigation_of(&self, url: &str) -> Option<jfn_bringup::Navigation> {
+    fn navigation_of(&self, url: &str) -> Option<crate::Navigation> {
         match self {
-            Painting::Awaiting { navigation, base } | Painting::Loaded { navigation, base }
-                if jfn_jellyfin::is_page_of(base, url) =>
-            {
-                Some(*navigation)
-            }
+            Painting::Awaiting { navigation, base }
+            | Painting::Loaded {
+                navigation, base, ..
+            } if jfn_jellyfin::is_page_of(base, url) => Some(*navigation),
             _ => None,
         }
     }
 
     /// Whether this browser is painting `navigation`.
-    fn names(&self, navigation: jfn_bringup::Navigation) -> bool {
+    fn names(&self, navigation: crate::Navigation) -> bool {
         match self {
             Painting::Awaiting {
                 navigation: live, ..
@@ -149,11 +155,29 @@ impl Painting {
         }
     }
 
-    /// The navigation a frame produced now can witness.
-    fn witness(&self) -> Option<jfn_bringup::Navigation> {
+    fn mark_presented(&mut self, navigation: crate::Navigation) -> bool {
         match self {
-            Painting::Loaded { navigation, .. } => Some(*navigation),
-            Painting::None | Painting::Awaiting { .. } => None,
+            Painting::Loaded {
+                navigation: live,
+                presented,
+                ..
+            } if *live == navigation && !*presented => {
+                *presented = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The navigation a frame produced now can witness.
+    fn witness(&self) -> Option<crate::Navigation> {
+        match self {
+            Painting::Loaded {
+                navigation,
+                presented: false,
+                ..
+            } => Some(*navigation),
+            _ => None,
         }
     }
 }
@@ -166,6 +190,7 @@ pub(crate) struct BrowserState {
 }
 
 pub(crate) struct Inner {
+    pub(crate) session: Arc<crate::runtime::Session>,
     // identity / state queries (slice 1)
     name: Mutex<String>,
     _owner_connected: Sender<Infallible>,
@@ -210,7 +235,6 @@ pub(crate) struct Inner {
     // arrives via OnPopupSize, options via the "popupOptions" renderer IPC;
     // try_show_popup fires when popup_visible + size_received + options_received.
     popup: Mutex<PopupState>,
-    dropdown: jfn_platform_abi::MenuDelivery,
 
     /// The newest effective navigation not yet submitted to a real main frame;
     /// an empty vector is absence and the vector contains at most one typed load.
@@ -256,7 +280,29 @@ unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
 impl Inner {
+    pub(crate) fn report_presented(
+        &self,
+        navigation: crate::Navigation,
+        presented: jfn_gpu_paint::Presented,
+    ) {
+        let first = self.painting.lock().mark_presented(navigation);
+        if first {
+            self.report_web_event(crate::WebEvent::FramePresented(
+                crate::NavigationPresented::witnessed(navigation, presented),
+            ));
+        }
+    }
+
+    pub(crate) fn report_web_event(&self, event: crate::WebEvent) {
+        self.session.dispatch(|| {
+            if let Some(handler) = self.deferred_navigation.on_event.get() {
+                handler(event);
+            }
+        });
+    }
+
     pub(crate) fn new(
+        session: Arc<crate::runtime::Session>,
         surface: Arc<WebOverlaySurface>,
         deferred_navigation: Arc<DeferredNavigation>,
         paint_mode: PaintMode,
@@ -265,6 +311,7 @@ impl Inner {
         let paint_scheduler = paint_mode.make_scheduler();
         let (owner_connected, owner_disconnected) = crossbeam_channel::unbounded();
         Arc::new(Self {
+            session,
             name: Mutex::new(String::new()),
             _owner_connected: owner_connected,
             owner_disconnected,
@@ -288,7 +335,6 @@ impl Inner {
                 selected_idx: -1,
                 ..PopupState::default()
             }),
-            dropdown: jfn_platform_abi::menu_delivery(jfn_platform_abi::MenuKind::Dropdown),
             deferred_navigation,
             message_handler: Mutex::new(None),
             created_callback: Mutex::new(None),
@@ -371,7 +417,7 @@ impl Inner {
 impl Inner {
     /// Records the newest effective page, removes the previous navigation's
     /// witness immediately, and attempts delivery to the current main frame.
-    pub(crate) fn navigate(&self, navigation: jfn_bringup::Navigation, url: &str) {
+    pub(crate) fn navigate(&self, navigation: crate::Navigation, url: &str) {
         self.deferred_navigation.navigate(navigation, url);
         *self.painting.lock() = Painting::Awaiting {
             navigation,
@@ -392,7 +438,7 @@ impl Inner {
 
     /// Immediately removes a matching navigation from frames and failures and
     /// records an intentional blank load until a main frame accepts it.
-    pub(crate) fn abandon_navigation(&self, navigation: jfn_bringup::Navigation) {
+    pub(crate) fn abandon_navigation(&self, navigation: crate::Navigation) {
         self.deferred_navigation.abandon(navigation);
         let matched_live_navigation = {
             let mut painting = self.painting.lock();
@@ -411,14 +457,14 @@ impl Inner {
 
     /// The navigation a frame produced now can witness, and `None` until a
     /// requested document has finished loading.
-    pub(crate) fn witness_navigation(&self) -> Option<jfn_bringup::Navigation> {
+    pub(crate) fn witness_navigation(&self) -> Option<crate::Navigation> {
         self.painting.lock().witness()
     }
 
     /// The navigation a main-frame load of `url` belongs to, for charging that
     /// load's failure; `None` when `url` is a page of no navigation this
     /// browser was asked for.
-    pub(crate) fn load_navigation(&self, url: &str) -> Option<jfn_bringup::Navigation> {
+    pub(crate) fn load_navigation(&self, url: &str) -> Option<crate::Navigation> {
         self.painting.lock().navigation_of(url)
     }
 }
@@ -436,9 +482,8 @@ impl jfn_platform_abi::FrameSource for Inner {
             return;
         }
         self.invalidate_view();
-        let external_bf = jfn_platform_abi::try_get()
-            .and_then(|p| p.cef_host())
-            .is_some_and(|h| h.external_begin_frame());
+        let external_bf = jfn_platform_abi::try_lease()
+            .is_some_and(|p| p.cef_host().is_some_and(|h| h.external_begin_frame()));
         if external_bf {
             self.send_external_begin_frame();
         }
@@ -460,18 +505,29 @@ mod tests {
 
     fn awaiting(base: &str) -> Painting {
         Painting::Awaiting {
-            navigation: jfn_bringup::Navigation::for_test(1),
+            navigation: crate::Navigation::new(1),
             base: base.to_owned(),
         }
     }
 
     #[test]
+    fn presentation_is_reported_once_and_only_for_the_loaded_navigation() {
+        let navigation = crate::Navigation::new(1);
+        let mut painting = awaiting(SUBPATH_BASE);
+        assert!(!painting.mark_presented(navigation));
+        let mut painting = painting.loaded("https://host/jellyfin/web/index.html");
+        assert!(!painting.mark_presented(crate::Navigation::new(2)));
+        assert_eq!(painting.witness(), Some(navigation));
+        assert!(painting.mark_presented(navigation));
+        assert_eq!(painting.witness(), None);
+        assert!(!painting.mark_presented(navigation));
+        assert_eq!(painting.navigation_of(SUBPATH_BASE), Some(navigation));
+    }
+
+    #[test]
     fn a_subpath_hosted_navigation_is_promoted_by_its_own_page() {
         let painting = awaiting(SUBPATH_BASE).loaded("https://host/jellyfin/web/index.html");
-        assert_eq!(
-            painting.witness(),
-            Some(jfn_bringup::Navigation::for_test(1))
-        );
+        assert_eq!(painting.witness(), Some(crate::Navigation::new(1)));
     }
 
     #[test]
@@ -484,7 +540,7 @@ mod tests {
     fn a_failed_load_of_a_subpath_hosted_page_charges_its_navigation() {
         assert_eq!(
             awaiting(SUBPATH_BASE).navigation_of("https://host/jellyfin/web/index.html"),
-            Some(jfn_bringup::Navigation::for_test(1))
+            Some(crate::Navigation::new(1))
         );
     }
 }

@@ -80,7 +80,7 @@ impl Inner {
             && code != ERR_ABORTED
             && let Some(navigation) = self.load_navigation(url)
         {
-            jfn_bringup::advance(jfn_bringup::Event::NavigationFailed(navigation));
+            self.report_web_event(crate::WebEvent::NavigationFailed(navigation));
         }
     }
 

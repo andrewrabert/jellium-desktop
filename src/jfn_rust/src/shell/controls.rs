@@ -10,7 +10,7 @@ use iced_core::{
 };
 use iced_widget::pick_list;
 
-use crate::theme::{self, Theme};
+use crate::shell::theme::{self, Theme};
 
 type Renderer = iced_wgpu::Renderer;
 

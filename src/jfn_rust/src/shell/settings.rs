@@ -5,8 +5,8 @@ use iced_core::{Element, Length, Padding};
 use iced_widget::{button, checkbox, column, scrollable, text};
 use jfn_platform_abi::{DisplayBackend, WindowDecorations};
 
-use crate::controls;
-use crate::theme::{self, Theme};
+use crate::shell::controls;
+use crate::shell::theme::{self, Theme};
 
 pub const SETTINGS_SCROLL: Id = Id::new("shell-settings-scroll");
 pub const CLOSE_CONTROL: Id = Id::new("shell-settings-close");
@@ -76,11 +76,13 @@ impl Default for Settings {
 
 impl Settings {
     pub fn new() -> Self {
-        let platform = jfn_platform_abi::get();
-        let decoration_options = decoration_options(
-            platform.window_decorations_supported(),
-            platform.window_decoration_options().iter(),
-        );
+        let decoration_options = jfn_platform_abi::try_lease().map_or_else(Vec::new, |lease| {
+            let platform = lease.platform();
+            decoration_options(
+                platform.window_decorations_supported(),
+                platform.window_decoration_options().iter(),
+            )
+        });
         Self {
             audio_passthrough: jfn_config::audio_passthrough(),
             device_name: jfn_config::device_name(),
@@ -111,7 +113,7 @@ impl Settings {
             self.group(SECTION_TITLES[1], column![
                 self.setting(
                     "Audio Passthrough",
-                    crate::field::field(AUDIO_PASSTHROUGH_FIELD, "", &self.audio_passthrough)
+                    crate::shell::field::field(AUDIO_PASSTHROUGH_FIELD, "", &self.audio_passthrough)
                         .on_input(Message::AudioPassthroughEdited)
                         .on_submit(Message::CommitAudioPassthrough)
                         .on_unfocus(Message::CommitAudioPassthrough)
@@ -162,7 +164,9 @@ impl Settings {
                 "How the window titlebar is drawn. Changing requires restart.",
             ));
         }
-        if transparent_titlebar_visible(jfn_platform_abi::get().display()) {
+        if jfn_platform_abi::try_lease()
+            .is_some_and(|lease| transparent_titlebar_visible(lease.platform().display()))
+        {
             advanced = advanced.push(self.toggle(
                 TRANSPARENT_TITLEBAR_CONTROL,
                 "Transparent Titlebar",
@@ -181,7 +185,7 @@ impl Settings {
             ))
             .push(self.setting(
                 "Device Name",
-                crate::field::field(DEVICE_NAME_FIELD, &self.device_name_default, &self.device_name)
+                crate::shell::field::field(DEVICE_NAME_FIELD, &self.device_name_default, &self.device_name)
                     .on_input(Message::DeviceNameEdited)
                     .on_submit(Message::CommitDeviceName)
                     .on_unfocus(Message::CommitDeviceName)
@@ -298,7 +302,9 @@ impl Settings {
             }
             Message::LogLevelChanged(value) => jfn_config::set_log_level(&value),
             Message::OpenMpvConfigDirectory => {
-                jfn_platform_abi::get().open_path(&jfn_paths::mpv_home());
+                if let Some(lease) = jfn_platform_abi::try_lease() {
+                    lease.platform().open_path(&jfn_paths::mpv_home());
+                }
                 return Outcome::None;
             }
             Message::ResetSavedServer => {

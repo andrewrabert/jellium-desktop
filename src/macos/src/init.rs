@@ -519,10 +519,17 @@ unsafe fn stop_display_link(state: &mut InitState) {
     }
 }
 
-/// Lock `INIT_STATE` and rebuild the display link. Skips while shutting
-/// down (the link is being torn down) and when no window is held yet.
-/// Store the frame driver and add the CADisplayLink to the run loop. Called
-/// once, by `CefHost::start_frame_driver`.
+/// Stop frame production and release its callback on the main thread.
+pub fn stop_frame_driver() {
+    let mut state = INIT_STATE.lock();
+    // SAFETY: display-link operations are called on the application's main thread.
+    unsafe {
+        stop_display_link(&mut state);
+    }
+    state.frame_driver.take();
+}
+
+/// Store the driver before starting CADisplayLink on the main thread.
 pub fn start_frame_driver(driver: std::sync::Arc<dyn Fn() + Send + Sync>) -> bool {
     let mut state = INIT_STATE.lock();
     state.frame_driver = Some(driver);
@@ -532,6 +539,7 @@ pub fn start_frame_driver(driver: std::sync::Arc<dyn Fn() + Send + Sync>) -> boo
     unsafe { start_display_link(&mut state) }
 }
 
+/// Rebuild the link unless shutdown has begun or no window exists.
 fn restart_display_link_locked() {
     if jfn_shutting_down() {
         return;
@@ -639,7 +647,7 @@ use std::time::Instant;
 // link.
 // =====================================================================
 
-pub fn macos_init(_mpv: *mut c_void) -> bool {
+pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformInitError> {
     tracing::info!(target: LOG_TARGET, "[INIT] macos_init: waiting for mpv window");
 
     let mut state = INIT_STATE.lock();
@@ -681,8 +689,10 @@ pub fn macos_init(_mpv: *mut c_void) -> bool {
             macos_pump_block(remaining.as_secs_f64());
         }
         if state.window.is_null() {
-            tracing::error!(target: LOG_TARGET, "[INIT] mpv did not create a window");
-            return false;
+            return Err(jfn_platform_abi::PlatformInitError::backend(
+                "macOS window acquisition",
+                "mpv did not create a visible window before deadline",
+            ));
         }
         tracing::info!(target: LOG_TARGET, "[INIT] macos_init: got window={:?}", state.window);
 
@@ -830,7 +840,7 @@ pub fn macos_init(_mpv: *mut c_void) -> bool {
             "[INIT] Metal compositor initialized input_view={:?}",
             state.input_view
         );
-        true
+        Ok(())
     }
 }
 

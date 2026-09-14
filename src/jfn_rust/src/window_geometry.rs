@@ -14,7 +14,8 @@ use jfn_config::JfnWindowGeometry;
 const DEFAULT_LOGICAL: LogicalSize = LogicalSize { w: 1600, h: 900 };
 
 fn plat() -> &'static dyn Platform {
-    jfn_platform_abi::get()
+    // SAFETY: geometry wiring is owned by the app boot/run/teardown sequence.
+    unsafe { jfn_platform_abi::get() }
 }
 
 /// Owns the boot→live→persist lifecycle for window geometry.

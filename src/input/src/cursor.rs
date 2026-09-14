@@ -58,7 +58,7 @@ pub(crate) fn set_owner(target: Target) {
 }
 
 fn apply(shape: CursorShape) {
-    if let Some(p) = jfn_platform_abi::try_get() {
-        p.set_cursor(shape);
+    if let Some(p) = jfn_platform_abi::try_lease() {
+        p.platform().set_cursor(shape);
     }
 }

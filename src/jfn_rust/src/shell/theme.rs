@@ -92,8 +92,8 @@ impl iced_core::widget::text::Catalog for Theme {
 
 /// [`FIELD`] fill, a two-pixel border that is [`ACCENT`] while focused and
 /// [`FIELD`] otherwise, [`TEXT`] value, [`ACCENT`] selection.
-pub fn field_style(focused: bool) -> crate::field::Style {
-    crate::field::Style {
+pub fn field_style(focused: bool) -> crate::shell::field::Style {
+    crate::shell::field::Style {
         background: iced_core::Background::Color(FIELD),
         border: iced_core::Border {
             color: if focused { ACCENT } else { FIELD },

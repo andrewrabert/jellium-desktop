@@ -16,8 +16,11 @@ impl Inner {
     pub(crate) fn menu_selection_callback(self: &Arc<Self>, session: Session) -> MenuSelection {
         let inner = Arc::clone(self);
         MenuSelection::new(move |id| {
-            let mut task = DispatchMenuResultTask::new(inner, session, id);
-            let _ = post_task(ThreadId::UI, Some(&mut task));
+            let authority = Arc::clone(&inner.session);
+            authority.dispatch(|| {
+                let mut task = DispatchMenuResultTask::new(inner, session, id);
+                let _ = post_task(ThreadId::UI, Some(&mut task));
+            });
         })
     }
 
@@ -40,8 +43,10 @@ impl Inner {
             return;
         }
         let inner = Arc::clone(self);
-        let mut task = DispatchMenuCommandTask::new(inner, id);
-        let _ = post_task(ThreadId::UI, Some(&mut task));
+        self.session.dispatch(|| {
+            let mut task = DispatchMenuCommandTask::new(inner, id);
+            let _ = post_task(ThreadId::UI, Some(&mut task));
+        });
     }
 
     fn dispatch_menu_command(&self, id: c_int) {
@@ -90,7 +95,7 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.inner.dispatch_menu_result(self.session, self.id);
+            self.inner.session.dispatch(|| self.inner.dispatch_menu_result(self.session, self.id));
         }
     }
 }
@@ -102,7 +107,7 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.inner.dispatch_menu_command(self.id);
+            self.inner.session.dispatch(|| self.inner.dispatch_menu_command(self.id));
         }
     }
 }

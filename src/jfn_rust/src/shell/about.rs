@@ -7,8 +7,8 @@ use iced_core::widget::Id;
 use iced_core::{Alignment, Element, Length, Padding};
 use iced_widget::{Text, button, column, container, image, row, text};
 
-use crate::controls;
-use crate::theme::{self, Theme};
+use crate::shell::controls;
+use crate::shell::theme::{self, Theme};
 
 pub const CONFIG_DIRECTORY_CONTROL: Id = Id::new("shell-about-config-directory");
 pub const CURRENT_LOG_CONTROL: Id = Id::new("shell-about-current-log");
@@ -22,35 +22,20 @@ pub enum Message {
 }
 
 pub struct About {
-    app_version: String,
-    cef_version: String,
-    config_dir: PathBuf,
-    log_file: Option<PathBuf>,
-}
-
-impl Default for About {
-    fn default() -> Self {
-        Self::new()
-    }
+    metadata: crate::shell::metadata::ApplicationMetadata,
 }
 
 impl About {
     /// Rows: app version, CEF version, config directory, current log file.
     /// The two path rows are absolute and clickable.
-    pub fn new() -> About {
-        let log_path = jfn_logging::active_path();
-        About {
-            app_version: jfn_cef::APP_VERSION_FULL.to_owned(),
-            cef_version: format!("{}", jfn_cef::cef_version()),
-            config_dir: absolute(jfn_paths::config_dir()),
-            log_file: (!log_path.is_empty()).then(|| absolute(PathBuf::from(log_path))),
-        }
+    pub fn new(metadata: crate::shell::metadata::ApplicationMetadata) -> About {
+        About { metadata }
     }
 
     pub fn view(&self) -> Element<'_, Message, Theme, iced_wgpu::Renderer> {
         let mut rows = column![
-            self.row(VERSION_LABEL, &self.app_version, None),
-            self.row(CEF_LABEL, &self.cef_version, None),
+            self.row(VERSION_LABEL, &self.metadata.app_version, None),
+            self.row(CEF_LABEL, &self.metadata.cef_version.to_string(), None),
         ]
         .spacing(8);
         for (label, id, path) in self.path_actions() {
@@ -58,7 +43,8 @@ impl About {
         }
 
         about_layout(
-            image(crate::logo::handle()).width(Length::Fixed(crate::logo::ABOUT_WIDTH)),
+            image(crate::shell::logo::handle())
+                .width(Length::Fixed(crate::shell::logo::ABOUT_WIDTH)),
             rows,
         )
     }
@@ -67,9 +53,9 @@ impl About {
         let mut actions = vec![(
             "Config directory",
             CONFIG_DIRECTORY_CONTROL,
-            &self.config_dir,
+            &self.metadata.config_dir,
         )];
-        if let Some(log) = &self.log_file {
+        if let Some(log) = &self.metadata.log_file {
             actions.push(("Current log file", CURRENT_LOG_CONTROL, log));
         }
         actions
@@ -101,7 +87,9 @@ impl About {
 
     /// Opens the row's path through `Platform::open_path`.
     pub fn open(&self, path: &Path) {
-        jfn_platform_abi::get().open_path(path);
+        if let Some(lease) = jfn_platform_abi::try_lease() {
+            lease.platform().open_path(path);
+        }
     }
 }
 
@@ -135,27 +123,15 @@ fn wrapped<'a>(content: impl IntoFragment<'a>) -> Text<'a, Theme, iced_wgpu::Ren
     text(content).wrapping(Wrapping::WordOrGlyph)
 }
 
-fn absolute(path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        return path;
-    }
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(path),
-        Err(_) => path,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn about(log_file: Option<PathBuf>) -> About {
-        About {
-            app_version: "app".to_owned(),
-            cef_version: "cef".to_owned(),
-            config_dir: PathBuf::from("/config"),
+        About::new(crate::shell::metadata::ApplicationMetadata {
             log_file,
-        }
+            ..crate::shell::metadata::ApplicationMetadata::testing()
+        })
     }
 
     #[test]
@@ -175,7 +151,7 @@ mod tests {
         ];
         let mut content: Element<'_, (), Theme, ()> = about_layout(
             Space::new()
-                .width(Length::Fixed(crate::logo::ABOUT_WIDTH))
+                .width(Length::Fixed(crate::shell::logo::ABOUT_WIDTH))
                 .height(Length::Fixed(1.0)),
             rows,
         );
@@ -200,7 +176,10 @@ mod tests {
         assert_eq!(row_children[0].bounds().width, 140.0);
         assert_eq!(value.x, 140.0);
         assert_eq!(value.x + value.width, first_row.bounds().width);
-        assert_eq!(logo.x, (parent.width - crate::logo::ABOUT_WIDTH) / 2.0);
+        assert_eq!(
+            logo.x,
+            (parent.width - crate::shell::logo::ABOUT_WIDTH) / 2.0
+        );
     }
 
     #[test]

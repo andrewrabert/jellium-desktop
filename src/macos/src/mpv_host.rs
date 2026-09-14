@@ -63,7 +63,7 @@ impl MpvHost for MacosMpvHost {
         }
     }
 
-    fn run_vo_wait(&self, pump: &mut dyn FnMut(VoWait) -> bool) {
+    fn run_vo_wait(&self, pump: &mut dyn FnMut(VoWait) -> std::ops::ControlFlow<()>) {
         unsafe {
             jfn_mpv::api::jfn_mpv_set_wakeup_callback(
                 crate::macos_mpv_wakeup_cb,
@@ -77,7 +77,7 @@ impl MpvHost for MacosMpvHost {
             // Drain AppKit before testing readiness: draining it after the
             // check could consume the last queued wake and then park forever.
             crate::macos_pump();
-            if !pump(VoWait::Drain) {
+            if let std::ops::ControlFlow::Break(()) = pump(VoWait::Drain) {
                 break;
             }
             crate::backend::macos_wait_for_source();

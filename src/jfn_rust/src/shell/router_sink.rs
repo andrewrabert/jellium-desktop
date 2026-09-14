@@ -11,7 +11,7 @@ use jfn_platform_abi::LogicalPoint;
 use jfn_platform_abi::cursor::CursorShape;
 use parking_lot::Mutex;
 
-use crate::actor::{Work, point};
+use crate::shell::actor::{Work, point};
 
 /// `csd.js`'s manual double-click window.
 const DOUBLE_PRESS: Duration = Duration::from_millis(400);
@@ -27,7 +27,10 @@ pub struct ShellSink;
 
 impl jfn_input::ShellInput for ShellSink {
     fn window_gesture(&self, hit: jfn_input::ShellHit) {
-        let Some(controls) = jfn_platform_abi::get().titlebar_controls() else {
+        let Some(lease) = jfn_platform_abi::try_lease() else {
+            return;
+        };
+        let Some(controls) = lease.platform().titlebar_controls() else {
             return;
         };
         match hit {
@@ -54,26 +57,33 @@ impl jfn_input::ShellInput for ShellSink {
     }
 
     fn context_menu(&self, p: LogicalPoint) {
-        crate::post(Work::ContextMenu(p));
+        crate::shell::post(Work::ContextMenu(p));
     }
 
     fn send_key(&self, key: jfn_input::key::ShellKey) {
-        let backend = jfn_platform_abi::get().display();
-        if crate::key::opens_edit_menu(backend, key) {
-            crate::post(Work::EditMenuAtCaret);
+        let Some(lease) = jfn_platform_abi::try_lease() else {
+            return;
+        };
+        let backend = lease.platform().display();
+        if crate::shell::key::opens_edit_menu(backend, key) {
+            crate::shell::post(Work::EditMenuAtCaret);
             return;
         }
-        crate::post(Work::Event(Event::Keyboard(crate::key::key_event(key))));
+        crate::shell::post(Work::Event(Event::Keyboard(crate::shell::key::key_event(
+            key,
+        ))));
     }
 
     fn send_text(&self, text: &str) {
         for ch in text.chars() {
-            crate::post(Work::Event(Event::Keyboard(crate::key::text_event(ch))));
+            crate::shell::post(Work::Event(Event::Keyboard(crate::shell::key::text_event(
+                ch,
+            ))));
         }
     }
 
     fn primary_paste(&self, p: LogicalPoint) {
-        crate::post(Work::PrimaryPaste(p));
+        crate::shell::post(Work::PrimaryPaste(p));
     }
 
     fn send_mouse_move(&self, p: LogicalPoint, _modifiers: u32, leave: bool) {
@@ -84,7 +94,7 @@ impl jfn_input::ShellInput for ShellSink {
                 position: point(p.x, p.y),
             }
         };
-        crate::post(Work::Event(Event::Mouse(event)));
+        crate::shell::post(Work::Event(Event::Mouse(event)));
     }
 
     fn send_mouse_click(
@@ -95,7 +105,7 @@ impl jfn_input::ShellInput for ShellSink {
         mouse_up: bool,
         _click_count: c_int,
     ) {
-        crate::post(Work::Event(Event::Mouse(mouse::Event::CursorMoved {
+        crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorMoved {
             position: point(p.x, p.y),
         })));
         // CEF mouse buttons: 0 = left, 1 = middle, 2 = right.
@@ -109,14 +119,14 @@ impl jfn_input::ShellInput for ShellSink {
         } else {
             mouse::Event::ButtonPressed(button)
         };
-        crate::post(Work::Event(Event::Mouse(event)));
+        crate::shell::post(Work::Event(Event::Mouse(event)));
     }
 
     fn send_mouse_wheel(&self, p: LogicalPoint, _modifiers: u32, delta_x: c_int, delta_y: c_int) {
-        crate::post(Work::Event(Event::Mouse(mouse::Event::CursorMoved {
+        crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorMoved {
             position: point(p.x, p.y),
         })));
-        crate::post(Work::Event(Event::Mouse(mouse::Event::WheelScrolled {
+        crate::shell::post(Work::Event(Event::Mouse(mouse::Event::WheelScrolled {
             delta: mouse::ScrollDelta::Pixels {
                 x: delta_x as f32,
                 y: delta_y as f32,
@@ -130,12 +140,12 @@ impl jfn_input::ShellInput for ShellSink {
         } else {
             iced_core::window::Event::Unfocused
         };
-        crate::post(Work::Event(Event::Window(event)));
+        crate::shell::post(Work::Event(Event::Window(event)));
     }
 
     fn edit(&self, command: jfn_input::EditCommand) {
-        crate::post(Work::EditAt {
-            field: crate::actor::Target::Focused,
+        crate::shell::post(Work::EditAt {
+            field: crate::shell::actor::Target::Focused,
             command,
         });
     }

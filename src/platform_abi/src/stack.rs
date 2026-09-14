@@ -97,7 +97,7 @@ fn apply(state: &mut StackState) {
 
 fn apply_non_web_stack(mut lower: Vec<SurfaceHandle>, upper: &[SurfaceHandle]) {
     lower.extend_from_slice(upper);
-    if let Some(platform) = crate::try_get() {
+    if let Some(platform) = crate::try_lease() {
         platform.apply_stack(&lower);
     }
 }
@@ -108,7 +108,7 @@ mod tests {
 
     use super::*;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::TEST_PLATFORM as TEST_LOCK;
 
     #[derive(Default)]
     struct RecordingStacker {
