@@ -10,6 +10,10 @@
             this.artworkAbortController = null;
             this.pendingArtworkUrl = null;
             this.attachedPlayer = null;
+            this.playerHandlers = null;
+            this.onPlaybackStart = null;
+            this.onPlaybackStop = null;
+            this.lastQueueCaps = null;
 
             console.debug('[Media] inputPlugin constructed with playbackManager:', !!playbackManager);
 
@@ -124,38 +128,70 @@
                 });
         }
 
-        startPositionUpdates() {
+        // Every playbackManager query below names its player explicitly.
+        // The manager's own defaults fall back to `_currentPlayer`, which
+        // is null from onPlaybackStopped until the next item's
+        // onPlaybackStarted — and that window is exactly when mpv's
+        // load-paused `pause` signal and the first `playing` arrive,
+        // because they are what resolves the play() promise that sets
+        // it. `getCurrentTicks(null)` throws "player cannot be null", so
+        // an implicit call from those handlers threw on every
+        // stop-then-play. With no player at all there is nothing to
+        // report; the native side already knows the position.
+        _player(player) {
+            if (player) return player;
+            if (this.attachedPlayer) return this.attachedPlayer;
             const pm = this.playbackManager;
-            const player = this.attachedPlayer;
+            if (!pm) return null;
+            return (pm.getCurrentPlayer ? pm.getCurrentPlayer() : pm._currentPlayer) || null;
+        }
 
-            const initialPos = pm.currentTime ? pm.currentTime() : 0;
-            if (typeof initialPos === 'number' && initialPos >= 0) {
+        // Position in ms, or null when there is no player to ask.
+        _currentTimeMs(player) {
+            const pm = this.playbackManager;
+            const p = this._player(player);
+            if (!pm || !p || typeof pm.currentTime !== 'function') return null;
+            const t = pm.currentTime(p);
+            return (typeof t === 'number' && t >= 0) ? t : null;
+        }
+
+        _playerState(player) {
+            const pm = this.playbackManager;
+            const p = this._player(player);
+            if (!pm || !p || typeof pm.getPlayerState !== 'function') return null;
+            return pm.getPlayerState(p);
+        }
+
+        _playbackRate(player) {
+            const p = this._player(player);
+            return (p && typeof p.getPlaybackRate === 'function') ? p.getPlaybackRate() : 1.0;
+        }
+
+        startPositionUpdates() {
+            const initialPos = this._currentTimeMs();
+            if (initialPos !== null) {
                 window.jmpNative.notifyPosition(Math.floor(initialPos));
             }
 
             this.positionTracking = {
                 startTime: Date.now(),
-                startPos: initialPos,
-                rate: (player && player.getPlaybackRate) ? player.getPlaybackRate() : 1.0
+                startPos: initialPos || 0,
+                rate: this._playbackRate()
             };
         }
 
         resetPositionTracking() {
-            const pm = this.playbackManager;
-            const player = this.attachedPlayer;
-            const pos = pm.currentTime ? pm.currentTime() : 0;
             this.positionTracking = {
                 startTime: Date.now(),
-                startPos: pos,
-                rate: (player && player.getPlaybackRate) ? player.getPlaybackRate() : 1.0
+                startPos: this._currentTimeMs() || 0,
+                rate: this._playbackRate()
             };
         }
 
         checkPositionDrift() {
             if (!this.positionTracking || !this.playbackManager) return;
-            const pm = this.playbackManager;
-            const actual = pm.currentTime ? pm.currentTime() : 0;
-            if (typeof actual !== 'number' || actual < 0) return;
+            const actual = this._currentTimeMs();
+            if (actual === null) return;
 
             const elapsed = Date.now() - this.positionTracking.startTime;
             const expected = this.positionTracking.startPos + (elapsed * this.positionTracking.rate);
@@ -177,6 +213,15 @@
             this.positionTracking = null;
         }
 
+        // Feeds the OS media session's next/previous capability. Two
+        // boundaries look alike from here and are handled differently:
+        // a real stop resets jellyfin-web's queue before `playbackstop`
+        // fires, so an empty playlist is a true state (nothing to step
+        // to) and is reported; the next item's `playing` arrives before
+        // `setPlaylist`, so the same empty queue shows up again and is
+        // deduplicated, and `playbackstart` right after carries the real
+        // one. A non-empty playlist with no current index is the only
+        // transient, and is skipped.
         updateQueueState() {
             try {
                 if (!window.jmpNative) return;
@@ -188,33 +233,96 @@
                 const playlist = qm?.getPlaylist();
                 const currentIndex = qm?.getCurrentPlaylistIndex();
 
-                if (!playlist || !Array.isArray(playlist) || playlist.length === 0 ||
-                    currentIndex === undefined || currentIndex === null || currentIndex < 0) {
-                    console.warn('[Media] updateQueueState: queue invalid (idx=' + currentIndex + ' len=' + (playlist?.length || 0) + '), keeping last state');
-                    return;
+                let canNext = false;
+                let canPrev = false;
+                if (Array.isArray(playlist) && playlist.length > 0) {
+                    if (typeof currentIndex !== 'number' || currentIndex < 0) {
+                        console.debug('[Media] updateQueueState: playlist set but no current item yet (len=' + playlist.length + ')');
+                        return;
+                    }
+                    canNext = currentIndex < playlist.length - 1;
+                    const state = this._playerState();
+                    const isMusic = state?.NowPlayingItem?.MediaType === 'Audio';
+                    canPrev = isMusic ? true : (currentIndex > 0);
                 }
 
-                const canNext = currentIndex < playlist.length - 1;
+                const last = this.lastQueueCaps;
+                if (last && last.canNext === canNext && last.canPrev === canPrev) return;
+                this.lastQueueCaps = { canNext, canPrev };
 
-                const state = pm.getPlayerState ? pm.getPlayerState() : null;
-                const isMusic = state?.NowPlayingItem?.MediaType === 'Audio';
-                const canPrev = isMusic ? true : (currentIndex > 0);
-
-                console.debug('[Media] updateQueueState: idx=' + currentIndex + ' len=' + playlist.length + ' canNext=' + canNext + ' canPrev=' + canPrev);
+                console.debug('[Media] updateQueueState: idx=' + currentIndex + ' len=' + (playlist?.length || 0) + ' canNext=' + canNext + ' canPrev=' + canPrev);
                 window.jmpNative.notifyQueueChange(canNext, canPrev);
             } catch (e) {
                 console.error('[Media] updateQueueState error:', e);
             }
         }
 
+        // The player object is a singleton, so this normally runs once per
+        // page. Handler references are kept because jellyfin-web's
+        // Events.off(obj, name) without the function removes nothing.
+        attachPlayer(player) {
+            this.detachPlayer();
+            this.attachedPlayer = player;
+            const self = this;
+
+            this.playerHandlers = {
+                playing: () => {
+                    console.debug('[Media] player.playing event');
+                    if (!window.jmpNative) return;
+                    window.jmpNative.notifyPlaybackState('Playing');
+                    self.updateQueueState();
+
+                    const pos = self._currentTimeMs(player);
+                    if (pos !== null) window.jmpNative.notifyPosition(Math.floor(pos));
+                    self.resetPositionTracking();
+
+                    window.jmpNative.notifyRateChange(self._playbackRate(player));
+                },
+                pause: () => {
+                    console.debug('[Media] player.pause event');
+                    if (!window.jmpNative) return;
+                    window.jmpNative.notifyPlaybackState('Paused');
+                    const pos = self._currentTimeMs(player);
+                    if (pos !== null) window.jmpNative.notifyPosition(Math.floor(pos));
+                },
+                ratechange: () => {
+                    const rate = self._playbackRate(player);
+                    console.debug('[Media] player.ratechange event, rate:', rate);
+                    if (window.jmpNative) {
+                        window.jmpNative.notifyRateChange(rate);
+                        const pos = self._currentTimeMs(player);
+                        if (pos !== null) window.jmpNative.notifyPosition(Math.floor(pos));
+                    }
+                    self.resetPositionTracking();
+                },
+                timeupdate: () => {
+                    self.checkPositionDrift();
+                }
+            };
+            for (const [name, fn] of Object.entries(this.playerHandlers)) {
+                window.Events.on(player, name, fn);
+            }
+        }
+
+        detachPlayer() {
+            const player = this.attachedPlayer;
+            if (player && this.playerHandlers && window.Events) {
+                for (const [name, fn] of Object.entries(this.playerHandlers)) {
+                    window.Events.off(player, name, fn);
+                }
+            }
+            this.playerHandlers = null;
+            this.attachedPlayer = null;
+        }
+
         setupEvents(pm) {
             console.debug('[Media] Setting up playbackManager events');
             const self = this;
 
-            window.Events.on(pm, 'playbackstart', (e, player) => {
+            this.onPlaybackStart = (e, player) => {
                 console.debug('[Media] playbackstart event, player:', !!player);
 
-                const state = pm.getPlayerState ? pm.getPlayerState() : null;
+                const state = self._playerState(player);
 
                 if (state && state.NowPlayingItem) {
                     self.notifyMetadata(state.NowPlayingItem);
@@ -226,60 +334,11 @@
                 self.updateQueueState();
 
                 if (player && player !== self.attachedPlayer) {
-                    if (self.attachedPlayer) {
-                        window.Events.off(self.attachedPlayer, 'playing');
-                        window.Events.off(self.attachedPlayer, 'pause');
-                        window.Events.off(self.attachedPlayer, 'ratechange');
-                        window.Events.off(self.attachedPlayer, 'timeupdate');
-                    }
-                    self.attachedPlayer = player;
-
-                    window.Events.on(player, 'playing', () => {
-                        console.debug('[Media] player.playing event');
-                        if (window.jmpNative) window.jmpNative.notifyPlaybackState('Playing');
-                        self.updateQueueState();
-
-                        const pos = pm.currentTime ? pm.currentTime() : 0;
-                        if (pos !== undefined && pos !== null) {
-                            window.jmpNative.notifyPosition(Math.floor(pos));
-                        }
-                        self.resetPositionTracking();
-
-                        const rate = player.getPlaybackRate ? player.getPlaybackRate() : 1.0;
-                        window.jmpNative.notifyRateChange(rate);
-                    });
-
-                    window.Events.on(player, 'pause', () => {
-                        console.debug('[Media] player.pause event');
-                        if (window.jmpNative) {
-                            window.jmpNative.notifyPlaybackState('Paused');
-                            const pos = pm.currentTime ? pm.currentTime() : 0;
-                            if (typeof pos === 'number' && pos >= 0) {
-                                window.jmpNative.notifyPosition(Math.floor(pos));
-                            }
-                        }
-                    });
-
-                    window.Events.on(player, 'ratechange', () => {
-                        const rate = player.getPlaybackRate ? player.getPlaybackRate() : 1.0;
-                        console.debug('[Media] player.ratechange event, rate:', rate);
-                        if (window.jmpNative) {
-                            window.jmpNative.notifyRateChange(rate);
-                            const pos = pm.currentTime ? pm.currentTime() : 0;
-                            if (typeof pos === 'number' && pos >= 0) {
-                                window.jmpNative.notifyPosition(Math.floor(pos));
-                            }
-                        }
-                        self.resetPositionTracking();
-                    });
-
-                    window.Events.on(player, 'timeupdate', () => {
-                        self.checkPositionDrift();
-                    });
+                    self.attachPlayer(player);
                 }
-            });
+            };
 
-            window.Events.on(pm, 'playbackstop', (e, stopInfo) => {
+            this.onPlaybackStop = (e, stopInfo) => {
                 try {
                     console.debug('[Media] playbackstop event, stopInfo:', JSON.stringify(stopInfo));
                 } catch (err) {
@@ -295,7 +354,10 @@
                     console.debug('[Media] Navigating to next item, keeping metadata');
                 }
                 self.updateQueueState();
-            });
+            };
+
+            window.Events.on(pm, 'playbackstart', this.onPlaybackStart);
+            window.Events.on(pm, 'playbackstop', this.onPlaybackStop);
 
             window.Events.on(pm, 'playlistitemremove', () => self.updateQueueState());
             window.Events.on(pm, 'playlistitemadd', () => self.updateQueueState());
@@ -329,7 +391,7 @@
                 console.debug('[Media] positionSeek received:', positionMs);
                 const currentPlayer = pm.getCurrentPlayer ? pm.getCurrentPlayer() : pm._currentPlayer;
                 if (currentPlayer) {
-                    const duration = pm.duration ? pm.duration() : 0;
+                    const duration = pm.duration ? pm.duration(currentPlayer) : 0;
                     if (duration > 0) {
                         const percent = (positionMs * 10000) / duration * 100;
                         console.debug('[Media] Seeking to', percent.toFixed(2), '% (', positionMs, 'ms of', duration, 'ticks)');
@@ -355,16 +417,10 @@
                 this.artworkAbortController.abort();
                 this.artworkAbortController = null;
             }
-            if (this.attachedPlayer && window.Events) {
-                window.Events.off(this.attachedPlayer, 'playing');
-                window.Events.off(this.attachedPlayer, 'pause');
-                window.Events.off(this.attachedPlayer, 'ratechange');
-                window.Events.off(this.attachedPlayer, 'timeupdate');
-                this.attachedPlayer = null;
-            }
+            this.detachPlayer();
             if (this.playbackManager && window.Events) {
-                window.Events.off(this.playbackManager, 'playbackstart');
-                window.Events.off(this.playbackManager, 'playbackstop');
+                if (this.onPlaybackStart) window.Events.off(this.playbackManager, 'playbackstart', this.onPlaybackStart);
+                if (this.onPlaybackStop) window.Events.off(this.playbackManager, 'playbackstop', this.onPlaybackStop);
             }
         }
     }
