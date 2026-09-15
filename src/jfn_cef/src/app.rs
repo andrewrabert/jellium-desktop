@@ -15,11 +15,14 @@ use crate::state;
 use crate::v8_handler::NativeHandlerBuilder;
 
 // `app://` scheme options. Match CEF_SCHEME_OPTION_* from
-// include/internal/cef_types.h.
+// include/internal/cef_types.h (verified against CEF 151.3.16):
+// STANDARD 1<<0, LOCAL 1<<1, DISPLAY_ISOLATED 1<<2, SECURE 1<<3,
+// CORS_ENABLED 1<<4, CSP_BYPASSING 1<<5, FETCH_ENABLED 1<<6.
 const SCHEME_OPTION_STANDARD: i32 = 1 << 0;
 const SCHEME_OPTION_LOCAL: i32 = 1 << 1;
-const SCHEME_OPTION_SECURE: i32 = 1 << 4;
-const SCHEME_OPTION_CORS_ENABLED: i32 = 1 << 6;
+const SCHEME_OPTION_SECURE: i32 = 1 << 3;
+const SCHEME_OPTION_CORS_ENABLED: i32 = 1 << 4;
+const SCHEME_OPTION_FETCH_ENABLED: i32 = 1 << 6;
 
 // V8 property attribute. Equivalent to V8_PROPERTY_ATTRIBUTE_READONLY.
 fn readonly_attr() -> V8Propertyattribute {
@@ -176,7 +179,8 @@ wrap_app! {
                 SCHEME_OPTION_STANDARD
                     | SCHEME_OPTION_SECURE
                     | SCHEME_OPTION_LOCAL
-                    | SCHEME_OPTION_CORS_ENABLED,
+                    | SCHEME_OPTION_CORS_ENABLED
+                    | SCHEME_OPTION_FETCH_ENABLED,
             );
         }
 
