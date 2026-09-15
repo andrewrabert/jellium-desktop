@@ -1,0 +1,169 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Built by dev/windows/installer/build_msi.ps1, which stages the payload and
+  passes every path in through -d preprocessor variables. UpgradeCode is this
+  product's fixed identity: change it and upgrades stop chaining.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <?define ProductName = "Jellium Desktop" ?>
+  <?define Manufacturer = "Jellium" ?>
+  <?define HomePage = "https://github.com/andrewrabert/jellium-desktop" ?>
+
+  <!-- Scope is fixed at build time, so component keypaths can name a concrete
+       hive instead of the ambiguous HKMU (which trips ICE57). -->
+  <?if $(var.Scope) = "perUser" ?>
+    <?define RegistryRoot = "HKCU" ?>
+  <?else?>
+    <?define RegistryRoot = "HKLM" ?>
+  <?endif?>
+
+  <Package Name="$(var.ProductName)"
+           Manufacturer="$(var.Manufacturer)"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="A2D06AA8-CC53-4482-ADF1-97FB7FDE33F8"
+           Scope="$(var.Scope)"
+           Compressed="yes"
+           InstallerVersion="500"
+           Language="1033"
+           Codepage="1252">
+
+    <SummaryInformation Description="$(var.ProductName) $(var.FullVersion)"
+                        Keywords="Jellyfin,Media,Player,Installer" />
+
+    <!-- AllowSameVersionUpgrades keeps re-running the same dev build from
+         stacking duplicate Add/Remove Programs entries. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  Schedule="afterInstallValidate"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first if you want to downgrade." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- CEF requires Windows 10 or later. VersionNT saturates at 603 for
+         anything past 8.1, so this only rejects 8.1 and older. -->
+    <Launch Condition="Installed OR VersionNT &gt;= 603"
+            Message="[ProductName] requires Windows 10 or later." />
+
+    <!-- No ARPNOMODIFY here: WixUI_InstallDir already sets it, and a second
+         definition is a hard build error. -->
+    <Icon Id="JelliumIcon.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="JelliumIcon.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="$(var.HomePage)" />
+    <Property Id="ARPHELPLINK" Value="$(var.HomePage)/issues" />
+    <Property Id="ARPCOMMENTS" Value="Unofficial Jellyfin desktop client ($(var.FullVersion))" />
+
+    <!-- Desktop shortcut, on by default. Silent installs can opt out with
+         `msiexec /i ... DESKTOPSHORTCUT=0 /qn`. -->
+    <Property Id="DESKTOPSHORTCUT" Value="1" Secure="yes" />
+
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch $(var.ProductName)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#JelliumDesktopExe]" />
+    <CustomAction Id="LaunchApplication"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixShellExec"
+                  Impersonate="yes"
+                  Return="ignore" />
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <UI>
+      <Publish Dialog="ExitDialog"
+               Control="Finish"
+               Event="DoAction"
+               Value="LaunchApplication"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
+    </UI>
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
+
+    <?if $(var.Scope) = "perUser" ?>
+      <!-- Per-user installs land in the same place VS Code / Teams use, so
+           no elevation prompt is needed. -->
+      <StandardDirectory Id="LocalAppDataFolder">
+        <Directory Id="ProgramsFolder" Name="Programs">
+          <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)" />
+        </Directory>
+      </StandardDirectory>
+    <?else?>
+      <StandardDirectory Id="ProgramFiles6432Folder">
+        <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)" />
+      </StandardDirectory>
+    <?endif?>
+
+    <Feature Id="Main" Title="$(var.ProductName)" Level="1" AllowAbsent="no">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentGroupRef Id="AppPayload" />
+      <ComponentRef Id="AppPathsRegistration" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <!-- The executable is declared by hand so the launch action can reference a
+         stable file id; everything else is harvested. -->
+    <Component Id="MainExecutable" Directory="INSTALLFOLDER">
+      <File Id="JelliumDesktopExe"
+            Source="$(var.StageDir)\jellium-desktop.exe"
+            KeyPath="yes" />
+    </Component>
+
+    <ComponentGroup Id="AppPayload" Directory="INSTALLFOLDER">
+      <Files Include="$(var.StageDir)\**">
+        <Exclude Files="$(var.StageDir)\jellium-desktop.exe" />
+        <Exclude Files="$(var.StageDir)\**\*.pdb" />
+        <Exclude Files="$(var.StageDir)\**\*.lib" />
+      </Files>
+    </ComponentGroup>
+
+    <!-- Makes `jellium-desktop` resolvable from Win+R and ShellExecute. -->
+    <Component Id="AppPathsRegistration" Directory="INSTALLFOLDER">
+      <RegistryKey Root="$(var.RegistryRoot)"
+                   Key="Software\Microsoft\Windows\CurrentVersion\App Paths\jellium-desktop.exe">
+        <RegistryValue Type="string" Value="[INSTALLFOLDER]jellium-desktop.exe" KeyPath="yes" />
+        <RegistryValue Name="Path" Type="string" Value="[INSTALLFOLDER]" />
+      </RegistryKey>
+    </Component>
+
+    <!-- Shortcut folders count as user-profile data even in a per-machine
+         install (where they resolve to the All Users locations), so both
+         components take an HKCU marker value as their keypath and name the
+         target by path rather than by [#JelliumDesktopExe] - the layout
+         Windows Installer expects, and the one that validates cleanly. -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut Id="StartMenuJelliumDesktop"
+                  Name="$(var.ProductName)"
+                  Description="Desktop client for Jellyfin"
+                  Target="[INSTALLFOLDER]jellium-desktop.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="JelliumIcon.ico" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\$(var.Manufacturer)\$(var.ProductName)"
+                       Name="StartMenuShortcut"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Condition="DESKTOPSHORTCUT = &quot;1&quot;">
+        <Shortcut Id="DesktopJelliumDesktop"
+                  Name="$(var.ProductName)"
+                  Description="Desktop client for Jellyfin"
+                  Target="[INSTALLFOLDER]jellium-desktop.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="JelliumIcon.ico" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\$(var.Manufacturer)\$(var.ProductName)"
+                       Name="DesktopShortcut"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+  </Fragment>
+</Wix>

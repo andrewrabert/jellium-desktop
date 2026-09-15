@@ -20,8 +20,20 @@ sudo xattr -cr /Applications/Jellium\ Desktop.app
 ```
 
 ### Windows
-- [x64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-windows/main/windows-x64.zip)
-- [arm64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-windows/main/windows-arm64.zip)
+- Installer (.msi)
+  - [x64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-windows/main/windows-x64-msi.zip)
+  - [arm64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-windows/main/windows-arm64-msi.zip)
+- Portable (.zip)
+  - [x64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-windows/main/windows-x64.zip)
+  - [arm64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-windows/main/windows-arm64.zip)
+
+The installer is unsigned, so SmartScreen shows a warning on first run — choose
+"More info" then "Run anyway". It installs to `Program Files`, adds Start Menu
+and desktop shortcuts, and uninstalls from Settings. For unattended deployment:
+
+```
+msiexec /i JelliumDesktop-<version>-windows-x64.msi /qn DESKTOPSHORTCUT=0
+```
 
 
 ## Development
@@ -34,6 +46,7 @@ Available recipes:
     appimage ...    # [linux] build AppImage
     flatpak ...     # [linux] build Flatpak bundle
     dmg             # [macos] build Apple Disk Image (.dmg)
+    msi *args       # [windows] build Windows Installer (.msi)
 
     [maintenance]
     outdated      # List outdated dependencies

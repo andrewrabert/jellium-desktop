@@ -85,10 +85,18 @@ jobs:
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSINSTALL=%%i"
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" %MATRIX_ARCH% || exit /b 1
           set "PATH=%PATH%;%MSYS_BIN%"
-          cargo xtask package --external-mpv "%CD%\third_party\mpv-install" --prefix build/install --dist dist
+          cargo xtask package --external-mpv "%CD%\third_party\mpv-install" --prefix build/install --dist dist || exit /b 1
+          rem Reuse the tree `package` just staged; runs here so it inherits vcvars.
+          pwsh -NoLogo -ExecutionPolicy Bypass -File dev\windows\installer\build_msi.ps1 -SkipStage -StageDir build\install -Arch %MATRIX_ARCH% -Validate || exit /b 1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: windows-${{ matrix.arch }}
           path: dist/JelliumDesktop-*.zip
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{ matrix.arch }}-msi
+          path: dist/JelliumDesktop-*.msi
