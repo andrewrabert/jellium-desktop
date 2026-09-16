@@ -1,10 +1,7 @@
 use slotmap::SlotMap;
 
 slotmap::new_key_type! {
-    /// Opaque, `Copy` menu-session identity. Generational: a key to a
-    /// resolved session never aliases a later one, so a late resolve is a
-    /// no-op.
-    pub struct Session;
+                pub struct Session;
 }
 
 #[derive(Default)]

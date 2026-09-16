@@ -1,18 +1,14 @@
-//! Native CEF adapter for application menu data supplied by the composition root.
-
 use cef::rc::ConvertReturnValue;
 use cef::{ImplMenuModel, MenuModel, sys};
 use std::os::raw::c_void;
 use std::sync::Arc;
 
-/// Application-owned context menu policy injected into the browser session.
 #[derive(Clone)]
 pub struct ApplicationMenu {
     pub items: Vec<jfn_platform_abi::MenuItem>,
     pub on_selected: Arc<dyn Fn(i32) -> bool + Send + Sync>,
 }
 
-/// The caller transfers one reference to the native menu model into this adapter.
 pub(crate) fn build_closure(
     items: Vec<jfn_platform_abi::MenuItem>,
 ) -> Box<crate::client::ContextBuilderFn> {

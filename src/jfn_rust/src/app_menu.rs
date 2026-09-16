@@ -1,10 +1,7 @@
-//! Application menu policy, composed into the shell and CEF adapters at startup.
-
 use jfn_platform_abi::{
     LogicalPoint, MenuDelivery, MenuItem, MenuKind, MenuRequest, MenuSelection,
 };
 
-// CEF's custom command range. Shell edit menus use their own request-local IDs.
 const TOGGLE_FULLSCREEN: i32 = 26_500;
 const CLIENT_SETTINGS: i32 = TOGGLE_FULLSCREEN + 1;
 const EXIT: i32 = TOGGLE_FULLSCREEN + 2;

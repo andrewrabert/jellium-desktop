@@ -44,8 +44,6 @@ wrap_task! {
     }
 }
 
-/// Tint the DWM titlebar so it matches the current theme color.
-/// rgb is 0x00RRGGBB; DWMWA_CAPTION_COLOR wants 0x00BBGGRR (COLORREF).
 fn win_set_theme_color(rgb: u32) {
     let Some(hwnd) = crate::platform::win_hwnd() else {
         return;
@@ -64,8 +62,6 @@ fn win_set_theme_color(rgb: u32) {
     };
 }
 
-/// Map IdleInhibitLevel (None=0, System=1, Display=2) to execution-state
-/// flags and post the call onto TID_UI so it lives on a stable thread.
 fn win_set_idle_inhibit(level: c_int) {
     let mut flags = ES_CONTINUOUS;
     match level {
@@ -77,8 +73,6 @@ fn win_set_idle_inhibit(level: c_int) {
     let _ = post_task(ThreadId::UI, Some(&mut task));
 }
 
-/// The `CF_UNICODETEXT` on the already-open clipboard; `None` when it holds
-/// none, or the handle could not be locked.
 unsafe fn win_clipboard_text() -> Option<String> {
     unsafe {
         let handle = GetClipboardData(u32::from(CF_UNICODETEXT.0)).ok()?;
@@ -93,9 +87,6 @@ unsafe fn win_clipboard_text() -> Option<String> {
     }
 }
 
-/// Hands the OS a `GMEM_MOVEABLE` copy of `text` as `CF_UNICODETEXT` on the
-/// already-open, already-emptied clipboard. `false` leaves the clipboard
-/// holding nothing this call put there, and the block freed.
 unsafe fn win_clipboard_offer(text: &str) -> bool {
     let wide: Vec<u16> = OsStr::new(text)
         .encode_wide()
@@ -113,8 +104,6 @@ unsafe fn win_clipboard_offer(text: &str) -> bool {
         }
         std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
         let _ = GlobalUnlock(mem);
-        // Ownership of the block passes to the OS only once SetClipboardData
-        // succeeds; a failure leaves it ours to free.
         if SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(mem.0))).is_err() {
             let _ = GlobalFree(Some(mem));
             return false;
@@ -123,8 +112,6 @@ unsafe fn win_clipboard_offer(text: &str) -> bool {
     }
 }
 
-/// `None` when the clipboard holds no `CF_UNICODETEXT`, or it could not be
-/// opened.
 fn win_clipboard_read_text_async(on_done: OnText) {
     let mut text: Option<String> = None;
     unsafe {
@@ -136,9 +123,6 @@ fn win_clipboard_read_text_async(on_done: OnText) {
     on_done(text.as_deref());
 }
 
-/// Places `text` on the clipboard as `CF_UNICODETEXT`. A hand-off the OS
-/// refused puts back the text the clipboard held, which the emptying required
-/// to take ownership had just removed.
 fn win_clipboard_write_text(text: &str) {
     unsafe {
         if OpenClipboard(None).is_err() {
@@ -155,7 +139,6 @@ fn win_clipboard_write_text(text: &str) {
     }
 }
 
-/// Open an external URL via `ShellExecuteW(open)`.
 fn win_open_external_url(url: &str) {
     if url.is_empty() {
         return;
@@ -180,7 +163,6 @@ use jfn_platform_abi::{
     IdleInhibitLevel, MenuDelivery, MenuKind, OnText, SurfaceHandle, WindowGeometry, WindowPos,
 };
 
-/// SMTC-backed [`jfn_platform_abi::MediaSink`].
 struct SmtcSink;
 
 impl jfn_platform_abi::MediaSink for SmtcSink {
@@ -228,33 +210,26 @@ impl Platform for WindowsPlatform {
         win_cleanup();
     }
 
-    // mpv's window is gone by the time this runs and the compositor devices
-    // are already released
     fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {}
 
     fn window_decoration_options(&self) -> jfn_platform_abi::DecorationOptions {
         jfn_platform_abi::DecorationOptions::all()
     }
 
-    // the decorations setting has no effect here
     fn window_decorations_supported(&self) -> bool {
         false
     }
 
-    // DWM draws the titlebar; the app draws none
     fn effective_decorations(&self) -> jfn_platform_abi::EffectiveDecorations {
         jfn_platform_abi::EffectiveDecorations::ServerSide
     }
 
-    // CEF runs hardware-accelerated on Windows
     fn shared_texture_supported(&self) -> bool {
         true
     }
 
-    // the shared-texture answer is fixed; nothing revises it
     fn set_shared_texture_unsupported(&self) {}
 
-    // the clipboard is not readable by another app without focus
     fn web_paste_reads_clipboard(&self) -> bool {
         true
     }
@@ -333,12 +308,10 @@ impl Platform for WindowsPlatform {
         win_toggle_fullscreen();
     }
 
-    // mpv's own WndProc settles the size; nothing here gates a frame
     fn resize_gate(&self) -> Option<&dyn jfn_platform_abi::ResizeGate> {
         None
     }
 
-    // DWM draws the titlebar
     fn titlebar_controls(&self) -> Option<&dyn jfn_platform_abi::TitlebarControls> {
         None
     }
@@ -351,7 +324,6 @@ impl Platform for WindowsPlatform {
         crate::scale::display_scale(at)
     }
 
-    // mpv creates the HWND; the Win32 sample of it is its live geometry
     fn window_owner(&self) -> jfn_platform_abi::WindowOwner<'_> {
         jfn_platform_abi::WindowOwner::Mpv(&crate::window::WIN_WINDOW_SOURCE)
     }

@@ -1,18 +1,3 @@
-//! Process-wide shutdown signal.
-//!
-//! A single atomic flag (`SIGNAL.requested`) gates teardown across the whole
-//! process. Shared between SIGINT/SIGTERM, UI close, hotkeys, and CEF
-//! window-close paths. `jfn_shutdown_initiate` is idempotent and
-//! async-signal-safe up to whatever the registered handler does — the call
-//! itself just CAS's the flag and runs the registered handler.
-//!
-//! A handler registered via `jfn_shutdown_set_handler` runs on the first
-//! call — it runs *inline on the calling thread*, so it MUST only signal or
-//! wake (e.g. signal the shutdown manager); it must never block, close a
-//! browser, or reenter CEF. The actual teardown is orchestrated off-thread by
-//! the manager, which then calls `jfn_shutdown_fanout` to wake every
-//! subsystem thread that registered via `jfn_shutdown_register_waker`.
-
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
@@ -34,8 +19,6 @@ impl ShutdownSignal {
             handler.map_or(std::ptr::null_mut(), |f| f as *mut ()),
             Ordering::SeqCst,
         );
-        // The store/load pairs participate in one total order, so registration
-        // and initiation cannot both miss the other. Duplicate wakes are fine.
         if self.requested.load(Ordering::SeqCst)
             && let Some(handler) = handler
         {
@@ -48,8 +31,6 @@ impl ShutdownSignal {
         }
         let handler = self.handler.load(Ordering::SeqCst);
         if !handler.is_null() {
-            // SAFETY: install only stores fn() pointers, which remain valid
-            // throughout the process. This performs no allocation or locking.
             let callback: fn() = unsafe { std::mem::transmute(handler) };
             callback();
         }
@@ -58,32 +39,18 @@ impl ShutdownSignal {
 static SIGNAL: ShutdownSignal = ShutdownSignal::new();
 static WAKERS: Mutex<Vec<&'static WakeEvent>> = Mutex::new(Vec::new());
 
-/// Returns true if [`jfn_shutdown_initiate`] has been called at least once.
 pub fn jfn_shutting_down() -> bool {
     SIGNAL.requested.load(Ordering::Acquire)
 }
 
-/// Install (or clear, with `None`) the idempotent wake callback invoked on the
-/// first [`jfn_shutdown_initiate`] call. The callback runs inline on the
-/// calling thread (possibly a signal handler or a CEF dispatch), so it MUST
-/// only signal/wake — never block, close a browser, or reenter CEF.
-/// Registration replays an existing request; a race can deliver duplicate wakes.
 pub fn jfn_shutdown_set_handler(handler: Option<fn()>) {
     SIGNAL.install(handler);
 }
 
-/// Register a wake event that will be signaled when the shutdown manager
-/// fans out (`jfn_shutdown_fanout`). One uniform observation pattern across
-/// long-lived threads — each subsystem owns its own `WakeEvent`, polls its
-/// own fd/handle alongside its native event source, and exits on signal.
-///
-/// `ev` must remain live for the rest of the process.
 pub fn jfn_shutdown_register_waker(ev: &'static WakeEvent) {
     WAKERS.lock().push(ev);
 }
 
-/// Signal every registered waker. Called from the manager once it observes
-/// shutdown — never from a signal handler (this locks a mutex).
 pub fn jfn_shutdown_fanout() {
     let wakers = WAKERS.lock();
     for ev in wakers.iter() {
@@ -91,9 +58,6 @@ pub fn jfn_shutdown_fanout() {
     }
 }
 
-/// Idempotent. First call: sets the flag and runs the registered handler.
-/// Subsequent calls are no-ops. Async-signal-safe up to whatever the
-/// handler does.
 pub fn jfn_shutdown_initiate() {
     SIGNAL.initiate();
 }

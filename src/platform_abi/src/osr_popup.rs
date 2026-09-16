@@ -7,9 +7,6 @@ pub trait OsrPopupSurface: Send + Sync {
 
     fn hide(&self, _s: SurfaceHandle) {}
 
-    /// `lw`/`lh` are the parent layer's logical size; the frame carries its own
-    /// extent. A backend with no popup surface hands the frame back
-    /// undischarged, so its producer owes the successor.
     fn present<'a>(
         &self,
         s: SurfaceHandle,

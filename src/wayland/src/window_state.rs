@@ -1,10 +1,3 @@
-//! The single owner of Wayland window geometry/scale state. Everything lives
-//! in ONE `RwLock<Inner>`: the scale the compositor stated and the last
-//! published extent. Readers that need several fields coherently take a
-//! single [`WindowState::window_extent`] snapshot; the per-field accessors read
-//! one field each and must not be composed into a geometry that spans two
-//! generations.
-
 use parking_lot::RwLock;
 
 use crate::runtime::WlRuntime;
@@ -36,8 +29,6 @@ impl WindowSize {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowMode {
     Floating,
-    /// Compositor-tiled (snapped). Like Maximized/Fullscreen the size is
-    /// compositor-dictated, so it must not feed the floating restore size.
     Tiled,
     Maximized,
     Fullscreen,
@@ -91,7 +82,6 @@ pub(crate) struct WindowState {
     inner: RwLock<Inner>,
 }
 
-/// A coherent view of the window geometry from one lock acquisition.
 #[derive(Clone, Copy)]
 pub(crate) struct WindowExtentSnapshot {
     logical: WindowSize,
@@ -151,9 +141,6 @@ impl WindowState {
         self.inner.read().scale
     }
 
-    /// The scale this backend reports: the one the compositor has stated, else
-    /// [`crate::scale::unstated`], whose log flag rides in the same lock as
-    /// the absent scale.
     pub(crate) fn scale(&self) -> Scale {
         let stated = {
             let st = self.inner.read();
@@ -168,14 +155,6 @@ impl WindowState {
         }
     }
 
-    /// Records [`crate::scale::unstated`] as the scale this backend states, for
-    /// the one session where no source will ever state one: no
-    /// `wp_fractional_scale_manager_v1` to send `preferred_scale`, and an
-    /// output probe that answered nothing.
-    ///
-    /// [`WindowState::stated_scale`] and [`WindowState::publish`] read the
-    /// scale, not the absence, so this is where the absence stops for them.
-    /// Records nothing when a scale is already held.
     pub(crate) fn resolve_unstated_scale(&self) {
         let mut st = self.inner.write();
         if st.scale.is_some() {
@@ -184,16 +163,6 @@ impl WindowState {
         st.scale = Some(crate::scale::unstated(&mut st.unstated));
     }
 
-    /// Publishes the extent `logical`, `mode` and the stated scale name.
-    ///
-    /// Publishes nothing while no scale is stated; the present that the first
-    /// stated scale drives re-publishes the configure that arrived before it.
-    /// An extent the scale cannot build leaves the published extent and its
-    /// generation untouched, and says so.
-    ///
-    /// The consumer notifications below read the value back through the
-    /// accessors, so they must run after the write lock is released or they
-    /// deadlock.
     pub(crate) fn publish(&self, rt: &'static WlRuntime, logical: WindowSize, mode: WindowMode) {
         let built = {
             let mut st = self.inner.write();
@@ -233,8 +202,6 @@ impl WindowState {
         jfn_platform_abi::notify_window_changed();
     }
 
-    /// The compositor's `wp_fractional_scale_v1.preferred_scale`: the
-    /// authoritative scale, recorded whatever is already held.
     pub(crate) fn report_scale(&self, scale: Scale120) {
         let first = {
             let mut st = self.inner.write();
@@ -247,8 +214,6 @@ impl WindowState {
         }
     }
 
-    /// The output probe's scale, recorded only while none is held: a probe
-    /// result that lands after the compositor has spoken is stale.
     pub(crate) fn seed_scale(&self, scale: Scale120) {
         let seeded = {
             let mut st = self.inner.write();

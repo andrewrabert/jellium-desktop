@@ -1,16 +1,3 @@
-//! Decoder + demuxer enumeration.
-//!
-//! Two sources:
-//! - **Decoders**: linked libavcodec, iterated via `av_codec_iterate` and
-//!   classified by `AVMediaType`. Deduped by `AVCodecID` so wrapper
-//!   variants (`h264`, `h264_qsv`, ...) collapse to one entry under the
-//!   generic name returned by `avcodec_get_name` — Jellyfin matches
-//!   against ffprobe-derived generic names.
-//! - **Demuxers**: mpv property `demuxer-lavf-list`, an array of strings.
-//!
-//! mpv routes all decoding through libavcodec, so the resulting codec set
-//! is identical to what mpv's `decoder-list` would report.
-
 use crate::handle::Handle;
 use crate::node::Node;
 use crate::sys;
@@ -50,12 +37,6 @@ pub fn query(handle: Option<&Handle>) -> Capabilities {
     unsafe { query_raw(handle.map(|h| h.raw()).unwrap_or(std::ptr::null_mut())) }
 }
 
-/// Same as [`query`], but takes a raw `mpv_handle*` (non-owning). Used by
-/// the C FFI. `raw` may be NULL — in that case the demuxer list is empty.
-///
-/// # Safety
-/// `raw`, if non-NULL, must point to a live `mpv_handle` for the
-/// duration of the call. Reads `demuxer-lavf-list` via `mpv_get_property`.
 pub unsafe fn query_raw(raw: *mut sys::mpv_handle) -> Capabilities {
     let mut caps = Capabilities {
         decoders: enumerate_decoders(),
@@ -162,21 +143,17 @@ mod tests {
 
     #[test]
     fn enumerate_decoders_includes_h264_and_aac() {
-        // Linked libavcodec must expose at least these two well-known
-        // decoder ids under their generic names.
         let codecs = enumerate_decoders();
         assert!(!codecs.is_empty(), "expected non-empty decoder list");
         let names: HashSet<&str> = codecs.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains("h264"), "missing h264 decoder");
         assert!(names.contains("aac"), "missing aac decoder");
 
-        // Dedup invariant: every entry has a unique name (one per AVCodecID).
         let mut seen = HashSet::new();
         for c in &codecs {
             assert!(seen.insert(c.name.clone()), "duplicate codec {}", c.name);
         }
 
-        // Kind classification: at least one of each must be present.
         assert!(codecs.iter().any(|c| c.kind == MediaKind::Video));
         assert!(codecs.iter().any(|c| c.kind == MediaKind::Audio));
     }

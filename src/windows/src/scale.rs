@@ -1,27 +1,18 @@
-//! The Windows scale rule: the DPI the OS reports, the extent a client rect
-//! at that DPI names, and the pointer mapping that extent gives.
-
 use std::num::NonZeroU64;
 
 #[cfg(target_os = "windows")]
 use jfn_platform_abi::WindowPos;
 use jfn_platform_abi::{LogicalPoint, PhysicalPoint, PhysicalSize, Scale, WindowExtent};
 
-/// The DPI every Windows scale is expressed against.
 pub const BASE_DPI: NonZeroU64 = match NonZeroU64::new(96) {
     Some(d) => d,
     None => unreachable!(),
 };
 
-/// The exact `dpi / 96`. `None` for a zero DPI.
 pub fn scale_from_dpi(dpi: u32) -> Option<Scale> {
     Scale::from_ratio(u64::from(dpi), BASE_DPI)
 }
 
-/// The scale Windows reports for a raw `GetDpiFor*` result.
-///
-/// Logs the raw DPI beside the value reported whenever the exact conversion
-/// rejects it; [`Scale::ONE`] is what this backend reports then.
 pub fn report_dpi(source: &str, dpi: u32) -> Scale {
     if let Some(scale) = scale_from_dpi(dpi) {
         return scale;
@@ -34,10 +25,6 @@ pub fn report_dpi(source: &str, dpi: u32) -> Scale {
     reported
 }
 
-/// The scale Windows reports for `at`.
-///
-/// The system DPI is per-process, not per-display, so every position names
-/// the same scale.
 #[cfg(target_os = "windows")]
 pub fn display_scale(at: Option<WindowPos>) -> Scale {
     tracing::trace!(
@@ -47,21 +34,11 @@ pub fn display_scale(at: Option<WindowPos>) -> Scale {
     crate::platform::win_display_scale()
 }
 
-/// The extent a client rect and a window DPI name.
-///
-/// Windows publishes no logical size, so this backend divides the client
-/// size by the scale that DPI names.
-///
-/// `None` when the DPI is zero, when the division names no logical size, or
-/// when either axis is below two pixels.
 pub fn extent(client: PhysicalSize, dpi: u32) -> Option<WindowExtent> {
     let scale = scale_from_dpi(dpi)?;
     WindowExtent::new(client, scale, client.to_logical(scale)?)
 }
 
-/// The pointer position in the space `extent`'s logical size names.
-///
-/// The identity before the first sample exists.
 pub fn view_point(extent: Option<WindowExtent>, p: PhysicalPoint) -> LogicalPoint {
     extent.map_or(LogicalPoint { x: p.x, y: p.y }, |e| e.to_logical_point(p))
 }
@@ -71,8 +48,6 @@ mod tests {
     use super::*;
     use jfn_platform_abi::COVERED_SCALES;
 
-    /// The DPI Windows reports for each scale in the covered set — the
-    /// display-scaling percentages 50, 75, 100, 125, 150 and 200 of 96.
     const COVERED_DPI: [u32; 6] = [48, 72, 96, 120, 144, 192];
 
     const CLIENT: PhysicalSize = PhysicalSize { w: 1280, h: 720 };

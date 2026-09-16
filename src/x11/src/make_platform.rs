@@ -1,5 +1,3 @@
-//! X11 backend impl of [`jfn_platform_abi::Platform`].
-
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
@@ -35,7 +33,6 @@ impl Platform for X11Platform {
         }
     }
 
-    // the paint tier resolves in the mpv host's prepare, before init
     fn early_init(&self) {}
 
     fn init(
@@ -50,8 +47,6 @@ impl Platform for X11Platform {
         crate::lifecycle::cleanup();
     }
 
-    // Runs after mpv_terminate_destroy: mpv's embedded window is gone, so the
-    // top-level's connection can finally close.
     fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
         crate::geometry::drop_toplevel_connection();
     }
@@ -72,8 +67,6 @@ impl Platform for X11Platform {
         surface::present(SurfaceId::from_handle(s), frame)
     }
 
-    /// X11 owns the overlay's size through parent geometry; the only part of
-    /// the request this backend applies is the reserved top strip.
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
         surface::surface_set_top_inset(SurfaceId::from_handle(s), size.physical_top);
     }
@@ -131,19 +124,15 @@ impl Platform for X11Platform {
         Some(&crate::x11_state::X11_RESIZE_GATE)
     }
 
-    // the window manager draws the titlebar
     fn titlebar_controls(&self) -> Option<&dyn TitlebarControls> {
         None
     }
 
-    // the window manager draws the titlebar; the app draws none
     fn effective_decorations(&self) -> jfn_platform_abi::EffectiveDecorations {
         jfn_platform_abi::EffectiveDecorations::ServerSide
     }
 
     fn set_fullscreen(&self, fullscreen: bool) {
-        // The app owns fullscreen: drive the toplevel's `_NET_WM_STATE` and
-        // reconcile; WM-initiated flips flow back via the geometry thread.
         crate::geometry::set_parent_fullscreen(fullscreen);
     }
 
@@ -163,7 +152,6 @@ impl Platform for X11Platform {
         crate::scale::display_scale(at)
     }
 
-    // the app creates the WM-managed window; mpv embeds into its child
     fn window_owner(&self) -> WindowOwner<'_> {
         WindowOwner::App(&crate::window_source::X11_WINDOW_SOURCE)
     }
@@ -176,7 +164,6 @@ impl Platform for X11Platform {
         Some(WindowPos { x, y })
     }
 
-    /// X11 constrains only the size; position is left to the WM.
     fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry {
         match crate::lifecycle::screen_bounds() {
             Some(bounds) => jfn_platform_abi::geometry::clamp_size_to_bounds(g, bounds),
@@ -184,7 +171,6 @@ impl Platform for X11Platform {
         }
     }
 
-    // the geometry and input threads own their own loops
     fn pump(&self) {}
 
     fn set_theme_color(&self, rgb: u32) {
@@ -203,10 +189,8 @@ impl Platform for X11Platform {
         crate::paint::resolved().is_some_and(|t| t.use_dmabuf)
     }
 
-    // the paint tier resolves shared-texture support once and never revises it
     fn set_shared_texture_unsupported(&self) {}
 
-    // platform init resolves shared-texture support
     fn cef_init_precedes_mpv_window(&self) -> bool {
         false
     }
@@ -231,7 +215,6 @@ impl Platform for X11Platform {
             .map(|_| &crate::selection::X11Primary as &dyn jfn_platform_abi::PrimarySelection)
     }
 
-    /// CEF owns its own X11 clipboard; the shell overlay's does not reach it.
     fn web_paste_reads_clipboard(&self) -> bool {
         false
     }

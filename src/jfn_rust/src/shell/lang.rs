@@ -1,6 +1,3 @@
-//! Ported verbatim from the former `web/overlay.lang.js`, whose table was
-//! generated from jellyfin-web/src/strings/.
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Strings {
     pub server_host: &'static str,
@@ -17,7 +14,6 @@ pub struct Strings {
     pub select_all: &'static str,
 }
 
-/// The edit menu's labels for one language.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EditEntry {
     pub lang: &'static str,
@@ -29,7 +25,6 @@ pub struct EditEntry {
     pub select_all: &'static str,
 }
 
-/// Resolved per language, falling back to [`FALLBACK_LANGUAGE`].
 pub const EDIT_LANGUAGES: &[EditEntry] = &[EditEntry {
     lang: "en-us",
     undo: "Undo",
@@ -1091,20 +1086,17 @@ fn find(lang: &str) -> Option<&'static Entry> {
     LANGUAGES.iter().find(|e| e.lang == lang)
 }
 
-#[allow(clippy::expect_used)] // table invariant: the fallback language is present
+#[allow(clippy::expect_used)]
 fn fallback() -> &'static Entry {
     find(FALLBACK_LANGUAGE).expect("fallback language missing from LANGUAGES")
 }
 
-/// Exact tag, then the primary subtag, then [`FALLBACK_LANGUAGE`].
 pub fn entry_for(locale: &str) -> &'static Entry {
     find(locale)
         .or_else(|| find(locale.split('-').next().unwrap_or(locale)))
         .unwrap_or_else(fallback)
 }
 
-/// Per-field fallback to [`FALLBACK_LANGUAGE`], with "Server Address" as the
-/// last resort for the host label.
 pub fn strings_for(locale: &str) -> Strings {
     let e = entry_for(locale);
     let f = fallback();
@@ -1137,9 +1129,6 @@ pub fn strings_for(locale: &str) -> Strings {
     }
 }
 
-/// Exact tag, then the primary subtag, then [`FALLBACK_LANGUAGE`]; the last is
-/// the only entry the table is guaranteed to hold, so a miss on it yields the
-/// first entry rather than none.
 fn edit_entry_for(locale: &str) -> &'static EditEntry {
     let find = |lang: &str| EDIT_LANGUAGES.iter().find(|e| e.lang == lang);
     find(locale)
@@ -1148,14 +1137,11 @@ fn edit_entry_for(locale: &str) -> &'static EditEntry {
         .unwrap_or(&EDIT_LANGUAGES[0])
 }
 
-/// The overlay's strings, resolved once from the system locale.
 pub fn strings() -> &'static Strings {
     static STRINGS: std::sync::OnceLock<Strings> = std::sync::OnceLock::new();
     STRINGS.get_or_init(|| strings_for(&system_locale()))
 }
 
-/// `LC_ALL`, `LC_MESSAGES`, `LANG`, lowercased, `_` folded to `-`, encoding and
-/// modifier suffixes stripped; [`FALLBACK_LANGUAGE`] when none is set.
 pub fn system_locale() -> String {
     for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
         let Ok(raw) = std::env::var(key) else {

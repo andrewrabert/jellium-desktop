@@ -1,9 +1,3 @@
-//! Windows menus — native Win32 popups tracked on the input thread.
-//!
-//! `TrackPopupMenuEx` blocks its caller for the whole life of the menu, so a
-//! request is parked here and handed to the input thread through a posted
-//! message; the CEF UI thread that opened it returns immediately.
-
 use std::ffi::{OsStr, c_int};
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,15 +18,12 @@ use windows::core::PCWSTR;
 use crate::input::input_hwnd;
 use crate::platform::win_get_scale;
 
-/// Asks the input thread to track the parked request.
 pub(crate) const WM_JFN_MENU_TRACK: u32 = WM_APP + 0x100;
 
-/// Asks the input thread to end the menu it is tracking.
 pub(crate) const WM_JFN_MENU_END: u32 = WM_APP + 0x101;
 
 struct Pending {
     items: Vec<MenuItem>,
-    /// Anchor in logical (view) coordinates.
     x: c_int,
     y: c_int,
     on_selected: MenuSelection,
@@ -95,7 +86,6 @@ fn wide(s: &str) -> Vec<u16> {
         .collect()
 }
 
-/// Runs on the input thread, from `input_wndproc`.
 pub(crate) fn on_input_message(hwnd: HWND, msg: u32) {
     if msg == WM_JFN_MENU_END {
         let _ = unsafe { EndMenu() };

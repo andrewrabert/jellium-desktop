@@ -1,6 +1,3 @@
-//! The connect screen's spinner, ported from `overlay.css`'s `spin` keyframes:
-//! an 80-pixel ring, 6 pixels thick, one turn per second.
-
 use std::time::Instant;
 
 use iced_core::{Color, Element, Length, Point, Rectangle, Size, mouse};
@@ -15,8 +12,6 @@ const TURN: f32 = 1.0;
 pub struct Spinner {
     accent: Color,
     track: Color,
-    /// Owned by the connect screen, not by the view: a widget-cache rebuild
-    /// must not restart the turn.
     started: Instant,
 }
 

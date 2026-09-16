@@ -1,40 +1,13 @@
-//! Build-script hooks for the jellium-desktop binary.
-//!
-//! * On Windows, embed `resources/win/iconres.rc` so File Explorer
-//!   surfaces the version, company, and product strings (FILE/PRODUCT
-//!   version), and so the application icon shows up next to the .exe.
-//!   The rc is processed by `embed-resource`, which shells out to the
-//!   VS/MSVC `rc.exe` (or mingw's `windres` under non-MSVC toolchains).
-//!
-//! * On Windows we also hide the console: `[lib] crate-type = ["rlib"]`
-//!   plus `[[bin]]` defaults to console subsystem; pass the
-//!   `/SUBSYSTEM:WINDOWS` link arg so the binary launches without a
-//!   spawned console window.
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     decode_shell_logo()?;
 
-    // Linux: bundle libcef.so / libmpv.so / libEGL.so etc. into a single
-    // install dir alongside the binary (AppImage / flatpak / manual
-    // install all follow this layout). $ORIGIN matches that and avoids
-    // requiring LD_LIBRARY_PATH at runtime.
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     {
         println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
-        // Permit later DT_NEEDED libraries (libcef.so) to resolve symbols
-        // they don't list explicitly.
         println!("cargo:rustc-link-arg-bins=-Wl,--disable-new-dtags");
-        // ELF symbol preemption needs our `wl_display_connect` interposer in the
-        // dynamic symbol table to shadow libwayland's for libmpv.
         println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic");
 
-        // Additional rpath entries for system / out-of-tree library
-        // installs (e.g. Arch's `cef` package puts libcef.so in
-        // /usr/lib/cef, jellium-desktop-libmpv-git in
-        // /opt/jellium-desktop/libmpv/lib). xtask sets this when
-        // --system-cef or --external-mpv resolves outside $ORIGIN.
-        // Colon-separated; $ORIGIN entries still take precedence.
         println!("cargo:rerun-if-env-changed=JFN_EXTRA_RPATH");
         if let Ok(extra) = std::env::var("JFN_EXTRA_RPATH") {
             for entry in extra.split(':').filter(|s| !s.is_empty()) {
@@ -45,9 +18,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "windows")]
     {
-        // VS_VERSION_INFO is parameterized by VERSION + git-describe —
-        // expand iconres.rc.in inline (the template uses @VAR@
-        // placeholders, plain textual substitution).
         use std::path::PathBuf;
 
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -63,7 +33,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let template = std::fs::read_to_string(&rc_template)?;
 
-        // `env!` (not std::env::var) so rustc re-runs this script on a bump.
         println!("cargo:rerun-if-changed=../Cargo.toml");
         let version = env!("CARGO_PKG_VERSION").to_string();
         let numeric: Vec<&str> = version.split('-').next().unwrap_or("").split('.').collect();
@@ -71,8 +40,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut minor: u32 = numeric.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         let mut patch: u32 = numeric.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
         let fileflags = if version.contains('-') {
-            // Zero out FILEVERSION for dev builds so they can never be
-            // confused with or outrank a release on numeric comparison.
             major = 0;
             minor = 0;
             patch = 0;
@@ -80,9 +47,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "0x0L"
         };
-        // "<VERSION>+<short hash>[-dirty]" for pre-release VERSIONs; a clean
-        // release stays bare. xtask injects JFN_GIT_HASH/JFN_GIT_DIRTY; fall
-        // back to gitoxide for bare `cargo build`.
         println!("cargo:rerun-if-env-changed=JFN_GIT_HASH");
         println!("cargo:rerun-if-env-changed=JFN_GIT_DIRTY");
         let (git_hash, dirty) = match std::env::var("JFN_GIT_HASH") {
@@ -116,8 +80,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         embed_resource::compile(&rc_out, embed_resource::NONE).manifest_required()?;
 
-        // Hide the console window for GUI launches. `/SUBSYSTEM:WINDOWS`
-        // pairs with a `main`-style entrypoint via mainCRTStartup.
         println!("cargo:rustc-link-arg-bins=/SUBSYSTEM:WINDOWS");
         println!("cargo:rustc-link-arg-bins=/ENTRY:mainCRTStartup");
     }
@@ -125,7 +87,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Fallback for bare `cargo build` (no xtask). Empty hash when there is no repo.
 #[cfg(target_os = "windows")]
 fn git_info(repo_root: &std::path::Path) -> (String, bool) {
     let Ok(repo) = gix::discover(repo_root) else {
@@ -140,8 +101,6 @@ fn git_info(repo_root: &std::path::Path) -> (String, bool) {
     (hash, dirty)
 }
 
-/// Re-run when HEAD moves. git_dir holds HEAD; common_dir holds refs/packed-refs
-/// (they differ under a linked worktree).
 #[cfg(target_os = "windows")]
 fn track_git_refs(repo_root: &std::path::Path) {
     let Ok(repo) = gix::discover(repo_root) else {
@@ -164,7 +123,6 @@ fn track_git_refs(repo_root: &std::path::Path) {
     }
 }
 
-// Decode once at build time so the shell uploads pixels without a runtime codec.
 fn decode_shell_logo() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{BufReader, Write};
 

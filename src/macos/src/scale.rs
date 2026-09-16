@@ -1,23 +1,13 @@
-//! The macOS scale rule: the `backingScaleFactor` AppKit reports, turned into
-//! an exact [`Scale`], and this backend's own decision when it cannot be.
-
 use std::ffi::c_int;
 
 use jfn_platform_abi::Scale;
 #[cfg(target_os = "macos")]
 use jfn_platform_abi::WindowPos;
 
-/// The exact value of a `backingScaleFactor`. `None` for a non-positive one.
 pub fn scale_from_backing(factor: f64) -> Option<Scale> {
     Scale::from_f64(factor)
 }
 
-/// The scale macOS reports for the `backingScaleFactor` `source` gave.
-///
-/// `None` names a source that gave no factor at all. Logs the raw `CGFloat`
-/// beside the value reported whenever the exact conversion rejects it, and
-/// names the silent source when there is none; [`Scale::ONE`] is what this
-/// backend reports in both cases.
 pub fn report_backing(source: &str, factor: Option<f64>) -> Scale {
     if let Some(scale) = factor.and_then(scale_from_backing) {
         return scale;
@@ -36,11 +26,6 @@ pub fn report_backing(source: &str, factor: Option<f64>) -> Scale {
     reported
 }
 
-/// `points * scale`, integer round-half-up: the backing-pixel value a
-/// `CGFloat` measured in points names.
-///
-/// `None` when `points` is not finite, or when the result does not fit
-/// `c_int`.
 pub fn to_backing(scale: Scale, points: f64) -> Option<c_int> {
     if !points.is_finite() {
         return None;
@@ -53,10 +38,6 @@ pub fn to_backing(scale: Scale, points: f64) -> Option<c_int> {
     Some(rounded as c_int)
 }
 
-/// The scale macOS reports for `at`.
-///
-/// A position in backing pixels names no `NSScreen` without screen-identity
-/// persistence, so every position names the main screen's scale.
 #[cfg(target_os = "macos")]
 pub fn display_scale(at: Option<WindowPos>) -> Scale {
     tracing::trace!(

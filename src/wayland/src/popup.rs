@@ -71,8 +71,6 @@ fn send(rt: &WlRuntime, command: PopupCommand) {
     }
 }
 
-/// Captures the trigger when content requests a popup, before layout work.
-/// Ordinary button presses never create speculative protocol objects.
 pub(crate) struct WlMenuHost {
     pub(crate) rt: &'static WlRuntime,
 }
@@ -90,8 +88,6 @@ impl jfn_platform_abi::MenuHost for WlMenuHost {
     }
 }
 
-/// Content adapter. Protocol routing invokes the registered destination;
-/// only this adapter knows the destination contains a software menu.
 pub(crate) struct MenuInput {
     rt: &'static WlRuntime,
     generation: Generation,

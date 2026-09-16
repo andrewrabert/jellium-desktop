@@ -34,7 +34,6 @@ pub fn stage_cef(out: &Path, cef: &cef::Cef) -> Result<()> {
         new_id.as_ref(),
         bin.as_os_str(),
     ])?;
-    // libEGL / libGLESv2 symlinks (CEF expects them next to the binary on macOS).
     for lib in ["libEGL.dylib", "libGLESv2.dylib"] {
         let dst = out.join(lib);
         let _ = std::fs::remove_file(&dst);
@@ -74,7 +73,6 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
     std::fs::create_dir_all(&fw_dir)?;
     std::fs::create_dir_all(&resources_dir)?;
 
-    // Binary + staged libmpv
     let bin_src = build_dir.join("jellium-desktop");
     let bin_dst = macos_dir.join("jellium-desktop");
     xfs::copy_executable(&bin_src, &bin_dst)?;
@@ -83,8 +81,6 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
         &macos_dir.join("libmpv.2.dylib"),
     )?;
 
-    // CEF framework — copy from build/Frameworks/ (already install_name-fixed for
-    // build-tree layout; CompleteBundleMac re-rewrites for bundle layout).
     let fw_src = build_dir
         .join("Frameworks")
         .join(format!("{FRAMEWORK_NAME}.framework"));
@@ -94,7 +90,6 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
     }
     xfs::copy_dir_recursive(&fw_src, &fw_dst)?;
 
-    // libEGL / libGLESv2 symlinks (bundle layout: MacOS/ → ../Frameworks/...).
     for lib in ["libEGL.dylib", "libGLESv2.dylib"] {
         let dst = macos_dir.join(lib);
         let _ = std::fs::remove_file(&dst);
@@ -103,7 +98,6 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
             .with_context(|| format!("symlink {} -> {}", dst.display(), target))?;
     }
 
-    // Info.plist
     let ver = version::read()?;
     let mut vars = HashMap::new();
     vars.insert("APP_VERSION_FULL", ver.full.clone());
@@ -116,7 +110,6 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
         &vars,
     )?;
 
-    // AppIcon
     let icon_src = paths::repo_root()
         .join("resources")
         .join("macos")
@@ -125,7 +118,6 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
         xfs::copy_file(&icon_src, &resources_dir.join("AppIcon.icns"))?;
     }
 
-    // MoltenVK ICD descriptor.
     let icd_dir = resources_dir.join("vulkan").join("icd.d");
     std::fs::create_dir_all(&icd_dir)?;
     let icd_dst = icd_dir.join("MoltenVK_icd.json");
@@ -137,7 +129,6 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
         &icd_dst,
     )?;
 
-    // Complete the bundle: dep-walk, install_name rewrites, codesign.
     bundle_macos::complete(&app)?;
     Ok(app)
 }

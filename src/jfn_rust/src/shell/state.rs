@@ -18,11 +18,6 @@ pub fn overlay_visible(modal_occupied: bool, titlebar_shown: bool) -> bool {
     modal_occupied || titlebar_shown
 }
 
-/// The strip reserved above the web overlay, in logical pixels.
-///
-/// Reserved whenever decorations are client-side and the window is not
-/// fullscreen, so the strip is held constant across every video and OSD
-/// transition and Chromium is never resized by one.
 pub fn reserved_strip(inputs: ChromeInputs) -> i32 {
     if inputs.client_side_decorations && !inputs.fullscreen {
         TITLEBAR_LOGICAL_HEIGHT
@@ -31,10 +26,6 @@ pub fn reserved_strip(inputs: ChromeInputs) -> i32 {
     }
 }
 
-/// The routing state a window's extent and the chrome over it name.
-///
-/// The size published is `extent`'s own logical size, never a re-derivation
-/// of it; a window with no extent publishes zero.
 pub fn shell_state(
     extent: Option<jfn_platform_abi::WindowExtent>,
     inputs: ChromeInputs,
@@ -141,7 +132,6 @@ mod tests {
 
     #[test]
     fn a_logical_size_division_cannot_reproduce_is_published_verbatim() {
-        // 1497 / 2.5 rounds to 599; the producer's own 598 must survive.
         let Some(scale) = Scale::from_f64(2.5) else {
             return;
         };

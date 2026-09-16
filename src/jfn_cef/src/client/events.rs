@@ -6,8 +6,6 @@ use jfn_platform_abi::cursor::CursorShape;
 use super::{Inner, tasks};
 use crate::platform_ops;
 
-/// CEF's `ERR_ABORTED`, taken from the generated bindings rather than its
-/// value.
 const ERR_ABORTED: c_int = cef::sys::cef_errorcode_t::ERR_ABORTED as c_int;
 
 impl Inner {
@@ -41,8 +39,6 @@ impl Inner {
         jfn_logging::log(jfn_logging::Category::Js, lvl, &formatted);
     }
 
-    /// Marks which navigation's document is now producing pixels; a frame of
-    /// that document still has to be presented before anything retires.
     pub(crate) fn on_load_end(&self, is_main: bool, code: c_int, url: &str) {
         let formatted = format!(
             "CefLayer::OnLoadEnd name={} main={} code={} url={}",
@@ -74,8 +70,6 @@ impl Inner {
             jfn_logging::Level::Error,
             &formatted,
         );
-        // An aborted main-frame load is another navigation replacing this one,
-        // not a failure.
         if is_main
             && code != ERR_ABORTED
             && let Some(navigation) = self.load_navigation(url)

@@ -1,8 +1,3 @@
-//! Argv parser for jellium-desktop, built on clap. `--version` is a plain
-//! `bool` intercepted by `app::jfn_app_main` after parsing, so the libmpv
-//! version probe the version string needs only fires when `--version` is
-//! actually requested.
-
 use clap::{ArgAction, Parser};
 
 const ENV_LOG_LEVEL: &str = "JELLIUM_DESKTOP_LOG_LEVEL";
@@ -13,12 +8,6 @@ const ENV_CACHE_DIR: &str = "JELLIUM_DESKTOP_CACHE_DIR";
 #[cfg(test)]
 const ENV_BACKED: &[&str] = &[ENV_LOG_LEVEL, ENV_LOG_FILE, ENV_CONFIG_DIR, ENV_CACHE_DIR];
 
-/// jellium-desktop — Jellyfin native desktop client.
-///
-/// The four path/logging options also read a `JELLIUM_DESKTOP_*` environment
-/// variable; an explicit flag always wins over the variable. Each option is
-/// `Option<T>` with no clap default, so an absent flag/var falls back to the
-/// settings.json / platform-default layer.
 #[derive(Parser, Debug)]
 #[command(
     name = "jellium-desktop",
@@ -26,47 +15,36 @@ const ENV_BACKED: &[&str] = &[ENV_LOG_LEVEL, ENV_LOG_FILE, ENV_CONFIG_DIR, ENV_C
     args_override_self = true
 )]
 pub struct Cli {
-    /// Print version information and exit.
     #[arg(short = 'v', long, action = ArgAction::SetTrue)]
     pub version: bool,
 
-    /// Log filter, e.g. info | debug | debug,mpv=trace,CEF=off (default: info).
     #[arg(long, env = ENV_LOG_LEVEL)]
     pub log_level: Option<String>,
 
-    /// Write logs to this file ('' to disable).
     #[arg(long, env = ENV_LOG_FILE)]
     pub log_file: Option<String>,
 
-    /// Override the app config directory.
     #[arg(long, env = ENV_CONFIG_DIR)]
     pub config_dir: Option<String>,
 
-    /// Override the CEF/cache directory.
     #[arg(long, env = ENV_CACHE_DIR)]
     pub cache_dir: Option<String>,
 
-    /// Hardware decoding mode (default: no).
     #[arg(long)]
     pub hwdec: Option<String>,
 
-    /// Audio passthrough codecs, e.g. ac3,dts-hd,eac3,truehd.
     #[arg(long)]
     pub audio_passthrough: Option<String>,
 
-    /// Use exclusive audio output.
     #[arg(long, action = ArgAction::SetTrue)]
     pub audio_exclusive: bool,
 
-    /// Audio channel layout, e.g. stereo, 5.1, 7.1.
     #[arg(long)]
     pub audio_channels: Option<String>,
 
-    /// Chrome remote debugging port: 1024..=65535, or 0 to disable.
     #[arg(long)]
     pub remote_debug_port: Option<jfn_cef::DebuggingPort>,
 
-    /// Disable CEF GPU compositing.
     #[arg(long, action = ArgAction::SetTrue)]
     pub disable_gpu_compositing: bool,
 
@@ -81,8 +59,6 @@ mod tests {
     use clap::error::ErrorKind;
     use std::sync::Mutex;
 
-    // clap reads process env at parse time, so env-mutating tests and the
-    // tests that assert env-backed flags are unset must serialize on this.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard(&'static str);
@@ -98,7 +74,6 @@ mod tests {
         }
     }
 
-    // clap reads the real process env at parse time, so "unset" assertions must clear it first.
     struct EnvClear(Vec<(&'static str, Option<String>)>);
     impl EnvClear {
         fn new() -> Self {
@@ -344,8 +319,6 @@ mod tests {
         assert_eq!(ok(&["app"]).config_dir.as_deref(), Some("/tmp/jfd-cfg"));
     }
 
-    // The `///` help strings hardcode these defaults as literals; nothing
-    // links them to the consts, so guard the drift here.
     #[test]
     fn const_defaults_match_help_text() {
         assert_eq!(jfn_config::HWDEC_DEFAULT, "no");

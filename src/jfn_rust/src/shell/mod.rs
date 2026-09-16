@@ -1,10 +1,3 @@
-//! The shell overlay: one app-drawn surface hosting the connect screen, the
-//! about panel and the titlebar.
-//!
-//! It is allocated once at boot, before CEF exists, and freed once at
-//! shutdown; between the two only its visibility changes. jellyfin-web is the
-//! only CEF layer left in the process.
-
 #![deny(clippy::let_underscore_must_use)]
 
 pub mod about;
@@ -36,14 +29,11 @@ use parking_lot::{Condvar, Mutex};
 use actor::{Actor, Channel, Work};
 use jfn_platform_abi::{Plane, SurfaceHandle, SurfaceSize, Visibility};
 
-/// Application policy injected by the process composition root.
 #[derive(Clone, Copy)]
 pub struct ApplicationActions {
     pub open_menu: fn(jfn_platform_abi::LogicalPoint, bool),
 }
 
-/// Owns its surface and actor. Drop requests a bounded stop. Unconfirmed
-/// termination pins the platform lease instead of allowing native destruction.
 #[must_use = "the shell owns a render thread and native surface"]
 pub struct Shell {
     actor: Option<Actor>,
@@ -59,8 +49,6 @@ struct Subscriptions {
 }
 pub use actor::{JoinOutcome as ShutdownOutcome, LoopStartError};
 
-/// One-shot evidence that the renderer can present. Waiting is bounded because
-/// native target acquisition can require an event loop that has not started yet.
 #[must_use = "the application must choose how to handle renderer readiness"]
 pub struct Readiness(std::sync::mpsc::Receiver<Result<(), LoopStartError>>);
 impl Readiness {
@@ -109,17 +97,11 @@ pub enum StartError {
     #[error("shell thread could not start: {0}")]
     Thread(#[from] std::io::Error),
 }
-/// The actor's sender, created before any thread exists, so work posted before
-/// the render thread starts is delivered when it does.
 static CHANNEL: OnceLock<Channel> = OnceLock::new();
 static SURFACE: Mutex<Option<SurfaceHandle>> = Mutex::new(None);
-/// Set once the bundled font is in the global font database; [`wait_fonts_ready`]
-/// blocks on it.
 static FONTS_READY: (Mutex<Option<Result<(), FontWarmupError>>>, Condvar) =
     (Mutex::new(None), Condvar::new());
 
-/// Publishes the routing state of a window with no shell overlay: no modal, no
-/// titlebar, no reserved strip, at the window's current logical size.
 pub(crate) fn publish_no_overlay() {
     let Some(lease) = jfn_platform_abi::try_lease() else {
         return;
@@ -132,14 +114,6 @@ pub(crate) fn publish_no_overlay() {
     ));
 }
 
-/// Opens the process's wgpu device, allocates the shell overlay surface,
-/// claims it for direct presentation, installs the shell input sink, the about
-/// handler and the decorations listener, and spawns the render actor.
-///
-/// Returns ownership of the actor and surface, or a synchronous startup failure.
-/// The returned readiness receiver reports renderer startup independently of
-/// surface and thread acquisition. The application chooses its failure policy.
-/// Must run after `Platform::init` and before `CefInitialize`.
 pub fn shell_start(
     platform: &jfn_platform_abi::PlatformRuntime,
     metadata: metadata::ApplicationMetadata,
@@ -170,8 +144,6 @@ pub fn shell_start(
     jfn_platform_abi::stack::occupy(Plane::ShellOverlay, surface);
     *SURFACE.lock() = Some(surface);
 
-    // Declares that we present to it ourselves: from here the backend attaches
-    // no buffer, grabs no input, and drops every present for this surface.
     let _claimed = plat.surface_window_target(surface);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -216,7 +188,6 @@ impl Shell {
         };
         CLOSED.store(true, std::sync::atomic::Ordering::Release);
         self.subscriptions.take();
-        // Serialize with any window callback that already obtained the surface.
         *SURFACE.lock() = None;
         let result = if let Some(actor) = self.actor.take() {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -258,15 +229,6 @@ pub fn shell_surface() -> SurfaceHandle {
     SURFACE.lock().unwrap_or(SurfaceHandle::NONE)
 }
 
-/// Loads the bundled font into the process font system on its own thread, so
-/// the scan overlaps mpv bring-up instead of gating first paint.
-///
-/// The handle is joined before `CefInitialize`: fontdb's directory walk must
-/// not run while Chromium is manipulating process file descriptors.
-///
-/// This is the only place in the process that builds the font system before a
-/// frame is drawn; the shell overlay's own text resolves through
-/// [`theme::FONT`], so no glyph the overlay draws depends on the scan's result.
 #[must_use = "font warmup must finish before CEF initialization"]
 pub struct FontWarmup {
     worker: Option<std::thread::JoinHandle<()>>,
@@ -301,8 +263,6 @@ impl Drop for FontWarmup {
     }
 }
 
-/// The completion guard releases font waiters during both ordinary return and
-/// unwinding. A failed scan never masquerades as successful font readiness.
 fn warm_fonts_with(warm: impl FnOnce(), complete: impl FnOnce(Result<(), FontWarmupError>)) {
     struct Completion<F: FnOnce(Result<(), FontWarmupError>)> {
         callback: Option<F>,
@@ -361,30 +321,22 @@ fn signal_fonts_ready(result: Result<(), FontWarmupError>) {
     ready.notify_all();
 }
 
-/// Opens the combined overlay on its About tab. Installed as
-/// [`jfn_platform_abi::set_about_handler`].
 pub fn shell_open_about() {
     post(Work::OpenAbout);
 }
 
-/// Opens client settings. Work posted before the render thread starts remains
-/// queued in the process-wide shell channel.
 pub fn shell_open_client_settings() {
     post(Work::OpenClientSettings);
 }
 
 const FONT: &[u8] = include_bytes!("assets/NotoSans-Regular.ttf");
 
-/// Posts `work` to the render actor. Never drops it: an actor that has not
-/// started yet finds it queued in the channel it takes at spawn.
 pub(crate) fn post(work: Work) {
     if !CLOSED.load(std::sync::atomic::Ordering::Acquire) {
         CHANNEL.get_or_init(Channel::new).post(work);
     }
 }
 
-/// Subscribed into the refresh report at [`shell_start`]; wakes the pass, which
-/// now has a cadence to animate the spinner on.
 fn refresh_changed() {
     post(Work::Redraw);
 }
@@ -425,8 +377,6 @@ fn push_window_state() {
     post(Work::Resize { extent });
     let surface = surface_guard.unwrap_or(SurfaceHandle::NONE);
     if surface != SurfaceHandle::NONE {
-        // The overlay spans the whole window: the reserved strip is the web
-        // layer's inset, not the overlay's.
         plat.surface_resize(
             surface,
             SurfaceSize {

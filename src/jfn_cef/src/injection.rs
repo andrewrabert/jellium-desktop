@@ -1,11 +1,3 @@
-//! Native-shim injection. jellyfin-web is the process's one browser; its
-//! JS function list + script list ship to the renderer via the `extra_info`
-//! DictionaryValue, together with the cached Jellyfin device-profile JSON.
-//!
-//! Built fresh per-browser-create on the C++ thread that calls
-//! `CefBrowserHost::CreateBrowser`. CEF copies the dictionary into the
-//! cross-process payload, so we don't hold a long-lived reference.
-
 use cef::{
     CefString, DictionaryValue, ImplDictionaryValue, ImplListValue, dictionary_value_create,
     list_value_create,
@@ -224,8 +216,6 @@ pub(crate) struct ExtraInfo {
     device_profile_json: Option<String>,
     shared_textures_enabled: bool,
     window_decorations: Option<WindowDecorations>,
-    /// Decoration modes the user may choose between; empty when the setting
-    /// does not apply (non-Linux).
     window_decoration_options: Vec<WindowDecorations>,
 }
 
@@ -361,11 +351,6 @@ fn write_string_list<'a>(
     Some(())
 }
 
-/// Set the cached Jellyfin device-profile JSON. Called once at startup
-/// after mpv capabilities are queried. Returns silently if already set.
-///
-/// # Safety
-/// `json_utf8` must reference `len` valid UTF-8 bytes, or be null.
 pub unsafe fn jfn_cef_set_device_profile_json(json_utf8: *const c_char, len: usize) {
     if json_utf8.is_null() || len == 0 {
         return;

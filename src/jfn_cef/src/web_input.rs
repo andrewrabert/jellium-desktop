@@ -1,8 +1,3 @@
-//! jellyfin-web's half of the input router.
-//!
-//! Every command upgrades the process registry's weak client reference at the
-//! point of use. Commands remain no-ops while no browser client is available.
-
 use std::os::raw::c_int;
 
 use jfn_input::WebInput;

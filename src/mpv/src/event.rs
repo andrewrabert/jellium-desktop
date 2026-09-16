@@ -1,17 +1,8 @@
-//! Owned event types decoded from `mpv_event`.
-//!
-//! Raw `mpv_event` payloads (returned by `mpv_wait_event`) are only valid
-//! until the next `mpv_wait_event` call on the same handle. `Event::from_raw`
-//! copies the data out so the caller can drop the loan immediately.
-
 use crate::log::LogLevel;
 use crate::node::Node;
 use crate::sys;
 use std::ffi::CStr;
 
-/// User-assigned ID passed as `reply_userdata` to
-/// `mpv_observe_property`. Re-emitted on `Event::PropertyChange` so callers
-/// can dispatch without string-comparing property names.
 pub type ObserveId = u64;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,16 +25,12 @@ impl EndFileReason {
                 Self::Error(crate::error::Error::new(error))
             }
             sys::mpv_end_file_reason::MPV_END_FILE_REASON_REDIRECT => Self::Redirect,
-            // The bindgen newtype wraps c_int on MSVC but c_uint on unix
-            // targets, so the cast is required on one and a no-op on the other.
             #[allow(clippy::unnecessary_cast)]
             other => Self::Unknown(other.0 as i32),
         }
     }
 }
 
-/// Property-change payload, format-typed. Mirrors what
-/// `mpv_event_property::data` decodes to under each `mpv_format`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PropertyValue {
     None,
@@ -55,9 +42,6 @@ pub enum PropertyValue {
 }
 
 impl PropertyValue {
-    /// # Safety
-    /// `p` must point to a valid `mpv_event_property` whose `data` (if
-    /// non-null) matches the declared `format`.
     pub unsafe fn from_raw(p: *const sys::mpv_event_property) -> Self {
         if p.is_null() {
             return Self::None;
@@ -94,12 +78,10 @@ pub struct LogMessage {
     pub text: String,
 }
 
-/// Reply identifier carried by async command/property events.
 pub type ReplyUserdata = u64;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    /// `MPV_EVENT_NONE` — emitted on timeout from `wait_event`.
     None,
     Shutdown,
     LogMessage(LogMessage),
@@ -139,13 +121,7 @@ pub enum Event {
 }
 
 impl Event {
-    /// Decode a raw `mpv_event` borrowed from libmpv into an owned `Event`.
-    ///
-    /// # Safety
-    /// `ev` must reference a valid `mpv_event` returned by `mpv_wait_event`.
-    /// All borrowed pointers are copied; the caller may invoke
-    /// `mpv_wait_event` again immediately after this returns.
-    #[allow(clippy::unnecessary_cast)] // mpv_event_id.0 is i32 on windows, u32 on linux
+    #[allow(clippy::unnecessary_cast)]
     pub unsafe fn from_raw(ev: *const sys::mpv_event) -> Self {
         if ev.is_null() {
             return Event::None;

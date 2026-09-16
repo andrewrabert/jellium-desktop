@@ -1,5 +1,3 @@
-//! Hwdec mode policy: which mpv hardware-decode backends each OS offers.
-
 pub const HWDEC_DEFAULT: &str = "no";
 
 #[expect(
@@ -27,12 +25,10 @@ pub fn hwdec_options() -> &'static [&'static str] {
     }
 }
 
-/// A hardware-decode mode this OS offers, parsed once from user input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hwdec(&'static str);
 
 impl Hwdec {
-    /// The mpv `hwdec` option value.
     pub fn as_str(self) -> &'static str {
         self.0
     }
@@ -91,8 +87,6 @@ mod tests {
         assert_eq!(HWDEC_DEFAULT.parse::<Hwdec>().ok(), Some(Hwdec::default()));
     }
 
-    /// mpv's documented `--hwdec` default: "no: always use software decoding
-    /// (default)". The settings view shows this value for an unset setting.
     #[test]
     fn default_is_mpv_software_decoding() {
         assert_eq!(Hwdec::default().as_str(), "no");

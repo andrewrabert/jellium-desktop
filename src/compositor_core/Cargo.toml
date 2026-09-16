@@ -8,9 +8,6 @@ publish.workspace = true
 name = "jfn_compositor_core"
 crate-type = ["rlib"]
 
-# Pure logic — no platform deps. Compiles and unit-tests on every host so
-# the macOS/Windows compositors can share (and verify) this bookkeeping
-# without a target build.
 
 [lints]
 workspace = true

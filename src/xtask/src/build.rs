@@ -19,7 +19,6 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         (mpv::build(&out, args.mpv_cli)?, false)
     };
 
-    // Cargo invocation — mirror the env CMake passes today.
     let target_dir = paths::cargo_target_dir(&out);
     let manifest = paths::workspace_manifest();
     let mut cmd = Command::new("cargo");
@@ -46,9 +45,6 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         cmd.env_remove("CEF_RESOURCES_DIR");
     }
 
-    // Single source of truth for the embedded commit hash. xtask always runs
-    // (never cargo-cached), so it recomputes every build; the build scripts
-    // read these via cargo:rerun-if-env-changed for exact invalidation.
     let (git_hash, git_dirty) = version::git_info();
     cmd.env("JFN_GIT_HASH", git_hash.unwrap_or_default());
     cmd.env("JFN_GIT_DIRTY", if git_dirty { "1" } else { "0" });
@@ -66,10 +62,6 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         cmd.env("JFN_MPV_LIB_DIR", &mpv_info.build_dir);
     }
 
-    // Linux: rpath system / out-of-tree lib dirs into the binary so it
-    // resolves DT_NEEDED entries that aren't shipped alongside it.
-    // In-tree builds (.cache/cef + meson mpv) stay relocatable —
-    // libs are staged next to the binary and $ORIGIN handles them.
     if cfg!(target_os = "linux") {
         let mut rpaths: Vec<String> = Vec::new();
         if cef_info.link_external {

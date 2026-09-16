@@ -1,11 +1,3 @@
-//! Windows input — Win32 child window owning all keyboard/mouse for CEF.
-//!
-//! Runs on a dedicated thread (spawned by `platform.rs::win_init`);
-//! registers a `JellyfinCefInput` window class, creates a child of mpv's
-//! HWND covering the client area, and translates `WM_*` messages into
-//! the platform-agnostic `jfn_input_dispatch_*` entry points exposed by
-//! `src/input/src/lib.rs`.
-
 #![allow(non_snake_case)]
 
 use parking_lot::Mutex;
@@ -79,8 +71,6 @@ static STATE: Mutex<State> = Mutex::new(State {
     cursor_type: CursorShape::Pointer.as_raw(),
 });
 
-/// The input child window, or `None` before the input thread creates it and
-/// after it tears it down.
 pub(crate) fn input_hwnd() -> Option<HWND> {
     let raw = STATE.lock().input_hwnd_raw;
     (raw != 0).then_some(HWND(raw as *mut _))
@@ -115,8 +105,6 @@ fn get_appcommand_lparam(lp: LPARAM) -> u16 {
     (hiword_i16(lp.0 as u32) as u16) & 0x7FFF
 }
 
-/// The physical key `lparam` names: the scancode, `0xE0`-prefixed when the
-/// extended bit is set.
 fn physical_key(lparam: LPARAM) -> PhysicalKey {
     let scancode = ((lparam.0 >> 16) as u32 & 0xff) as u16;
     let extended = ((lparam.0 >> 16) as u32 & KF_EXTENDED) != 0;
@@ -127,17 +115,11 @@ fn physical_key(lparam: LPARAM) -> PhysicalKey {
     })
 }
 
-/// The character `vk` produces with no modifier applied, through
-/// `MapVirtualKeyW(MAPVK_VK_TO_CHAR)` with the dead-key bit cleared.
 fn logical_char(vk: u16) -> Option<char> {
     let mapped = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_CHAR) };
-    // The high bit marks a dead key; the character it names is still the one
-    // the key produces.
     jfn_input::key::logical_char(mapped & 0x7fff_ffff)
 }
 
-/// Whether the input window's top-level ancestor is the foreground window.
-/// A menu's tracking loop leaves it unchanged.
 fn toplevel_active(hwnd: HWND) -> bool {
     let toplevel = unsafe { GetAncestor(hwnd, GA_ROOT) };
     !toplevel.is_invalid() && toplevel == unsafe { GetForegroundWindow() }
@@ -292,14 +274,10 @@ fn is_button_down(msg: u32) -> bool {
     matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN)
 }
 
-/// The pointer position in the space CEF's view was sized in, mapped through
-/// the extent `crate::window` last sampled. The identity before the first
-/// sample exists.
 fn view_point(x: i32, y: i32) -> LogicalPoint {
     crate::scale::view_point(crate::window::client_extent(), PhysicalPoint { x, y })
 }
 
-/// One debug line per press.
 fn log_press(msg: u32, physical: PhysicalPoint, logical: LogicalPoint) {
     let Some(extent) = crate::window::client_extent() else {
         return;
@@ -579,9 +557,6 @@ pub(crate) fn jfn_input_windows_resize_to_parent(pw: c_int, ph: c_int) {
     let _ = unsafe { SetWindowPos(hwnd, None, 0, 0, pw, ph, flags) };
 }
 
-/// Platform::set_cursor — invoked from the CEF UI thread. Stores the
-/// pending cursor type and posts a synthetic WM_SETCURSOR so the input
-/// thread applies it via SetCursor (which is thread-affine).
 pub(crate) fn jfn_input_windows_set_cursor(t: c_int) {
     let hwnd_raw = {
         let mut s = STATE.lock();

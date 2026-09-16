@@ -35,28 +35,21 @@ enum Cmd {
     Install(InstallArgs),
     Package(PackageArgs),
     FetchCef,
-    /// Print the full version string (`<semver>+<short-sha>[-dirty]`).
     Version,
 }
 
 #[derive(clap::Args, Clone)]
 pub struct BuildArgs {
-    /// download-cef root; staged next to the binary.
     #[arg(long)]
     pub external_cef: Option<PathBuf>,
-    /// rpath an installed CEF in place.
     #[arg(long)]
     pub cef_path: Option<PathBuf>,
-    /// Use the named external libmpv directory (must contain include/ and lib/).
     #[arg(long, env = "EXTERNAL_MPV_DIR")]
     pub external_mpv: Option<PathBuf>,
-    /// Also build the standalone mpv CLI binary from the submodule.
     #[arg(long)]
     pub mpv_cli: bool,
-    /// Disable the KWin per-window titlebar color feature (drops the default cargo feature).
     #[arg(long)]
     pub no_kde_palette: bool,
-    /// Build directory (staged binary + runtime resources land here).
     #[arg(long, default_value = "build")]
     pub out: PathBuf,
 }
@@ -65,10 +58,8 @@ pub struct BuildArgs {
 pub struct InstallArgs {
     #[command(flatten)]
     pub build: BuildArgs,
-    /// Destination prefix.
     #[arg(long)]
     pub prefix: PathBuf,
-    /// Skip the build step; install from an existing `--out` directory.
     #[arg(long)]
     pub skip_build: bool,
 }
@@ -77,7 +68,6 @@ pub struct InstallArgs {
 pub struct PackageArgs {
     #[command(flatten)]
     pub install: InstallArgs,
-    /// Output directory for the produced archive.
     #[arg(long, default_value = "dist")]
     pub dist: PathBuf,
 }

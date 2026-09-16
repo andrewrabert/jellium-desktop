@@ -1,13 +1,8 @@
-//! Idle-inhibit sink. Watches phase + media_type transitions and drives
-//! the platform idle-inhibit level via the registered callback wired to
-//! `g_platform.set_idle_inhibit`.
-
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 
 use crate::types::{MediaType, PlaybackEvent, PlaybackEventKind, PlaybackPhase, PlaybackSnapshot};
 
-// IdleInhibitLevel: None, System, Display.
 const LEVEL_NONE: u32 = 0;
 const LEVEL_SYSTEM: u32 = 1;
 const LEVEL_DISPLAY: u32 = 2;
@@ -19,7 +14,6 @@ fn cb_slot() -> &'static Mutex<Option<SetCb>> {
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
-/// Install the platform idle-inhibit setter. `cb == None` disables the sink.
 pub fn jfn_playback_set_idle_inhibit_handler(cb: Option<SetCb>) {
     *cb_slot().lock() = cb;
 }

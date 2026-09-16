@@ -1,8 +1,3 @@
-//! The shell's half of the input router.
-//!
-//! The router hands the overlay window-space events; this turns them into iced
-//! events and posts them to the render actor.
-
 use std::os::raw::c_int;
 use std::time::{Duration, Instant};
 
@@ -13,12 +8,10 @@ use parking_lot::Mutex;
 
 use crate::shell::actor::{Work, point};
 
-/// `csd.js`'s manual double-click window.
 const DOUBLE_PRESS: Duration = Duration::from_millis(400);
 
 static LAST_DRAG_PRESS: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// The shape iced's `mouse_interaction` resolved to for the current frame.
 pub(crate) fn set_interaction(interaction: mouse::Interaction) {
     jfn_input::cursor::cursor_from_shell(shape_of(interaction));
 }
@@ -108,7 +101,6 @@ impl jfn_input::ShellInput for ShellSink {
         crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorMoved {
             position: point(p.x, p.y),
         })));
-        // CEF mouse buttons: 0 = left, 1 = middle, 2 = right.
         let button = match button {
             1 => mouse::Button::Middle,
             2 => mouse::Button::Right,

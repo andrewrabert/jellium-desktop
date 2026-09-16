@@ -1,8 +1,3 @@
-//! Pure data types shared between the state machine and coordinator.
-//!
-//! These are internal Rust types. The FFI-facing shapes live in `ffi.rs`
-//! and are populated from these at sink-delivery time.
-
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum MediaType {
@@ -31,7 +26,6 @@ pub enum PlaybackPhase {
 }
 
 impl PlaybackPhase {
-    /// Whether media is loaded: every phase but `Stopped`.
     pub fn is_active(self) -> bool {
         matches!(self, Self::Starting | Self::Playing | Self::Paused)
     }

@@ -1,5 +1,3 @@
-//! xkb keysym → Windows VK code.
-
 use xkbcommon::xkb::keysyms as ks;
 
 pub fn keysym_to_vkey(sym: u32) -> i32 {
@@ -44,9 +42,6 @@ pub fn keysym_to_vkey(sym: u32) -> i32 {
         ks::KEY_KP_End => 0x23,
         ks::KEY_KP_Insert => 0x2D,
         ks::KEY_KP_Delete => 0x2E,
-        // OEM punctuation. Required so Chromium can derive event.key (e.g.
-        // '>' from Shift+Period) for DOM keydown handlers; without a VK
-        // here, jellyfin-web shortcuts like '<' / '>' never match.
         ks::KEY_semicolon | ks::KEY_colon => 0xBA,
         ks::KEY_equal | ks::KEY_plus => 0xBB,
         ks::KEY_comma | ks::KEY_less => 0xBC,

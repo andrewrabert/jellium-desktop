@@ -1,7 +1,3 @@
-//! CEF's Alloy OSR popup renders `<select>` hover/selection highlights as
-//! opaque black on macOS, so its popup runs invisibly and a native NSMenu is
-//! presented in its place.
-
 use jfn_platform_abi::{MENU_DISMISSED, MenuHost, MenuRequest, menu_has_selectable};
 
 use crate::ns_menu::{MenuEntry, MenuSpec, present_on_main};

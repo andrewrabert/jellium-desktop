@@ -26,8 +26,6 @@ impl WakeEvent {
         let _ = self.fd.read();
     }
 
-    /// Block until signaled. Level-triggered, so a `signal()` that lands
-    /// before the call returns immediately.
     pub fn wait(&self) {
         crate::fd_wait::wait(self.fd.as_raw_fd());
     }

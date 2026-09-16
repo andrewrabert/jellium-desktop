@@ -1,37 +1,18 @@
-//! Window ownership as a two-valued fact, and everything that follows from
-//! it: the boot-geometry seeding path, whether mpv's size is reconciled at
-//! boot, and which [`WindowSource`] is authoritative.
-
 use crate::geometry::{BootGeometry, LogicalSize, PhysicalSize, Scale, mpv_reconcile_size};
 use crate::window_source::WindowSource;
 
-/// The app window where the app creates it: its live geometry, and the boot
-/// geometry seeded into it.
 pub trait AppCreatedWindow: WindowSource {
-    /// Sizes, places and maximizes the app window per `g` before returning.
     fn seed_boot_geometry(&self, g: &BootGeometry);
 }
 
-/// The app window where mpv creates it: its live geometry, observed from
-/// mpv's own window.
 pub trait MpvCreatedWindow: WindowSource {}
 
-/// The window options mpv is started with where mpv creates the app window.
 pub struct MpvBootWindow {
-    /// mpv's `--geometry`, physical pixels.
     pub geometry: String,
     pub force_position: bool,
     pub maximized: bool,
 }
 
-/// Which party creates and holds the app window.
-///
-/// The sole determinant of the boot-geometry seeding path, of whether mpv's
-/// size is reconciled at boot, and of which [`WindowSource`] is
-/// authoritative. A compositor-backed source implements [`AppCreatedWindow`]
-/// and nothing else, so it cannot stand under [`WindowOwner::Mpv`];
-/// [`MpvBootWindow`] is produced by the [`WindowOwner::Mpv`] arm alone, so an
-/// app-created window has no geometry string to hand mpv.
 #[derive(Clone, Copy)]
 pub enum WindowOwner<'src> {
     App(&'src dyn AppCreatedWindow),
@@ -39,7 +20,6 @@ pub enum WindowOwner<'src> {
 }
 
 impl<'src> WindowOwner<'src> {
-    /// The live geometry authority for the app window.
     pub fn source(&self) -> &'src dyn WindowSource {
         match self {
             WindowOwner::App(w) => *w,
@@ -47,10 +27,6 @@ impl<'src> WindowOwner<'src> {
         }
     }
 
-    /// Seeds the app-created window with `g`, answering `None`.
-    ///
-    /// Seeds nothing where mpv creates the window, answering the options it
-    /// is started with.
     pub fn apply_boot_geometry(&self, g: &BootGeometry) -> Option<MpvBootWindow> {
         match self {
             WindowOwner::App(w) => {
@@ -65,11 +41,6 @@ impl<'src> WindowOwner<'src> {
         }
     }
 
-    /// The physical size mpv's window is resized to at boot.
-    ///
-    /// `None` where the app creates the app window: mpv sizes nothing there.
-    /// `None` where `locked`, where `saved_logical` maps to no representable
-    /// physical size, and where it maps to `saved_physical`.
     pub fn reconcile_mpv_size(
         &self,
         reported: Scale,

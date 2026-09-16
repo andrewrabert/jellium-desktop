@@ -1,5 +1,3 @@
-//! Keyboard focus and activation for Client Settings controls.
-
 use iced_core::Renderer as _;
 use iced_core::keyboard::{self, Key, key::Named};
 use iced_core::widget::operation::{Focusable, Scrollable};
@@ -14,7 +12,6 @@ use crate::shell::theme::{self, Theme};
 
 type Renderer = iced_wgpu::Renderer;
 
-/// The direction in which Settings keyboard focus moves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Direction {
     Forward,
@@ -79,8 +76,6 @@ struct Control<'a, Message> {
     keyboard: Keyboard<Message>,
 }
 
-/// Makes an action or checkbox keyboard-focusable and activatable with Enter
-/// or Space.
 pub fn action<'a, Message: Clone + 'a>(
     id: Id,
     content: impl Into<Element<'a, Message, Theme, Renderer>>,
@@ -93,8 +88,6 @@ pub fn action<'a, Message: Clone + 'a>(
     })
 }
 
-/// Makes a named tab keyboard-focusable and activatable with the same action
-/// semantics as the other shell controls.
 pub fn tab<'a, Message: Clone + 'a>(
     id: Id,
     content: impl Into<Element<'a, Message, Theme, Renderer>>,
@@ -103,8 +96,6 @@ pub fn tab<'a, Message: Clone + 'a>(
     action(id, content, message)
 }
 
-/// Builds a mouse- and keyboard-capable select. Enter or Space opens it, arrow
-/// keys move its cyclic highlight, Enter or Space commits, and Escape cancels.
 pub fn select<'a, T, Message>(
     id: Id,
     selected: T,
@@ -669,8 +660,6 @@ impl Operation for FocusAndReveal {
     }
 }
 
-/// Cyclically moves focus across all rendered named controls and reveals the
-/// target in the named Settings viewport.
 pub fn move_focus(viewport: Id, direction: Direction) -> impl Operation {
     widget::operation::then(
         Scan {
@@ -686,7 +675,6 @@ pub fn move_focus(viewport: Id, direction: Direction) -> impl Operation {
     )
 }
 
-/// Captures the platform-reported absolute translation of a named scrollable.
 pub struct ScrollOffset {
     viewport: Id,
     offset: Option<widget::operation::scrollable::AbsoluteOffset>,
@@ -727,7 +715,6 @@ pub fn scroll_offset(viewport: Id) -> ScrollOffset {
     }
 }
 
-/// Restores a named scrollable to an exact absolute offset.
 pub struct RestoreScroll {
     viewport: Id,
     offset: widget::operation::scrollable::AbsoluteOffset,
@@ -762,7 +749,6 @@ pub fn restore_scroll(
     RestoreScroll { viewport, offset }
 }
 
-/// Operation collecting the ID of the one currently focused named control.
 #[derive(Default)]
 pub struct FocusedId(Option<Id>);
 
@@ -786,7 +772,6 @@ impl Operation for FocusedId {
     }
 }
 
-/// Collects the current focused ID when applied to a rendered widget tree.
 pub fn focused_id() -> FocusedId {
     FocusedId::default()
 }

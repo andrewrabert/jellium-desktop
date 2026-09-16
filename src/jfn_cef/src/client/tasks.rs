@@ -83,10 +83,6 @@ wrap_task! {
     }
 }
 
-/// Posts the one browser-close task onto TID_UI. A rejected post returns before
-/// ownership transfer, a canceled accepted task is reported by channel
-/// disconnection, and a delivered task waits for the client's RAII owner
-/// channel to disconnect after `OnBeforeClose`.
 pub(crate) fn post_close_and_wait(
     inner: Arc<Inner>,
     deadline: std::time::Instant,

@@ -1,9 +1,3 @@
-//! Two-phase server probe over `CefURLRequest`.
-//!
-//! HEAD with redirect-follow finds the canonical base URL, then GET
-//! `{base}/System/Info/Public` confirms a Jellyfin server. Travelling over
-//! CEF keeps Chromium's proxy and TLS-trust configuration applied to it.
-
 use cef::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -38,14 +32,6 @@ pub(crate) struct Probe {
 }
 
 impl Probe {
-    /// Answers with the canonical base URL of the Jellyfin server `url`
-    /// resolves to, and with nothing else: a URL that resolves to no Jellyfin
-    /// server answers `None`, on the CEF UI thread.
-    ///
-    /// Callable from any thread: `CefURLRequest::Create` is UI-thread-only
-    /// under a multi-threaded message loop, so the request is built inside a
-    /// posted TID_UI task and its handle is published back into the returned
-    /// `Probe`.
     pub(crate) fn start(
         session: Arc<crate::runtime::Session>,
         url: &str,
@@ -80,9 +66,6 @@ impl Probe {
         Probe { state }
     }
 
-    /// Aborts the in-flight request on TID_UI; `on_done` never fires
-    /// afterwards, including when the request had not been built yet.
-    /// Called by the session's UI drain barrier, before releasing native CEF.
     pub(crate) fn cancel_on_ui(self) {
         {
             let mut state = self.state.lock();
@@ -93,7 +76,6 @@ impl Probe {
     }
 }
 
-/// Builds the HEAD request on TID_UI and publishes its handle.
 fn start_on_ui(state: &Arc<Mutex<ProbeState>>) {
     let head_url = {
         let st = state.lock();
@@ -151,7 +133,6 @@ fn on_complete(state: &Arc<Mutex<ProbeState>>, request: &Urlrequest) {
         cancel_on_ui(state);
         return;
     }
-    // HEAD phase: extract resolved base URL, post GET on /System/Info/Public.
     let next_request = {
         let mut st = state.lock();
         if st.callback.is_none() {
@@ -182,7 +163,6 @@ fn on_complete(state: &Arc<Mutex<ProbeState>>, request: &Urlrequest) {
         return;
     }
 
-    // GET phase complete: validate body, then invoke caller.
     let (success, base, cb) = {
         let mut st = state.lock();
         let mut ok = false;

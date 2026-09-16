@@ -60,7 +60,6 @@ define_class!(
     }
 );
 
-/// Owns the spec so it outlives the caller across the async hop to the main queue.
 struct MenuRun {
     cb: Arc<SelectionCb>,
     spec: MenuSpec,
@@ -70,7 +69,6 @@ unsafe fn show_menu_on_main(run: MenuRun) {
     let window = jfn_macos_get_window();
     let input_view = jfn_macos_get_input_view();
     if window.is_null() || input_view.is_null() {
-        // Report cancel so callers don't hang waiting on a selection.
         run.cb.fire(-1);
         return;
     }
@@ -110,7 +108,6 @@ unsafe fn show_menu_on_main(run: MenuRun) {
         let _: () = unsafe { msg_send![item, setTarget: &*target] };
         let _: () = unsafe { msg_send![item, setEnabled: entry.enabled] };
         if entry.checked {
-            // NSControlStateValueOn == 1
             let _: () = unsafe { msg_send![item, setState: 1isize] };
         }
         let _: () = unsafe { msg_send![menu, addItem: item] };
@@ -136,8 +133,6 @@ unsafe fn show_menu_on_main(run: MenuRun) {
         ]
     };
 
-    // Modal call; if no item was picked the target hasn't fired yet —
-    // report cancel.
     run.cb.fire(-1);
     drop(target);
 }

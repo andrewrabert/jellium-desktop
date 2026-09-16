@@ -1,9 +1,3 @@
-//! Public Rust API for the playback module.
-//!
-//! Sinks register typed closures (`Box<dyn Fn(&PlaybackEvent) + Send +
-//! Sync>`); the coordinator worker fans events out by invoking them
-//! directly. Producers call [`post`] with a typed [`Input`].
-
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 
@@ -11,16 +5,8 @@ pub use crate::coordinator::Input;
 use crate::coordinator::{CoordinatorHandle, PlaybackCoordinator};
 use crate::types::*;
 
-// =====================================================================
-// Sink closure types
-// =====================================================================
-
 pub type EventSink = Box<dyn Fn(&PlaybackEvent) + Send + Sync>;
 pub type ActionSink = Box<dyn Fn(&PlaybackAction) + Send + Sync>;
-
-// =====================================================================
-// Singleton coordinator
-// =====================================================================
 
 static COORD: OnceLock<Mutex<Option<PlaybackCoordinator>>> = OnceLock::new();
 
@@ -56,8 +42,6 @@ pub fn jfn_playback_init() {
         ));
         *guard = Some(c);
     }
-    // The immediate reconcile is load-bearing: mode posts made before the
-    // coordinator existed were dropped by `post`, and no wakeup replays them.
     crate::ingest_driver::jfn_playback_reconcile_window_mode();
 }
 
@@ -82,8 +66,6 @@ fn register_builtin_sinks(c: &PlaybackCoordinator) {
 }
 
 pub fn jfn_playback_shutdown() {
-    // stop() joins the worker, whose sinks call post() → coord_slot;
-    // holding the guard across stop() deadlocks.
     let coord = coord_slot().lock().take();
     if let Some(mut c) = coord {
         c.stop();
@@ -101,10 +83,6 @@ pub fn register_action_sink(sink: ActionSink) {
 pub fn jfn_playback_snapshot() -> PlaybackSnapshot {
     coord_handle().map_or_else(PlaybackSnapshot::fresh, |h| h.snapshot())
 }
-
-// =====================================================================
-// Producer entry point
-// =====================================================================
 
 pub fn post(input: Input) {
     if let Some(h) = coord_handle() {

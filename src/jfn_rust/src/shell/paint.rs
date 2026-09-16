@@ -1,8 +1,3 @@
-//! The shell overlay's swapchain, iced engine and renderer.
-//!
-//! Everything here runs on the render actor's thread, which is the only writer
-//! of the swapchain and of the platform layer behind it.
-
 use std::sync::Arc;
 
 use iced_core::renderer::Renderer as _;
@@ -79,17 +74,10 @@ impl Painter {
         &self.viewport
     }
 
-    /// Acquires one frame with no gate held. A stale or occluded swapchain
-    /// hands back the retry it owes instead.
     pub fn acquire(&mut self) -> jfn_gpu_paint::Acquired<'static> {
         self.swapchain.acquire()
     }
 
-    /// Encodes the renderer's scene into `frame` inside the submit gate and
-    /// commits it outside.
-    ///
-    /// The frame is always cleared fully transparent; opacity is a widget's to
-    /// draw.
     pub fn present(&mut self, frame: jfn_gpu_paint::Frame<'static>) -> Presented {
         let format = self.swapchain.format();
         let renderer = &mut self.renderer;
@@ -100,7 +88,6 @@ impl Painter {
     }
 }
 
-/// The swapchain size an extent names.
 pub fn frame_size(extent: WindowExtent) -> FrameSize {
     let physical = extent.physical();
     FrameSize {
@@ -109,8 +96,6 @@ pub fn frame_size(extent: WindowExtent) -> FrameSize {
     }
 }
 
-/// The viewport an extent names: its physical size, and the platform's
-/// reported scale as iced's window scale, application scale 1.0.
 pub fn viewport(extent: WindowExtent) -> Viewport {
     let size = frame_size(extent);
     Viewport::with_physical_size(
@@ -122,8 +107,6 @@ pub fn viewport(extent: WindowExtent) -> Viewport {
     )
 }
 
-/// Text is hinted against the scale it is drawn at, so a scale change
-/// re-hints it.
 fn hint_scale(renderer: &mut Renderer, extent: WindowExtent) {
     renderer.hint(iced_core::renderer::Scale {
         window: extent.scale().as_f32(),
@@ -138,7 +121,6 @@ mod tests {
 
     const LOGICAL: LogicalSize = LogicalSize { w: 1280, h: 720 };
 
-    /// One extent per covered scale, each carrying that scale verbatim.
     fn extents() -> Vec<Option<WindowExtent>> {
         COVERED_SCALES
             .into_iter()

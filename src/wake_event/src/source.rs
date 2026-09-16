@@ -4,8 +4,6 @@ use std::os::fd::{AsRawFd as _, BorrowedFd};
 use calloop::{EventSource, Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory};
 
 pub enum Drain {
-    /// The fd stays readable; a level-triggered fan-out lets several loops
-    /// observe one signal.
     Never,
     BeforeCallback,
 }
@@ -17,12 +15,7 @@ pub struct WakeSource {
 }
 
 impl WakeSource {
-    /// `fd` must outlive the source; the caller owns the [`WakeEvent`].
-    ///
-    /// [`WakeEvent`]: crate::WakeEvent
     pub fn new(fd: c_int, drain: Drain) -> WakeSource {
-        // SAFETY: the caller keeps the owning `WakeEvent` alive for at least as
-        // long as this source.
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };
         WakeSource {
             fd,
@@ -57,8 +50,6 @@ impl EventSource for WakeSource {
     fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
         let token = factory.token();
         self.token = Some(token);
-        // SAFETY: the fd outlives this source, and unregistration always
-        // happens before the source is dropped.
         unsafe { poll.register(self.fd, Interest::READ, Mode::Level, token) }
     }
 

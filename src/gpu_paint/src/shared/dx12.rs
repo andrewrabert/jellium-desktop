@@ -1,5 +1,3 @@
-//! D3D12 shared-handle import for CEF accelerated-paint frames.
-
 use wgpu_hal::dx12;
 use windows::Win32::Foundation::{HANDLE, LUID};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -11,11 +9,8 @@ use crate::SharedTexture;
 use crate::error::SurfaceLost;
 use crate::shared::{ImportFailed, Imported, Opened};
 
-/// An adapter LUID, packed into one integer so it compares by value.
 pub type ProducerId = i64;
 
-/// The adapter this device opened on, packed high:low. Chromium is pinned to
-/// it on the command line, so no frame ever has to name it.
 pub(crate) fn adapter_luid(adapter: &wgpu::Adapter) -> Option<ProducerId> {
     unsafe { adapter.as_hal::<dx12::Api>() }
         .and_then(|hal| unsafe { hal.raw_adapter().GetDesc1() }.ok())
@@ -37,8 +32,6 @@ const fn pack_luid(luid: LUID) -> ProducerId {
     ((luid.HighPart as i64) << 32) | (luid.LowPart as i64)
 }
 
-/// D3D12 can always open a shared handle; whether the *frame* opens is a
-/// per-import question and whether this is CEF's adapter is the caller's.
 pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<Opened, SurfaceLost> {
     let (device, queue) = pollster::block_on(adapter.request_device(&device_descriptor(adapter)))?;
     Ok(Opened {
@@ -52,8 +45,6 @@ fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static>
     wgpu::DeviceDescriptor {
         label: Some("jfn_gpu_paint device"),
         required_features: wgpu::Features::empty(),
-        // Adapter limits — the swapchain may be larger than the downlevel
-        // 2048×2048 cap on modern displays.
         required_limits: adapter.limits(),
         experimental_features: wgpu::ExperimentalFeatures::default(),
         memory_hints: wgpu::MemoryHints::Performance,
@@ -61,8 +52,6 @@ fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static>
     }
 }
 
-/// Stateless: the handle is CEF's and is only valid inside the paint callback,
-/// so nothing survives the frame.
 pub(crate) struct Importer;
 
 impl Importer {
@@ -82,9 +71,6 @@ impl Importer {
         let hal_device =
             unsafe { device.as_hal::<dx12::Api>() }.ok_or(ImportFailed("not a D3D12 device"))?;
 
-        // CEF owns this handle and reclaims it when the paint callback
-        // returns — `OpenSharedHandle` does not take it, and closing it here
-        // would pull the texture out of CEF's pool.
         let mut resource: Option<ID3D12Resource> = None;
         unsafe {
             hal_device
@@ -97,8 +83,6 @@ impl Importer {
         })?;
         let resource = resource.ok_or(ImportFailed("OpenSharedHandle returned null"))?;
 
-        // The resource states its own extent and format; CEF's coded size
-        // describes the frame, not necessarily this allocation.
         let desc = unsafe { resource.GetDesc() };
         let format = wgpu_format(desc.Format).ok_or_else(|| {
             tracing::warn!("gpu_paint: shared texture format {:?}", desc.Format);
@@ -138,7 +122,6 @@ impl Importer {
 }
 
 fn wgpu_format(format: DXGI_FORMAT) -> Option<wgpu::TextureFormat> {
-    // `DXGI_FORMAT` is a newtype, so these are values rather than patterns.
     if format == DXGI_FORMAT_B8G8R8A8_UNORM {
         Some(wgpu::TextureFormat::Bgra8Unorm)
     } else if format == DXGI_FORMAT_R8G8B8A8_UNORM {
@@ -148,8 +131,6 @@ fn wgpu_format(format: DXGI_FORMAT) -> Option<wgpu::TextureFormat> {
     }
 }
 
-/// No queue-family transfer on D3D12: the resource crosses devices in the
-/// COMMON state and wgpu's own barriers take it from there.
 pub(crate) fn acquire_barrier(
     _device: &wgpu::Device,
     _encoder: &mut wgpu::CommandEncoder,

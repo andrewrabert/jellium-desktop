@@ -56,7 +56,6 @@ wrap_context_menu_handler! {
             }
             if self.inner.has_context_menu_builder() {
                 m.add_separator();
-                // C++ thunk uses CefMenuModelCToCpp::Wrap which adopts one ref.
                 unsafe { Rc::add_ref(m) };
                 let raw = ImplMenuModel::get_raw(m) as *mut c_void;
                 self.inner.invoke_context_menu_builder(raw);
@@ -115,9 +114,6 @@ wrap_context_menu_handler! {
             host.open(MenuRequest {
                 items,
                 x: params.xcoord(),
-                // The anchor is in the web overlay's own view space; the app menu
-                // is placed in window space, so the strip the overlay was sized
-                // below is added back.
                 y: params.ycoord() + self.inner.view_top(),
                 width: 0,
                 initial: MENU_DISMISSED,

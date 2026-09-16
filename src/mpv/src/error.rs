@@ -1,11 +1,7 @@
-//! libmpv error codes wrapped in `Result`.
-
 use crate::sys;
 use std::ffi::CStr;
 use std::fmt;
 
-/// libmpv error. `code` is the negative integer libmpv returns; the string
-/// payload is the static `mpv_error_string` lookup at construction time.
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("{}", self.message())]
 pub struct Error {
@@ -17,10 +13,7 @@ impl Error {
         Self { code }
     }
 
-    /// Human-readable error string from libmpv. Never null — libmpv falls
-    /// back to "unknown error" for out-of-range codes.
     pub fn message(&self) -> &'static str {
-        // SAFETY: mpv_error_string returns a pointer to a static string.
         let ptr = unsafe { sys::mpv_error_string(self.code) };
         if ptr.is_null() {
             return "unknown mpv error";
@@ -39,8 +32,6 @@ impl fmt::Debug for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Wrap a libmpv return code into `Result<()>`. libmpv contract: `>= 0` on
-/// success, negative on failure.
 pub(crate) fn check(code: i32) -> Result<()> {
     if code >= 0 {
         Ok(())

@@ -1,12 +1,3 @@
-//! The mpv window's client rect, DPI, position, and mode, and the
-//! [`WindowSource`] that publishes them.
-//!
-//! One sample pass is the whole window state: CEF's render size, the
-//! persisted geometry and position, the scale the context menu and the OSR
-//! popup are placed with, and the mode playback reconciles against all read
-//! the stored snapshot. No pull issues an mpv call, and a pull with a stored
-//! snapshot issues no Win32 query either.
-
 use std::thread::JoinHandle;
 
 use jfn_platform_abi::{
@@ -39,7 +30,6 @@ static NOTIFY: Mutex<NotifyState> = Mutex::new(NotifyState {
 static NOTIFY_WAKE: Condvar = Condvar::new();
 static NOTIFIER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
-/// Start the notifier thread. Idempotent; runs until [`stop_notifier`].
 pub(crate) fn start_notifier() {
     let mut slot = NOTIFIER.lock();
     if slot.is_some() {
@@ -67,8 +57,6 @@ pub(crate) fn start_notifier() {
     }));
 }
 
-/// Stop and join the notifier thread. Pending dirtiness is dropped; the
-/// process is tearing down.
 pub(crate) fn stop_notifier() {
     let handle = NOTIFIER.lock().take();
     let Some(handle) = handle else {
@@ -79,10 +67,6 @@ pub(crate) fn stop_notifier() {
     let _ = handle.join();
 }
 
-/// Re-read mpv's window in one pass — client rect, DPI, position, maximized,
-/// fullscreen — and store it as the window's snapshot. Returns the client
-/// size just stored; `None` when there is no window or its client rect is
-/// empty, which leaves the stored snapshot untouched.
 pub(crate) fn sample() -> Option<PhysicalSize> {
     let hwnd = crate::platform::win_ensure_hwnd()?;
     let mut rc = RECT::default();
@@ -110,9 +94,6 @@ pub(crate) fn sample() -> Option<PhysicalSize> {
     Some(client)
 }
 
-/// Window position relative to the monitor's working area (excludes the
-/// taskbar), in physical pixels. Matches mpv's `--geometry +X+Y` coordinate
-/// system on Windows (`vo_calc_window_geometry` uses the working area).
 fn window_position(hwnd: HWND) -> Option<WindowPos> {
     let mut wr = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut wr) }.ok()?;
@@ -130,9 +111,6 @@ fn window_position(hwnd: HWND) -> Option<WindowPos> {
     })
 }
 
-/// The client size, the client origin in screen coordinates, the window rect,
-/// the DPI the extent was built from, and the DPI awareness of both the window
-/// and this thread.
 fn log_sample(hwnd: HWND, dpi: u32, extent: WindowExtent) {
     let physical = extent.physical();
     let logical = extent.logical();
@@ -154,16 +132,12 @@ fn log_sample(hwnd: HWND, dpi: u32, extent: WindowExtent) {
     );
 }
 
-/// [`sample`], then wake every window-changed consumer synchronously.
-/// For init-time publishing on the app main thread; the WndProc hook uses
-/// [`publish_deferred`].
 pub(crate) fn republish() -> Option<PhysicalSize> {
     let client = sample()?;
     notify_window_changed();
     Some(client)
 }
 
-/// [`sample`], then hand the wakeup to the notifier thread.
 pub(crate) fn publish_deferred() -> Option<PhysicalSize> {
     let client = sample()?;
     NOTIFY.lock().dirty = true;
@@ -171,8 +145,6 @@ pub(crate) fn publish_deferred() -> Option<PhysicalSize> {
     Some(client)
 }
 
-/// The stored snapshot, seeded by one [`sample`] when nothing is stored yet —
-/// the boot wait pulls it before `win_init` runs.
 pub(crate) fn snapshot() -> Option<WindowSnapshot> {
     if let Some(snap) = *SNAPSHOT.lock() {
         return Some(snap);
@@ -181,21 +153,14 @@ pub(crate) fn snapshot() -> Option<WindowSnapshot> {
     *SNAPSHOT.lock()
 }
 
-/// Client size and scale as of the last sample.
 pub(crate) fn client_extent() -> Option<WindowExtent> {
     snapshot()?.extent
 }
 
-/// The scale the client window's DPI named at the last sample, or `None`
-/// before the window exists.
-///
-/// One sample names the extent and the scale together, so a menu anchor and
-/// the extent the pointer maps through can never come from two DPIs.
 pub(crate) fn client_scale() -> Option<Scale> {
     Some(client_extent()?.scale())
 }
 
-/// Forget the stored snapshot.
 pub(crate) fn clear() {
     *SNAPSHOT.lock() = None;
 }

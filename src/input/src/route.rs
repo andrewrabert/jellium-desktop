@@ -1,15 +1,8 @@
-//! Where an input event goes.
-//!
-//! A pure function of the shell overlay's state and the pointer position:
-//! no display server, no GPU, no CEF process.
-
 use jfn_platform_abi::LogicalPoint;
 use std::ffi::c_int;
 
-/// Resize-grip thickness on an edge, logical pixels.
 pub const EDGE_LOGICAL: c_int = 8;
 
-/// Resize-grip box at a corner, logical pixels.
 pub const CORNER_LOGICAL: c_int = 20;
 
 const EDGE_TOP: c_int = 1;
@@ -31,32 +24,19 @@ pub struct ShellState {
     pub window_w: c_int,
     pub window_h: c_int,
     pub titlebar_h: c_int,
-    /// Width of the minimize/maximize/close strip at the titlebar's right edge.
     pub controls_w: c_int,
-    /// Logical height of the strip the shell overlay reserves above the web
-    /// overlay. Held across video and OSD transitions.
     pub reserved_strip: c_int,
 }
 
-/// What the shell overlay owns at `p`. Grips win over the bar at overlaps.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ShellHit {
-    /// A modal view owns the whole window.
     Modal,
-    /// A resize grip; the payload is the xdg_toplevel resize-edge mask,
-    /// top=1 bottom=2 left=4 right=8, corners the ORs.
     Grip(c_int),
-    /// The titlebar's drag region.
     Drag,
-    /// The titlebar's window-control buttons.
     Controls,
-    /// jellyfin-web owns it.
     Miss,
 }
 
-/// A modal takes everything. Otherwise the resize grips take the pointer
-/// first, then the titlebar strip splits into its controls and its drag
-/// region; with no titlebar the shell takes nothing.
 pub fn hit(state: ShellState, p: LogicalPoint) -> ShellHit {
     if state.modal_open {
         return ShellHit::Modal;
@@ -76,7 +56,6 @@ pub fn hit(state: ShellState, p: LogicalPoint) -> ShellHit {
     ShellHit::Drag
 }
 
-/// `Target::Shell` for every hit but [`ShellHit::Miss`].
 pub fn route_pointer(state: ShellState, p: LogicalPoint) -> Target {
     match hit(state, p) {
         ShellHit::Miss => Target::Web,
@@ -84,7 +63,6 @@ pub fn route_pointer(state: ShellState, p: LogicalPoint) -> Target {
     }
 }
 
-/// A modal takes every key; otherwise every key goes to jellyfin-web.
 pub fn route_key(state: ShellState) -> Target {
     if state.modal_open {
         Target::Shell
@@ -93,15 +71,10 @@ pub fn route_key(state: ShellState) -> Target {
     }
 }
 
-/// The window's own focus while no modal owns input, never while one does.
 pub fn web_focus(window_focused: bool, modal_open: bool) -> bool {
     window_focused && !modal_open
 }
 
-// text the shell overlay's focused widget inserts
-// a control codepoint restates the named key the key event already carried
-// a system char is Windows' WM_SYSCHAR, an Alt-modified accelerator
-// Command, or Ctrl without Alt, is a shortcut; Ctrl with Alt is AltGr and types
 pub fn is_text(ch: char, modifiers: u32, is_system_key: bool) -> bool {
     use jfn_platform_abi::event_flags as ef;
     let held = |flag: u32| modifiers & flag != 0;
@@ -111,8 +84,6 @@ pub fn is_text(ch: char, modifiers: u32, is_system_key: bool) -> bool {
         && !(held(ef::EVENTFLAG_CONTROL_DOWN) && !held(ef::EVENTFLAG_ALT_DOWN))
 }
 
-/// The xdg_toplevel resize-edge mask under `p`, or `None`.
-/// top=1 bottom=2 left=4 right=8; corners are the ORs.
 pub fn resize_edge(state: ShellState, p: LogicalPoint) -> Option<c_int> {
     if state.modal_open || !state.titlebar_shown {
         return None;
@@ -150,7 +121,6 @@ pub fn resize_edge(state: ShellState, p: LogicalPoint) -> Option<c_int> {
     if mask == 0 { None } else { Some(mask) }
 }
 
-/// Window-space `p` translated into the web overlay's own space.
 pub fn to_web_point(p: LogicalPoint, state: ShellState) -> LogicalPoint {
     LogicalPoint {
         x: p.x,

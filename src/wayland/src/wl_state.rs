@@ -1,21 +1,3 @@
-//! Wayland surface / present / transition state, driven through the
-//! [`crate::wl_ops`] entry points reached from the Platform adapter
-//! ([`crate::make_platform`]).
-//!
-//! Owns:
-//!   * A dedicated `EventQueue` over an mpv-owned `wl_display`
-//!     (foreign-display backend, never closes the fd)
-//!   * Bindings for `wl_compositor`, `wl_subcompositor`, `wl_shm`,
-//!     `zwp_linux_dmabuf_v1`, `wp_viewporter`
-//!   * The list of per-layer `PlatformSurface`s
-//!   * The fullscreen-transition state machine (begin/end + tolerance
-//!     gate for the paint path)
-//!
-//! All mutable state lives behind a single `Mutex` — mirrors the C++
-//! `surface_mtx` discipline. Coarse locking is intentional: the paint
-//! path holds the lock during commit/flush, and finer-grained locking
-//! would risk null-attach vs. commit ordering races.
-
 use parking_lot::{Condvar, Mutex};
 use std::ffi::c_void;
 use std::os::fd::BorrowedFd;
@@ -62,16 +44,8 @@ const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 
 const DRM_FORMAT_ARGB8888: u32 = fourcc(b'A', b'R', b'2', b'4');
 
-/// FS transition tolerance in texels — first paint within this of the
-/// new mpv size ends the transition.
 pub(crate) const TRANSITION_TOLERANCE_TEXELS: i32 = 32;
 
-// =====================================================================
-// Per-surface state
-// =====================================================================
-
-/// A layer's synchronized subsurface.
-/// The app root `wl_surface`, exposed only as a subsurface parent.
 #[derive(Clone)]
 pub(crate) struct RootParent(WlSurface);
 
@@ -107,11 +81,6 @@ impl Subsurface {
         self.0.place_above(sibling);
     }
 
-    /// Commits apply on this surface's own commit rather than the parent's.
-    ///
-    /// A synchronized subsurface only reaches the compositor when its parent
-    /// commits, so the frame callbacks a FIFO swapchain throttles on never
-    /// arrive and the second present blocks forever.
     pub(crate) fn set_desync(&self) {
         self.0.set_desync();
     }
@@ -131,7 +100,6 @@ impl DmabufBuffer {
         self.buf.id()
     }
 
-    /// Marks the buffer in-use until its next release.
     pub(crate) fn attach_to(&self, surface: &WlSurface) {
         self.registry.mark_attached(&self.id());
         surface.attach(Some(&self.buf), 0, 0);
@@ -236,9 +204,6 @@ pub(crate) fn draw_argb8888(
     if stride <= 0 || h <= 0 {
         return None;
     }
-    // The pool rounds slots up to a 64-byte boundary, so the canvas it hands
-    // back can be longer than the buffer's pixel data. Trim it to what the
-    // compositor will actually read.
     let len = (h as usize).checked_mul(stride as usize)?;
     let (buffer, canvas) = pool.create_buffer(w, h, stride, Format::Argb8888).ok()?;
     if !fill(canvas.get_mut(..len)?) {
@@ -265,12 +230,8 @@ pub(crate) fn draw_from_pixels(
 pub(crate) struct PlatformSurface {
     pub surface: Option<SurfaceRef>,
     pub subsurface: Option<Subsurface>,
-    /// The process's single statement of whether this surface is on screen; the
-    /// actor mirrors it only as the request it has yet to commit.
     pub visibility: Visibility,
     pub layer_actor: Option<LayerActor>,
-    /// Set by `Platform::surface_window_target`. The actor attaches no buffer
-    /// and drops every present for a surface with this set.
     pub external: bool,
     pub top_logical: i32,
     pub top_physical: i32,
@@ -290,15 +251,9 @@ impl PlatformSurface {
     }
 }
 
-// =====================================================================
-// Wl-side state (one global, mutex-guarded — mirrors C++ surface_mtx)
-// =====================================================================
-
 pub(crate) struct WlState {
     pub conn: Connection,
     pub qh: QueueHandle<DispatchState>,
-    /// Dedicated event queue — kept alive so all our proxies route here
-    /// instead of mpv's default queue.
     #[allow(dead_code)]
     pub queue: EventQueue<DispatchState>,
 
@@ -310,23 +265,16 @@ pub(crate) struct WlState {
 
     pub root_surface: Option<RootParent>,
 
-    /// Stack order, bottom-to-top. Raw pointers are valid for the
-    /// lifetime of each `PlatformSurface` (heap-allocated via `Box`,
-    /// removed before drop).
     pub stack: Vec<*mut PlatformSurface>,
 
     pub was_fullscreen: bool,
 
     pub gpu: Option<&'static Surfaces>,
-    /// When true, a software present routes through each surface's GPU paint
-    /// worker (Vulkan WSI) instead of `wl_shm`.
     pub use_gpu_paint: bool,
 
     pub scene: crate::scene::Scene,
 }
 
-// Raw pointers in `stack` are only ever dereferenced under the Mutex
-// that wraps the WlState itself.
 unsafe impl Send for WlState {}
 
 pub(crate) struct DispatchState {
@@ -340,15 +288,11 @@ impl DispatchState {
     }
 }
 
-/// The `wl_callback`s the app waits on: the `wl_surface.frame` of a commit
-/// that carries a buffer, the `wl_display.sync` of one that empties the
-/// surface.
 pub(crate) struct Callbacks {
     armed: Mutex<Vec<(ObjectId, Arc<Signal>)>>,
     closed: AtomicBool,
 }
 
-/// One acknowledgement's resolved flag and the parking spot for its waiter.
 struct Signal {
     done: Mutex<bool>,
     woken: Condvar,
@@ -369,7 +313,6 @@ impl Callbacks {
         }
     }
 
-    /// Arms `callback` and hands back the token its `done` event resolves.
     pub(crate) fn arm(&'static self, callback: &WlCallback) -> Acked {
         let signal = Arc::new(Signal {
             done: Mutex::new(false),
@@ -394,7 +337,6 @@ impl Callbacks {
         signal.resolve();
     }
 
-    /// Releases every waiter, so no acknowledgement outlives the connection.
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         let armed = std::mem::take(&mut *self.armed.lock());
@@ -404,13 +346,11 @@ impl Callbacks {
     }
 }
 
-/// One compositor acknowledgement in flight.
 pub(crate) struct Acked {
     signal: Arc<Signal>,
 }
 
 impl Acked {
-    /// Blocks until the compositor fired the callback, or the connection closed.
     pub(crate) fn wait(self) {
         let mut done = self.signal.done.lock();
         while !*done {
@@ -446,12 +386,6 @@ impl Dispatch<WlRegistry, GlobalListContents> for DispatchState {
     }
 }
 
-// =====================================================================
-// Dispatch impls — all no-ops; events we'd care about (wl_buffer.release,
-// dmabuf format/modifier) are intentionally ignored to match the C++
-// implementation's behavior.
-// =====================================================================
-
 macro_rules! noop_dispatch {
     ($($ty:ty),+ $(,)?) => {
         $(
@@ -481,18 +415,9 @@ noop_dispatch!(
     WpViewport,
 );
 
-// Release-state metadata for a live dmabuf buffer, keyed by protocol identity
-// rather than an owning proxy clone (which would make this a second owner).
-//
-// Under a synchronized subsurface the compositor keeps reading a buffer for a
-// frame after it is replaced. Destroying or re-attaching one while `released`
-// is false shows a blank frame.
 struct ManagedBuffer {
     id: ObjectId,
     released: bool,
-    // Holds the owning proxy only after `retire_buffer` on a still-unreleased
-    // buffer: ownership moves here so it can be destroyed once its release
-    // arrives. `None` while the buffer is owned elsewhere (attached / pooled).
     doomed: Option<WlBuffer>,
 }
 
@@ -593,8 +518,6 @@ impl Dispatch<WlBuffer, ()> for DispatchState {
     }
 }
 
-/// Dispatch the CEF connection's pending events (notably `wl_buffer.release`).
-/// Called from the root-window read loop, the only reader of the shared display.
 pub(crate) fn pump_events(rt: &'static crate::runtime::WlRuntime) {
     if let Some(state) = rt.try_core() {
         let mut st = state.lock();
@@ -604,11 +527,6 @@ pub(crate) fn pump_events(rt: &'static crate::runtime::WlRuntime) {
             .dispatch_pending(&mut DispatchState::new(rt.buffers(), rt.callbacks()));
     }
 }
-
-// =====================================================================
-// Init — bind globals against a dedicated EventQueue over the foreign
-// (mpv-owned) wl_display.
-// =====================================================================
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InitError {
@@ -628,7 +546,6 @@ pub(crate) fn bind_error(interface: &'static str) -> impl FnOnce(BindError) -> I
     move |source| InitError::Bind { interface, source }
 }
 
-/// SAFETY: `display_ptr` must be a live `*mut wl_display` owned by mpv.
 pub(crate) unsafe fn init(
     rt: &'static crate::runtime::WlRuntime,
     display_ptr: *mut c_void,
@@ -682,9 +599,6 @@ fn surface_from_handle(
     what: &str,
 ) -> Option<RootParent> {
     let raw = handle.as_ptr();
-    // SAFETY: the handle carries a live `wl_proxy*` for the root `wl_surface` on
-    // the same `wl_display` backing `conn` (minted by root_window from the real
-    // root surface, which outlives the process).
     let id = match unsafe {
         wayland_client::backend::ObjectId::from_ptr(WlSurface::interface(), raw.cast())
     } {
@@ -710,7 +624,6 @@ fn parent_layer_locked(st: &mut WlState, ptr: *mut PlatformSurface) {
     let Some(root) = st.root_surface.clone() else {
         return;
     };
-    // SAFETY: live PlatformSurface address held in `stack`, accessed under the lock.
     let s = unsafe { &mut *ptr };
     if s.subsurface.is_some() {
         return;
@@ -720,8 +633,6 @@ fn parent_layer_locked(st: &mut WlState, ptr: *mut PlatformSurface) {
     };
     let sub = root.attach_child(&st.subcompositor, surface.as_arg(), &st.qh);
     sub.set_position(0, 0);
-    // A surface already claimed for external presentation must not wait on a
-    // parent commit to reach the compositor.
     if s.external {
         sub.set_desync();
     }
@@ -751,10 +662,6 @@ pub(crate) fn parent_layer(st: &mut WlState, ptr: *mut PlatformSurface) {
     parent_layer_locked(st, ptr);
 }
 
-// =====================================================================
-// Helpers
-// =====================================================================
-
 impl WlState {
     pub(crate) fn flush(&self) {
         let _ = self.conn.flush();
@@ -774,8 +681,6 @@ impl WlState {
     }
 }
 
-// Does an incoming frame's visible size match the authoritative physical window
-// size (within tolerance)? Reads the single source, not a per-layer copy.
 pub(crate) fn size_in_tolerance(rt: &crate::runtime::WlRuntime, vw: i32, vh: i32) -> bool {
     let Some(ext) = rt.window().window_extent() else {
         return true;
@@ -783,10 +688,6 @@ pub(crate) fn size_in_tolerance(rt: &crate::runtime::WlRuntime, vw: i32, vh: i32
     let (pw, ph) = (ext.physical().w(), ext.physical().h());
     (vw - pw).abs() <= TRANSITION_TOLERANCE_TEXELS && (vh - ph).abs() <= TRANSITION_TOLERANCE_TEXELS
 }
-
-// =====================================================================
-// Dmabuf buffer creation
-// =====================================================================
 
 pub(crate) struct DmabufPlane<'a> {
     pub(crate) fd: BorrowedFd<'a>,
@@ -796,7 +697,6 @@ pub(crate) struct DmabufPlane<'a> {
     pub(crate) h: i32,
 }
 
-/// Create a dmabuf-backed wl_buffer from a single-plane fd.
 pub(crate) fn create_dmabuf_buffer(
     reg: &'static DmabufRegistry,
     dmabuf: &ZwpLinuxDmabufV1,

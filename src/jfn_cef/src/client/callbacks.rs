@@ -29,7 +29,6 @@ impl Inner {
             return;
         }
         let pending = self.take_pending_menu_callback();
-        // Ids below USER_FIRST are CEF built-in commands; only cont() executes them.
         if id >= 0 && id < MenuId::USER_FIRST.get_raw() as c_int {
             if let Some(cb) = pending {
                 cb.cont(id, EventFlags::default());

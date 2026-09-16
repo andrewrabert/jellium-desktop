@@ -7,16 +7,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(std::path::Path::parent)
         .ok_or("CARGO_MANIFEST_DIR has no grandparent")?;
 
-    // `env!` (not std::env::var) so rustc records the dep and re-runs this
-    // script when the workspace version bumps.
     println!("cargo:rerun-if-changed=../Cargo.toml");
     let version = env!("CARGO_PKG_VERSION");
     println!("cargo:rustc-env=JFN_APP_VERSION={version}");
 
-    // VERSION_FULL = "<VERSION>+<git short hash>[-dirty]", but only for
-    // pre-release VERSIONs (those with a "-suffix"); a clean release stays
-    // bare. xtask injects JFN_GIT_HASH/JFN_GIT_DIRTY as the authoritative
-    // source; fall back to gitoxide for a bare `cargo build`.
     println!("cargo:rerun-if-env-changed=JFN_GIT_HASH");
     println!("cargo:rerun-if-env-changed=JFN_GIT_DIRTY");
     println!("cargo:rerun-if-env-changed=CEF_RESOURCES_DIR");
@@ -45,7 +39,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Fallback for bare `cargo build` (no xtask). Empty hash when there is no repo.
 fn git_info(repo_root: &std::path::Path) -> (String, bool) {
     let Ok(repo) = gix::discover(repo_root) else {
         return (String::new(), false);
@@ -59,8 +52,6 @@ fn git_info(repo_root: &std::path::Path) -> (String, bool) {
     (hash, dirty)
 }
 
-/// Re-run when HEAD moves. git_dir holds HEAD; common_dir holds refs/packed-refs
-/// (they differ under a linked worktree).
 fn track_git_refs(repo_root: &std::path::Path) {
     let Ok(repo) = gix::discover(repo_root) else {
         return;

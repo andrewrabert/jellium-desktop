@@ -1,5 +1,3 @@
-//! `NativeV8Handler`: generic IPC relay from page JS to the browser process.
-
 use cef::*;
 
 #[derive(Clone)]
@@ -38,8 +36,6 @@ wrap_v8_handler! {
                     }
                 }
 
-            // Use current V8 context's frame so the message is associated
-            // with the frame that executed the JS call.
             let Some(ctx) = v8_context_get_current_context() else { return 0 };
             let Some(frame) = ctx.frame() else { return 0 };
             frame.send_process_message(ProcessId::from(sys::cef_process_id_t::PID_BROWSER), Some(&mut msg));

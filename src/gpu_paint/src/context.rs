@@ -1,5 +1,3 @@
-//! The process's one wgpu device, shared across surfaces.
-
 use crate::error::{Kind, SurfaceLost};
 use crate::painter::{AlphaSource, Surface};
 use crate::shared;
@@ -7,15 +5,8 @@ use crate::swapchain::Swapchain;
 use crate::types::WindowTarget;
 use crate::{FrameSize, ProducerId};
 
-/// The one swapchain format the process presents in, on every window system.
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
-/// The only handle to wgpu in the process. Held once; [`crate::Surface`]s
-/// borrow it.
-///
-/// Everything here is device-wide: the device is shared across every surface
-/// and popup on every platform, and so are the pipeline objects, which depend
-/// on nothing a surface owns.
 pub struct Surfaces {
     pub(crate) instance: wgpu::Instance,
     pub(crate) adapter: wgpu::Adapter,
@@ -23,24 +14,15 @@ pub struct Surfaces {
     pub(crate) queue: wgpu::Queue,
     pub(crate) bind_layout: wgpu::BindGroupLayout,
     pub(crate) sampler: wgpu::Sampler,
-    /// `device.limits().max_texture_dimension_2d`, read once — `limits()`
-    /// clones the whole limits struct and sits on per-frame paths.
     pub(crate) max_texture_dim: u32,
-    /// Sample and write through, for producers that already premultiplied.
     pipeline: wgpu::RenderPipeline,
-    /// Premultiply in the shader, for producers that hand over straight alpha.
     pipeline_premultiplied: wgpu::RenderPipeline,
-    // wgpu-core's surface.configure drains the whole device queue and errors if
-    // another thread submits mid-drain, leaving the surface unconfigured → next
-    // acquire fatally panics. Configure takes the write side, submit the read.
     pub(crate) submit_gate: parking_lot::RwLock<()>,
     can_import_shared: bool,
 }
 
 static INSTANCE: std::sync::OnceLock<Option<Surfaces>> = std::sync::OnceLock::new();
 
-/// The process's one wgpu device, or `None` before the first
-/// [`Surfaces::init`] and on a machine with no usable adapter.
 pub fn surfaces() -> Option<&'static Surfaces> {
     INSTANCE.get()?.as_ref()
 }
@@ -62,20 +44,6 @@ impl Surfaces {
         }
     }
 
-    /// Open the process's one wgpu device, or hand back the one already open.
-    ///
-    /// The first call fixes the adapter for the process lifetime; `producer`
-    /// on any later call is ignored. `None` when this system has no usable GPU
-    /// path at all.
-    ///
-    /// On the platforms that call it first, this creates the process's GPU
-    /// instance — which on X11 must happen before the mpv proxy repoints
-    /// `DISPLAY` and before mpv init: NVIDIA's Vulkan ICD
-    /// does a lazy, one-time global init on first `vkCreateInstance` that
-    /// includes an internal `XOpenDisplay`. Running it here keeps the ICD's
-    /// connection on the real server and completes before mpv's VO thread is
-    /// spawned, winning the loader-scan race that otherwise crashes NVIDIA
-    /// proprietary (two threads reading a half-populated ICD dispatch table).
     pub fn init(producer: Option<ProducerId>) -> Option<&'static Surfaces> {
         INSTANCE
             .get_or_init(|| match Self::open(producer) {
@@ -88,11 +56,6 @@ impl Surfaces {
             .as_ref()
     }
 
-    /// Whether *this device* can import CEF's shared buffers.
-    ///
-    /// The consumer half only. Whether CEF can *produce* them is a separate
-    /// question, answered by `jfn_linux_util::dmabuf_probe`; callers AND the
-    /// two to get the app-level answer CEF needs before any browser exists.
     pub fn can_import_shared(&self) -> bool {
         self.can_import_shared
     }
@@ -116,9 +79,6 @@ impl Surfaces {
             tracing::error!("gpu_paint: wgpu error: {e}");
         }));
 
-        // Importing needs both halves: this device's import path must be live,
-        // and it must be the same device CEF allocates on — an import from a
-        // different GPU fails at bind time.
         let can_import_shared = import_capable && device_matched;
 
         tracing::info!(
@@ -151,8 +111,6 @@ impl Surfaces {
         })
     }
 
-    /// Bind a swapchain to one window. `size` seeds the swapchain extent; the
-    /// surface takes its frame kind from the first frame presented to it.
     pub fn new_surface(
         &self,
         target: WindowTarget,
@@ -161,10 +119,6 @@ impl Surfaces {
         Surface::new(self, target, size)
     }
 
-    /// Bind a swapchain to one window that the caller draws into itself.
-    ///
-    /// Format, present mode and composite-alpha mode come from the same
-    /// per-target policy [`Surface`] uses.
     pub fn new_swapchain(
         &self,
         target: WindowTarget,
@@ -177,7 +131,6 @@ impl Surfaces {
         &self.adapter
     }
 
-    /// The LUID of the adapter this device was opened on, packed high:low.
     #[cfg(windows)]
     pub fn adapter_luid(&self) -> Option<ProducerId> {
         shared::adapter_luid(&self.adapter)
@@ -192,17 +145,10 @@ impl Surfaces {
     }
 }
 
-/// Whether this system has any adapter worth opening a device on.
-///
-/// For callers that must fail early on a machine with no GPU but cannot yet
-/// answer *which* adapter to open — that needs a frame from the producer,
-/// which needs a browser. Opens no device and no surface, and warms the
-/// enumeration so the frame that does open the device pays nothing for it.
 pub fn any_adapter() -> bool {
     !enumerated().adapters.is_empty()
 }
 
-/// The device-wide draw state every surface shares.
 struct Pipelines {
     bind_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -248,7 +194,6 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
     let pipeline_premultiplied =
         build_pipeline(device, &pipeline_layout, &shader, "fs_main_premultiplied");
 
-    // Nearest, no anisotropy — 1:1 sampling, never stretch.
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("jfn_gpu_paint sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -313,8 +258,6 @@ fn build_instance() -> wgpu::Instance {
     })
 }
 
-/// The one backend that can present on this platform. Kept to a single choice
-/// so the adapter we probe is always the adapter we open.
 const fn native_backends() -> wgpu::Backends {
     #[cfg(target_os = "linux")]
     {
@@ -330,8 +273,6 @@ const fn native_backends() -> wgpu::Backends {
     }
 }
 
-/// On dx12, stop wgpu fetching and waiting on a frame-latency waitable object:
-/// the present path runs on a thread that must not block.
 fn instance_options() -> wgpu::BackendOptions {
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut options = wgpu::BackendOptions::default();
@@ -342,7 +283,6 @@ fn instance_options() -> wgpu::BackendOptions {
     options
 }
 
-/// The instance and the adapters it found, enumerated once for the process.
 struct Enumerated {
     instance: wgpu::Instance,
     adapters: Vec<wgpu::Adapter>,
@@ -350,15 +290,6 @@ struct Enumerated {
 
 static ENUMERATED: std::sync::OnceLock<Enumerated> = std::sync::OnceLock::new();
 
-/// Enumerate the usable adapters once, and keep them.
-///
-/// Enumeration is not cheap — dx12 opens and closes a device per adapter to
-/// read its capabilities, about a second per GPU — and on Windows the paint
-/// device is opened from CEF's first frame, on the thread CEF paints from.
-/// Enumerating there stalls painting for as long as it takes, which is longer
-/// than the startup overlay is on screen. So it happens once, at whichever
-/// call comes first (a platform's pre-flight [`any_adapter`], or [`Surfaces::init`]
-/// itself), and every later caller reuses the result.
 fn enumerated() -> &'static Enumerated {
     ENUMERATED.get_or_init(|| {
         let instance = build_instance();
@@ -375,8 +306,6 @@ fn enumerated() -> &'static Enumerated {
     })
 }
 
-/// Pick an adapter, and report whether it is the one CEF produces on. A
-/// mismatch is not fatal — it only means shared import is unavailable.
 fn pick_adapter(producer: Option<shared::ProducerId>) -> Option<(wgpu::Adapter, bool)> {
     let adapters = &enumerated().adapters;
 
@@ -394,7 +323,5 @@ fn pick_adapter(producer: Option<shared::ProducerId>) -> Option<(wgpu::Adapter, 
             wgpu::DeviceType::VirtualGpu => 1,
             _ => 0,
         })?;
-    // With no device to match against, the best adapter is as good as it gets
-    // and counts as matched; a device we asked for and missed does not.
     Some((chosen.clone(), producer.is_none()))
 }

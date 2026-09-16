@@ -19,8 +19,6 @@ const BOOST_MULTIPLIER: NonZeroU32 = match NonZeroU32::new(2) {
 const INVALIDATE_TICK_LIMIT: i32 = 1000;
 const SKIP_PAINTS_AFTER_RESIZE: i32 = 1;
 
-// After each window resize, keep producing compositor frames until
-// `CefLayer::noteStableSize` calls `window.__cefStopRaf`.
 const JS_PAINT_NUDGE: &str = r#"
 (function () {
     console.debug('CEF paint nudge installed');
@@ -46,7 +44,6 @@ const JS_PAINT_NUDGE: &str = r#"
 "#;
 
 struct PaintState {
-    /// The rate the boost displaced; `None` while no boost is live.
     saved_frame_rate: AtomicCell<Option<FrameRate>>,
     resize_gen: AtomicU64,
     invalidate_running: AtomicBool,
@@ -178,8 +175,6 @@ impl PaintScheduler {
         self.mode.refresh_rate_changed(target)
     }
 
-    /// [`Verdict::Supersede`] is returned only while the invalidate loop that
-    /// produces the successor is running.
     pub(crate) fn verdict(&self, inner: &Inner) -> Verdict {
         self.mode.verdict(inner)
     }
@@ -244,8 +239,6 @@ fn start_invalidate_loop(scheduler: PaintScheduler, state: &PaintState, inner: &
 }
 
 fn active_kick_apply(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<Inner>) {
-    // Boost CEF compositor rate while the loop is live — JS rAF ties to
-    // compositor rate, so this speeds up convergence to post-resize dims.
     if let Some(fps) = inner.frame_rate.load()
         && inner.browser_alive()
         && state.saved_frame_rate.load().is_none()
@@ -256,9 +249,6 @@ fn active_kick_apply(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<
     active_invalidate_tick(scheduler, state, inner);
 }
 
-/// Ends the invalidate loop: restores the frame rate it boosted and clears the
-/// running flag. Both exits — the stop flag and a display that reports no
-/// refresh interval — go through here.
 fn stop_invalidate(state: &PaintState, inner: &Arc<Inner>) {
     if let Some(saved) = state.saved_frame_rate.swap(None)
         && inner.browser_alive()
@@ -284,9 +274,6 @@ fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: 
             inner.send_external_begin_frame();
         }
     }
-    // The loop ticks at the display's own refresh; a display that reports none
-    // spaces nothing, so the loop stops rather than run at a rate this process
-    // invented.
     let Some(period) = jfn_gpu_paint::refresh_interval() else {
         stop_invalidate(state, inner);
         return;
@@ -299,10 +286,8 @@ fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: 
     });
 }
 
-/// What the scheduler decided about one produced frame.
 pub(crate) enum Verdict {
     Present,
-    /// The frame is elided; the producer named here owes the successor.
     Supersede,
 }
 
@@ -311,9 +296,6 @@ fn active_verdict(state: &PaintState, inner: &Inner) -> Verdict {
     let last_gen = state.last_paint_gen.load(Ordering::Acquire);
     if cur_gen != last_gen {
         state.last_paint_gen.store(cur_gen, Ordering::Release);
-        // Rate-clamp the skip-counter reset. Continuous drag bumps gen
-        // many times per second; resetting on every bump would keep
-        // wiping the counter before any paint clears the skip threshold.
         let now_ns_val = now_ns();
         let period_ns = jfn_gpu_paint::refresh_interval().map_or(i64::MAX, |period| {
             period.as_nanos().min(i64::MAX as u128) as i64
@@ -329,17 +311,12 @@ fn active_verdict(state: &PaintState, inner: &Inner) -> Verdict {
     }
     let count = state.paints_since_resize.fetch_add(1, Ordering::AcqRel) + 1;
     let pump = state.pump_paint_count.load(Ordering::Acquire);
-    // The skip is only ever taken while the invalidate loop is running, so the
-    // frame it elides has a successor already on the way.
     let verdict = if count > SKIP_PAINTS_AFTER_RESIZE {
         Verdict::Present
     } else {
         Verdict::Supersede
     };
     if pump > 0 && count == pump {
-        // Pumped enough frames — signal stop to host Invalidate loop and
-        // renderer's rAF loop. Counter remains past pump so subsequent
-        // paints don't re-fire.
         state.invalidate_stop.store(true, Ordering::Release);
         inner.exec_js("window.__cefStopRaf && window.__cefStopRaf();");
     }

@@ -62,8 +62,6 @@ struct ShmPayload {
     height: i32,
 }
 
-/// One software frame as its producer handed it over: the rows it covers, the
-/// regions that changed, and the geometry both are read against.
 struct SoftwareFrame<'a> {
     pixels: &'a [u8],
     dirty: &'a [JfnRect],
@@ -78,8 +76,6 @@ enum PendingFrame {
     Dmabuf(SharedTexture),
 }
 
-/// Every event that invalidates the shadow (dmabuf, hide, resize) must reset it
-/// to `Stale`, or a later dirty-only frame patches stale pixels.
 enum ShadowState {
     Stale,
     Valid { size: (i32, i32) },
@@ -87,19 +83,11 @@ enum ShadowState {
 
 struct LayerState {
     pending: Option<PendingFrame>,
-    /// The producer that owes the pending frame's successor, held so a frame
-    /// the swapchain could not take can ask for the one that replaces it.
     source: Option<Arc<dyn FrameSource>>,
     shadow: ShadowState,
     viewport: ViewportState,
-    /// The visibility the worker has yet to carry into a commit. Not a second
-    /// statement of visibility: the surface's own field is the only one.
     requested: Option<Visibility>,
-    /// Numbers the visibility requests; the requester waits for [`Self::acked`]
-    /// to carry its own number or a later one.
     request_seq: u64,
-    /// The acknowledgement of the commit that carried request `n`, taken by the
-    /// requester waiting on it.
     acked: Option<(u64, Acked)>,
     viewport_dirty: bool,
     shutdown: bool,
@@ -120,7 +108,6 @@ impl LayerState {
         }
     }
 
-    /// Returns this request's number, the one its acknowledgement carries.
     fn request_visibility(&mut self, visibility: Visibility) -> u64 {
         self.requested = Some(visibility);
         self.request_seq = self.request_seq.wrapping_add(1);
@@ -132,14 +119,11 @@ impl LayerState {
         self.request_seq
     }
 
-    /// A newer frame supersedes the pending one it replaces.
     fn supersede(&mut self, successor: PendingFrame) {
         self.pending = Some(successor);
     }
 
     fn resize(&mut self, viewport: ViewportState) {
-        // Callers invoke this per frame; without the guard an unchanged extent
-        // would stale the shadow every frame and defeat dirty-only coalescing.
         if self.viewport == viewport {
             return;
         }
@@ -168,10 +152,6 @@ impl LayerState {
             )
     }
 
-    /// Merges dirty rects into a co-pending dirty-only frame of the same size
-    /// instead of replacing it and dropping the earlier rects. An empty-damage
-    /// frame still stores: nothing the stream accepted is dropped for carrying
-    /// no rects.
     fn store_shm(
         &mut self,
         rects: Vec<ShmRect>,
@@ -264,8 +244,6 @@ impl LayerActor {
             .update(|s| s.resize(ViewportState { lw, lh, pw, ph }));
     }
 
-    /// Requests `visibility`; the returned commit is acknowledged when the
-    /// compositor fires the callback armed with the commit that carried it.
     pub(crate) fn apply_visibility(&self, visibility: Visibility) -> VisibilityCommit {
         let seq = self.mailbox.update(|s| s.request_visibility(visibility));
         let mailbox = self.mailbox.clone();
@@ -283,8 +261,6 @@ impl LayerActor {
         )
     }
 
-    /// Enqueues `frame`; the slot's occupant is discharged by a commit or by
-    /// the frame that supersedes it, never by being dropped.
     pub(crate) fn present_dmabuf(&self, frame: SharedTexture, source: Arc<dyn FrameSource>) {
         self.mailbox.update(|s| {
             s.present_dmabuf(frame);
@@ -359,11 +335,6 @@ impl LayerActor {
     }
 }
 
-// ===================================================================
-// Worker loop decision (pure)
-// ===================================================================
-
-/// The primary frame op for one worker iteration.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Action<F> {
     Hide,
@@ -372,15 +343,6 @@ pub(crate) enum Action<F> {
     Nop,
 }
 
-/// The frame op for one worker iteration, from one mailbox snapshot. Driven by
-/// the final desired `visibility`: a frame arriving in the same wake as a
-/// coalesced hide+show is presented, not dropped.
-///
-/// # Examples
-/// ```ignore
-/// let action = decide(Some(7u32), Visibility::Shown, false);
-/// assert_eq!(action, Action::Present(7));
-/// ```
 pub(crate) fn decide<F>(
     pending: Option<F>,
     visibility: Visibility,
@@ -396,10 +358,6 @@ pub(crate) fn decide<F>(
         Action::Nop
     }
 }
-
-// ===================================================================
-// Actor thread
-// ===================================================================
 
 #[derive(Default)]
 struct ShmShadow {
@@ -439,11 +397,8 @@ struct Runner {
     backend: Backend,
     gpu: Option<&'static Surfaces>,
     gpu_failed: Arc<AtomicBool>,
-    /// Gates present-failure logging to the first failure of a failing streak.
     present_failing: bool,
     dmabuf_pool: Vec<DmabufBuf>,
-    /// Held until the compositor releases it: an attached buffer must outlive
-    /// its use by the compositor.
     current: Option<AttachedBuffer>,
 }
 
@@ -503,8 +458,6 @@ fn run(
             Some(at) => mailbox.wait_until(at, ready, take),
             None => Some(mailbox.wait(ready, take)),
         };
-        // Nothing arrived before the held frame came due: present it against
-        // the viewport it would have used.
         let (pending, viewport, requested, viewport_dirty, shutdown) =
             taken.unwrap_or_else(|| (None, mailbox.peek(|s| s.viewport), None, false, false));
 
@@ -535,23 +488,16 @@ fn run(
     runner.shutdown();
 }
 
-/// One wake of the actor: the frame op it decided on and the state that op
-/// commits against.
 struct Wake {
     action: Action<PendingFrame>,
-    /// The producer named by the pending frame, asked for its successor when
-    /// the frame is not presented.
     source: Option<Arc<dyn FrameSource>>,
     visibility: Visibility,
     viewport: ViewportState,
     viewport_dirty: bool,
-    /// The visibility request this wake carries, if any.
     request_seq: Option<u64>,
 }
 
 impl Runner {
-    /// Issues this wake's commit stream and returns the acknowledgement of a
-    /// visibility request it carried.
     fn service(
         &mut self,
         layer: &LayerSurface,
@@ -566,8 +512,6 @@ impl Runner {
             viewport_dirty,
             request_seq,
         } = wake;
-        // Whether this wake's commit stream attached a buffer, which decides
-        // which callback a visibility request's commit can be acknowledged by.
         let mut carries_buffer = false;
         let mut layer_committed = match action {
             Action::Hide => self.hide(layer),
@@ -578,9 +522,6 @@ impl Runner {
                     true
                 }
                 Err(PresentError::Gpu(PresentFailed::Deferred(deferred))) => {
-                    // The producer is named by the frame it made; a frame with
-                    // no named producer is not held, because nothing could be
-                    // asked for its successor.
                     if let Some(source) = source {
                         retry.defer(frame, source, deferred.retry_at());
                     }
@@ -592,8 +533,6 @@ impl Runner {
                 }
             },
             Action::ReapplyViewport => {
-                // Zero source args leave the latched source untouched; only the
-                // destination is rescaled to the new logical size.
                 layer.set_viewport(0, 0, viewport.lw, viewport.lh);
                 layer.commit();
                 true
@@ -601,19 +540,12 @@ impl Runner {
             Action::Nop => false,
         };
 
-        // The visibility gate keeps this fallback commit off a hidden GPU/WSI
-        // surface, whose buffers the compositor's swapchain owns.
         if visibility.is_shown() && !layer_committed && viewport_dirty {
-            // Zero source args leave the latched source untouched; only the
-            // destination is rescaled to the new logical size.
             layer.set_viewport(0, 0, viewport.lw, viewport.lh);
             layer.commit();
             layer_committed = true;
         }
 
-        // A request completes only on a commit carrying it, and that commit is
-        // the last one this wake issues, so its acknowledgement stands for
-        // everything before it.
         let acked = request_seq.map(|seq| {
             (
                 seq,
@@ -637,9 +569,6 @@ impl Runner {
         self.current = buf;
     }
 
-    /// Hiding is a commit that empties the surface, never a restack: nothing
-    /// about a surface's position changes with its visibility. Always commits,
-    /// so it always reports `true`.
     fn hide(&mut self, layer: &LayerSurface) -> bool {
         layer.attach_none();
         layer.commit();
@@ -661,9 +590,6 @@ impl Runner {
         }
     }
 
-    /// Presents through the path this runner's backend has: a gpu payload
-    /// reaching a degraded backend goes out as a full shm frame, and an shm
-    /// payload reaching a gpu backend degrades it first.
     fn present(
         &mut self,
         frame: &PendingFrame,
@@ -687,8 +613,6 @@ impl Runner {
         }
     }
 
-    /// The shm path for a payload the gpu path could not take: a full frame,
-    /// because the backend's shadow never saw the pixels this one patches.
     fn present_pixels_shm(
         &mut self,
         layer: &LayerSurface,
@@ -731,8 +655,6 @@ impl Runner {
                     p.height as i32,
                 );
             };
-            // This path only ever carries CPU pixels; Wayland's shared frames
-            // are a `wl_buffer` dmabuf attach and never reach wgpu.
             let new = gpu
                 .new_surface(
                     target,
@@ -760,9 +682,6 @@ impl Runner {
             bgra: &p.pixels,
             dirty: &p.dirty,
         };
-        // Set the viewport source inside the present closure, not here: a
-        // dropped frame must not leave a source pending ahead of the next
-        // buffer. Clamped to min(buffer, physical) to stay within bounds.
         let src_w = (p.width as i32).min(vps.pw);
         let src_h = (p.height as i32).min(vps.ph);
         painter.present_pixels(pixel_frame, || {
@@ -1158,7 +1077,7 @@ mod tests {
     fn valid_shadow_at_wrong_size_still_full_copies() {
         let mut mb = LayerState::new(vp());
         mb.store_shm(vec![], Some(vec![0u8; 4 * 100 * 100]), 100, 100);
-        mb.pending = None; // worker consumed the full frame
+        mb.pending = None;
         assert!(!mb.needs_full_copy(100, 100));
         assert!(mb.needs_full_copy(200, 200));
     }
@@ -1168,7 +1087,7 @@ mod tests {
         let mut mb = LayerState::new(vp());
         mb.store_shm(vec![], Some(vec![0u8; 4 * 100 * 100]), 100, 100);
         assert!(matches!(mb.shadow, ShadowState::Valid { .. }));
-        mb.pending = None; // worker consumed the full frame
+        mb.pending = None;
         assert!(!mb.needs_full_copy(100, 100));
         mb.request_visibility(Visibility::Hidden);
         assert!(matches!(mb.shadow, ShadowState::Stale));
@@ -1291,11 +1210,8 @@ mod tests {
 
     #[test]
     fn copy_dirty_rect_skips_row_past_buffer() {
-        // A stride that lies about the buffer length pushes later rows out of
-        // range; `get` skips them instead of panicking.
         let pixels = vec![0u8; 8];
         let r = copy_dirty_rect(&pixels, 1_000, 2, 2, &rect(0, 0, 2, 2)).unwrap();
-        // First row fits (off 0..8); the second (off 1000..) is out of range.
         assert_eq!(r.pixels.len(), 8);
     }
 

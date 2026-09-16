@@ -1,11 +1,3 @@
-//! Safe Rust bindings for libmpv (`mpv/client.h`).
-//!
-//! Scope is the control plane: handle lifecycle, options, properties,
-//! commands, events, logging. Render APIs (`mpv/render.h`,
-//! `mpv/render_gl.h`) are intentionally excluded — the desktop client uses
-//! the mpv-as-window model where mpv owns its own window/GPU and libmpv is
-//! only the control surface.
-
 #![warn(unsafe_op_in_unsafe_fn)]
 
 pub mod sys;

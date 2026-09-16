@@ -3,8 +3,6 @@ use std::path::PathBuf;
 
 pub(super) const DEFAULT_LOG_TO_FILE: bool = false;
 
-/// `dirs` resolves `$HOME` through `getpwuid_r` before this fallback is
-/// reached.
 fn home_subdir(subdir: &str) -> PathBuf {
     PathBuf::from(home()).join(subdir)
 }

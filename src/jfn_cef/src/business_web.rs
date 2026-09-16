@@ -1,9 +1,3 @@
-//! jellyfin-web's business logic.
-//!
-//! Routes the ~20 jellyfin-web IPC names to mpv, settings, theme color, and the
-//! playback coordinator. The state it keeps across those names is owned by the
-//! web overlay whose handlers it installs.
-
 use cef::{ImplListValue, ListValue};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -27,7 +21,6 @@ use jfn_playback::{Input as PbInput, MediaType as PbMediaType, post as pb_post};
 
 use jfn_mpv::api::JfnMpvLoadOptions;
 
-// MediaType matching jfn-playback's enum: Unknown=0, Audio=1, Video=2.
 const MT_UNKNOWN: u8 = 0;
 const MT_AUDIO: u8 = 1;
 const MT_VIDEO: u8 = 2;
@@ -43,15 +36,10 @@ struct MediaMetadata {
     media_type: u8,
 }
 
-/// Whether the window was already fullscreen when jellyfin-web raised the video
-/// OSD, so dismissing the OSD only leaves fullscreen if the OSD put us there.
 static WAS_FULLSCREEN_BEFORE_OSD: Mutex<bool> = Mutex::new(false);
 
-/// Install jellyfin-web's handlers before its client is submitted to CEF.
 pub(crate) fn install(client: &Arc<Inner>, application_menu: crate::ApplicationMenu) {
     client.set_created_callback(Some(Arc::new(|| {
-        // The router owns this browser's CEF focus: it is live here, and a
-        // focus published before it existed reached nothing.
         jfn_input::web_became_live();
     })));
 
@@ -171,8 +159,6 @@ fn handle_player_load(args: &ListValue) {
         parse_metadata_json(&metadata_json)
     };
 
-    // Atomic pre-load posts so MPRIS/JS see start position before
-    // mpv has opened the file.
     pb_post(PbInput::LoadStarting(meta.id.clone()));
     pb_post(PbInput::Position(start_ms as i64 * 1000));
 
@@ -203,9 +189,6 @@ fn handle_player_load(args: &ListValue) {
     unsafe { jfn_mpv_load_file(url_c.as_ptr(), &opts) };
 }
 
-/// Run `f` if the IPC arrived with an args list. Always returns `true` —
-/// every arm using this is considered "handled" even when args are
-/// missing, matching the prior behaviour.
 fn with_args(args: Option<&ListValue>, f: impl FnOnce(&ListValue)) -> bool {
     if let Some(a) = args {
         f(a);
@@ -221,7 +204,6 @@ fn handle_message(message: BrowserMessage) -> bool {
         return true;
     }
 
-    // mpv handle not yet initialised — return false so CEF treats the message as unhandled.
     if jfn_mpv_handle_get().is_null() {
         return false;
     }
@@ -349,10 +331,7 @@ fn handle_message(message: BrowserMessage) -> bool {
                 can_go_prev: a.bool(1) != 0,
             });
         }),
-        "notifyPlaybackState" => {
-            // mpv is the authoritative source via coordinator; ignore JS hint.
-            true
-        }
+        "notifyPlaybackState" => true,
         "notifySeek" => with_args(args, |a| {
             pb_post(PbInput::Seeked(list_int(a, 0) as i64 * 1000));
         }),

@@ -1,9 +1,3 @@
-//! systemd-logind idle inhibitor via zbus.
-//!
-//! Holds an OwnedFd returned by org.freedesktop.login1.Manager.Inhibit; the
-//! inhibit lasts as long as the fd is open. Replacing the inhibit closes the
-//! previous fd, which atomically releases the prior inhibitor.
-
 use parking_lot::Mutex;
 use std::os::fd::OwnedFd;
 

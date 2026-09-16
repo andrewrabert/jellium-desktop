@@ -1,5 +1,3 @@
-//! The edit menu, raised through the platform's own menu host.
-
 use std::os::raw::c_int;
 
 use jfn_platform_abi::{
@@ -10,10 +8,8 @@ use crate::shell::actor::{Target, Work};
 use crate::shell::fields::Snapshot;
 use crate::shell::lang::Strings;
 
-/// Edit commands are local to this request; zero is reserved for Windows menu cancellation.
 const MENU_ID_EDIT_FIRST: c_int = 1;
 
-/// The edit menu's items, in order.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Item {
     Undo,
@@ -57,7 +53,6 @@ impl Item {
         }
     }
 
-    /// Enabled exactly when it would change something; Paste always.
     pub fn enabled(self, field: &Snapshot) -> bool {
         let edit = field.edit_state();
         match self {
@@ -87,9 +82,6 @@ impl Item {
     }
 }
 
-/// Raises the edit menu for `field` at `anchor`, in window coordinates. A
-/// selection posts [`crate::shell::actor::Work::EditAt`] naming `field`; a dismissal
-/// posts nothing. No accelerator text is drawn.
 pub fn open_edit(field: &Snapshot, anchor: LogicalPoint, strings: &Strings) {
     let Some(lease) = jfn_platform_abi::try_lease() else {
         return;

@@ -1,5 +1,3 @@
-//! CEF process bootstrap + App handlers.
-
 mod app;
 mod app_menu;
 mod business_common;

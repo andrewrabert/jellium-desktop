@@ -1,15 +1,3 @@
-//! The shell's own text field.
-//!
-//! Every text field the shell overlay draws is one of these. It is built on
-//! iced's public editor primitives — [`iced_core::text::Editor`],
-//! [`iced_core::text::editor::State`] and
-//! [`iced_core::text::paragraph::Plain`] — and owns its own undo history, so
-//! the history is the widget's rather than the editor's private one.
-//!
-//! The field is one line: [`Act::Paste`] and every inserted character run
-//! through [`jfn_input::text::one_line`], and the Enter key submits rather
-//! than breaking the line.
-
 use std::any::Any;
 use std::sync::Arc;
 
@@ -34,7 +22,6 @@ type Renderer = iced_wgpu::Renderer;
 type TextEditor = <Renderer as text::Renderer>::Editor;
 type Font = <Renderer as text::Renderer>::Font;
 
-/// The field's fill, border and text colours.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Style {
     pub background: Background,
@@ -44,52 +31,34 @@ pub struct Style {
     pub selection: Color,
 }
 
-/// One edit applied to a named field, focused or not.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Act {
     Undo,
     Redo,
     Cut,
     Copy,
-    /// Inserted through [`jfn_input::text::one_line`].
     Paste(String),
     SelectAll,
-    /// Places the caret at the window point and collapses the selection.
     PlaceCaret(Point),
-    /// Selects the word under the window point.
     SelectWord(Point),
 }
 
-/// One step of the field's own undo history: the text and the caret as they
-/// stood before the edit that recorded it.
 #[derive(Clone, Debug)]
 struct Step {
     text: String,
     cursor: Cursor,
 }
 
-/// One field's editor, its focus and caret, and its undo history.
-///
-/// The widget hands it to [`iced_core::widget::Operation::custom`], which is
-/// how the shell reads and edits a field iced's own operations cannot reach.
 pub struct State {
     editor: TextEditor,
     focus: editor::State,
     placeholder: Plain<<Renderer as text::Renderer>::Paragraph>,
-    /// The widget's layout bounds, in window coordinates, as the last layout
-    /// pass placed them. A window point an [`Act`] carries is resolved
-    /// against these.
     bounds: Rectangle,
-    /// The editor's origin within [`State::bounds`].
     origin: Vector,
     undo: Vec<Step>,
     redo: Vec<Step>,
-    /// Bumped by every change that altered the selected text.
     selection_generation: u64,
-    /// The editor holds a value the model has not been told about.
     dirty: bool,
-    /// An operation removed focus; its update is delivered on the next event
-    /// pass, when the widget has a shell to publish through.
     operation_unfocus: bool,
 }
 
@@ -111,22 +80,18 @@ impl Default for State {
 }
 
 impl State {
-    /// The value; the placeholder is not part of it.
     pub fn is_empty(&self) -> bool {
         self.editor.is_empty()
     }
 
-    /// The selected text; `None` when the selection is empty.
     pub fn selection(&self) -> Option<String> {
         self.editor.copy()
     }
 
-    /// An undo step was recorded and not yet taken back.
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
 
-    /// An undo step was taken back and not yet put back.
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
@@ -135,15 +100,10 @@ impl State {
         self.focus.is_focused()
     }
 
-    /// Bumped by every change that altered the selected text, a selection
-    /// replaced by an identical one included, the empty selection included.
     pub fn selection_generation(&self) -> u64 {
         self.selection_generation
     }
 
-    /// Runs `change` on the editor, marking the value unpublished when it
-    /// altered the text and bumping the selection generation when it altered
-    /// the selection.
     fn change(&mut self, change: impl FnOnce(&mut TextEditor)) {
         let text = self.editor.text();
         let selection = self.editor.copy();
@@ -154,8 +114,6 @@ impl State {
         }
     }
 
-    /// Whether the editor holds a value the model has not been told about,
-    /// taking the mark with it.
     fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
     }
@@ -164,12 +122,10 @@ impl State {
         std::mem::take(&mut self.operation_unfocus)
     }
 
-    /// The editor's origin within the widget's layout bounds.
     pub fn origin(&self) -> Vector {
         self.origin
     }
 
-    /// The caret, in the coordinates of the editor's origin.
     pub fn caret(&self) -> Point {
         match self.editor.selection() {
             editor::Selection::Caret(position) => position,
@@ -179,7 +135,6 @@ impl State {
         }
     }
 
-    /// The selection's rectangles, in the coordinates of the editor's origin.
     pub fn selection_bounds(&self) -> Vec<Rectangle> {
         match self.editor.selection() {
             editor::Selection::Caret(_) => Vec::new(),
@@ -187,12 +142,6 @@ impl State {
         }
     }
 
-    /// Applies `act`, recording an undo step for every edit that changed the
-    /// text, and returns the text `Cut` and `Copy` produced.
-    ///
-    /// The history holds one step per changed edit, coalesces none and is
-    /// unbounded, matching what iced's own editor records; `Undo` and `Redo`
-    /// restore a step rather than reaching the editor's private history.
     pub fn act(&mut self, act: &Act) -> Option<String> {
         match act {
             Act::Undo => {
@@ -235,13 +184,10 @@ impl State {
         }
     }
 
-    /// A window point in the coordinates of the editor's origin.
     fn local(&self, at: Point) -> Point {
         at - Vector::new(self.bounds.x, self.bounds.y) - self.origin
     }
 
-    /// Performs one editing action, recording an undo step when it changed the
-    /// text.
     fn edit(&mut self, edit: Edit) {
         let before = Step {
             text: self.editor.text(),
@@ -270,7 +216,6 @@ impl State {
         self.undo.push(displaced);
     }
 
-    /// Puts `step` into the editor and returns the state it displaced.
     fn restore(&mut self, step: Step) -> Step {
         let displaced = Step {
             text: self.editor.text(),
@@ -283,9 +228,6 @@ impl State {
         displaced
     }
 
-    /// Replaces the whole value without recording a step: the caller's value is
-    /// authoritative, a rebuilt widget tree is not an edit, and a value the
-    /// model replaced leaves no step to take back.
     fn adopt(&mut self, value: &str) {
         if self.editor.text() == value {
             return;
@@ -297,17 +239,6 @@ impl State {
     }
 }
 
-/// The binding a key press resolves to inside a field.
-///
-/// `Escape` resolves to none, so it leaves the field's caret and focus intact
-/// and reaches the modal stack as an ignored event.
-///
-/// Redo is Ctrl+Y on Windows, Wayland and X11, Ctrl+Shift+Z on Wayland and
-/// X11, and Command+Shift+Z on macOS; Command+Shift+Z is redo before it is
-/// undo.
-///
-/// Every other press resolves through
-/// [`iced_core::text::editor::Binding::from_key_press`].
 pub fn binding<Message>(backend: DisplayBackend, key_press: KeyPress) -> Option<Binding<Message>> {
     use iced_core::keyboard::{Key, key::Named};
 
@@ -338,7 +269,6 @@ pub fn binding<Message>(backend: DisplayBackend, key_press: KeyPress) -> Option<
     Binding::from_key_press(key_press)
 }
 
-/// A shell field. Every text field the shell overlay draws is one of these.
 pub struct Field<'a, Message> {
     id: Id,
     placeholder: &'a str,
@@ -351,7 +281,6 @@ pub struct Field<'a, Message> {
     width: Length,
 }
 
-/// Every shell field carries an [`Id`]; there is no unnamed one.
 pub fn field<'a, Message>(id: Id, placeholder: &'a str, value: &'a str) -> Field<'a, Message> {
     Field {
         id,
@@ -377,7 +306,6 @@ impl<'a, Message: Clone + 'a> Field<'a, Message> {
         self
     }
 
-    /// Publishes `message` after this field loses keyboard focus.
     pub fn on_unfocus(mut self, message: Message) -> Field<'a, Message> {
         self.on_unfocus = Some(message);
         self
@@ -406,7 +334,6 @@ impl<'a, Message: Clone + 'a> Field<'a, Message> {
         renderer.default_font()
     }
 
-    /// The text the placeholder is drawn from, laid out to `bounds`.
     fn placeholder_text(&self, renderer: &Renderer, bounds: Size) -> Text<&'a str, Font> {
         Text {
             content: self.placeholder,
@@ -423,10 +350,6 @@ impl<'a, Message: Clone + 'a> Field<'a, Message> {
         }
     }
 
-    /// Publishes the editor's value when a change has not reached the model
-    /// yet. The model holds the field's value and the editor is only where it
-    /// is edited, so a key press, an [`Act`] a menu queued and an [`Act`] a
-    /// middle press queued all publish here, once per pass.
     fn commit(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
         let Some(on_input) = &self.on_input else {
             return;
@@ -437,9 +360,6 @@ impl<'a, Message: Clone + 'a> Field<'a, Message> {
         shell.publish(on_input(state.editor.text()));
     }
 
-    /// Applies one editor action. Enter submits the edited value rather than
-    /// breaking the line, undo and redo take the field's own history, and every
-    /// insertion stays on one line.
     fn apply(&self, state: &mut State, action: Action, shell: &mut Shell<'_, Message>) {
         match action {
             Action::Edit(Edit::Enter) => {
@@ -708,8 +628,6 @@ mod tests {
 
     use crate::shell::fields::Snapshot;
 
-    /// The modifier the platform's own shortcuts are held with, as iced
-    /// resolves it: Command on macOS, Ctrl everywhere else.
     const COMMAND: Modifiers = Modifiers::COMMAND;
 
     const BACKENDS: [DisplayBackend; 4] = [

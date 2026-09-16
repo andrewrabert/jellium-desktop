@@ -11,9 +11,6 @@ impl Inner {
             .unwrap_or(false)
     }
 
-    /// Leaves the deferred load untouched without a browser or main frame,
-    /// applies page identity or blank abandonment before frame delivery, and
-    /// clears the deferred load only after invoking the real frame's load.
     pub(super) fn deliver_deferred_navigation(&self) {
         let Some(browser) = self.browser.lock().browser.clone() else {
             return;
@@ -64,8 +61,6 @@ impl Inner {
             }
         });
 
-        // Cloned out before invoking: the callback runs under no lock of this
-        // client and remains available to consecutive CEF-owned browsers.
         let created = self.created_callback.lock().clone();
         if let Some(callback) = created {
             callback();
@@ -86,20 +81,15 @@ impl Inner {
             jfn_logging::Level::Debug,
             &format!("OnBeforeClose name={}", self.name_str()),
         );
-        // A browser dying mid-menu must not strand the session slot.
         self.menu_reset();
         self.on_deactivated();
 
-        // The callback itself owns this Arc. A successful request transfers a
-        // new client containing that same Arc back to CEF before the old
-        // browser-to-client relationship is released.
         if self.session.is_active() {
             let _ = self.create("");
         }
     }
 
     pub(crate) fn on_before_popup(&self, url: &str) -> bool {
-        // Leading '-' guard blocks argv-style option smuggling into xdg-open.
         if url.is_empty() || url.starts_with('-') {
             return true;
         }

@@ -1,7 +1,3 @@
-//! X11 host-window creation, init/cleanup/clamp, and helpers for atom
-//! interning, ARGB visual discovery, parent geometry queries, and overlay
-//! repositioning.
-
 use parking_lot::Mutex;
 use x11rb::connection::Connection as X11rbConnection;
 use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
@@ -20,15 +16,9 @@ use crate::x11_state::{
     set_paint_services,
 };
 
-/// Must match `StartupWMClass` in `net.nullsum.JelliumDesktop.desktop` so the
-/// DE resolves the window to that desktop file for the taskbar icon.
 const WM_CLASS_VALUE: &[u8] = b"net.nullsum.JelliumDesktop\0net.nullsum.JelliumDesktop\0";
 const APP_TITLE: &[u8] = b"Jellium Desktop";
 
-/// Advertise the app top-level's identity and, when the full XSync handshake can
-/// be established, the `_NET_WM_SYNC_REQUEST` protocol. Returns the created sync
-/// counter id, or 0 if sync could not be set up (then the protocol is NOT
-/// advertised — a WM must never wait on a counter we would never set).
 fn set_toplevel_identity(conn: &RustConnection, win: u32, atoms: &Atoms) -> u32 {
     let _ = conn.change_property8(
         PropMode::REPLACE,
@@ -52,8 +42,6 @@ fn set_toplevel_identity(conn: &RustConnection, win: u32, atoms: &Atoms) -> u32 
 
     let sync_counter = setup_sync_counter(conn, win, atoms);
 
-    // Keep WM_DELETE_WINDOW; add _NET_WM_SYNC_REQUEST only when the counter is
-    // real (all-or-nothing).
     let mut protocols = vec![atoms.wm_delete_window];
     if sync_counter != 0 && atoms.net_wm_sync_request != 0 {
         protocols.push(atoms.net_wm_sync_request);
@@ -76,9 +64,6 @@ fn set_toplevel_identity(conn: &RustConnection, win: u32, atoms: &Atoms) -> u32 
     sync_counter
 }
 
-/// Create the resize-sync XSync counter and set `_NET_WM_SYNC_REQUEST_COUNTER`
-/// on the top-level. Returns 0 on any failure so the caller withholds the
-/// protocol advertisement.
 fn setup_sync_counter(conn: &RustConnection, win: u32, atoms: &Atoms) -> u32 {
     use x11rb::protocol::sync::{ConnectionExt as _, Int64};
 
@@ -122,7 +107,6 @@ fn setup_sync_counter(conn: &RustConnection, win: u32, atoms: &Atoms) -> u32 {
     counter
 }
 
-/// Find a 32-bit TrueColor visual.
 fn find_argb_visual(screen: &Screen) -> Option<u32> {
     screen
         .allowed_depths
@@ -176,10 +160,6 @@ fn intern_atoms(conn: &RustConnection) -> Atoms {
     }
 }
 
-/// Create the app-owned WM toplevel and the video-host child mpv embeds into
-/// (`--wid`), at the boot geometry, and start the geometry thread. Runs
-/// before mpv init — while the proxy has `DISPLAY` repointed — so every
-/// connection here targets the real display explicitly. Idempotent.
 pub(crate) fn ensure_host_window() -> bool {
     if host().is_some() {
         return true;
@@ -192,9 +172,6 @@ pub(crate) fn ensure_host_window() -> bool {
         return false;
     };
 
-    // The top-level is created on the connection the geometry thread owns and
-    // polls: the WM delivers `WM_DELETE` (empty-mask SendEvent) only to the
-    // creating client, so that client must be the one watching for the close.
     let display = crate::mpv_proxy::real_display();
     let (geo_conn, screen_num) = match RustConnection::connect(display.as_deref()) {
         Ok((conn, screen_num)) => (std::sync::Arc::new(conn), screen_num as i32),
@@ -245,8 +222,6 @@ pub(crate) fn ensure_host_window() -> bool {
     }
     let sync_counter = set_toplevel_identity(&geo_conn, toplevel, &atoms);
     if boot.position().is_some() {
-        // User-specified hints make the WM honor the restored position
-        // instead of applying its own placement policy.
         let mut hints = WmSizeHints::new();
         hints.position = Some((WmSizeHintsSpecification::UserSpecified, boot_x, boot_y));
         hints.size = Some((WmSizeHintsSpecification::UserSpecified, boot_w, boot_h));
@@ -279,8 +254,6 @@ pub(crate) fn ensure_host_window() -> bool {
     }
 
     if maximized {
-        // Pre-map EWMH: the WM reads the initial `_NET_WM_STATE` when it maps
-        // the window; client messages only apply to already-mapped windows.
         let _ = geo_conn.change_property32(
             PropMode::REPLACE,
             toplevel,
@@ -375,11 +348,6 @@ pub(crate) fn query_parent_geometry_x11rb(
     ))
 }
 
-/// Platform init. Opens the control/interop connections, finds the ARGB
-/// visual, drains the paint tier resolved in [`crate::mpv_host`]'s `prepare`
-/// into the state seeded by [`ensure_host_window`], and starts the input
-/// thread. mpv is already up and embedded in the video host by the time this
-/// runs.
 pub fn init() -> Result<(), jfn_platform_abi::PlatformInitError> {
     use jfn_platform_abi::PlatformInitError as Error;
     crate::mpv_proxy::restore_real_display();
@@ -449,9 +417,6 @@ pub fn cleanup() {
     if let Some(selections) = crate::selection::selections() {
         selections.cleanup();
     }
-    // Stop every surviving content actor (frees content GCs + SHM + GPU
-    // resources on the content connection). Structure teardown (unmap/destroy)
-    // rides on the geometry thread's shutdown + the top-level connection close.
     {
         let records: Vec<_> = crate::registry::registry()
             .lock()
@@ -479,11 +444,6 @@ pub fn cleanup() {
     crate::mpv_proxy::stop();
 }
 
-/// The primary screen's pixel extent, read on a short-lived connection to the
-/// real display. `None` when that connection could not be opened.
-///
-/// Runs before `init()`, so it opens its own connection — the mpv proxy may
-/// have `DISPLAY` repointed by then.
 pub fn screen_bounds() -> Option<jfn_platform_abi::geometry::Bounds> {
     let display = crate::mpv_proxy::real_display();
     let (conn, screen_num) = RustConnection::connect(display.as_deref()).ok()?;

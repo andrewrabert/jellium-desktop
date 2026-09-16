@@ -1,14 +1,3 @@
-//! Digests mpv events into coordinator inputs.
-//!
-//! Consumes [`mpv::Event`] values from the Rust event loop and produces
-//! coordinator [`Input`]s plus a couple of side outputs that don't fit
-//! the [`Input`] vocabulary (the window-extent mirror for the
-//! geometry-save cache).
-//!
-//! Per-process state (fullscreen, window_max, display_hz)
-//! lives in [`IngestState`] so multiple
-//! ingest calls observe the same change-suppression behavior.
-
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use crossbeam_utils::atomic::AtomicCell;
@@ -18,7 +7,6 @@ use jfn_platform_abi::{LogicalSize, PhysicalSize, Scale, WindowExtent};
 use crate::coordinator::Input;
 use crate::types::{EndReason, PlaybackBufferedRange};
 
-/// Property observe-IDs passed to `mpv_observe_property`.
 pub mod observe_id {
     pub const OSD_DIMS: u64 = 2;
     pub const FULLSCREEN: u64 = 3;
@@ -38,46 +26,25 @@ pub mod observe_id {
 
 const MAX_BUFFERED_RANGES: usize = 8;
 
-/// Caller-provided platform hooks. Implementations stay outside this crate so
-/// jfn-playback doesn't grow a platform dep.
 pub trait IngestCtx {
-    /// The display scale the platform reports.
     fn scale(&self) -> Scale;
 
-    /// The app window's logical size where the OS, not mpv's
-    /// `osd-dimensions`, is the authority for it.
     fn os_logical_size(&self) -> Option<LogicalSize>;
 }
 
-/// One ingest-loop output. Most map to coordinator inputs; the two side
-/// variants exist because the prior C++ path didn't route them through
-/// the dispatcher queue either.
 #[derive(Debug)]
 pub(crate) enum IngestOut {
     Input(Input),
-    /// The window-extent cell was rewritten; the driver wakes the
-    /// platform-abi window subscribers, which pull the new snapshot.
     WindowExtentChanged,
-    /// Terminal: libmpv has shut down. Caller breaks out of the event
-    /// loop and triggers the rest of the app's teardown.
     Shutdown,
 }
 
-/// Shared atomic cache mirroring the prior C++ `s_*` statics. Holds
-/// last-observed values so digest functions can suppress duplicate
-/// emissions (display-fps) and so external readers
-/// (`fullscreen`, `window_maximized`, `display_hz`)
-/// see the current state without round-tripping through the
-/// coordinator snapshot.
 #[derive(Debug, Default)]
 pub struct IngestState {
     fullscreen: AtomicBool,
     window_maximized: AtomicBool,
-    /// Last known window extent, written whole by the osd-dimensions
-    /// digest.
     extent: AtomicCell<Option<WindowExtent>>,
     display_hz: AtomicCell<f64>,
-    /// mpv's native window handle; `0` until the VO has a window.
     window_id: AtomicI64,
 }
 
@@ -104,16 +71,12 @@ impl IngestState {
     pub fn set_display_hz(&self, hz: f64) {
         self.display_hz.store(hz);
     }
-    /// mpv's native window handle as last reported by `window-id`; `None`
-    /// until mpv's VO has a window.
     pub fn window_id(&self) -> Option<i64> {
         let id = self.window_id.load(Ordering::Relaxed);
         (id != 0).then_some(id)
     }
 }
 
-/// Decode one [`Event`] into zero or more [`IngestOut`]s.
-/// Re-exported under stable FFI-facing name for [`crate::ingest_driver`].
 pub(crate) fn ingest_event_for_ffi<C: IngestCtx>(
     event: &Event,
     state: &IngestState,
@@ -122,8 +85,6 @@ pub(crate) fn ingest_event_for_ffi<C: IngestCtx>(
     ingest(event, state, ctx)
 }
 
-/// Run only the property-digest path. Used by the Wayland fast path
-/// that synthesizes osd-dimension updates outside the mpv event stream.
 pub(crate) fn ingest_property_for_ffi<C: IngestCtx>(
     id: ObserveId,
     value: &PropertyValue,
@@ -268,19 +229,10 @@ fn digest_osd_dims<C: IngestCtx>(
     vec![IngestOut::WindowExtentChanged]
 }
 
-/// The extent a reported scale and an exact logical content size name; the
-/// physical size is the single conversion of the logical one.
 pub(crate) fn extent_at(scale: Scale, logical: LogicalSize) -> Option<WindowExtent> {
     WindowExtent::new(logical.to_physical(scale)?, scale, logical)
 }
 
-/// The extent a reported scale and mpv's exact pixel size name.
-///
-/// mpv's pixel size is carried through verbatim; the logical size is the
-/// single conversion of it.
-///
-/// `None` when the division names no logical size, or when either axis is
-/// below two pixels.
 pub(crate) fn extent_of(scale: Scale, physical: PhysicalSize) -> Option<WindowExtent> {
     WindowExtent::new(physical, scale, physical.to_logical(scale)?)
 }
@@ -395,7 +347,6 @@ mod tests {
     #[test]
     fn fullscreen_carries_maximized_when_entering() {
         let state = IngestState::new();
-        // Window first reports maximized true.
         let _ = ingest(
             &prop(observe_id::WINDOW_MAX, PropertyValue::Flag(true)),
             &state,
@@ -416,7 +367,6 @@ mod tests {
         assert!(fullscreen);
         assert!(was_maximized);
 
-        // Leaving fullscreen always reports was_maximized = false.
         let out = ingest(
             &prop(observe_id::FULLSCREEN, PropertyValue::Flag(false)),
             &state,
@@ -547,7 +497,6 @@ mod tests {
 
     #[test]
     fn mpv_s_pixel_size_survives_a_scale_that_does_not_divide_it() {
-        // 1497 / 2.5 rounds to 599; mpv's own 1497 must reach the extent.
         let physical = PhysicalSize { w: 1497, h: 843 };
         let observed = Scale::from_f64(2.5).map(|scale| {
             let state = IngestState::new();

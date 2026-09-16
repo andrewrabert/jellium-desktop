@@ -1,19 +1,7 @@
-//! The CEF ABI boundary for accelerated-paint frames.
-//!
-//! CEF releases the resources backing a frame to its internal pool when the
-//! paint callback returns, so anything that outlives the callback — X11 and
-//! Wayland both hand the frame to an actor thread — must be acquired before
-//! then. This module is the one place that acquisition happens; downstream the
-//! frame is an owned [`SharedTexture`] and everything is safe code.
-
 use cef::AcceleratedPaintInfo;
 
 use crate::platform_ops::{FrameSize, SharedTexture};
 
-/// Take ownership of one accelerated-paint frame. `None` when it is unusable.
-///
-/// Call this only once the frame is going to be presented — it costs a `dup`
-/// per plane on Linux, and the callers ahead of it drop frames.
 #[cfg(target_os = "linux")]
 pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     use std::os::fd::BorrowedFd;
@@ -32,16 +20,12 @@ pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     if coded.w <= 0 || coded.h <= 0 {
         return None;
     }
-    // Include every memory plane the modifier uses; DCC/CCS modifiers add an
-    // auxiliary plane beyond the color plane.
     let n = info.plane_count.clamp(0, info.planes.len() as i32) as usize;
     if n < 1 {
         return None;
     }
     let mut planes = Vec::with_capacity(n);
     for p in &info.planes[..n] {
-        // SAFETY: `p.fd` is a live dmabuf fd for the duration of this
-        // callback; CEF reclaims it when we return, which is why we dup.
         let borrowed = unsafe { BorrowedFd::borrow_raw(p.fd) };
         planes.push(DmabufPlane {
             fd: nix::unistd::dup(borrowed).ok()?,
@@ -61,8 +45,6 @@ pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     ))
 }
 
-/// The compositor opens the shared handle inline, within this callback, so
-/// there is nothing to acquire.
 #[cfg(windows)]
 pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     if info.shared_texture_handle.is_null() {
@@ -76,8 +58,6 @@ pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     ))
 }
 
-/// The compositor wraps the `IOSurface` in an `MTLTexture` inline, within this
-/// callback, so there is nothing to acquire.
 #[cfg(target_os = "macos")]
 pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     if info.shared_texture_io_surface.is_null() {
@@ -91,8 +71,6 @@ pub(crate) fn acquire(info: &AcceleratedPaintInfo) -> Option<SharedTexture> {
     ))
 }
 
-/// The pair CEF states about every frame, on the platforms whose payload does
-/// not carry its own size. `None` when the coded size is not presentable.
 #[cfg(not(target_os = "linux"))]
 fn extents(info: &AcceleratedPaintInfo) -> Option<(FrameSize, FrameSize)> {
     let coded = FrameSize {

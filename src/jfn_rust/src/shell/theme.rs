@@ -1,16 +1,8 @@
-//! The overlay's palette, ported from the former `web/overlay.css`.
-
 use iced_core::Color;
 
-/// Every opaque pixel the shell overlay puts on screen belongs to a widget:
-/// the frame is always cleared fully transparent, so wherever no widget draws,
-/// jellyfin-web shows through. The two colours a frame cannot derive for
-/// itself are carried here.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Theme {
-    /// The titlebar strip's fill.
     pub chrome_background: Color,
-    /// The open modal's backdrop, alpha included.
     pub backdrop: Color,
 }
 
@@ -23,8 +15,6 @@ impl Default for Theme {
     }
 }
 
-/// The buffered theme colour jellyfin-web last reported, [`BACKGROUND`] until
-/// it unlocks. The titlebar and the modal backdrop both paint it.
 pub fn chrome_background() -> Color {
     from_rgb(jfn_color::theme::jfn_theme_color_current())
 }
@@ -46,29 +36,18 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
     }
 }
 
-/// `#101010`, the same background the app already paints everywhere else.
 pub const BACKGROUND: Color = rgb(0x10, 0x10, 0x10);
 
-/// The bundled family, named rather than left to `Family::SansSerif` — which
-/// cosmic-text resolves against the system database. Every widget the shell
-/// overlay builds takes it as [`iced_core::renderer::Settings::default_font`],
-/// so it is the overlay's `Font::DEFAULT` in the only sense that governs what
-/// is drawn.
 pub const FONT: iced_core::Font = iced_core::Font::new("Noto Sans");
 
-/// `#2b2b2b`, the about card's fill.
 pub const CARD: Color = rgb(0x2b, 0x2b, 0x2b);
 
-/// `#555555`, the about card's border.
 pub const CARD_BORDER: Color = rgb(0x55, 0x55, 0x55);
 
-/// `#00a4dc`.
 pub const ACCENT: Color = rgb(0x00, 0xa4, 0xdc);
 
-/// `#292929`.
 pub const FIELD: Color = rgb(0x29, 0x29, 0x29);
 
-/// `rgba(255, 255, 255, 0.8)`.
 pub const TEXT: Color = Color {
     r: 1.0,
     g: 1.0,
@@ -90,8 +69,6 @@ impl iced_core::widget::text::Catalog for Theme {
     }
 }
 
-/// [`FIELD`] fill, a two-pixel border that is [`ACCENT`] while focused and
-/// [`FIELD`] otherwise, [`TEXT`] value, [`ACCENT`] selection.
 pub fn field_style(focused: bool) -> crate::shell::field::Style {
     crate::shell::field::Style {
         background: iced_core::Background::Color(FIELD),
@@ -109,8 +86,6 @@ pub fn field_style(focused: bool) -> crate::shell::field::Style {
     }
 }
 
-/// The focus indicator shared by Settings actions, checkboxes, and selects.
-/// It overlays their existing state without replacing its fill or text style.
 pub fn control_focus_border() -> iced_core::Border {
     iced_core::Border {
         color: ACCENT,
@@ -350,13 +325,10 @@ impl iced_widget::container::Catalog for Theme {
     }
 }
 
-/// `#8ab4f8`, the about panel's clickable paths.
 pub const LINK: Color = rgb(0x8a, 0xb4, 0xf8);
 
-/// `#888`, the about panel's row labels.
 pub const MUTED: Color = rgb(0x88, 0x88, 0x88);
 
-/// `#f0f0f0`, the titlebar's icon colour.
 pub const CHROME_TEXT: Color = rgb(0xf0, 0xf0, 0xf0);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -373,11 +345,7 @@ pub enum ButtonClass {
 pub enum ContainerClass {
     #[default]
     Transparent,
-    /// The open modal's full-window field, filled with [`Theme::backdrop`].
     Backdrop,
-    /// The titlebar strip, filled opaque with [`Theme::chrome_background`].
     Chrome,
-    /// The about panel's body: [`CARD`], a one-pixel [`CARD_BORDER`],
-    /// eight-pixel corners.
     Card,
 }

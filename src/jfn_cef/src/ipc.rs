@@ -31,7 +31,6 @@ pub(crate) fn list_opt_string(args: &ListValue, idx: usize) -> Option<String> {
     }
 }
 
-/// JS can send integers as `VTYPE_DOUBLE` (e.g. via `parseFloat`); round to i32 in that case.
 pub(crate) fn list_int(args: &ListValue, idx: usize) -> i32 {
     let t = args.get_type(idx);
     if t.as_ref() == &sys::cef_value_type_t::VTYPE_DOUBLE {

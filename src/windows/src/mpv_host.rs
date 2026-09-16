@@ -1,5 +1,3 @@
-//! Windows [`MpvHost`]: pre-create environment only.
-
 use jfn_platform_abi::{MpvHost, WindowDecorations};
 
 pub(crate) struct WindowsMpvHost;
@@ -11,8 +9,6 @@ impl MpvHost for WindowsMpvHost {
         }
     }
 
-    /// Windows publishes no exact logical size; mpv's `osd-dimensions` is the
-    /// authority here.
     fn logical_content_size(&self) -> Option<jfn_platform_abi::LogicalSize> {
         None
     }

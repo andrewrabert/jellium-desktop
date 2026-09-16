@@ -46,8 +46,6 @@ pub fn run(args: &PackageArgs) -> Result<()> {
 
 fn write_archive(prefix: &Path, out: &Path) -> Result<()> {
     if cfg!(target_os = "macos") {
-        // `prefix` is the .app bundle here (install::run is OS-specific); zip it
-        // under its own dir name so the bundle, not its contents, is the root.
         let app_parent = prefix
             .parent()
             .with_context(|| format!("{} has no parent directory", prefix.display()))?;

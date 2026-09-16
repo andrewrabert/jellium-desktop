@@ -1,5 +1,3 @@
-//! Every translation between the router's key identity and iced's.
-
 use std::os::raw::c_int;
 
 use iced_core::keyboard::{self, Key, Location, Modifiers, key};
@@ -7,7 +5,6 @@ use jfn_input::key::{PhysicalKey, ShellKey};
 use jfn_platform_abi::DisplayBackend;
 use keycode::{KeyMap, KeyMapping, KeyMappingCode};
 
-/// The iced key event `key` becomes.
 pub fn key_event(key: ShellKey) -> keyboard::Event {
     let logical = logical(key.windows_key_code, key.logical);
     let physical = physical(key.physical);
@@ -33,7 +30,6 @@ pub fn key_event(key: ShellKey) -> keyboard::Event {
     }
 }
 
-/// The iced modifiers a CEF `EVENTFLAG_*` mask becomes.
 pub fn modifiers(raw: u32) -> Modifiers {
     use jfn_platform_abi::event_flags as ef;
     let mut mods = Modifiers::empty();
@@ -44,12 +40,6 @@ pub fn modifiers(raw: u32) -> Modifiers {
     mods
 }
 
-/// The physical key iced resolves a shortcut from when the character cannot:
-/// the W3C code the platform's own code names, through `keycode`'s Chrome
-/// mapping.
-///
-/// A code the mapping does not name carries the platform's own code as a
-/// [`key::NativeCode`].
 pub fn physical(key: PhysicalKey) -> key::Physical {
     let (mapping, native) = match key {
         PhysicalKey::Xkb(code) => (KeyMapping::Xkb(code), key::NativeCode::Xkb(u32::from(code))),
@@ -63,8 +53,6 @@ pub fn physical(key: PhysicalKey) -> key::Physical {
         .map_or(key::Physical::Unidentified(native), key::Physical::Code)
 }
 
-/// The named key the virtual-key code names, else the character the key
-/// produces, else [`Key::Unidentified`].
 pub fn logical(windows_key_code: c_int, logical: Option<char>) -> Key {
     let named = match windows_key_code {
         0x08 => Some(key::Named::Backspace),
@@ -94,7 +82,6 @@ pub fn logical(windows_key_code: c_int, logical: Option<char>) -> Key {
     }
 }
 
-/// The key press one typed character becomes for the focused field.
 pub fn text_event(ch: char) -> keyboard::Event {
     let mut buffer = [0u8; 4];
     let text: iced_core::SmolStr = (&*ch.encode_utf8(&mut buffer)).into();
@@ -110,13 +97,9 @@ pub fn text_event(ch: char) -> keyboard::Event {
     }
 }
 
-/// The Windows virtual-key code of the Menu key.
 const VK_APPS: c_int = 0x5d;
-/// The Windows virtual-key code of F10.
 const VK_F10: c_int = 0x79;
 
-/// Whether `key` raises the edit menu for the focused field: the Menu key and
-/// Shift+F10 on Wayland, X11 and Windows, and neither on macOS.
 pub fn opens_edit_menu(backend: DisplayBackend, key: ShellKey) -> bool {
     use jfn_platform_abi::event_flags as ef;
     if !key.pressed || backend == DisplayBackend::MacOS {
@@ -126,8 +109,6 @@ pub fn opens_edit_menu(backend: DisplayBackend, key: ShellKey) -> bool {
     key.windows_key_code == VK_APPS || (shift && key.windows_key_code == VK_F10)
 }
 
-/// The iced code a Chrome-mapping code names. The two enumerations share the
-/// W3C names; the codes listed here are the ones both spell.
 fn code(code: KeyMappingCode) -> Option<key::Code> {
     macro_rules! shared {
         ($($name:ident),* $(,)?) => {
@@ -322,20 +303,12 @@ mod tests {
     use super::*;
     use jfn_platform_abi::event_flags::{EVENTFLAG_CONTROL_DOWN, EVENTFLAG_SHIFT_DOWN};
 
-    /// The Windows virtual-key code of the Menu key, spelled here so a change
-    /// to the constant it mirrors fails these tests.
     const VK_APPS: c_int = 0x5d;
-    /// The Windows virtual-key code of F10, spelled here so a change to the
-    /// constant it mirrors fails these tests.
     const VK_F10: c_int = 0x79;
-    /// The Windows virtual-key code of F9, a key no edit menu binds.
     const VK_F9: c_int = 0x78;
-    /// The Windows virtual-key code of the `A` key.
     const VK_A: c_int = 0x41;
-    /// The Windows virtual-key code of the `Y` key.
     const VK_Y: c_int = 0x59;
 
-    /// Every backend the Menu key and Shift+F10 raise the edit menu on.
     const WITH_MENU_KEY: [DisplayBackend; 3] = [
         DisplayBackend::Wayland,
         DisplayBackend::X11,

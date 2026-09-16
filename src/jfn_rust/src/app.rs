@@ -1,6 +1,3 @@
-//! Process entry point. [`jfn_app_main`] owns the full main loop and
-//! returns the exit code.
-
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -17,15 +14,10 @@ use jfn_platform_abi::{IdleInhibitLevel, Instance, Platform, WindowGeometry};
 
 use crate::cli;
 
-// Shorthand for the installed Platform backend. `install()` happens before
-// any of the call sites here run.
 fn plat() -> &'static dyn Platform {
-    // SAFETY: process wiring owns the prepared/runtime native phase until all producers stop.
     unsafe { jfn_platform_abi::get() }
 }
 
-/// The started web overlay, for the C handler thunks the playback coordinator
-/// still calls through.
 static WEB_OVERLAY: parking_lot::Mutex<Option<jfn_cef::WebOverlay>> = parking_lot::Mutex::new(None);
 
 #[derive(Debug, thiserror::Error)]
@@ -36,8 +28,6 @@ enum RuntimeShutdownError {
     ManagerJoinFailed,
 }
 
-/// mpv background applied over the user's mpv.conf color for the app's
-/// lifetime before the theme rotator takes over.
 const STARTUP_BG_HEX: &str = "#101010";
 
 enum BackgroundCapture {
@@ -65,10 +55,8 @@ impl BootError {
     }
 }
 
-/// What `CefInitialize` was given.
 struct CefInit {
     runtime: InitializedCef,
-    /// Whether CEF composites through shared textures.
     shared_textures: bool,
 }
 
@@ -78,8 +66,6 @@ fn cs(s: &str) -> CString {
     CString::new(s).unwrap_or_default()
 }
 
-/// Normalize the audio-passthrough list: if `dts-hd` is present, drop
-/// bare `dts` (the HD variant subsumes it).
 fn normalize_passthrough(s: &str) -> String {
     if !s.contains("dts-hd") {
         return s.to_string();
@@ -131,9 +117,6 @@ fn log_mpv_versions() {
     }
 }
 
-/// Restores the builtin CLOSE_WIN -> quit binding that
-/// `input-default-bindings=no` drops. Async: the boot path never parks on
-/// mpv's core.
 fn install_mpv_close_binding() {
     let kb = cs("keybind");
     let name = cs("CLOSE_WIN");
@@ -142,10 +125,6 @@ fn install_mpv_close_binding() {
     unsafe { jfn_mpv::api::jfn_mpv_command_async(argv.as_ptr(), argv.len()) };
 }
 
-/// Wake any thread parked in `mpv_wait_event` whenever a host publishes a
-/// window change, so the VO wait re-reads the readiness inputs mpv never
-/// reports: `MpvHost::host_ready` and the host-owned extent on backends that
-/// own their toplevel.
 fn wake_mpv_on_window_change() -> jfn_platform_abi::WindowSubscription {
     jfn_platform_abi::subscribe_window_changed(jfn_mpv::api::jfn_mpv_wakeup)
 }
@@ -167,7 +146,6 @@ struct StartupOptions {
     audio_exclusive: bool,
     audio_channels: String,
     log_level: String,
-    /// The file logs are written to; `None` disables file logging.
     log_file: Option<PathBuf>,
     disable_gpu_compositing: bool,
     remote_debugging_port: jfn_cef::DebuggingPort,
@@ -180,7 +158,6 @@ fn resolve_startup_options(cli: &cli::Cli) -> StartupOptions {
     let saved_log_level = jfn_config::log_level();
     let saved_audio_exclusive = jfn_config::audio_exclusive();
 
-    // An unknown CLI value falls back to the mpv default.
     let hwdec = match cli.hwdec.as_deref() {
         Some(value) => value.parse::<jfn_config::Hwdec>().unwrap_or_default(),
         None => saved_hwdec,
@@ -275,7 +252,6 @@ fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
     unsafe { jfn_mpv::boot::jfn_mpv_handle_init(&boot as *const _) }
 }
 
-/// Returns the completed boot state or the reason startup stopped.
 fn wait_for_vo_window(mut boot: BackgroundCapture) -> Result<ReadyBoot, BootError> {
     use std::ops::ControlFlow::{Break, Continue};
     let _shutdown_wake = crate::manager::BootShutdownWake::start()?;
@@ -345,7 +321,6 @@ fn publish_device_profile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) {
     }
 }
 
-/// Consumes the browser bootstrap and returns its initialized session.
 fn initialize_cef(
     runtime: BrowserCef,
     platform: &jfn_platform_abi::PlatformRuntime,
@@ -428,7 +403,6 @@ fn initialize_playback_coordination() -> PlaybackCoordination {
         jfn_playback::jfn_shutdown_initiate();
     });
 
-    // The coordinator reconciles immediately, so install every sink first.
     jfn_playback::ffi::jfn_playback_init();
     PlaybackCoordination { stopped: false }
 }
@@ -459,8 +433,6 @@ impl std::fmt::Display for CleanupErrors {
 }
 impl std::error::Error for CleanupErrors {}
 
-/// Owns the process mpv handle and its ingestion dependency. A runtime can only
-/// be terminated after ingestion has stopped, including startup rollback.
 struct MpvRuntime {
     raw: std::ptr::NonNull<jfn_mpv::sys::mpv_handle>,
     window_wake: Option<jfn_platform_abi::WindowSubscription>,
@@ -486,8 +458,6 @@ impl MpvRuntime {
         }
         self.window_wake.take();
         jfn_playback::ingest_driver::jfn_playback_stop_mpv_event_thread();
-        // On rejection the returned work retains termination authority; it may
-        // be retried before the retained PostWindowCleanup is completed.
         plat().run_blocking(Box::new(jfn_mpv::boot::jfn_mpv_handle_terminate))
     }
 }
@@ -500,8 +470,6 @@ impl Drop for MpvRuntime {
     }
 }
 
-/// A prepared host may precede mpv acquisition; an initialized platform always
-/// owns mpv. Each phase carries exactly the native resources it can own.
 struct PreparedNative {
     prepared: jfn_platform_abi::PreparedPlatform,
 }
@@ -561,8 +529,6 @@ impl NativePhase for InitializedNative {
     }
 }
 struct NativeOwner<P: NativePhase>(Option<P>);
-// The only optional phase is the consumed teardown slot. Callers cannot form
-// an initialized startup phase without its concrete platform and mpv owners.
 #[allow(clippy::expect_used)]
 impl<P: NativePhase> NativeOwner<P> {
     fn get(&self) -> &P {
@@ -593,8 +559,6 @@ impl<P: NativePhase> Drop for NativeOwner<P> {
     }
 }
 
-/// Field drop order is intentional: producers and CEF drain before native
-/// backend cleanup, mpv termination, and post-window cleanup.
 struct StartupResources<P: NativePhase> {
     services: Services,
     native: NativeOwner<P>,
@@ -714,7 +678,6 @@ struct RunningRuntime {
     _overlay: jfn_cef::WebOverlay,
 }
 impl RunningRuntime {
-    /// Enable external producers only after all overlay/manager callbacks exist.
     fn start_ingestion(&self, instance: &Instance) -> Result<(), PlaybackStartError> {
         plat().media_session().start(instance);
         if !jfn_playback::ingest_driver::jfn_playback_start_mpv_event_thread() {
@@ -731,8 +694,6 @@ impl RunningRuntime {
         };
         if let Err(error) = &ingestion {
             tracing::error!(target: "Main", "{error}");
-            // The manager already exists, so startup failure can drain browsers
-            // through the normal main-loop path instead of abandoning them.
             jfn_playback::jfn_shutdown_initiate();
         }
         plat().run_main_loop();
@@ -746,8 +707,6 @@ impl RunningRuntime {
         if let Err(error) = &manager {
             tracing::error!(target: "Main", "shutdown manager: {error}");
         }
-        // InitializedCef independently requires confirmed drain; manager failure
-        // never becomes permission to shut down still-live browsers.
         let cleanup = self.resources.cleanup();
         if let Err(error) = &cleanup {
             tracing::error!(target: "Main", "shutdown: {error}");
@@ -756,8 +715,6 @@ impl RunningRuntime {
     }
 }
 
-/// Boot-time mpv size reconcile (saved scale vs the scale the platform
-/// reports); seeds the display-hz cache and returns it for browser init.
 fn boot_mpv_reconcile() -> Option<jfn_gpu_paint::RefreshRate> {
     jfn_playback::ingest_driver::jfn_playback_seed_display_hz_sync();
     let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
@@ -772,9 +729,6 @@ fn boot_mpv_reconcile() -> Option<jfn_gpu_paint::RefreshRate> {
         plat().scale(), snap.fullscreen
     );
 
-    // Saved intent, not an observation: the OS may still be applying the
-    // maximize, and a set_geometry landing mid-flight leaves mpv's stored
-    // window size disagreeing with the visible window.
     let locked = saved.maximized || snap.fullscreen || snap.maximized;
     let reconciled = crate::window_geometry::saved_sizes(&saved).and_then(|(logical, physical)| {
         plat()
@@ -805,8 +759,6 @@ fn start_web_overlay(
     cef: &CefInit,
     user_video_bg: u32,
 ) -> Result<StartedOverlay, OverlayStartupError> {
-    // Must run before the browser is created: the pre-loaded page fires its
-    // initial theme-color IPC at DOMContentLoaded.
     let titlebar_themed = jfn_config::titlebar_theme_color();
     unsafe {
         jfn_color::theme::jfn_theme_color_init(
@@ -820,8 +772,6 @@ fn start_web_overlay(
     }
     jfn_color::theme::jfn_theme_color_set_video_bg(user_video_bg);
 
-    // The overlay creates its browser itself, at the first size the window
-    // snapshot and the shell overlay's reserved strip yield.
     let manager = crate::manager::jfn_manager_prepare()?;
     let overlay = jfn_cef::WebOverlay::start(
         &cef.runtime,
@@ -881,8 +831,6 @@ pub fn jfn_app_main() -> c_int {
 
     let version = cef_runtime.version().clone();
 
-    // Path overrides must be applied before settings load and CEF
-    // root_cache_path construction below.
     let cli = cli::Cli::parse();
     if cli.version {
         print_version(&version);
@@ -931,8 +879,6 @@ pub fn jfn_app_main() -> c_int {
             return 1;
         }
     };
-    // The accept loop lives on `runtime`'s workers while `run_app` blocks the
-    // main thread on the native loop, so `runtime` must outlive `run_app`.
     match runtime.block_on(Listener::try_start(
         &instance,
         jfn_instance_ipc::jfn::handle,
@@ -985,8 +931,6 @@ fn run_app(
         native: NativeOwner(Some(PreparedNative { prepared })),
     };
 
-    // Boot geometry resolves before the host prepare so its display probes
-    // hit the real server, not the mpv proxy the prepare may install.
     let Some(boot) = crate::window_geometry::controller().boot() else {
         tracing::error!(target: "Main", "boot geometry unrepresentable at the reported scale");
         return 1;
@@ -995,16 +939,10 @@ fn run_app(
 
     setup_mpv_environment();
 
-    // Hosts that own their toplevel create it here, before mpv init, so its
-    // window ID can be handed to mpv as `wid`.
     plat().mpv_host().ensure_host_window();
 
     let mpv_log_level = mpv_log_level_from_filter();
 
-    // mpv's --geometry takes physical pixels (see m_geometry_apply in
-    // third_party/mpv/options/m_option.c). Window boot options only apply
-    // when mpv owns the window; toplevel-owning backends size and
-    // position/maximize the host window themselves.
     let backend_byte: u8 = plat().display() as u8;
     let mpv_started = std::time::Instant::now();
     let raw = init_mpv_handle(MpvInitOptions {
@@ -1032,23 +970,14 @@ fn run_app(
         return 1;
     }
 
-    // force-window=yes keeps VO creation on mpv's core thread. The user's
-    // mpv.conf color is only known after mpv_initialize parsed the config, so
-    // the capture is async: the reply lands in the boot pump, which writes the
-    // override and gates boot readiness on it.
     jfn_mpv::api::jfn_mpv_request_background_color();
 
-    // input-default-bindings=no drops the builtin CLOSE_WIN -> quit binding;
-    // the WM close button needs it back.
     install_mpv_close_binding();
 
     resources.native.get_mut().mpv.window_wake = Some(wake_mpv_on_window_change());
 
     let boot = BackgroundCapture::Pending;
 
-    // Platform init precedes both the shell overlay and `CefInitialize`: the
-    // overlay's surface needs the backend's compositor devices, and the
-    // connect screen must be on screen while CEF is still starting.
     let mut resources = match resources.initialize() {
         Ok(resources) => resources,
         Err(error) => {
@@ -1071,8 +1000,6 @@ fn run_app(
                 return 1;
             }
         };
-    // fontdb's directory walk must not run while Chromium is manipulating
-    // process file descriptors.
     if let Some(fonts) = resources.services.fonts.take()
         && let Err(error) = fonts.join()
     {
@@ -1080,9 +1007,6 @@ fn run_app(
         return 1;
     }
 
-    // CEF's process bring-up needs nothing mpv owns; where the platform
-    // allows it, it runs while the core thread builds the VO and its GPU
-    // context instead of after.
     let deferred = if plat().cef_init_precedes_mpv_window() {
         match initialize_cef(runtime, platform, &opts) {
             Ok(cef) => {
@@ -1109,7 +1033,6 @@ fn run_app(
         match readiness.wait(platform, std::time::Duration::from_secs(5)) {
             Ok(()) => tracing::debug!(target: "Main", "shell renderer ready"),
             Err(error) => {
-                // Product policy: failure of the connect/settings UI is fatal.
                 tracing::error!(target: "Main", "shell startup: {error}");
                 return 1;
             }
@@ -1118,10 +1041,6 @@ fn run_app(
     log_mpv_versions();
     run_with_cef(boot, deferred, resources, &opts, instance)
 }
-
-// =====================================================================
-// mpv boot helpers + VO wait loop
-// =====================================================================
 
 fn mpv_log_level_from_filter() -> &'static str {
     let e = |level| jfn_logging::log_enabled(Category::Mpv, level);
@@ -1140,18 +1059,12 @@ fn mpv_log_level_from_filter() -> &'static str {
     }
 }
 
-/// What one drained libmpv event means for the boot wait.
 enum BootEvent {
-    /// The queue was empty, or the parked wait timed out.
     Idle,
-    /// mpv is going away before its window came up.
     Fatal,
-    /// Folded into boot state.
     Consumed,
 }
 
-/// Log messages reach tracing, the background-color reply applies the startup
-/// override, every other event reaches the ingest layer.
 fn consume_boot_event(boot: &mut BackgroundCapture, event: jfn_mpv::api::WaitEvent) -> BootEvent {
     match event {
         jfn_mpv::api::WaitEvent::None => BootEvent::Idle,
@@ -1177,7 +1090,6 @@ fn consume_boot_event(boot: &mut BackgroundCapture, event: jfn_mpv::api::WaitEve
     }
 }
 
-/// Applies the startup override and records the captured color as one state.
 fn apply_startup_background(boot: &mut BackgroundCapture, value: &jfn_mpv::PropertyValue) {
     let user_video_bg = jfn_mpv::api::background_color_from_reply(value).unwrap_or(0);
     let startup_bg = cs(STARTUP_BG_HEX);
@@ -1185,7 +1097,6 @@ fn apply_startup_background(boot: &mut BackgroundCapture, value: &jfn_mpv::Prope
     *boot = BackgroundCapture::Applied { user_video_bg };
 }
 
-/// Produces startup evidence from the current window and captured background.
 fn boot_progress(boot: &BackgroundCapture) -> Option<ReadyBoot> {
     let BackgroundCapture::Applied { user_video_bg } = boot else {
         return None;
@@ -1202,10 +1113,6 @@ fn boot_progress(boot: &BackgroundCapture) -> Option<ReadyBoot> {
     })
 }
 
-// =====================================================================
-// run_with_cef body — Rust port
-// =====================================================================
-
 fn cef_severity_for_cef_filter() -> jfn_cef::LogSeverity {
     let enabled = |level| jfn_logging::log_enabled(Category::Cef, level);
     if enabled(Level::Trace) || enabled(Level::Debug) {
@@ -1218,10 +1125,6 @@ fn cef_severity_for_cef_filter() -> jfn_cef::LogSeverity {
         jfn_cef::LogSeverity::Error
     }
 }
-
-// Handler thunks installed via jfn_playback_set_*_handler. They capture
-// nothing (Rust function items are 'static) and forward to the platform
-// backend / jfn-cef.
 
 extern "C" fn h_idle_inhibit(level: u32) {
     let lvl = match level {
@@ -1261,7 +1164,6 @@ extern "C" fn h_theme_set_mpv_bg(hex: *const c_char) {
     unsafe { jfn_mpv::api::jfn_mpv_set_background_color_hex(hex) };
 }
 
-/// Owns the run_with_cef body — invoked once by `jfn_app_main`.
 fn run_with_cef(
     boot: ReadyBoot,
     deferred: Option<BrowserCef>,

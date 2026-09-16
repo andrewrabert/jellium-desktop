@@ -15,10 +15,6 @@ thiserror.workspace = true
 wgpu.workspace = true
 pollster = "1.0"
 
-# wgpu-hal is pinned to wgpu's exact build so the hal types are identical to
-# the ones wgpu links; every shared-texture import reaches the backend device
-# through them. One backend per platform — the same single choice the adapter
-# probe makes.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix.workspace = true
 raw-window-handle = "0.6"

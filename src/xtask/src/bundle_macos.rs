@@ -7,9 +7,6 @@ use std::process::Command;
 const CEF_FRAMEWORK_NAME: &str = "Chromium Embedded Framework";
 const SYSTEM_PREFIXES: &[&str] = &["/usr/lib/", "/System/", "/Library/"];
 
-// Homebrew installs dylibs as read-only and `std::fs::copy` preserves source
-// permissions. The bundled copy must be writable so `install_name_tool` (and a
-// re-run of this bundling step) can modify it.
 fn copy_writable(src: &Path, dst: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if dst.exists() {
@@ -36,8 +33,6 @@ pub fn complete(app: &Path) -> Result<()> {
     let brew_prefix = brew_prefix()?;
     println!("Homebrew prefix: {}", brew_prefix.display());
 
-    // CEF framework: rewrite install_name from build-tree (@executable_path/Frameworks/...)
-    // to bundle-tree (@executable_path/../Frameworks/...).
     let cef_fw_lib = fw_dir
         .join(format!("{CEF_FRAMEWORK_NAME}.framework"))
         .join(CEF_FRAMEWORK_NAME);
@@ -59,10 +54,8 @@ pub fn complete(app: &Path) -> Result<()> {
         );
     }
 
-    // Bundle MoltenVK (loaded via ICD discovery, not linked).
     bundle_moltenvk(&fw_dir, &brew_prefix)?;
 
-    // Iterative dep walk: fix all dylibs in MacOS/ + Frameworks/* + main exec.
     let mut framework_libs: HashSet<String> = std::fs::read_dir(&fw_dir)?
         .filter_map(|e| e.ok())
         .filter_map(|e| {
@@ -112,10 +105,8 @@ pub fn complete(app: &Path) -> Result<()> {
         println!("  {n}");
     }
 
-    // Codesign — inside-out (matches CMake script ordering exactly).
     codesign(app, &fw_dir, &macos_dir, &entitlements)?;
 
-    // Strip quarantine.
     let _ = Command::new("xattr").args(["-cr"]).arg(app).status();
 
     println!("Bundle complete: {}", app.display());
@@ -199,7 +190,6 @@ fn resolve_dependency(dep_path: &str, brew_prefix: &Path) -> Option<String> {
 }
 
 fn search_cellar(brew_prefix: &Path, name: &str) -> Option<String> {
-    // Equivalent to `file(GLOB ${brew}/Cellar/*/*/lib/${name})` — take first hit.
     let cellar = brew_prefix.join("Cellar");
     let formulas = std::fs::read_dir(&cellar).ok()?;
     for f in formulas.flatten() {
@@ -272,7 +262,6 @@ fn codesign(app: &Path, fw_dir: &Path, macos_dir: &Path, entitlements: &Path) ->
     let cef_fw = fw_dir.join(format!("{CEF_FRAMEWORK_NAME}.framework"));
 
     if cef_fw.exists() {
-        // Nested dylibs inside CEF framework first.
         if let Ok(entries) = std::fs::read_dir(cef_fw.join("Libraries")) {
             for e in entries.flatten() {
                 if e.path().extension().and_then(|s| s.to_str()) == Some("dylib") {
@@ -288,7 +277,6 @@ fn codesign(app: &Path, fw_dir: &Path, macos_dir: &Path, entitlements: &Path) ->
         sign(&cef_fw, Some(entitlements))?;
     }
 
-    // Other frameworks.
     for e in std::fs::read_dir(fw_dir)?.flatten() {
         let p = e.path();
         if p.extension().and_then(|s| s.to_str()) == Some("framework") && p != cef_fw {
@@ -297,7 +285,6 @@ fn codesign(app: &Path, fw_dir: &Path, macos_dir: &Path, entitlements: &Path) ->
         }
     }
 
-    // Loose dylibs in Frameworks/.
     for e in std::fs::read_dir(fw_dir)?.flatten() {
         let p = e.path();
         if p.extension().and_then(|s| s.to_str()) == Some("dylib") {
@@ -306,7 +293,6 @@ fn codesign(app: &Path, fw_dir: &Path, macos_dir: &Path, entitlements: &Path) ->
         }
     }
 
-    // Standalone Mach-O binaries in Frameworks/.
     for e in std::fs::read_dir(fw_dir)?.flatten() {
         let p = e.path();
         if p.is_file() && p.extension().and_then(|s| s.to_str()) != Some("dylib") {
@@ -320,7 +306,6 @@ fn codesign(app: &Path, fw_dir: &Path, macos_dir: &Path, entitlements: &Path) ->
         }
     }
 
-    // Dylibs in MacOS/.
     for e in std::fs::read_dir(macos_dir)?.flatten() {
         let p = e.path();
         if p.extension().and_then(|s| s.to_str()) == Some("dylib") {

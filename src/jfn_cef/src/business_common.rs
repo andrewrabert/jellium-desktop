@@ -1,19 +1,5 @@
-//! Shared helpers for the three `business_*` modules.
-//!
-//! Two groups, separated by the dividers below:
-//!   1. Generic CEF/Rust helpers — could lift into a `cef-rs-helpers` crate.
-//!   2. App-specific dispatch — Jellium Desktop config wiring.
-
 use std::ffi::CString;
 
-// --- generic Rust/C interop ------------------------------------------------
-
-/// Convert a JS-supplied string into a `CString` for FFI, logging + dropping
-/// on interior NUL. `label` names the IPC arm in the warn message so the
-/// log line is enough to locate the offending handler.
-///
-/// Avoids the prior `CString::new(x).unwrap_or_default()` pattern that
-/// silently handed `""` to downstream consumers (e.g. mpv).
 pub(crate) fn js_cstr_or_warn(label: &str, s: &str) -> Option<CString> {
     match CString::new(s) {
         Ok(c) => Some(c),
@@ -28,11 +14,6 @@ pub(crate) fn js_cstr_or_warn(label: &str, s: &str) -> Option<CString> {
     }
 }
 
-// --- app-specific dispatch -------------------------------------------------
-
-/// `setSettingValue` IPC dispatch. Superset of the keys the overlay and the
-/// main web UI send today — both UIs share this single source of truth so
-/// new keys land in one place.
 pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>) {
     if key == "windowDecorations" {
         jfn_config::set_window_decorations(value);

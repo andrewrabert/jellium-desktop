@@ -1,7 +1,3 @@
-//! Token redaction for log output. Detects known query-param / JSON / header
-//! patterns that precede a Jellyfin access token and overwrites the token
-//! value with 'x' characters in place, preserving URL/JSON shape.
-
 use memchr::memmem;
 
 struct PatternRule {

@@ -1,4 +1,3 @@
-//! Fault injection at the lifecycle boundary, independent of a window server.
 #![allow(unused_variables, clippy::panic, clippy::unreachable)]
 use super::*;
 
@@ -273,8 +272,6 @@ fn cleanup_retires_admission_and_waits_for_an_inflight_callback() {
             None => panic!("callback cannot acquire initialized platform"),
         };
         assert!(entered.send(()).is_ok());
-        // Wait for shutdown to retire admission while retaining the callback's
-        // original authority, modelling an already-entered native input event.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while try_lease().is_some() {
             assert!(

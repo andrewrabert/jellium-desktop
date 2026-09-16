@@ -1,12 +1,3 @@
-//! Test whether the GPU stack can import a GBM-allocated dmabuf as an EGL
-//! image and bind it to a GL texture. Run once during Wayland init to decide
-//! whether CEF's shared-texture path will work; if not, we fall back to
-//! software CEF rendering.
-//!
-//! libEGL, libX11, and libgbm are all dlopened so the binary keeps no link
-//! dependency on them (the X11 case only fires when CEF runs under
-//! `--ozone-platform=x11` over XWayland).
-
 use crate::egl;
 use drm_fourcc::DrmFourcc;
 use libloading::Library;
@@ -16,8 +7,6 @@ use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 
-// GL is two constants and five entry points reached through
-// `eglGetProcAddress`; `glow` needs a loader context to give anything back.
 const GL_TEXTURE_2D: c_uint = 0x0DE1;
 const GL_NO_ERROR: c_uint = 0;
 const GBM_BO_USE_RENDERING: u32 = 0x0002;
@@ -65,21 +54,6 @@ type FnEglQueryDisplayAttribExt =
     unsafe extern "C" fn(egl::EGLDisplay, egl::Int, *mut isize) -> c_uint;
 type FnEglQueryDeviceStringExt = unsafe extern "C" fn(*mut c_void, egl::Int) -> *const c_char;
 
-/// Returns true if a GBM-allocated ARGB8888 dmabuf can be imported as an EGL
-/// image and bound to a GL texture on the EGL display CEF will use. The
-/// `ozone_platform` selects which display type to test (`"wayland"` uses the
-/// passed `wayland_egl_dpy`; anything else opens an XWayland display).
-///
-/// When libgbm or the DRM render node is unavailable the probe returns true
-/// (assume supported) — same fallback the C++ version used, so the platform
-/// can opt into shared textures and let Chromium fail loudly if the runtime
-/// stack disagrees.
-///
-/// `wayland_egl_dpy` may be NULL when `ozone_platform != "wayland"`.
-///
-/// # Safety
-/// `ozone_platform` must be NUL-terminated or null. `wayland_egl_dpy`
-/// must be a live `*mut wl_display` when `ozone_platform == "wayland"`.
 pub unsafe fn jfn_wl_dmabuf_probe(
     ozone_platform: *const c_char,
     wayland_egl_dpy: *mut c_void,
@@ -135,9 +109,6 @@ fn probe(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<bool, String> {
             1,
             khronos_egl::NONE,
         ];
-        // A pbuffer may legitimately be unavailable; a surfaceless context
-        // still makes current on drivers that advertise
-        // EGL_KHR_surfaceless_context.
         let pbuf = egl.create_pbuffer_surface(display, config, &pb_attrs).ok();
 
         if egl.make_current(display, pbuf, pbuf, Some(ctx)).is_err() {
@@ -192,8 +163,6 @@ fn acquire_display(
 ) -> Result<(egl::Display, bool, Option<X11Owned>), String> {
     if ozone == "wayland" {
         tracing::info!("dmabuf probe: testing on Wayland EGL display");
-        // SAFETY: the caller guarantees a live EGL display for the Wayland
-        // case.
         let display = unsafe { egl::Display::from_ptr(wayland_egl_dpy) };
         return Ok((display, false, None));
     }
@@ -221,10 +190,8 @@ fn acquire_display(
         if raw.is_null() {
             return Err("no EGL display for X11".into());
         }
-        // SAFETY: `raw` is a non-null display just returned by EGL.
         unsafe { egl::Display::from_ptr(raw) }
     } else {
-        // SAFETY: `dpy` is a live Xlib display owned by `owned`.
         let Some(display) = (unsafe { egl.get_display(dpy) }) else {
             return Err("no EGL display for X11".into());
         };
@@ -419,8 +386,6 @@ fn find_drm_node(egl: &egl::Egl, display: egl::Display) -> Option<OwnedFd> {
     Some(fd)
 }
 
-/// # Safety
-/// Same contract as [`jfn_wl_dmabuf_probe`].
 pub unsafe fn cef_render_node(
     ozone_platform: *const c_char,
     wayland_egl_dpy: *mut c_void,

@@ -1,6 +1,3 @@
-//! The two text rules every backend and the shell overlay share.
-
-/// Pairs the UTF-16 code units a platform delivers into whole characters.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Utf16 {
     high: Option<u16>,
@@ -14,10 +11,6 @@ impl Utf16 {
         Utf16 { high: None }
     }
 
-    /// The character `unit` completes.
-    ///
-    /// `None` while a high surrogate waits for its low half, and for a
-    /// surrogate that never pairs.
     pub fn feed(&mut self, unit: u16) -> Option<char> {
         let pending = self.high.take();
         if HIGH_SURROGATE.contains(&unit) {
@@ -33,8 +26,6 @@ impl Utf16 {
     }
 }
 
-/// `text` with every control character removed, for insertion into a shell
-/// field on one line.
 pub fn one_line(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }

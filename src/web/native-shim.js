@@ -1,7 +1,6 @@
 (function() {
     console.debug('[Media] Installing native shim...');
 
-    // Fullscreen state tracking via HTML5 Fullscreen API
     window._isFullscreen = false;
 
     document.addEventListener('fullscreenchange', () => {
@@ -9,7 +8,6 @@
         if (window._isFullscreen === fullscreen) return;
         window._isFullscreen = fullscreen;
         console.log('[Media] Fullscreen changed:', fullscreen);
-        // Notify player so UI updates (jellyfin-web listens for this)
         const player = window._mpvVideoPlayerInstance;
         if (player && player.events) {
             player.events.trigger(player, 'fullscreenchange');
@@ -22,13 +20,9 @@
         }
     });
 
-    // Double-click on video area toggles fullscreen.
-    // Detected in JS because Wayland doesn't provide click count natively.
     (function() {
         let lastTime = 0, lastX = 0, lastY = 0;
         document.addEventListener('mousedown', (e) => {
-            // left button only and only if clicked on main content (not header,
-            // or controls)
             if (e.button !== 0 || !e.target.classList.contains("mainAnimatedPage")) return;
             const now = Date.now();
             const dx = e.clientX - lastX;
@@ -43,16 +37,14 @@
                 lastX = e.clientX;
                 lastY = e.clientY;
             }
-        }, true);  // capture phase — before jellyfin-web can stopPropagation
+        }, true);  
     })();
 
-    // Buffered ranges storage (updated by native code)
     window._bufferedRanges = [];
     window._nativeUpdateBufferedRanges = function(ranges) {
         window._bufferedRanges = ranges || [];
     };
 
-    // Signal emulation (Qt-style connect/disconnect)
     function createSignal(name) {
         const callbacks = [];
         const signal = function(...args) {
@@ -72,10 +64,8 @@
         return signal;
     }
 
-    // Saved settings from native (injected as placeholder, replaced at load time)
     const _savedSettings = JSON.parse('__SETTINGS_JSON__');
 
-    // window.jmpInfo - settings and device info
     window.jmpInfo = {
         version: '__APP_VERSION__',
         deviceName: _savedSettings.deviceName || _savedSettings.deviceNameDefault,
@@ -142,7 +132,6 @@
         settingsDescriptionsUpdate: []
     };
 
-    // macOS-only: transparent titlebar toggle (shown first in Advanced section)
     if (navigator.platform.startsWith('Mac')) {
         jmpInfo.settingsDescriptions.advanced.unshift({
             key: 'transparentTitlebar',
@@ -169,7 +158,6 @@
         });
     }
 
-    // Player state
     const playerState = {
         position: 0,
         duration: 0,
@@ -178,10 +166,8 @@
         paused: false
     };
 
-    // window.api.player - MPV control API
     window.api = {
         player: {
-            // Signals (Qt-style)
             playing: createSignal('playing'),
             paused: createSignal('paused'),
             finished: createSignal('finished'),
@@ -198,11 +184,9 @@
             onVideoRecangleChanged: createSignal('onVideoRecangleChanged'),
             onMetaData: createSignal('onMetaData'),
 
-            // Methods
             load(url, options, streamdata, videoStream, audioStream, subtitleStream, externalAudioUrl, externalSubUrl, callback) {
                 console.debug('[Media] player.load:', url);
                 if (callback) {
-                    // Wait for playing signal before calling callback
                     const onPlaying = () => {
                         this.playing.disconnect(onPlaying);
                         this.error.disconnect(onError);
@@ -282,7 +266,6 @@
                 if (window.jmpNative) window.jmpNative.playerSetAspectMode(mode);
             },
             setVideoRectangle(x, y, w, h) {
-                // No-op for now, we always render fullscreen
             },
             getPosition(callback) {
                 if (callback) callback(playerState.position);
@@ -322,7 +305,6 @@
             groupUpdate: createSignal('groupUpdate')
         },
         input: {
-            // Signals for media session control commands
             hostInput: createSignal('hostInput'),
             positionSeek: createSignal('positionSeek'),
             rateChanged: createSignal('rateChanged'),
@@ -332,7 +314,6 @@
         }
     };
 
-    // Expose signal emitter for native code
     window._nativeEmit = function(signal, ...args) {
         console.debug('[Media] _nativeEmit called with signal:', signal, 'args:', args);
         if (window.api && window.api.player && window.api.player[signal]) {
@@ -357,7 +338,6 @@
         playerState.duration = ms;
         window.api.player.updateDuration(ms);
     };
-    // Native emitters for media session control commands
     window._nativeHostInput = function(actions) {
         console.debug('[Media] _nativeHostInput:', actions);
         window.api.input.hostInput(actions);
@@ -371,7 +351,6 @@
         window.api.input.positionSeek(positionMs);
     };
 
-    // window.NativeShell - app info and plugins
     const plugins = ['mpvVideoPlayer', 'mpvAudioPlayer', 'inputPlugin'];
     for (const plugin of plugins) {
         window[plugin] = () => window['_' + plugin];
@@ -392,9 +371,6 @@
         }
     };
 
-    // Device profile for direct play. Built in C++ at startup from mpv's
-    // actual decoder/demuxer/protocol support and injected here as a JSON
-    // literal (JSON is a subset of JS object syntax, so no parse needed).
     const _deviceProfile = __DEVICE_PROFILE_JSON__;
     function getDeviceProfile() {
         return _deviceProfile;
@@ -431,8 +407,6 @@
     window.initCompleted = Promise.resolve();
     window.apiPromise = Promise.resolve(window.api);
 
-    // Observe <meta name="theme-color"> for titlebar color sync.
-    // jellyfin-web's themeManager.js updates this tag when the user switches themes.
     function sendThemeColor(color) {
         if (color && window.jmpNative && window.jmpNative.themeColor) {
             window.jmpNative.themeColor(color);
@@ -446,34 +420,24 @@
     }
 
     document.addEventListener('DOMContentLoaded', () => {
-        // Inject CSS to hide cursor when jellyfin-web signals mouse idle.
-        // jellyfin-web adds 'mouseIdle' to body after inactivity during video playback.
-        // This CSS makes CEF report CT_NONE so the native side can hide the OS cursor.
         const style = document.createElement('style');
         let css = 'body.mouseIdle, body.mouseIdle * { cursor: none !important; }';
         css += '\n@keyframes mpv-video-zoomin { from { transform: scale3d(0.2, 0.2, 0.2); opacity: 0.6; } to { transform: none; opacity: initial; } }';
 
-        // Hide scrollbars app-wide (scroll still works via wheel/trackpad/keys).
         if (jmpInfo.settings.advanced.hideScrollbar) {
             css += '\n::-webkit-scrollbar, *::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }';
             css += '\nhtml { scrollbar-width: none !important; }';
         }
 
-        // macOS: offset UI elements so traffic lights don't overlap content
         if (navigator.platform.startsWith('Mac') && jmpInfo.settings.advanced.transparentTitlebar) {
             css += '\n:root { --mac-titlebar-height: 22px; }';
             css += '\n.skinHeader { padding-top: var(--mac-titlebar-height) !important; }';
             css += '\n.mainAnimatedPage { top: var(--mac-titlebar-height) !important; }';
             css += '\n.touch-menu-la { padding-top: var(--mac-titlebar-height); }';
-            // Dashboard uses MUI AppBar + Drawer instead of .skinHeader
             css += '\n.MuiAppBar-positionFixed { padding-top: var(--mac-titlebar-height) !important; }';
             css += '\n.MuiDrawer-paper { padding-top: var(--mac-titlebar-height) !important; }';
-            // Dialog headers (e.g. client settings modal)
             css += '\n.formDialogHeader { padding-top: var(--mac-titlebar-height) !important; }';
 
-            // Hide/show traffic lights with the video OSD.
-            // jellyfin-web uses an internal Events.trigger() system (obj._callbacks),
-            // not DOM events. Register directly on that callback structure.
             document._callbacks = document._callbacks || {};
             document._callbacks['SHOW_VIDEO_OSD'] = document._callbacks['SHOW_VIDEO_OSD'] || [];
             document._callbacks['SHOW_VIDEO_OSD'].push((_e, visible) => {
@@ -486,12 +450,10 @@
         style.textContent = css;
         document.head.appendChild(style);
 
-        // Sync titlebar color with theme-color meta tag
         const meta = document.querySelector('meta[name="theme-color"]');
         if (meta) {
             observeThemeColorMeta(meta);
         } else {
-            // Tag may be added dynamically — watch for it
             new MutationObserver((mutations, obs) => {
                 for (const m of mutations) {
                     for (const node of m.addedNodes) {

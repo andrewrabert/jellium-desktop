@@ -1,36 +1,19 @@
-//! Composition root for the `Platform` backend: the only place that
-//! decides which backend a build installs, and when.
-//!
-//! Windows and macOS have exactly one backend, known at compile time;
-//! Linux picks Wayland or X11 at runtime. That difference also dictates
-//! ordering — see the two install functions.
-
 #[cfg(target_os = "linux")]
 use jfn_platform_abi::{DisplayBackend, Platform};
 
-/// Install the backend on OSes with a single compile-time backend
-/// (Windows, macOS). Must run before CEF subprocess dispatch: CEF subprocesses
-/// bail out of the browser-process flow but may still query the
-/// platform. No-op on Linux ([`install_from_cli`] runs there instead).
 pub fn install_early() {
     #[cfg(target_os = "windows")]
     {
         jfn_platform_abi::install(jfn_windows::make_windows_platform());
-        // SAFETY: installation is process-owner wiring before runtime acquisition.
         unsafe { jfn_platform_abi::get() }.early_init();
     }
     #[cfg(target_os = "macos")]
     {
         jfn_platform_abi::install(jfn_macos::make_macos_platform());
-        // SAFETY: installation is process-owner wiring before runtime acquisition.
         unsafe { jfn_platform_abi::get() }.early_init();
     }
 }
 
-/// Install the backend on Linux, where Wayland vs X11 is chosen at
-/// runtime from `--platform` / session env. Runs after logging init so
-/// the backend choice is logged. No-op on OSes whose backend
-/// [`install_early`] already installed.
 pub fn install_from_cli(cli: &crate::cli::Cli) {
     #[cfg(target_os = "linux")]
     {
@@ -69,7 +52,6 @@ pub fn install_from_cli(cli: &crate::cli::Cli) {
             _ => unreachable!(),
         };
         jfn_platform_abi::install(p);
-        // SAFETY: installation is process-owner wiring before runtime acquisition.
         unsafe { jfn_platform_abi::get() }.early_init();
         tracing::info!(target: "Main", "Display backend: {}",
             if backend == DisplayBackend::Wayland { "wayland" } else { "x11" });

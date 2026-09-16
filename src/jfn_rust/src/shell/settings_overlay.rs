@@ -1,5 +1,3 @@
-//! Persistent tabbed Settings/About overlay.
-
 use iced_core::widget::Id;
 use iced_core::widget::operation::scrollable::AbsoluteOffset;
 use iced_core::{Alignment, Color, Element, Length, Padding};

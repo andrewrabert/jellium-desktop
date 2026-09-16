@@ -1,5 +1,3 @@
-//! X11 input thread.
-
 use std::ffi::c_int;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -79,8 +77,6 @@ impl Handle {
         if let Some(ev) = x11_shutdown_waker() {
             ev.signal();
         }
-        // The input thread is the producer for both channels, so it must be
-        // gone before either sender drops — otherwise a queued event is lost.
         if let Some(j) = self.join.take()
             && let Err(e) = j.join()
         {
@@ -256,8 +252,6 @@ fn cef_modifiers(st: &State) -> u32 {
     st.modifiers | st.mouse_button_modifiers
 }
 
-/// The pointer position in the space the window's logical size names; the
-/// identity before the geometry thread has published an extent.
 fn view_point(x: i32, y: i32) -> jfn_platform_abi::LogicalPoint {
     let extent = crate::x11_state::parent_snapshot().and_then(|s| {
         crate::scale::extent(
@@ -296,7 +290,7 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
         return;
     }
 
-    let native = (kc_raw as i32) - 8; // X keycode → linux input code
+    let native = (kc_raw as i32) - 8;
     let _ = st.dispatch.send(QueuedInputEvent::KeyRaw {
         sym,
         native: native as u32,
@@ -380,7 +374,6 @@ fn handle_button(st: &mut State, detail: u8, event_x: i16, event_y: i16, pressed
         st.mouse_button_modifiers &= !flag;
     }
 
-    // Browser bridge expects linux/input-event-codes.h button codes.
     let code: u32 = match button {
         1 => buttons::BTN_LEFT,
         2 => buttons::BTN_MIDDLE,
@@ -468,8 +461,6 @@ fn handle_xkb_state_notify(st: &mut State, ev: &xcb::xkb::StateNotifyEvent) {
 struct CursorState {
     conn: Arc<RustConnection>,
     window: u32,
-    // Never freed: `load_cursor` caches by name and hands back the same id, so
-    // freeing leaves a dangling id the next lookup would re-hand out.
     cache: std::collections::HashMap<CursorShape, u32>,
     cursor_handle: Option<X11rbCursorHandle>,
 }
@@ -482,8 +473,6 @@ fn live_overlay_windows() -> Vec<u32> {
 
 fn apply_cursor(st: &mut CursorState, shape: CursorShape) {
     let conn = &st.conn;
-    // Pointer sits over the grabbed overlay windows, so the cursor must be set on
-    // them, not the mpv window beneath.
     let windows = live_overlay_windows();
     if windows.is_empty() {
         return;
@@ -529,9 +518,6 @@ fn apply_cursor(st: &mut CursorState, shape: CursorShape) {
     let _ = conn.flush();
 }
 
-/// Per-process X11 shutdown waker. Allocated on first use and registered
-/// with the shutdown fan-out so the input loop can wait on its fd alongside
-/// xcb. The geometry loop waits on the same fd.
 pub(crate) fn x11_shutdown_waker() -> Option<&'static WakeEvent> {
     use std::sync::OnceLock;
     static EV: OnceLock<Option<&'static WakeEvent>> = OnceLock::new();
@@ -547,9 +533,6 @@ fn input_thread_body(mut st: State) {
         eprintln!("[x11] xkb setup failed; key input disabled");
     }
 
-    // No STRUCTURE_NOTIFY here: window structure (geometry/map state) is watched
-    // on a separate connection by the geometry thread. Select these events on
-    // the same xcb connection this thread polls; event masks are per-client.
     let mask = x::EventMask::KEY_PRESS
         | x::EventMask::KEY_RELEASE
         | x::EventMask::BUTTON_PRESS
@@ -585,8 +568,6 @@ fn input_thread_body(mut st: State) {
     }
 
     if let Some(ev) = x11_shutdown_waker() {
-        // `Drain::Never`: the geometry loop waits on the same eventfd, and
-        // level-triggered-undrained is what lets both threads see one signal.
         let res = handle.insert_source(WakeSource::new(ev.fd(), Drain::Never), move |(), (), _| {
             signal.stop();
         });
@@ -713,9 +694,6 @@ fn input_dispatch_thread_body(events: Channel<QueuedInputEvent>) {
     }
 }
 
-/// A focus change the window itself took or lost. A `NotifyGrab` or
-/// `NotifyUngrab` mode is the menu's keyboard grab and changes nothing, and so
-/// is a `NotifyPointer`, `NotifyPointerRoot` or `NotifyInferior` detail.
 fn handle_focus(st: &State, mode: x::NotifyMode, detail: x::NotifyDetail, gained: bool) {
     if matches!(mode, x::NotifyMode::Grab | x::NotifyMode::Ungrab) {
         return;
@@ -846,12 +824,6 @@ pub fn start(screen_num: i32, parent: u32) -> Option<Handle> {
     })
 }
 
-/// Capture pointer input directly on a WM-managed overlay.
-///
-/// Buttons go through a *passive grab* (`GrabButton`), not event selection,
-/// because only one client may select `ButtonPress` on a window and the WM may
-/// already hold it — a grab is independent of selection and cannot conflict.
-/// Must use the same xcb connection the input thread polls.
 pub fn grab_overlay_input(window: u32) {
     let Some(conn) = crate::x11_state::xcb_conn() else {
         return;

@@ -121,8 +121,6 @@ fn stale_socket_is_reclaimed() {
         .unwrap()
         .path()
         .to_path_buf();
-    // Only a bound-then-dropped socket yields ECONNREFUSED on connect; a plain
-    // file gives ENOTSOCK and never reaches the stale path.
     let dead = std::os::unix::net::UnixListener::bind(&path).unwrap();
     drop(dead);
     assert!(path.exists());

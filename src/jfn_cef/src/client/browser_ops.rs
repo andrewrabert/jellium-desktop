@@ -46,8 +46,6 @@ impl Inner {
         }
     }
 
-    /// Dead on platforms whose `CefHost` doesn't enable external
-    /// BeginFrame — callers gate on it.
     pub(crate) fn send_external_begin_frame(&self) {
         if let Some(h) = self.host() {
             h.send_external_begin_frame();
@@ -97,7 +95,6 @@ impl Inner {
             .is_some_and(|p| p.cef_host().is_some_and(|h| h.external_begin_frame()));
         wi.external_begin_frame_enabled = if external_bf { 1 } else { 0 };
 
-        // Zero is CEF's own default.
         let fr = self.frame_rate.load().map_or(0, FrameRate::get);
         let bs = BrowserSettings {
             background_color: 0,

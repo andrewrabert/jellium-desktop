@@ -1,7 +1,3 @@
-//! Spawn `xdg-open <url>` detached. Caller ensures the URL is non-empty and
-//! doesn't start with '-'. Also used to open local paths (xdg-open handles
-//! both URLs and filesystem paths).
-
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -15,7 +11,6 @@ pub fn open(url: &str) {
 
     match child {
         Ok(mut child) => {
-            // xdg-open exits quickly after daemonizing the real handler; reap it.
             thread::spawn(move || {
                 let _ = child.wait();
             });

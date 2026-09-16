@@ -31,8 +31,6 @@ impl Inner {
         self.height.store(logical.h, Ordering::Release);
         self.scale.store(Some(size.extent.scale()));
 
-        // Wayland viewport must update on every configure (not debounced) or
-        // src/dst go stale.
         self.surface().resize(size);
 
         if !self.browser_alive() {
@@ -40,8 +38,6 @@ impl Inner {
         }
 
         let now = now_ns();
-        // A display that reports no refresh spaces nothing: the resize applies
-        // on the spot rather than wait out an interval this process invented.
         let period_ns = jfn_gpu_paint::refresh_interval()
             .map_or(0, |period| period.as_nanos().min(i64::MAX as u128) as i64);
         let last = self.last_was_resized_ns.load(Ordering::Acquire);

@@ -1,15 +1,3 @@
-//! Generate libmpv bindings (`mpv/client.h`) and configure linkage.
-//!
-//! Header source order:
-//!   1. `JFN_MPV_INCLUDE_DIR` env override (set by xtask during in-tree build).
-//!   2. `EXTERNAL_MPV_DIR` env override.
-//!   3. pkg-config `mpv` (system install / `/opt/jellium-desktop/libmpv`).
-//!   4. Vendored `third_party/mpv/include`.
-//!
-//! Linkage: `JFN_MPV_LIB_DIR` (in-tree meson build dir) or `EXTERNAL_MPV_DIR/lib`
-//! emit a `rustc-link-search`; otherwise pkg-config supplies it.
-//! `cargo:rustc-link-lib=mpv` always emitted.
-
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
@@ -34,16 +22,8 @@ fn main() -> BuildResult<()> {
         .allowlist_function("mpv_.*")
         .allowlist_type("mpv_.*")
         .allowlist_var("MPV_.*")
-        // bindgen 0.71 emits these as opaque `_address: u8` stubs because
-        // they're first referenced via forward struct tags inside `mpv_node`
-        // before their full typedef appears. Block the broken output and
-        // hand-write correct definitions in `sys.rs`.
         .blocklist_type("mpv_node_list")
         .blocklist_type("mpv_byte_array")
-        // newtype_enum: emits `pub struct mpv_foo(pub i32)` with associated
-        // constants. Lets us access discriminants via `.0`, treat the enum
-        // as a non-exhaustive set, and round-trip values from mpv that
-        // don't match a known variant.
         .newtype_enum("mpv_event_id")
         .newtype_enum("mpv_format")
         .newtype_enum("mpv_log_level")
@@ -51,9 +31,6 @@ fn main() -> BuildResult<()> {
         .newtype_enum("mpv_end_file_reason")
         .derive_debug(true)
         .layout_tests(false)
-        // mpv's client.h embeds C example code in doc comments. Carrying
-        // those through as Rust doc comments breaks `cargo test` doctests,
-        // so strip comments from the generated bindings.
         .generate_comments(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
 
@@ -70,15 +47,6 @@ fn main() -> BuildResult<()> {
     Ok(())
 }
 
-/// Narrow libavcodec bindings: only the four symbols `capabilities`
-/// needs (`av_codec_iterate`, `av_codec_is_decoder`, `avcodec_get_name`)
-/// plus the `AVCodec` / `AVCodecID` / `AVMediaType` types they reference.
-///
-/// Header source order:
-///   1. `EXTERNAL_AVCODEC_DIR` env override.
-///   2. `EXTERNAL_MPV_DIR` env override (Windows ships ffmpeg headers
-///      under the same prefix — see `dev/windows/build_mpv_source.ps1`).
-///   3. pkg-config `libavcodec`.
 fn generate_avcodec_bindings() -> BuildResult<()> {
     println!("cargo:rerun-if-env-changed=EXTERNAL_AVCODEC_DIR");
 
@@ -92,9 +60,6 @@ fn generate_avcodec_bindings() -> BuildResult<()> {
         println!("cargo:rustc-link-search=native={}", libdir.display());
         println!("cargo:rustc-link-lib=avcodec");
     } else if let Ok(dir) = env::var("EXTERNAL_MPV_DIR") {
-        // Windows ps1 copies libavcodec/libavutil headers next to mpv
-        // headers and emits an avcodec.lib import library alongside
-        // mpv.lib. Detect that layout and reuse it.
         let root = PathBuf::from(&dir);
         let candidate = root.join("include").join("libavcodec").join("avcodec.h");
         if candidate.exists() {
@@ -182,7 +147,6 @@ fn resolve_paths() -> BuildResult<(Vec<PathBuf>, bool)> {
         linked = true;
     }
 
-    // Vendored fallback (header-only — does not configure linkage).
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let vendored = manifest.join("../../third_party/mpv/include");
     if vendored.exists() {

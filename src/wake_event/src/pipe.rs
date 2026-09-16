@@ -32,8 +32,6 @@ impl WakeEvent {
         crate::drain_raw_fd(self.read_fd.as_raw_fd());
     }
 
-    /// Block until signaled. Level-triggered, so a `signal()` that lands
-    /// before the call returns immediately.
     pub fn wait(&self) {
         crate::fd_wait::wait(self.read_fd.as_raw_fd());
     }

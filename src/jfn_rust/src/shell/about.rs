@@ -1,5 +1,3 @@
-//! The about panel, ported from the former `web/about.js`.
-
 use std::path::{Path, PathBuf};
 
 use iced_core::text::{IntoFragment, Wrapping};
@@ -26,8 +24,6 @@ pub struct About {
 }
 
 impl About {
-    /// Rows: app version, CEF version, config directory, current log file.
-    /// The two path rows are absolute and clickable.
     pub fn new(metadata: crate::shell::metadata::ApplicationMetadata) -> About {
         About { metadata }
     }
@@ -85,7 +81,6 @@ impl About {
         metadata_row(wrapped(label).class(Some(theme::MUTED)), value)
     }
 
-    /// Opens the row's path through `Platform::open_path`.
     pub fn open(&self, path: &Path) {
         if let Some(lease) = jfn_platform_abi::try_lease() {
             lease.platform().open_path(path);
@@ -116,9 +111,6 @@ fn metadata_row<'a, Message: 'a, Renderer: iced_core::Renderer + 'a>(
     .into()
 }
 
-/// Panel text that wraps on a word where it can and inside a token where it
-/// cannot: a path is one unbreakable word, and word wrapping alone paints it
-/// past the width its column was given.
 fn wrapped<'a>(content: impl IntoFragment<'a>) -> Text<'a, Theme, iced_wgpu::Renderer> {
     text(content).wrapping(Wrapping::WordOrGlyph)
 }

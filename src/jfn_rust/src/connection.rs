@@ -1,4 +1,3 @@
-//! App connection state, owned and updated by the shell actor.
 use jfn_cef::Navigation;
 use std::time::{Duration, Instant};
 pub(crate) const SPINNER_FLOOR: Duration = Duration::from_secs(1);
@@ -6,71 +5,48 @@ pub(crate) const FADE: Duration = Duration::from_millis(500);
 #[derive(Clone, Debug)]
 enum Request {
     CancelProbe,
-    /// Resolve `url` to a canonical base URL and confirm a Jellyfin server
-    /// answers there, citing `cycle` in the answer.
-    Probe {
-        cycle: u64,
-        url: String,
-    },
-    /// Load `url` in the web overlay as `navigation`, and stamp every frame
-    /// produced afterwards with it.
-    Navigate {
-        navigation: Navigation,
-        url: String,
-    },
-    /// Drop `navigation`: the web overlay stops stamping frames with it and
-    /// replaces the document it loaded with a blank one.
-    Abandon {
-        navigation: Navigation,
-    },
+    Probe { cycle: u64, url: String },
+    Navigate { navigation: Navigation, url: String },
+    Abandon { navigation: Navigation },
 }
 
 #[derive(Clone, Debug)]
 pub enum Screen {
-    /// The form, seeded with the URL connection knows.
     Form { url: String },
-    /// The logo and spinner, up since `since`.
     Working { since: Instant },
-    /// The failure view.
     Failed,
-    /// The witness arrived; the screen fades from `fade_from`.
     Retiring { fade_from: Instant },
-    /// The connection screen is no longer needed.
     Gone,
 }
 
-/// Connection phases and the data required by each phase.
 enum Phase {
-    /// No probe in flight; the form shows `url`.
-    Editing { url: String },
-    /// Probe `cycle` is resolving `url`. `unresolved` holds a failure the
-    /// spinner floor has not yet let show.
+    Editing {
+        url: String,
+    },
     Probing {
         url: String,
         cycle: u64,
         since: Instant,
         unresolved: bool,
     },
-    /// `navigation` is loading and no frame produced after it has been
-    /// presented.
     Loading {
         base: String,
         navigation: Navigation,
         since: Instant,
     },
-    /// The probe or the navigation failed; `url` is what the form returns to.
-    Failed { url: String },
-    /// The witness arrived; the connect screen is fading out.
+    Failed {
+        url: String,
+    },
     Retiring {
         navigation: Navigation,
         fade_from: Instant,
     },
-    /// jellyfin-web owns the screen.
-    Connected { navigation: Navigation },
+    Connected {
+        navigation: Navigation,
+    },
 }
 
 impl Phase {
-    /// The navigation this state names; `None` where it names none.
     fn navigation(&self) -> Option<Navigation> {
         match self {
             Phase::Loading { navigation, .. }
@@ -138,9 +114,7 @@ impl Connection {
         }
     }
 
-    /// Cancel work belonging to the old phase before starting the next one.
     fn enter(&mut self, next: Phase) {
-        // Invalidate results already queued by the canceled probe.
         if matches!(self.phase, Phase::Probing { .. }) {
             self.cycles += 1;
             self.requests.push(Request::CancelProbe);
@@ -153,8 +127,6 @@ impl Connection {
         self.phase = next;
     }
 
-    /// Starts a probe of the URL connection holds. An empty URL leaves the form
-    /// where it is: there is nothing to resolve.
     pub(crate) fn connect(&mut self) {
         let url = match &self.phase {
             Phase::Editing { url } => url.clone(),
@@ -178,8 +150,6 @@ impl Connection {
         self.requests.push(Request::Probe { cycle, url });
     }
 
-    /// The resolved base URL is saved before the navigation is issued: the URL
-    /// the next boot probes is the one this one reached.
     fn navigate(&mut self, base: String) {
         jfn_config::set_server_url(&base);
         jfn_config::settings_save_async();
@@ -201,8 +171,6 @@ impl Connection {
     }
 
     pub(crate) fn edit_url(&mut self, url: String) {
-        // A navigation has begun; editing the field starts a fresh
-        // connection rather than editing the one that is serving.
         let editing = matches!(
             self.phase,
             Phase::Editing { .. }

@@ -1,5 +1,3 @@
-//! X11 platform subsystem: surface management, input thread, Platform impl.
-
 #![cfg(target_os = "linux")]
 
 pub(crate) mod conn_source;

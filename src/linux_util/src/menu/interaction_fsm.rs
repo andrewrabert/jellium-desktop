@@ -35,7 +35,6 @@ pub enum MenuEffect {
     Close(i32),
 }
 
-/// Without a layout only `Dismiss`, Escape and Tab have an effect.
 pub fn step(
     s: &mut MenuState,
     ev: &MenuEvent,
@@ -63,8 +62,6 @@ pub fn step(
             if !layout.contains(x, y) {
                 return vec![MenuEffect::Close(-1)];
             }
-            // In-bounds press on a separator/disabled row or the padding band is
-            // ignored, not a dismiss.
             match layout.row_at(x, y).and_then(|idx| items.get(idx)) {
                 Some(item) => vec![MenuEffect::Close(item.id)],
                 None => vec![],
@@ -93,8 +90,6 @@ pub fn step(
     }
 }
 
-/// The id of `active` when it names an item that exists, is enabled and is not
-/// a separator.
 fn selectable(items: &[MenuItem], active: i32) -> Option<i32> {
     usize::try_from(active)
         .ok()

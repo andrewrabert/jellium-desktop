@@ -1,9 +1,3 @@
-//! Per-OS CEF handler-callback signature types. Each must match the native
-//! handle type CEF passes across its C ABI for that target, or the
-//! `wrap_*_handler!` expansion declares an `extern "C"` fn with the wrong
-//! signature.
-
-// macOS uses raw `*mut u8` handles and never touches `sys`.
 #[cfg(not(target_os = "macos"))]
 use cef::*;
 

@@ -21,7 +21,6 @@ fn options_as_items(options: &[String]) -> Vec<MenuItem> {
         .collect()
 }
 
-// Windows virtual-key codes CEF expects in KeyEvent::windows_key_code.
 const VK_RETURN: i32 = 0x0D;
 const VK_ESCAPE: i32 = 0x1B;
 const VK_UP: i32 = 0x26;
@@ -91,8 +90,6 @@ impl Inner {
             if !p.visible || !p.size_received || !p.options_received {
                 return;
             }
-            // Blink's popup rect (p.x/p.y) flips above the element near the
-            // window bottom; the anchor keeps the menu under the box.
             let (x, y) = p.anchor.unwrap_or((p.x, p.y));
             (
                 x,
@@ -156,14 +153,7 @@ impl Inner {
         (p.w, p.h)
     }
 
-    // CEF OSR has no "set selected index" API for <select>: the popup is a real
-    // RenderWidget that must be driven by forwarded input so Blink commits and
-    // closes it cleanly (which is what lets it reopen). We render the menu
-    // ourselves, then replay the user's pick into CEF's still-open popup —
-    // arrow-key to the chosen row + Enter to commit, or Escape to cancel.
     fn dispatch_popup_selection(&self, idx: i32, current: i32, selectable: &[i32]) {
-        // Blink already closed the popup: a replayed Escape or arrow would land
-        // on the page instead.
         if !self.popup.lock().visible {
             return;
         }
@@ -193,13 +183,9 @@ impl Inner {
             return;
         }
 
-        // Arrow stepping is in selectable-option space (Blink skips disabled
-        // rows), so map both the popup's current highlight and the target into
-        // that space and step by the difference.
         let pos = |opt: i32| selectable.iter().position(|&v| v == opt);
         let from = pos(current).unwrap_or(0) as i32;
         let Some(to) = pos(idx) else {
-            // Target isn't selectable (shouldn't happen) — just cancel cleanly.
             send_key(VK_ESCAPE);
             return;
         };

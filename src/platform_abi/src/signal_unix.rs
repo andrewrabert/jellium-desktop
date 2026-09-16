@@ -22,9 +22,6 @@ impl SignalGuard {
         }
     }
 
-    /// # Safety
-    /// `handler` must be async-signal-safe: it runs from inside a `sigaction`
-    /// handler installed on SIGINT/SIGTERM.
     #[must_use]
     pub unsafe fn install(handler: extern "C" fn(c_int)) -> Self {
         let sa = SigAction::new(
@@ -39,8 +36,6 @@ impl SignalGuard {
     }
 }
 
-// Reads a disposition the only way sigaction offers: install SIG_IGN, then put
-// the reported action straight back.
 fn snapshot(signal: Signal) -> Option<SigAction> {
     let probe = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
     let prev = unsafe { sigaction(signal, &probe) }.ok()?;

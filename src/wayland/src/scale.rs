@@ -1,8 +1,3 @@
-//! Fractional window scale in 120ths, the unit of `wp_fractional_scale_v1`
-//! (120 = 1.0). [`Scale120`] owns protocol parsing, ratio conversion, and
-//! checked dimension scaling, so a zero/negative/non-finite scale or an
-//! unrepresentable physical extent cannot leave this module.
-
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
@@ -14,17 +9,12 @@ use crate::window_state::WindowSize;
 pub(crate) struct Scale120(NonZeroU32);
 
 impl Scale120 {
-    /// wp_fractional_scale reports scale in 120ths (120 = 1.0).
     pub(crate) const BASE: u32 = 120;
 
-    /// Parse a `wp_fractional_scale_v1.preferred_scale` wire value (120ths;
-    /// zero is invalid on the wire).
     pub(crate) fn from_wire(raw: u32) -> Option<Self> {
         NonZeroU32::new(raw).map(Self)
     }
 
-    /// Exact rational physical/logical width, rounded to the nearest 120th —
-    /// no float round-trip.
     pub(crate) fn from_physical_logical(physical: u32, logical: NonZeroU32) -> Option<Self> {
         let num = u64::from(physical).checked_mul(u64::from(Self::BASE))?;
         let den = u64::from(logical.get());
@@ -32,22 +22,16 @@ impl Scale120 {
         Self::from_wire(u32::try_from(scaled).ok()?)
     }
 
-    /// The exact 120ths this carries; infallible, the wire value is non-zero.
     pub(crate) fn scale(self) -> Scale {
         Scale::from_nonzero_ratio(NonZeroU64::from(self.0), BASE_NONZERO)
     }
 }
 
-/// [`Scale120::BASE`] as the denominator [`Scale::from_nonzero_ratio`] takes.
 const BASE_NONZERO: NonZeroU64 = match NonZeroU64::new(Scale120::BASE as u64) {
     Some(d) => d,
     None => unreachable!(),
 };
 
-/// Whether this backend's unstated-scale decision has been logged.
-///
-/// Owned by the state whose absent scale it resolves, so `jfn-wayland` keeps
-/// no module-level static and nothing reaches the flag ambiently.
 pub(crate) struct UnstatedLog(bool);
 
 impl UnstatedLog {
@@ -56,19 +40,11 @@ impl UnstatedLog {
     }
 }
 
-/// 120 120ths. The one value `jfn-wayland` names for itself, spelled beside
-/// the decision it belongs to.
 const REPORTED: Scale120 = match NonZeroU32::new(Scale120::BASE) {
     Some(v) => Scale120(v),
     None => unreachable!(),
 };
 
-/// The scale Wayland reports when no compositor source has stated one.
-///
-/// The compositor states a scale through `wp_fractional_scale_v1` and, before
-/// the surface exists, through the output probe. Logged the first time `log`
-/// records the decision, whether the caller is a read that arrived before
-/// either source spoke or the bring-up that found neither ever will.
 pub(crate) fn unstated(log: &mut UnstatedLog) -> Scale120 {
     if !std::mem::replace(&mut log.0, true) {
         tracing::info!(
@@ -79,12 +55,6 @@ pub(crate) fn unstated(log: &mut UnstatedLog) -> Scale120 {
     REPORTED
 }
 
-/// The extent a compositor's own sizes and the scale it reported name.
-///
-/// The logical size is carried through verbatim.
-///
-/// `None` when the physical size and scale do not map to a logical one, or
-/// when either axis is below two pixels.
 pub(crate) fn extent(
     logical: WindowSize,
     physical: WindowSize,
@@ -163,7 +133,6 @@ mod tests {
             NonZeroU32::new(1).and_then(|l| Scale120::from_physical_logical(0, l)),
             None
         );
-        // 1 physical / 240 logical = 0.5 in 120ths → rounds up to 1.
         assert_eq!(
             NonZeroU32::new(240).and_then(|l| Scale120::from_physical_logical(1, l)),
             Scale120::from_wire(1)
@@ -202,7 +171,6 @@ mod tests {
 
     #[test]
     fn the_extent_carries_the_compositor_s_logical_size_verbatim() {
-        // 1497 / 2.5 rounds to 599; the compositor's own 598 must survive.
         let Some(scale) = Scale::from_f64(2.5) else {
             return;
         };
@@ -310,7 +278,6 @@ mod tests {
     fn scale_then_rederive_roundtrips_within_one_120th() {
         let mut next = lcg(0xB0BA);
         for _ in 0..10_000 {
-            // Realistic display range: scales 0.5..=4.0, widths ≥ 120.
             let raw = (next() % 421 + 60) as u32;
             let w = (next() % 7_500 + 120) as i32;
             let (Some(scale), Some(logical_nz)) =
@@ -325,8 +292,6 @@ mod tests {
                 continue;
             };
             let rederived = Scale120::from_physical_logical(physical_u32, logical_nz);
-            // Rounding the physical size loses at most half a pixel, which for
-            // widths ≥ 120 is at most one 120th of scale.
             assert!(
                 [raw - 1, raw, raw + 1]
                     .into_iter()

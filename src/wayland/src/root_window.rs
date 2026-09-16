@@ -53,15 +53,11 @@ use crate::wl_state::{InitError, ShmGlobal, bind_error, new_slot_pool};
 const APP_ID: &str = "net.nullsum.JelliumDesktop";
 const TITLE: &str = "Jellium Desktop";
 
-// Background behind the video/overlay, matching kBgColor (0x101010).
 const BG: [u8; 3] = [0x10, 0x10, 0x10];
 
 const DEFAULT_W: i32 = 1280;
 const DEFAULT_H: i32 = 720;
 
-/// The user's explicit decoration preference; `Auto` sends no `set_mode`, so
-/// the compositor's preferred mode (delivered in the decoration configure)
-/// decides.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u8)]
 enum DecorationRequest {
@@ -80,8 +76,6 @@ impl DecorationRequest {
     }
 }
 
-/// The root window's cross-thread surface: everything the dispatch thread
-/// shares with its requesters. The thread's own `RootState` stays on its stack.
 pub(crate) struct RootShared {
     decoration_request: Mutex<DecorationRequest>,
     effective: EffectiveState,
@@ -89,14 +83,8 @@ pub(crate) struct RootShared {
     started: AtomicBool,
     commands_tx: Sender<WindowCommand>,
     commands_rx: Receiver<WindowCommand>,
-    /// Coalesced request for one root commit; every producer that needs to
-    /// present latches it and the root thread drains it once per pass.
     pending_present: AtomicBool,
     root_surface: OnceLock<RootSurfaceHandle>,
-    /// The toplevel, parked for the life of the process. SCTK's `Window`
-    /// destroys the root `wl_surface` when its last handle drops, and the CEF
-    /// and mpv subsurfaces name that surface as their parent — so one handle
-    /// must outlive the root thread's `RootState`.
     window: OnceLock<Window>,
     thread: OnceLock<RootThread>,
 }
@@ -173,9 +161,6 @@ impl RootShared {
         }
     }
 
-    /// Queue a request for the root thread and wake it. Sending and waking are
-    /// one operation so a queued request can't sit unnoticed. The receiver is a
-    /// sibling field of the leaked runtime, so the send never fails.
     fn send(&self, cmd: WindowCommand) {
         let _ = self.commands_tx.send(cmd);
         self.wake();
@@ -227,9 +212,6 @@ impl RootShared {
     }
 }
 
-/// The decoration mode in effect. `ClientSide` until a decoration configure
-/// — or, absent the decoration protocol, an explicit server-side request —
-/// grants otherwise.
 struct EffectiveState(Mutex<EffectiveDecorations>);
 
 impl EffectiveState {
@@ -237,7 +219,6 @@ impl EffectiveState {
         *self.0.lock()
     }
 
-    /// Returns true when the stored value changed.
     fn store(&self, mode: EffectiveDecorations) -> bool {
         std::mem::replace(&mut *self.0.lock(), mode) != mode
     }
@@ -250,8 +231,6 @@ struct RootState {
     conn: Connection,
     window: Window,
     decorations_negotiated: bool,
-    // Single-owner protocol objects for window-control commands, owned by this
-    // thread. `seat` also drives interactive move/resize grabs.
     seat: Option<WlSeat>,
     #[cfg(feature = "kde-palette")]
     palette: Option<OrgKdeKwinServerDecorationPalette>,
@@ -259,7 +238,6 @@ struct RootState {
     viewport: WpViewport,
     bg_buffer: Option<SlotBuffer>,
     bg: [u8; 3],
-    // Held alive so the compositor keeps delivering preferred_scale.
     #[allow(dead_code)]
     frac_mgr: Option<WpFractionalScaleManagerV1>,
     #[allow(dead_code)]
@@ -283,8 +261,6 @@ impl RootState {
     }
 }
 
-/// Upper bound on the bring-up output probe: it round-trips on a second
-/// display connection, which a wedged compositor can stall forever.
 const SCALE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 mod floating_restore {
@@ -309,9 +285,6 @@ mod floating_restore {
 }
 use floating_restore::FloatingRestore;
 
-/// Buffer attach/commit take a [`Presented`], mintable only by [`acked`] from a
-/// [`WindowConfigure`] — so "never commit a buffer before acking a configure" is
-/// a type error rather than a review comment.
 mod present_cap {
     use super::WindowConfigure;
 
@@ -324,17 +297,11 @@ mod present_cap {
 }
 use present_cap::Presented;
 
-/// Pure presentation state machine. Given what the root window currently
-/// knows — mapped or not, pending configure or not, scale known or not, and
-/// the resolvable logical size — [`presentation::plan`] decides the next step.
-/// All Wayland I/O and cross-subsystem notifications stay in the effect layer
-/// ([`RootState::try_present`] / [`RootState::execute_present`]).
 mod presentation {
     use std::num::NonZeroI32;
 
     use crate::window_state::{WindowMode, WindowSize};
 
-    /// Everything `plan` needs, free of protocol objects so it is unit-testable.
     #[derive(Clone, Copy)]
     pub(super) struct Inputs {
         pub(super) mapped: bool,
@@ -344,16 +311,11 @@ mod presentation {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Step {
-        /// Nothing presentable: no configure yet, or no resolvable size.
         Wait,
-        /// Consume the pending configure (if any), update geometry, and request
-        /// the root commit.
         Present,
     }
 
     pub(super) fn plan(i: Inputs) -> Step {
-        // Never commit a buffer before a configure was acked (protocol
-        // violation); before the first map that means waiting for one.
         if !i.pending_configure && !i.mapped {
             return Step::Wait;
         }
@@ -396,9 +358,6 @@ impl RootState {
         )
     }
 
-    /// Effect layer around the pure [`presentation::plan`]: gathers inputs and
-    /// runs the decided step's Wayland I/O and notifications. May run inside an
-    /// event callback, so it must never block.
     fn try_present(&mut self) {
         let step = presentation::plan(presentation::Inputs {
             mapped: self.present.is_some(),
@@ -426,8 +385,6 @@ impl RootState {
         } else {
             return;
         };
-        // Never commit the root here: the loop's latch drain issues the one root
-        // commit that presents geometry with the overlay/video subtree.
         self.window.xdg_surface().set_window_geometry(0, 0, w, h);
         self.fill_background(w, h, present);
         self.current_size = Some(size);
@@ -436,8 +393,6 @@ impl RootState {
             tracing::info!(target: "Main", "root window: first configure {w}x{h} (app toplevel is live)");
         }
 
-        // Pass logical (not physical) size: mpv and the overlay apply scale
-        // themselves, so a physical size here would double-scale.
         self.rt.proxy().set_window_size(size);
         self.rt.window().publish(self.rt, size, self.mode);
 
@@ -461,8 +416,6 @@ impl RootState {
     }
 
     fn rebuild_background(&mut self, w: i32, h: i32, _present: Presented) {
-        // Build the replacement before retiring the current buffer so an
-        // allocation failure leaves a valid buffer owned rather than none.
         let Some(new) = self.create_solid_buffer() else {
             return;
         };
@@ -484,22 +437,15 @@ impl RootState {
     fn create_solid_buffer(&mut self) -> Option<SlotBuffer> {
         let bg = self.bg;
         crate::wl_state::draw_argb8888(self.shm_pool.as_mut()?, 1, 1, move |dst| {
-            // ARGB8888 little-endian byte order = [B, G, R, A].
             dst.copy_from_slice(&[bg[2], bg[1], bg[0], 0xFF]);
             true
         })
     }
 }
 
-/// Opaque handle to the app root `wl_surface`, carrying the live `wl_proxy`
-/// pointer — the only representation valid across the two wayland-client
-/// `Backend`s that share this one `wl_display` — so `wl_state` can rebuild the
-/// surface under its own `Backend` via `ObjectId::from_ptr`.
 #[derive(Copy, Clone)]
 pub(crate) struct RootSurfaceHandle(std::ptr::NonNull<c_void>);
 
-// Process-lifetime `wl_proxy` owned by the root thread; the handle only
-// republishes it for reconstruction and never destroys it.
 unsafe impl Send for RootSurfaceHandle {}
 unsafe impl Sync for RootSurfaceHandle {}
 
@@ -509,13 +455,6 @@ impl RootSurfaceHandle {
     }
 }
 
-// Window-control requests queued here and applied on the root thread by
-// `apply_command`. The toplevel/seat proxies are single-owner and live on that
-// thread, so requests cross this queue rather than caching proxy clones that
-// could be used after teardown. Move/resize carry the input serial captured at
-// request time. Mode toggles resolve against `RootState.mode` on that thread
-// — its sole mutator/reader — so a configure can't flip the mode between the
-// read and the protocol request.
 enum WindowCommand {
     Move {
         serial: u32,
@@ -527,14 +466,11 @@ enum WindowCommand {
     Fullscreen(ModeRequest),
     Maximized(ModeRequest),
     Minimize,
-    /// Applied on the root thread, which owns the surface, so the background
-    /// rebuild lands in the single owner commit.
     SetBackground([u8; 3]),
     #[cfg(feature = "kde-palette")]
     SetTitlebarPalette(String),
 }
 
-/// A requested window mode: explicit, or the opposite of the current one.
 #[derive(Copy, Clone)]
 enum ModeRequest {
     Set(bool),
@@ -557,8 +493,6 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
             if let Some(seat) = &state.seat {
                 state.window.move_(seat, serial);
             } else {
-                // Not re-queued: the serial is only valid for the input event it
-                // came from, so replaying it once a seat exists would be stale.
                 tracing::warn!(target: "Main", "interactive move dropped: no seat");
             }
         }
@@ -589,12 +523,8 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
         WindowCommand::SetBackground(bg) => {
             if bg != state.bg {
                 state.bg = bg;
-                // current_size is only set once presented, so the capability
-                // is present too; requiring it keeps the buffer attach behind
-                // an ack.
                 if let (Some(size), Some(present)) = (state.current_size, state.present) {
                     state.rebuild_background(size.w(), size.h(), present);
-                    // Apply via the single owner commit, not a standalone one.
                     state.rt.root().request_present();
                 }
             }
@@ -613,8 +543,6 @@ fn apply_command(state: &mut RootState, cmd: WindowCommand) {
 
 fn apply_fullscreen(state: &mut RootState, on: bool) {
     if on {
-        // A fullscreen-enter received while already fullscreen must not overwrite
-        // the saved restore mode, so capture it only when entering from another mode.
         if !matches!(state.mode, crate::window_state::WindowMode::Fullscreen) {
             state.pre_fs_maximized =
                 matches!(state.mode, crate::window_state::WindowMode::Maximized);
@@ -622,8 +550,6 @@ fn apply_fullscreen(state: &mut RootState, on: bool) {
         state.window.set_fullscreen(None);
     } else {
         state.window.unset_fullscreen();
-        // The compositor need not restore the pre-fullscreen maximized state, so
-        // re-request it (the final mode is still confirmed via a configure).
         if state.pre_fs_maximized {
             state.window.set_maximized();
             state.pre_fs_maximized = false;
@@ -632,22 +558,11 @@ fn apply_fullscreen(state: &mut RootState, on: bool) {
     let _ = state.conn.flush();
 }
 
-// The root `wl_surface.commit` is issued by exactly one owner — this dispatch
-// thread. Every other producer (CEF paint paths, mpv) that needs to present
-// requests it here, so geometry, overlay and video always land in one
-// uninterruptible root commit; no other thread can commit the root between a
-// geometry change and its children.
-// Teardown handle for the dispatch thread. Without it the thread sleeps in
-// calloop holding a `wl_display` read barrier; when no video ever played the
-// display is quiet, so the barrier is never released and mpv's VO-teardown
-// roundtrip hangs forever. `cleanup` signals + joins before that roundtrip.
 struct RootThread {
     stop: Arc<AtomicBool>,
     ping: calloop::ping::Ping,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
-/// Stop and join the dispatch thread, releasing its `wl_display` read barrier.
-/// Must run before mpv's VO teardown, or that roundtrip deadlocks on the barrier.
 pub(crate) fn cleanup(rt: &'static WlRuntime) {
     let Some(t) = rt.root().thread.get() else {
         return;
@@ -691,10 +606,6 @@ fn has_decoration_manager(globals: &wayland_client::globals::GlobalList) -> bool
     })
 }
 
-/// Create the app-owned toplevel and start its dispatch thread. The toplevel
-/// must exist before the VO-wait gate (which reads its size + scale), but the
-/// mpv VO display it needs only appears mid-wait — so this is idempotent and
-/// polled each tick until the display is available.
 pub(crate) fn ensure_started(rt: &'static WlRuntime) {
     if rt.root().started.load(Ordering::Acquire) {
         return;
@@ -737,9 +648,6 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
         &qh,
     );
     let surface = window.wl_surface().clone();
-    // Publish the root wl_proxy so wl_state can parent its CEF overlay under this
-    // surface: same libwayland wl_display, but a different wayland-client Backend,
-    // so it must be reconstructed there via ObjectId::from_ptr.
     if let Some(p) = std::ptr::NonNull::new(surface.id().as_ptr().cast()) {
         let _ = rt.root().root_surface.set(RootSurfaceHandle(p));
     }
@@ -771,11 +679,6 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
     window
         .xdg_surface()
         .set_window_geometry(0, 0, boot_w, boot_h);
-    // Roleless commit (no buffer attached) to elicit the first
-    // xdg_surface.configure — and, on compositors that send preferred_scale only
-    // in response to a commit, the first scale. It must not be gated on scale:
-    // xdg-shell requires this commit to obtain the configure that scale may
-    // itself depend on.
     surface.commit();
     let _ = conn.flush();
 
@@ -825,16 +728,11 @@ pub(crate) fn ensure_started(rt: &'static WlRuntime) {
     spawn_root_thread(rt, conn, queue, state, stop, ping, stop_source);
 }
 
-/// The fractional-scale objects for the root surface, when the compositor
-/// offers the protocol.
 struct FractionalScale {
     manager: Option<WpFractionalScaleManagerV1>,
     scale: Option<WpFractionalScaleV1>,
 }
 
-/// Binds fractional scale for `surface` and seeds the window's scale from the
-/// first output that states one. Without a stated scale the window waits for
-/// `preferred_scale`, or, where nothing can send one, resolves it itself.
 fn bind_fractional_scale(
     rt: &'static WlRuntime,
     globals: &wayland_client::globals::GlobalList,
@@ -869,9 +767,6 @@ fn bind_fractional_scale(
     FractionalScale { manager, scale }
 }
 
-/// Whether the decoration protocol will negotiate the mode. Without it a
-/// server-side request is honored blind — no titlebar is drawn — and anything
-/// else stays client-side.
 fn negotiate_decorations(
     rt: &'static WlRuntime,
     globals: &wayland_client::globals::GlobalList,
@@ -917,13 +812,8 @@ fn spawn_root_thread(
     }
 }
 
-// Apply queued window-control requests. Runs on the root thread each
-// iteration before it blocks, so a request enqueued before the wake fd could
-// ring is still serviced without waiting for another event.
 fn service_root_requests(state: &mut RootState) -> bool {
     let mut applied = false;
-    // Drained without a lock, so a command queued by an applied command's own
-    // effects is serviced in this same pass.
     let root: &'static RootShared = state.rt.root();
     for cmd in root.commands_rx.try_iter() {
         applied = true;
@@ -933,23 +823,10 @@ fn service_root_requests(state: &mut RootState) -> bool {
 }
 
 impl RootState {
-    /// Everything that must happen before the loop sleeps, repeated until it
-    /// stops making progress: a step's effects (a fed scale raising the present
-    /// latch, a command queued by a popup callback) are themselves work for the
-    /// steps around it, so one pass can leave the state unsettled.
     fn settle(&mut self) {
         loop {
             let mut progressed = false;
-            // Service queued control work before the sleep, not only after a
-            // wake: the ping is a no-op until RootThread is published, so a
-            // request stored during that startup window rings no fd and would
-            // otherwise sleep here until an unrelated compositor event arrives.
             progressed |= service_root_requests(self);
-            // Drain the latch before the sleep: an event handler (configure,
-            // scale) that raised it during dispatch must commit now, or the loop
-            // sleeps with the compositor still awaiting our commit. Gate on the
-            // present capability so a pre-configure request stays latched, not
-            // lost — swapping the latch only once we can present.
             if let Some(present) = self.present
                 && self
                     .rt
@@ -968,10 +845,6 @@ impl RootState {
     }
 }
 
-// The root queue is driven by calloop: `WaylandSource` owns the prepare_read /
-// poll / read dance, which must coordinate with the other readers on the shared
-// fd (a blocking dispatch here would deadlock them). A stop ping ends the loop
-// so the `wl_display` read barrier is released at shutdown.
 fn root_loop(
     conn: Connection,
     queue: EventQueue<RootState>,
@@ -1001,10 +874,6 @@ fn root_loop(
         WaylandSource::new(conn, queue),
         |_, queue, state: &mut RootState| {
             let dispatched = queue.dispatch_pending(state)?;
-            // This thread is the sole reader of the shared display; the read
-            // that woke us distributed events to every queue on it. Pump the CEF
-            // overlay queue so its `wl_buffer.release` events are processed and
-            // retired buffers get destroyed.
             crate::wl_state::pump_events(state.rt);
             Ok(dispatched)
         },
@@ -1014,22 +883,14 @@ fn root_loop(
         state.rt.callbacks().close();
         return;
     }
-    // `run` calls its callback only after a dispatch, so settle once here or
-    // work queued before the loop started would wait for the first event.
     state.settle();
     if let Err(e) = event_loop.run(None, &mut state, RootState::settle) {
         tracing::error!(target: "Main", "root window: event loop: {e}");
     }
-    // This loop is the only dispatcher of compositor acknowledgements; once it
-    // is gone none can ever resolve, so every waiter is released here.
     state.rt.callbacks().close();
-    // Do not drain the bg's release here: this thread shares the wl_display fd
-    // with the other readers, so a blocking roundtrip would deadlock them.
     state.bg_buffer = None;
 }
 
-/// Scaling is owned by `wp_fractional_scale_v1`, which SCTK does not implement,
-/// so every compositor callback here is deliberately inert.
 impl CompositorHandler for RootState {
     fn scale_factor_changed(
         &mut self,
@@ -1072,7 +933,6 @@ impl CompositorHandler for RootState {
 
 impl RootState {
     fn report_output_refresh(&self, output: &WlOutput) {
-        // `wl_output`'s mode refresh is in mHz.
         if let Some(refresh) = self
             .output_state
             .info(output)
@@ -1108,8 +968,6 @@ impl WindowHandler for RootState {
         jfn_playback::shutdown::jfn_shutdown_initiate();
     }
 
-    /// SCTK has already acked the serial and coalesced the toplevel size,
-    /// states, and decoration mode into `configure`.
     fn configure(
         &mut self,
         _: &Connection,
@@ -1127,8 +985,6 @@ impl WindowHandler for RootState {
         } else if configure.is_maximized() {
             crate::window_state::WindowMode::Maximized
         } else if configure.state.intersects(WindowState::TILED) {
-            // Any single tiled edge means compositor-tiled; `is_tiled` demands
-            // all four.
             crate::window_state::WindowMode::Tiled
         } else {
             crate::window_state::WindowMode::Floating
@@ -1140,8 +996,6 @@ impl WindowHandler for RootState {
             crate::window_state::feed_suspended(suspended);
         }
 
-        // Absent the decoration protocol SCTK reports its client-side default,
-        // which would overwrite the boot-time decision.
         if self.decorations_negotiated {
             let effective = match configure.decoration_mode {
                 sctk_window::DecorationMode::Client => EffectiveDecorations::ClientSide,
@@ -1176,8 +1030,6 @@ impl Dispatch<WpFractionalScaleV1, ()> for RootState {
                 return;
             };
             state.rt.window().report_scale(scale);
-            // Scale arrives without a configure (output change, or the first
-            // scale completing a withheld configure), so drive a present here too.
             state.try_present();
         }
     }
@@ -1305,7 +1157,6 @@ mod tests {
         p.hold(place(1));
         assert_eq!(p.on_map(), Some(place(1)));
         assert_eq!(p.on_map(), None);
-        // The consumed hold is now what the compositor holds.
         assert_eq!(p.send(place(1)), None);
     }
 
@@ -1319,7 +1170,6 @@ mod tests {
 
     #[test]
     fn no_configure_and_unmapped_waits() {
-        // Whatever else is known, nothing may happen before the first configure.
         for size in [false, true] {
             assert_eq!(plan(inputs(false, false, size)), Step::Wait);
         }
@@ -1335,7 +1185,6 @@ mod tests {
     fn presents_once_configured_and_sized() {
         assert_eq!(plan(inputs(false, true, true)), Step::Present);
         assert_eq!(plan(inputs(true, true, true)), Step::Present);
-        // Re-present without a new configure (size change after map).
         assert_eq!(plan(inputs(true, false, true)), Step::Present);
     }
 
@@ -1363,8 +1212,6 @@ mod tests {
 
     #[test]
     fn tiled_defers_like_maximized_not_floating() {
-        // Tiled is compositor-dictated: without a compositor size it must defer,
-        // not fall back to the saved floating size.
         assert_eq!(
             resolve_logical_size(NONE, None, size(1280, 720), WindowMode::Tiled),
             None

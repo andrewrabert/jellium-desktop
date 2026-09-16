@@ -1,13 +1,9 @@
-//! Runtime version of the libcef loaded into this process.
-
 use std::ffi::CStr;
 use std::fmt;
 use std::os::raw::c_int;
 
 use serde::{Serialize, Serializer};
 
-// Entries (from CEF's cef_version.h): 0-2 CEF major/minor/patch,
-// 3 commit number, 4-7 Chromium major/minor/build/patch.
 unsafe extern "C" {
     fn cef_version_info(entry: c_int) -> c_int;
 }
@@ -16,7 +12,6 @@ unsafe extern "C" {
 pub struct ShortHash([u8; 7]);
 
 impl ShortHash {
-    /// Extract seven hexadecimal ASCII characters; any suffix is intentionally ignored.
     pub fn from_prefix(full: &str) -> Option<Self> {
         let bytes = full.as_bytes().get(..7)?;
         if !bytes.iter().all(u8::is_ascii_hexdigit) {
@@ -65,7 +60,6 @@ impl fmt::Display for CefVersion {
     }
 }
 
-/// Serializes as the [`Display`](fmt::Display) form.
 impl Serialize for CefVersion {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
@@ -73,8 +67,6 @@ impl Serialize for CefVersion {
 }
 
 fn commit_hash(_runtime: &crate::runtime::LibraryLoaded) -> Result<ShortHash, VersionError> {
-    // cef_api_hash's first call also configures the libcef API version;
-    // it must get the same value the cef crate passes.
     let ptr = unsafe { cef::sys::cef_api_hash(cef::sys::CEF_API_VERSION_LAST, 2) };
     if ptr.is_null() {
         return Err(VersionError::MissingCommitHash);
@@ -88,7 +80,6 @@ fn commit_hash(_runtime: &crate::runtime::LibraryLoaded) -> Result<ShortHash, Ve
 pub(crate) fn probe(runtime: &crate::runtime::LibraryLoaded) -> Result<CefVersion, VersionError> {
     let commit = commit_hash(runtime)?;
     let v = |entry| {
-        // SAFETY: runtime proves the process library has been loaded and pinned.
         let value = unsafe { cef_version_info(entry) };
         u32::try_from(value).map_err(|_| VersionError::InvalidComponent { entry, value })
     };

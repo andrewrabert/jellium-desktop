@@ -1,5 +1,3 @@
-//! Native client settings modal.
-
 use iced_core::widget::Id;
 use iced_core::{Element, Length, Padding};
 use iced_widget::{button, checkbox, column, scrollable, text};
@@ -233,8 +231,6 @@ impl Settings {
             .into()
     }
 
-    /// The mode the Hardware Decoding control shows: the stored value itself,
-    /// so an unset setting shows the mode mpv is given, not a guess.
     fn selected_hwdec(hwdec: jfn_config::Hwdec) -> String {
         hwdec.as_str().to_owned()
     }
@@ -260,7 +256,6 @@ impl Settings {
         }
     }
 
-    /// Commits both text drafts before the containing overlay is dismissed.
     pub fn dismiss(&mut self) -> Outcome {
         self.commit_text(Message::CommitAudioPassthrough);
         self.commit_text(Message::CommitDeviceName);

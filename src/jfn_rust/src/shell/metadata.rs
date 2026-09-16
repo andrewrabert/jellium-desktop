@@ -1,5 +1,3 @@
-//! Immutable application facts supplied by the process owner, without native calls.
-
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -12,7 +10,7 @@ pub struct ApplicationMetadata {
 
 #[cfg(test)]
 impl ApplicationMetadata {
-    #[allow(clippy::expect_used)] // Literal fixture data, never a runtime probe.
+    #[allow(clippy::expect_used)]
     pub(crate) fn testing() -> Self {
         Self {
             app_version: "app".to_owned(),

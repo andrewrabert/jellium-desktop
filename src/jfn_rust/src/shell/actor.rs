@@ -1,9 +1,3 @@
-//! The render actor.
-//!
-//! Its thread is the sole writer of the swapchain and of the `CAMetalLayer` /
-//! `IDCompositionVisual` / `wl_surface` behind it. Everything else in the
-//! process talks to the overlay by posting [`Work`].
-
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
@@ -28,8 +22,6 @@ use crate::shell::paint::Painter;
 use crate::shell::state::{self, ChromeInputs};
 use crate::shell::theme::Theme;
 
-/// How long the actor waits for a surface target before giving up: the
-/// backend creates the window on its own thread, moments after `alloc_surface`.
 const TARGET_WAIT: Duration = Duration::from_secs(5);
 
 pub enum Work {
@@ -41,64 +33,37 @@ pub enum Work {
     OpenAbout,
     OpenClientSettings,
     Chrome(ChromeInputs),
-    /// The buffered theme colour changed; the titlebar and backdrop repaint.
     ChromeBackground(iced_core::Color),
-    /// A selection read's text; `None` for a read that fetched nothing.
     SelectionText {
         reader: Reader,
         text: Option<String>,
     },
-    /// A right press the shell overlay owns, in window coordinates.
     ContextMenu(LogicalPoint),
-    /// The Menu key or Shift+F10: the edit menu at the focused field's caret.
-    /// With no field focused it raises nothing.
     EditMenuAtCaret,
-    /// A middle press the shell overlay owns, in window coordinates.
     PrimaryPaste(LogicalPoint),
-    /// An edit menu's selection, for the field it named.
     EditAt {
         field: Target,
         command: jfn_input::EditCommand,
     },
-    /// CEF is initialized; pending connection operations can now be submitted.
     WebAttached(jfn_cef::WebOverlay),
     WebEvent(jfn_cef::WebEvent),
     Shutdown,
 }
 
-/// Which field an edit acts on.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Target {
-    /// The field holding keyboard focus, whichever it is.
     Focused,
-    /// The field a menu was raised over, focused or not.
     Named(Id),
 }
 
-/// Where a selection read's text goes.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Reader {
-    /// iced asked for it; it reaches the focused field as
-    /// [`iced_core::clipboard::Event::Read`].
     Iced,
-    /// A menu paste or a middle press asked for it; it is applied to the field
-    /// it names.
     Field(Id),
 }
 
-/// Bound on the render thread's shutdown drain; a wedged present must not hold
-/// the process open.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// When the next redraw is due, folded from every source: iced's
-/// `RedrawRequest`, the connection deadline, the spinner's own animation
-/// while the connect screen is working, and a model that changed during the
-/// pass. The caret's blink is not among
-/// them — a focused editor asks for its own next frame through the
-/// `RedrawRequest` this already folds, and an unfocused one asks for nothing.
-///
-/// A deadline already in the past yields one immediate pass and then `None`,
-/// never a zero-length wait that spins.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Deadline(Option<Instant>);
 
@@ -122,14 +87,11 @@ impl Deadline {
         self.0.is_some_and(|at| now >= at)
     }
 
-    /// `None` blocks until the next posted work; `Some` is the bounded wait.
     pub fn wait_for(self, now: Instant) -> Option<Duration> {
         self.0.map(|at| at.saturating_duration_since(now))
     }
 }
 
-/// The actor's channel, built before its thread exists. Work posted into it
-/// waits in the queue the thread takes at spawn rather than being dropped.
 pub struct Channel {
     tx: Sender<Work>,
     rx: parking_lot::Mutex<Option<Receiver<Work>>>,
@@ -169,31 +131,6 @@ pub struct Actor {
 }
 
 impl Actor {
-    /// Spawns the render thread. It is the sole writer of the swapchain and of
-    /// the `CAMetalLayer` / `IDCompositionVisual` / `wl_surface` behind it.
-    ///
-    /// One pass, in order:
-    ///   1. drain every queued [`Work`], blocking only when the queue is empty
-    ///      and no deadline is due, so a pointer stream faster than the refresh
-    ///      rate collapses into one pass instead of backing up;
-    ///   2. build the `UserInterface` from the model;
-    ///   3. `update` it with the drained events followed by
-    ///      `Event::Window(window::Event::RedrawRequested(Instant::now()))` —
-    ///      the event widgets commit hover, press, focus and caret state on;
-    ///   4. apply every produced message, and every event `update` reported
-    ///      ignored, to the model;
-    ///   5. if that changed the model, or `update` returned `State::Outdated`,
-    ///      begin the next pass immediately and draw nothing this one;
-    ///   6. otherwise acquire a frame, draw into it and present it. Hidden, and
-    ///      on a swapchain that had no frame to give, the pass draws nothing.
-    ///
-    /// A pass that changed the model re-applies focus to
-    /// [`Connect::focus_target`] before drawing, so the URL field keeps its
-    /// caret across a window resize and across an Escape the editor consumed as
-    /// an unfocus.
-    ///
-    /// The thread calls [`crate::shell::wait_fonts_ready`] before its first draw and
-    /// never again.
     pub fn spawn(
         surface: SurfaceHandle,
         channel: &Channel,
@@ -220,7 +157,6 @@ impl Actor {
         drop(self.tx.send(work));
     }
 
-    /// Requests shutdown and confirms termination, including TLS destructors.
     pub fn join(self) -> JoinOutcome {
         drop(self.tx.send(Work::Shutdown));
         join_bounded(self.thread, SHUTDOWN_TIMEOUT)
@@ -260,15 +196,12 @@ fn join_bounded(thread: JoinHandle<()>, timeout: Duration) -> JoinOutcome {
     rx.recv_timeout(timeout).unwrap_or(JoinOutcome::TimedOut)
 }
 
-/// A key ignored by the focused widget that the modal layer handles.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IgnoredKey {
     Escape,
     Focus(Direction),
 }
 
-/// Escape reaches any occupied modal. Tab and Shift-Tab cycle through the
-/// combined overlay's tabs and the active tab's controls.
 fn ignored_key(model: &Model, event: &Event) -> Option<IgnoredKey> {
     use iced_core::keyboard::{self, Key, key::Named};
     let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
@@ -325,7 +258,6 @@ impl Model {
         state::titlebar_shown(self.inputs)
     }
 
-    /// The modal stack's own view, then the titlebar, then nothing.
     fn view(&self) -> Element<'_, Message, Theme, iced_wgpu::Renderer> {
         if self.stack.occupied() {
             return self.stack.view(&self.screen).map(Message::Modal);
@@ -354,19 +286,15 @@ impl Model {
         }
     }
 
-    /// The open modal's backdrop; fully transparent when none is open, so
-    /// jellyfin-web shows through everywhere no widget draws.
     fn backdrop(&self) -> iced_core::Color {
         self.stack
             .backdrop(self.theme.chrome_background, &self.screen)
     }
 
-    /// When the model next needs a frame on its own.
     fn deadline(&self) -> Deadline {
         self.stack.deadline(&self.screen)
     }
 
-    /// What this model asks the overlay surface to be.
     fn visibility(&self) -> Visibility {
         Visibility::shown(state::overlay_visible(
             self.stack.occupied(),
@@ -393,16 +321,12 @@ fn settings_overlay_dismiss_last(messages: Vec<Message>) -> Vec<Message> {
 
 type Ui<'a> = UserInterface<'a, Message, Theme, iced_wgpu::Renderer>;
 
-/// Whether the loop goes on after a piece of work.
 #[derive(PartialEq, Eq)]
 enum Flow {
     Continue,
     Stop,
 }
 
-/// Focus bookkeeping that outlives a rebuilt widget tree. A changed modal gets
-/// its own initial target; a discarded widget cache restores the exact prior
-/// target instead of resetting Settings focus.
 #[derive(Default)]
 struct FocusMemory {
     modal_identity: Option<Identity>,
@@ -413,15 +337,12 @@ struct FocusMemory {
     settings_chain: Option<Box<dyn iced_core::widget::Operation>>,
 }
 
-/// What a rebuilt tree has to be told about focus before it takes events.
 struct FocusPlan {
     target: Option<Id>,
     restoration: Option<crate::shell::settings_overlay::Restoration>,
 }
 
 impl FocusMemory {
-    /// Decides the focus for the tree about to be built and records the modal
-    /// it was decided for.
     fn plan(&mut self, model: &mut Model) -> FocusPlan {
         let identity = model.stack.identity();
         let cache_was_lost = self.cache_lost;
@@ -453,9 +374,6 @@ impl FocusMemory {
         }
     }
 
-    /// Applies the plan, the settings focus chain a previous pass left, and a
-    /// pending focus move. Returns true when the move left a chain to finish
-    /// on the next pass.
     fn apply(&mut self, ui: &mut Ui<'_>, renderer: &iced_wgpu::Renderer, plan: FocusPlan) -> bool {
         if let Some(id) = plan.target {
             ui.operate(
@@ -499,17 +417,14 @@ impl FocusMemory {
     }
 }
 
-/// What `update` left behind for the rest of the pass.
 struct Updated {
     messages: Vec<Message>,
-    /// Events the focused widget ignored, offered to the open modal.
     ignored: Vec<Event>,
     outdated: bool,
     interaction: mouse::Interaction,
     redraw: Deadline,
 }
 
-/// The render loop's state between passes.
 struct Loop {
     actions: crate::shell::ApplicationActions,
     surface: SurfaceHandle,
@@ -524,18 +439,11 @@ struct Loop {
     current: WindowExtent,
     focus: FocusMemory,
     pending: Deadline,
-    /// Set by a pass that left the model unsettled: the next one starts
-    /// without waiting and draws nothing until it does settle.
     immediate: bool,
     batch: Vec<Work>,
-    /// Edits waiting for a widget tree to apply them to, and the requests
-    /// that need one to resolve against.
     queued: Vec<Apply>,
     deferred: Vec<Deferred>,
-    /// The primary selection this process last published, so an unchanged
-    /// selection does not re-take the selection every pass.
     last_primary: Option<(Id, u64)>,
-    /// The first draw waits for the bundled font; every later one does not.
     drew_nothing_yet: bool,
 }
 
@@ -580,7 +488,6 @@ pub enum LoopStartError {
 }
 
 impl Loop {
-    /// Brings the swapchain up at the window's current extent.
     fn start(
         surface: SurfaceHandle,
         wake_tx: &Sender<Work>,
@@ -659,9 +566,6 @@ impl Loop {
         }
     }
 
-    /// Blocks until work arrives or the nearest deadline is due. A deadline
-    /// already in the past yields one immediate pass rather than a
-    /// zero-length wait the loop would spin on.
     fn wait(&mut self, rx: &Receiver<Work>) -> Flow {
         let deadline = self.pending.merge(self.model.deadline());
         let now = Instant::now();
@@ -683,8 +587,6 @@ impl Loop {
         Flow::Continue
     }
 
-    /// Takes the whole queue, so a pointer stream faster than the refresh
-    /// rate collapses into one pass instead of backing up.
     fn drain(&mut self, rx: &Receiver<Work>) -> Flow {
         loop {
             match rx.try_recv() {
@@ -705,7 +607,6 @@ impl Loop {
         Flow::Continue
     }
 
-    /// Folds one piece of work into the state the next pass builds from.
     fn absorb(&mut self, work: Work) -> Flow {
         match work {
             Work::Event(event) => {
@@ -778,12 +679,8 @@ impl Loop {
         self.focus.cache_lost = true;
     }
 
-    /// One pass: rebuild the tree, update it with the drained events, and
-    /// either draw the settled result or fold the changes back into the model
-    /// for an immediate next pass.
     fn pass(&mut self) {
         self.model.transition(Transition::Tick(Instant::now()));
-        // Derive the modal view from the actor-owned connection.
         self.model.screen = self.model.connection.screen();
         self.model.stack.reconcile(&self.model.screen);
         self.pending = self.pending.merge(
@@ -842,8 +739,6 @@ impl Loop {
         );
         crate::shell::router_sink::set_interaction(updated.interaction);
 
-        // Asked while the widget tree still borrows the model, because applying
-        // any of it has to wait until the tree is gone.
         let settled = updated.messages.is_empty()
             && !updated
                 .ignored
@@ -854,8 +749,6 @@ impl Loop {
         if settled {
             if this.drew_nothing_yet {
                 this.drew_nothing_yet = false;
-                // The fontdb scan is paid on the warm-up thread, not here, and
-                // no paragraph caches against a fallback family.
                 if let Err(error) = crate::shell::wait_fonts_ready() {
                     tracing::error!("shell cannot paint: {error}");
                     return;
@@ -900,9 +793,6 @@ impl Loop {
     }
 }
 
-/// Resolves every request that waited for a widget tree, applies the edits
-/// they and earlier passes queued, and opens the edit menu one of them asked
-/// for.
 fn resolve_deferred(
     ui: &mut Ui<'_>,
     painter: &mut Painter,
@@ -951,8 +841,6 @@ fn resolve_deferred(
     }
 }
 
-/// The Settings tab's focus and scroll offset, read before `update` so the
-/// overlay can keep them across a rebuild.
 fn retained_settings(
     ui: &mut Ui<'_>,
     painter: &mut Painter,
@@ -971,9 +859,6 @@ fn retained_settings(
     offset.get().map(|offset| (focused.get(), offset))
 }
 
-/// Runs `update` with the drained events followed by a `RedrawRequested` —
-/// the event widgets commit hover, press, focus and caret state on — and
-/// services the clipboard traffic it produced.
 fn update_ui(
     ui: &mut Ui<'_>,
     painter: &mut Painter,
@@ -994,8 +879,6 @@ fn update_ui(
         painter.renderer(),
         &mut bus,
     );
-    // The focused widget sees every event first; only what iced ignored is
-    // offered to the open modal.
     let ignored: Vec<Event> = events
         .iter()
         .zip(statuses)
@@ -1035,21 +918,13 @@ fn update_ui(
     }
 }
 
-/// What one settled pass did.
 enum Painted {
-    /// The frame it drew reached the surface's commit stream.
     Shown(Presented),
-    /// It drew nothing, and the commit that hid the surface landed.
     Hidden,
-    /// The swapchain had no frame; the next pass is due at this instant.
     Deferred(Instant),
-    /// The swapchain had no frame and the display reports no refresh interval;
-    /// the wake was requested from the overlay's own frame source.
     Requested,
 }
 
-/// The shell overlay's own producer: a deferred acquire with no retry deadline
-/// asks it for the wake that re-runs the pass.
 struct Redraw(Sender<Work>);
 
 impl FrameSource for Redraw {
@@ -1058,13 +933,6 @@ impl FrameSource for Redraw {
     }
 }
 
-/// Draws and commits one settled pass. A shown overlay acquires the frame it
-/// draws into and presents it; a hidden or deferred one acquires nothing and
-/// draws nothing.
-///
-/// Hidden, the widget tree still updates and nothing is presented: a present
-/// against a surface that is not on screen blocks the thread inside the
-/// compositor's FIFO queue.
 fn paint(
     painter: &mut Painter,
     surface: SurfaceHandle,
@@ -1096,8 +964,6 @@ fn paint(
     }
 }
 
-/// A request that needs a widget tree to resolve against, held until the pass
-/// has built one.
 enum Deferred {
     ContextMenu(LogicalPoint),
     EditMenuAtCaret,
@@ -1105,7 +971,6 @@ enum Deferred {
     Edit(Target, jfn_input::EditCommand),
 }
 
-/// Applies every pass of a chained widget operation.
 fn operate_all<Message>(
     ui: &mut UserInterface<'_, Message, Theme, iced_wgpu::Renderer>,
     renderer: &iced_wgpu::Renderer,
@@ -1119,8 +984,6 @@ fn operate_all<Message>(
     }
 }
 
-/// Applies every queued [`Apply`] and returns what `Cut` and `Copy` produced,
-/// in order.
 fn apply_queued<Message>(
     ui: &mut UserInterface<'_, Message, Theme, iced_wgpu::Renderer>,
     renderer: &iced_wgpu::Renderer,
@@ -1136,9 +999,6 @@ fn apply_queued<Message>(
     produced
 }
 
-/// Queues the acts `command` becomes for `target`, and requests the clipboard
-/// read that `Paste` needs. An edit chosen from a menu leaves keyboard focus
-/// where it is, so the edit menu acts on an unfocused field on Wayland and X11.
 fn queue_edit(
     fields: &Fields,
     target: &Target,
@@ -1169,8 +1029,6 @@ fn queue_edit(
     queued.push(Apply::act(id, act));
 }
 
-/// Requests the OS clipboard's text; the reply arrives as
-/// [`Work::SelectionText`].
 fn read_clipboard(tx: Sender<Work>, reader: Reader) {
     let Some(lease) = jfn_platform_abi::try_lease() else {
         return;
@@ -1185,8 +1043,6 @@ fn read_clipboard(tx: Sender<Work>, reader: Reader) {
         }));
 }
 
-/// Requests the primary selection's text, replying `None` on a backend that
-/// serves none.
 fn read_primary(tx: Sender<Work>, reader: Reader) {
     let Some(lease) = jfn_platform_abi::try_lease() else {
         return;
@@ -1204,7 +1060,6 @@ fn read_primary(tx: Sender<Work>, reader: Reader) {
     }));
 }
 
-/// Writes iced's pending clipboard content, text alone.
 fn write_clipboard(clipboard: &clipboard::Clipboard) {
     if let Some(clipboard::Content::Text(text)) = &clipboard.write
         && let Some(lease) = jfn_platform_abi::try_lease()
@@ -1213,9 +1068,6 @@ fn write_clipboard(clipboard: &clipboard::Clipboard) {
     }
 }
 
-/// Writes the focused field's selection to the primary selection whenever the
-/// selection changed and is not empty; a selection replaced by an identical
-/// one is a change, and a backend that serves none writes nothing.
 fn publish_primary(fields: &Fields, last: &mut Option<(Id, u64)>) {
     let Some(lease) = jfn_platform_abi::try_lease() else {
         return;
@@ -1238,8 +1090,6 @@ fn publish_primary(fields: &Fields, last: &mut Option<(Id, u64)>) {
     primary.write_text(text);
 }
 
-/// The window point an edit menu raised from the keyboard anchors at: the
-/// focused field's caret.
 fn caret_anchor(field: &crate::shell::fields::Snapshot) -> LogicalPoint {
     LogicalPoint {
         x: field.caret.x as i32,
@@ -1247,13 +1097,6 @@ fn caret_anchor(field: &crate::shell::fields::Snapshot) -> LogicalPoint {
     }
 }
 
-/// The menu a right press raises: the edit menu over a shell field, with the
-/// focus and the caret act ADR 0012 gives the backend queued first, and the app
-/// menu everywhere else the shell overlay owns.
-///
-/// The field takes focus on Windows and macOS whether or not the press landed
-/// inside its selection, so the keys typed after the menu closes reach it and
-/// macOS's own Edit menu resolves [`Target::Focused`] to it.
 fn raise_menu(
     fields: &Fields,
     p: LogicalPoint,
@@ -1277,7 +1120,6 @@ fn raise_menu(
     Some(p)
 }
 
-/// Publishes the routing state at the extent's exact logical size.
 fn publish(model: &Model, extent: WindowExtent) {
     jfn_input::publish_shell_state(crate::shell::state::shell_state(
         Some(extent),
@@ -1286,9 +1128,6 @@ fn publish(model: &Model, extent: WindowExtent) {
     ));
 }
 
-/// Writes the overlay surface's visibility and returns once the commit
-/// carrying it has landed. The surface's own backend holds the value; the model
-/// holds only what it asked for.
 fn apply_visibility(surface: SurfaceHandle, model: &Model) -> Visibility {
     let Some(lease) = jfn_platform_abi::try_lease() else {
         return Visibility::Hidden;
@@ -1344,8 +1183,6 @@ fn await_target<T>(
     }
 }
 
-/// The extent the overlay starts at: the window source's own when it has one,
-/// else 1280x720 logical at the platform's reported scale.
 fn initial_extent() -> Option<WindowExtent> {
     let lease = jfn_platform_abi::try_lease()?;
     let plat = lease.platform();
@@ -1357,7 +1194,6 @@ fn initial_extent() -> Option<WindowExtent> {
     WindowExtent::new(logical.to_physical(scale)?, scale, logical)
 }
 
-/// The pointer position an iced event carries, for the sink's convenience.
 pub(crate) fn point(x: i32, y: i32) -> Point {
     Point::new(x as f32, y as f32)
 }
@@ -1389,7 +1225,6 @@ mod tests {
             super::join_bounded(thread, super::Duration::ZERO),
             super::JoinOutcome::TimedOut
         );
-        // Release the worker and its joiner after the bounded wait returns.
         drop(tx);
     }
 
@@ -1426,7 +1261,6 @@ mod tests {
             ),
             None
         );
-        // A continuous work stream must not extend the deadline.
         tx.send(super::Work::Redraw).unwrap();
         assert_eq!(
             super::await_target(&rx, &mut pending, super::Instant::now(), || None::<()>),

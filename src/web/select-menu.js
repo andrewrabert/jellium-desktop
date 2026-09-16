@@ -1,5 +1,3 @@
-// In-page replacement for the native <select> popup. 
-// A dirty hack, but more succinct+less_finnicky than dealing with layering native popups on X11
 (function () {
     var open = null;
 
@@ -42,8 +40,6 @@
         menu.className = 'm';
         shadow.appendChild(menu);
 
-        // Key rows by opt.index, not row position, so disabled options and
-        // optgroup headers don't skew the map back to selectedIndex.
         var rows = [];
         var rowIndex = [];
         function addOption(opt) {
@@ -149,7 +145,6 @@
         }
     }
 
-    // Capture phase so we intercept before the engine opens the native popup.
     document.addEventListener('mousedown', function (e) {
         if (e.button !== 0) return;
         var select = e.target.closest && e.target.closest('select');
@@ -161,7 +156,6 @@
     }, true);
 
     document.addEventListener('keydown', function (e) {
-        // While open, the menu's own capture-phase handler owns the keyboard.
         if (open) return;
         if (!isDropdown(document.activeElement)) return;
         var opens = e.key === ' ' || e.key === 'Enter' || e.key === 'F4' ||

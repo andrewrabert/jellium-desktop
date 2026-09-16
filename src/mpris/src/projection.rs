@@ -1,16 +1,3 @@
-//! MPRIS Player projection rules — every derived-field rule behind the
-//! sink's property getters and PropertiesChanged diffs:
-//!   - PlaybackStatus from playback.phase
-//!   - CanPlay/CanPause/CanSeek/CanControl from phase + duration
-//!   - Metadata cleared while phase==Stopped (caller substitutes empty
-//!     metadata when `metadata_active` is false)
-//!   - Rate locked to 0 while seeking|buffering|Starting
-//!
-//! Pass-through fields (volume, can_go_next, can_go_previous, metadata
-//! itself) are NOT computed here — they live in the sink's Content and are
-//! answered verbatim by the sink's property getters. Change detection runs
-//! over the emitted property values, not over these fields.
-
 use jfn_playback::PlaybackPhase;
 
 #[repr(u8)]
@@ -26,12 +13,7 @@ pub struct ProjectInput {
     pub phase: PlaybackPhase,
     pub seeking: bool,
     pub buffering: bool,
-    /// Duration from MprisContent.metadata, not from PlaybackSnapshot. The
-    /// two diverge during track transitions: snapshot reflects mpv's current
-    /// stream, MprisContent reflects the metadata the JS UI most recently
-    /// pushed.
     pub metadata_duration_us: i64,
-    /// MprisContent.pending_rate — applied verbatim when rolling.
     pub pending_rate: f64,
 }
 
@@ -42,17 +24,11 @@ pub struct MprisDerived {
     pub can_pause: bool,
     pub can_seek: bool,
     pub can_control: bool,
-    /// False -> caller substitutes empty metadata in the projected view so
-    /// MPRIS clients see a clean transport when nothing is loaded.
     pub metadata_active: bool,
     pub rate: f64,
 }
 
 fn status_for(phase: PlaybackPhase) -> MprisStatus {
-    // MPRIS only recognizes Playing/Paused/Stopped. Pre-roll (Starting)
-    // reflects user intent: the user pressed play, so PlaybackStatus reads
-    // Playing. The fact that frames aren't actually rolling yet is signalled
-    // through Rate=0 below.
     match phase {
         PlaybackPhase::Playing | PlaybackPhase::Starting => MprisStatus::Playing,
         PlaybackPhase::Paused => MprisStatus::Paused,
@@ -62,16 +38,10 @@ fn status_for(phase: PlaybackPhase) -> MprisStatus {
 
 pub fn project(input: &ProjectInput) -> MprisDerived {
     let active = input.phase.is_active();
-    // CanPause is true while committed to playing — Playing or Starting (user
-    // already pressed play). Paused exposes Play, not Pause; Stopped exposes
-    // neither.
     let can_pause = matches!(
         input.phase,
         PlaybackPhase::Playing | PlaybackPhase::Starting
     );
-    // Rate reflects actual frame motion, not user intent. Anything other
-    // than steady playback (pre-roll, seek, buffer underrun) pins it to 0
-    // so MPRIS clients don't extrapolate position.
     let rolling = input.phase == PlaybackPhase::Playing && !input.seeking && !input.buffering;
     MprisDerived {
         status: status_for(input.phase),
@@ -118,7 +88,6 @@ mod tests {
         assert!(!stopped.can_play && playing.can_play);
         assert!(!stopped.can_pause && playing.can_pause);
         assert!(!stopped.can_control && playing.can_control);
-        // duration still 0 -> CanSeek unchanged at false
         assert!(!stopped.can_seek && !playing.can_seek);
     }
 

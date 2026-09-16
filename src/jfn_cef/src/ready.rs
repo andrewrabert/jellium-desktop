@@ -1,7 +1,3 @@
-//! CEF UI readiness, including failure and cancellation at session teardown.
-//! Callbacks always execute on TID_UI. Before readiness they are queued; after
-//! stop they are dropped. No callback is invoked while holding the state lock.
-
 use cef::rc::Rc;
 use cef::{ImplTask, Task, ThreadId, WrapTask, post_task, wrap_task};
 use parking_lot::Mutex;
@@ -61,8 +57,6 @@ pub(crate) fn on_cef_ready(
             };
             let mut task = ReadyCallbackTask::new(Arc::new(Mutex::new(Some(callback))));
             let accepted = post_task(ThreadId::UI, Some(&mut task)) == 1;
-            // Callback destructors are user code too; release the lock before a rejected
-            // task drops its callback. Posting stays serialized with stop().
             drop(state);
             if accepted {
                 Ok(())

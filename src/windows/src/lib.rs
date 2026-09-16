@@ -1,5 +1,3 @@
-//! Windows `Platform` backend.
-
 pub mod scale;
 
 #[cfg(target_os = "windows")]

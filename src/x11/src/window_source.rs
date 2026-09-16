@@ -1,6 +1,3 @@
-//! Native [`WindowSource`]: the X11 backend owns the toplevel, so live
-//! geometry comes from the geometry thread's state, not mpv ingest.
-
 use jfn_platform_abi::{
     AppCreatedWindow, BootGeometry, PhysicalSize, WindowPos, WindowSnapshot, WindowSource,
 };
@@ -46,8 +43,6 @@ impl WindowSource for X11WindowSource {
 }
 
 impl AppCreatedWindow for X11WindowSource {
-    /// `ensure_host_window` creates the WM toplevel at this geometry, so the
-    /// seed must land before it runs.
     fn seed_boot_geometry(&self, g: &BootGeometry) {
         crate::lifecycle::set_boot_geometry(*g);
     }

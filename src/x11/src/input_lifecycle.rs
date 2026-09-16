@@ -1,9 +1,3 @@
-//! Lifecycle glue for the X11 input thread.
-//!
-//! Holds the per-thread `Handle` in a static `Mutex<Option<...>>` so the
-//! Platform-vtable cursor setter and the cleanup path can reach it from
-//! any thread.
-
 use crate::input::{Handle, set_cursor, start as start_thread};
 use jfn_platform_abi::cursor::CursorShape;
 use parking_lot::Mutex;

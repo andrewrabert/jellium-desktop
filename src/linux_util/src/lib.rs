@@ -1,8 +1,3 @@
-//! Linux-only platform helpers shared by the X11 and Wayland backends.
-//!
-//! The whole crate is `#![cfg(target_os = "linux")]`, so it's an empty rlib
-//! elsewhere and the workspace builds uniformly on every platform.
-
 #![cfg(target_os = "linux")]
 
 pub mod cli;
@@ -35,11 +30,6 @@ pub fn cef_paths() -> CefPaths {
     }
 }
 
-/// Default *preference*: KDE draws its own server-side decorations and lets
-/// us tint them via the palette protocol; elsewhere we draw our own
-/// client-side titlebar. Whether server-side decorations are available at all
-/// is decided per-backend (Wayland probes the compositor's protocols), not
-/// here.
 pub fn default_window_decorations() -> WindowDecorations {
     let kde = std::env::var("XDG_CURRENT_DESKTOP")
         .map(|v| v.split(':').any(|s| s.eq_ignore_ascii_case("KDE")))

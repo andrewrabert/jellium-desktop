@@ -1,14 +1,3 @@
-//! Windows SystemMediaTransportControls (SMTC) sink. The shared
-//! [`jfn_playback::sink_core`] harness owns the event queue and consumer
-//! thread (MTA-initialised); this crate supplies a [`WindowsSink`] whose
-//! `deliver` drives SMTC. ButtonPressed / PlaybackPositionChangeRequested
-//! callbacks dispatch via [`sink_core::execute`] / [`sink_core::seek_to_ms`].
-//!
-//! Public entry points:
-//!   * `jfn_windows_sink_start_for(hwnd)` — start the sink (SMTC binds to the
-//!     mpv window via GetForWindow).
-//!   * `jfn_windows_sink_stop()` — signal the thread to exit at next wake.
-
 #![cfg(target_os = "windows")]
 
 use std::time::Instant;
@@ -31,8 +20,6 @@ use windows::Win32::Security::Cryptography::{CRYPT_STRING_BASE64, CryptStringToB
 use windows::Win32::System::WinRT::{ISystemMediaTransportControlsInterop, RoGetActivationFactory};
 use windows::core::HSTRING;
 
-/// Start the sink. `hwnd_raw` is the HWND of the mpv window — required
-/// to bind SMTC via ISystemMediaTransportControlsInterop::GetForWindow.
 pub fn jfn_windows_sink_start_for(hwnd_raw: isize) {
     sink_core::run_sink("windows-sink", move || WindowsSink::new(hwnd_raw));
 }

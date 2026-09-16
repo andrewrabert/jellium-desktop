@@ -1,7 +1,3 @@
-//! The mpv-backed [`WindowSource`] macOS uses: live geometry comes from the
-//! ingest extent cell that mpv's property observations feed. Windows and X11
-//! have their own sources.
-
 use jfn_platform_abi::{MpvCreatedWindow, WindowSnapshot, WindowSource};
 
 pub struct MpvWindowSource;

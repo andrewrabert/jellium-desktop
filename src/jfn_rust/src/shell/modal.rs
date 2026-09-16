@@ -1,5 +1,3 @@
-//! The shell overlay's modal stack.
-
 use std::time::Instant;
 
 use iced_core::widget::Id;
@@ -12,43 +10,32 @@ use crate::shell::connect::Connect;
 use crate::shell::settings_overlay::{Outcome as OverlayOutcome, SettingsOverlay, Tab};
 use crate::shell::theme::Theme;
 
-/// The shell overlay's modal views, bottom first. The top is drawn.
 pub struct Stack {
     settings_factory: fn() -> crate::shell::settings::Settings,
     metadata: crate::shell::metadata::ApplicationMetadata,
     views: Vec<View>,
 }
 
-/// Stable identity of the top modal, independent of its active tab and initial
-/// focus.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Identity {
     Connect,
     SettingsOverlay,
 }
 
-/// One modal view.
 pub enum View {
     Connect(Connect),
     SettingsOverlay(Box<SettingsOverlay>),
 }
 
-/// Everything that can change the stack.
 #[derive(Clone, Debug)]
 pub enum Transition {
-    /// The native macOS About command selected the About tab.
     OpenAbout,
-    /// A shared app menu or the web UI asked for client settings.
     OpenClientSettings,
-    /// Escape reached the stack unhandled.
     Escape,
-    /// A message the top view published.
     Message(Message),
-    /// Time advanced to `now`.
     Tick(Instant),
 }
 
-/// A message a modal view publishes.
 #[derive(Clone, Debug)]
 pub enum Message {
     Connect(crate::shell::connect::Message),
@@ -110,7 +97,6 @@ impl Stack {
         })
     }
 
-    /// Total over every (stack, transition) pair.
     pub(crate) fn update(&mut self, transition: Transition, connection: &mut Connection) {
         match transition {
             Transition::OpenAbout => self.open_overlay(Tab::About),
@@ -143,8 +129,6 @@ impl Stack {
         }
     }
 
-    /// The top view alone sees a message; one addressed to a view beneath it is
-    /// dropped rather than acted on behind the one that has the screen.
     fn deliver(&mut self, message: Message, connection: &mut Connection) {
         match (self.views.last_mut(), message) {
             (Some(View::Connect(_)), Message::Connect(m)) => match m {
@@ -168,9 +152,6 @@ impl Stack {
         }
     }
 
-    /// Places the connect screen at the bottom while `screen` shows one, and
-    /// removes it from wherever it sits once `screen` is [`Screen::Gone`]. The
-    /// connect screen enters and leaves the stack here and nowhere else.
     pub fn reconcile(&mut self, screen: &Screen) {
         match (screen, self.connect_index()) {
             (Screen::Gone, Some(at)) => {
@@ -193,8 +174,6 @@ impl Stack {
         }
     }
 
-    /// The top view's backdrop; transparent when the stack is empty, so
-    /// jellyfin-web shows through everywhere no widget draws.
     pub fn backdrop(&self, chrome: Color, screen: &Screen) -> Color {
         match self.top() {
             Some(View::Connect(connect)) => connect.backdrop(chrome, screen),
@@ -203,7 +182,6 @@ impl Stack {
         }
     }
 
-    /// Every view's deadline, not just the top one's.
     pub fn deadline(&self, screen: &Screen) -> Deadline {
         self.views
             .iter()
@@ -213,7 +191,6 @@ impl Stack {
             })
     }
 
-    /// The stable identity of the currently rendered top modal.
     pub fn identity(&self) -> Option<Identity> {
         match self.top() {
             Some(View::Connect(_)) => Some(Identity::Connect),
@@ -222,7 +199,6 @@ impl Stack {
         }
     }
 
-    /// The focus target to use only when the top modal identity changes.
     pub fn initial_focus(&self, screen: &Screen) -> Option<Id> {
         match self.top() {
             Some(View::Connect(connect)) => connect.focus_target(screen),

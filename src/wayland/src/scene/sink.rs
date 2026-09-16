@@ -1,5 +1,3 @@
-//! Effect interpreters for [`super::reduce`].
-
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::{Effect, LayerId};
@@ -26,15 +24,11 @@ fn layer_ptr(id: LayerId) -> *mut PlatformSurface {
     id.0 as *mut PlatformSurface
 }
 
-// The synchronized subsurface stays owned by its PlatformSurface (the raw object
-// never escapes); only the sibling surface handle is cloned out for restacking.
 fn layer_surface(id: LayerId) -> Option<WlSurface> {
     let p = layer_ptr(id);
     if p.is_null() {
         return None;
     }
-    // SAFETY: LayerId is a live PlatformSurface address (removed from the scene
-    // before the box is freed), dereferenced only under the wl_state lock.
     let s = unsafe { &*p };
     s.surface.as_ref().map(|sr| sr.as_arg().clone())
 }
@@ -53,7 +47,6 @@ impl WlSink {
         if p.is_null() {
             return;
         }
-        // SAFETY: see `layer_surface` — live address, accessed under the lock.
         let s = unsafe { &*p };
         let Some(sub) = s.subsurface.as_ref() else {
             return;

@@ -1,11 +1,3 @@
-//! The process's one web overlay: jellyfin-web's browser, the platform
-//! surface it paints into, and the size it is driven at.
-//!
-//! It owns its surface and its browser handle; every caller that drives it
-//! holds a [`WebOverlay`] clone. Its size is a pure function of the window
-//! snapshot and the strip the shell overlay publishes, and the browser is
-//! created as soon as that function yields one.
-
 pub mod size;
 
 use std::ffi::c_int;
@@ -39,15 +31,9 @@ struct Overlay {
     subscription: Mutex<Option<jfn_input::ShellStateSubscription>>,
     close: Mutex<()>,
     window_subscription: Mutex<Option<jfn_platform_abi::WindowSubscription>>,
-    /// CEF is the sole strong authority after a creation request is accepted.
-    /// Written and read on TID_UI only (`ensure_browser`, `SetRefreshTask`).
     client: OnceLock<Weak<Inner>>,
     deferred_navigation: Arc<DeferredNavigation>,
-    /// Fixed for the process; seeds every `Inner` this overlay creates.
     paint_mode: PaintMode,
-    /// The rate the next-created `Inner` is seeded with; `None` leaves CEF's
-    /// default. Written and read on TID_UI only (`ensure_browser`,
-    /// `SetRefreshTask`).
     frame_rate: AtomicCell<Option<FrameRate>>,
 }
 
@@ -72,15 +58,9 @@ pub enum CloseDeliveryError {
 #[error("the session already owns a web overlay")]
 pub struct OverlayStartError;
 
-/// The started overlay registry does not prolong either the overlay or its
-/// CEF-owned client.
 static STARTED: Mutex<Weak<Overlay>> = Mutex::new(Weak::new());
 
 impl WebOverlay {
-    /// Allocates the platform surface, installs the jfn-input web sink and
-    /// jellyfin-web's message handlers, subscribes to the window snapshot and
-    /// to [`jfn_input::on_shell_state_scoped`], and creates the browser as soon as
-    /// both yield a size with a positive width and height.
     pub fn start(
         runtime: &crate::InitializedCef,
         config: WebOverlayConfig,
@@ -131,9 +111,6 @@ impl WebOverlay {
         self.inner.client.get().and_then(Weak::upgrade)
     }
 
-    /// Posts [`WebOverlay::sync_on_ui`] onto TID_UI. Its callers include the
-    /// window-snapshot listener, which the compositor's own dispatch loop runs
-    /// inline.
     fn sync(&self) {
         self.inner.session.dispatch(|| {
             let mut task = SyncTask::new(self.clone());
@@ -141,9 +118,6 @@ impl WebOverlay {
         });
     }
 
-    /// Re-derives the size, creates the browser at the first size, and shows
-    /// the surface — on TID_UI, so every acknowledgement it awaits is delivered
-    /// by a thread that is not this one.
     fn sync_on_ui(&self) {
         if !self.inner.session.is_active() {
             return;
@@ -161,9 +135,6 @@ impl WebOverlay {
         self.ensure_browser(size);
     }
 
-    /// Create the browser once, with the view already sized: CEF reads the view
-    /// rect during creation, and a zero-sized one aborts Chromium on the first
-    /// navigation.
     fn ensure_browser(&self, size: SurfaceSize) {
         if self.inner.client.get().is_some() {
             if let Some(client) = self.client() {
@@ -209,7 +180,6 @@ impl WebOverlay {
         }
     }
 
-    /// Thread-agnostic; posts a TID_UI task.
     pub fn set_refresh_rate(&self, rate: RefreshRate) {
         self.inner.session.dispatch(|| {
             let mut task = SetRefreshTask::new(Arc::downgrade(&self.inner), FrameRate::from(rate));
@@ -217,7 +187,6 @@ impl WebOverlay {
         });
     }
 
-    /// Thread-agnostic; posts a TID_UI task that calls `WasHidden(hidden)`.
     pub fn set_hidden(&self, hidden: bool) {
         self.inner.session.dispatch(|| {
             if let Some(client) = self.client() {
@@ -226,7 +195,6 @@ impl WebOverlay {
         });
     }
 
-    /// No-op where the platform does not drive frames itself.
     pub fn send_external_begin_frame(&self) {
         self.inner.session.dispatch(|| {
             if let Some(client) = self.client() {
@@ -235,7 +203,6 @@ impl WebOverlay {
         });
     }
 
-    /// Queue a probe using Chromium's proxy and TLS configuration.
     pub fn probe(&self, cycle: u64, url: &str) -> Result<(), crate::ready::ReadinessError> {
         self.post_operation(Operation::Probe {
             cycle,
@@ -247,7 +214,6 @@ impl WebOverlay {
         self.post_operation(Operation::CancelProbe)
     }
 
-    /// Queue a navigation, retaining it until a browser exists.
     pub fn navigate(
         &self,
         navigation: crate::Navigation,
@@ -287,8 +253,6 @@ impl WebOverlay {
         }
     }
 
-    /// A matching deferred or live navigation becomes an intentional blank
-    /// load; a nonmatching request changes neither live nor deferred navigation.
     fn abandon_on_ui(&self, navigation: crate::Navigation) {
         if let Some(client) = self.client() {
             client.abandon_navigation(navigation);
@@ -305,16 +269,11 @@ impl WebOverlay {
         });
     }
 
-    /// Posts one TID_UI close and blocks until `OnBeforeClose` has fired.
-    /// Callable from any non-TID_UI thread.
     pub fn close_blocking(&self) -> Result<(), CloseDeliveryError> {
-        // Retained overlay handles remain harmless after CefShutdown.
         if self.inner.session.is_drained() {
             return Ok(());
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        // Never wait for another closer: this also keeps a CEF UI caller from
-        // blocking the very browser-close task that the other caller awaits.
         let Some(_closing) = self.inner.close.try_lock() else {
             return Err(CloseDeliveryError::Timeout("concurrent close"));
         };
@@ -329,8 +288,6 @@ impl WebOverlay {
             crate::ready::stop();
             self.inner.window_subscription.lock().take();
             self.inner.subscription.lock().take();
-            // This barrier runs after every accepted UI task, including browser
-            // creation. Looking up the client before it would miss queued creation.
             let (tx, rx) = std::sync::mpsc::channel();
             let mut task = DrainBarrierTask::new(self.clone(), Arc::new(Mutex::new(Some(tx))));
             if post_task(ThreadId::UI, Some(&mut task)) != 1 {
@@ -360,8 +317,6 @@ impl WebOverlay {
     }
 }
 
-/// Release the overlay's creation dependency only after native drain succeeds.
-/// Inert clones can then survive CEF and platform shutdown without pinning them.
 fn drain_and_release<T, E>(
     session: &crate::runtime::Session,
     dependency: &Mutex<Option<T>>,
@@ -375,7 +330,6 @@ fn drain_and_release<T, E>(
     })
 }
 
-/// The exclusive owner of the web overlay's platform handle.
 pub(crate) struct WebOverlaySurface {
     platform: jfn_platform_abi::PlatformLease,
     handle: jfn_platform_abi::SurfaceHandle,
@@ -467,9 +421,6 @@ impl Drop for WebOverlaySurface {
     }
 }
 
-/// Hold the dispatch gate through native input calls; a cloned client must not
-/// escape the gate and race native shutdown. Reentrant callbacks on the same
-/// thread may safely route another input operation while this gate is held.
 pub(crate) fn with_current_client<R>(f: impl FnOnce(&Inner) -> R) -> Option<R> {
     let overlay = STARTED.lock().upgrade()?;
     overlay
@@ -481,9 +432,6 @@ pub(crate) fn with_current_client<R>(f: impl FnOnce(&Inner) -> R) -> Option<R> {
         .flatten()
 }
 
-/// Subscribed into the window snapshot at [`WebOverlay::start`]; posts the
-/// overlay's sync and returns, so the thread that publishes the change waits
-/// for nothing.
 fn sync_started() {
     if let Some(inner) = STARTED.lock().upgrade() {
         WebOverlay { inner }.sync();
@@ -525,7 +473,6 @@ fn probe(overlay: &WebOverlay, cycle: u64, url: &str) {
     *PROBE.lock() = Some(probe);
 }
 
-/// The in-flight probe, kept alive for the length of the request it made.
 static PROBE: Mutex<Option<crate::server_probe::Probe>> = Mutex::new(None);
 
 type DrainSender = Arc<Mutex<Option<std::sync::mpsc::Sender<Option<Arc<Inner>>>>>>;
@@ -537,7 +484,6 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            // URL request cancellation belongs on its CEF UI thread.
             if let Some(probe) = PROBE.lock().take() { probe.cancel_on_ui(); }
             if let Some(sender) = self.sender.lock().take() {
                 let _ = sender.send(self.overlay.client());

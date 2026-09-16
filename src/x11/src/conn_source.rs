@@ -1,5 +1,3 @@
-//! One calloop `EventSource` over an X connection, shared by x11rb and xcb.
-
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::Arc;
@@ -10,18 +8,14 @@ use x11rb::errors::ConnectionError;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
-/// An X connection that owns one socket and a userspace event queue.
 pub(crate) trait PollConn: 'static {
     type Event;
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn socket_fd(&self) -> RawFd;
 
-    /// Reads the socket, then yields the next parsed event; never blocks.
     fn next_event(&self) -> Result<Option<Self::Event>, Self::Error>;
 
-    /// Yields only events already parsed into userspace; errors read as `None`
-    /// and are reported by the next `next_event`.
     fn next_queued_event(&self) -> Option<Self::Event>;
 }
 
@@ -34,8 +28,6 @@ pub(crate) struct ConnSource<C: PollConn> {
 
 impl<C: PollConn> ConnSource<C> {
     pub(crate) fn new(conn: Arc<C>) -> ConnSource<C> {
-        // SAFETY: the fd is the connection's socket, and `conn` (held alongside
-        // it) keeps that socket open for as long as this borrow is live.
         let fd = unsafe { BorrowedFd::borrow_raw(conn.socket_fd()) };
         ConnSource {
             conn,
@@ -75,8 +67,6 @@ impl<C: PollConn> EventSource for ConnSource<C> {
     fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
         let token = factory.token();
         self.token = Some(token);
-        // SAFETY: `self.fd` stays valid for as long as `self.conn` is alive,
-        // and unregistration always happens before this source is dropped.
         unsafe { poll.register(self.fd, Interest::READ, Mode::Level, token) }
     }
 
@@ -91,10 +81,6 @@ impl<C: PollConn> EventSource for ConnSource<C> {
         poll.unregister(self.fd)
     }
 
-    /// Every X round trip drains the socket and parses whatever events it finds
-    /// into userspace, so the fd can look idle to `poll(2)` while events sit
-    /// unhandled. Returning synthetic readiness here is what gets those events
-    /// dispatched instead of blocking on socket traffic that may never come.
     fn before_sleep(&mut self) -> calloop::Result<Option<(Readiness, Token)>> {
         while let Some(ev) = self.conn.next_queued_event() {
             self.pending.push_back(ev);
@@ -149,8 +135,6 @@ impl PollConn for RustConnection {
     }
 }
 
-/// `xcb::Error`'s own `Display` names only the category, so the cause is
-/// formatted with `Debug` here and carried as `source()`.
 #[derive(Debug, thiserror::Error)]
 #[error("xcb connection error: {0:?}")]
 pub(crate) struct XcbSourceError(#[source] xcb::Error);

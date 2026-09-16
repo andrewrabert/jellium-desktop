@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Replace `@VAR@` substitutions in the file (mirrors CMake `configure_file(@ONLY)`).
 pub fn configure_file(src: &Path, dst: &Path, vars: &HashMap<&str, String>) -> Result<()> {
     let content =
         std::fs::read_to_string(src).with_context(|| format!("read {}", src.display()))?;

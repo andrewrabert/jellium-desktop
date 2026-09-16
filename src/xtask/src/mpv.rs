@@ -88,7 +88,6 @@ pub fn library_path(build_dir: &Path) -> PathBuf {
     build_dir.join(LINK_NAME)
 }
 
-/// The shared library filename used at runtime (with SONAME).
 pub fn runtime_library_name() -> &'static str {
     RUNTIME_NAME
 }

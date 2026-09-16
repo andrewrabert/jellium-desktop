@@ -2,12 +2,9 @@ use crate::paths;
 use anyhow::{Context, Result, anyhow};
 
 pub struct Version {
-    /// "<raw>[+<short-hash>[-dirty]]" — adds git suffix iff raw is a
-    /// pre-release (has a "-suffix").
     pub full: String,
 }
 
-/// Short HEAD hash and dirty flag. `(None, false)` when there is no repo.
 pub fn git_info() -> (Option<String>, bool) {
     let Ok(repo) = gix::discover(paths::repo_root()) else {
         return (None, false);

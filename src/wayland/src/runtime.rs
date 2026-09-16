@@ -1,5 +1,3 @@
-//! The crate's owned state root.
-
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -134,18 +132,12 @@ impl WlRuntime {
         self.paint_request
     }
 
-    /// Probe for decoration globals. Must run before the mpv proxy rewrites
-    /// `WAYLAND_DISPLAY`, or the probe connects to the proxy socket instead of
-    /// the real compositor.
     pub(crate) fn probe_decorations(&self) {
         let _ = self.decorations.set(crate::decoration_probe::probe_bounded(
             DECORATION_PROBE_TIMEOUT,
         ));
     }
 
-    /// Probe failure (or a missed [`Self::probe_decorations`]) reads as "no
-    /// globals", which resolves to CSD — the only mode that never depends on
-    /// the compositor.
     pub(crate) fn decorations(&self) -> DecorationGlobals {
         self.decorations.get().copied().unwrap_or_default()
     }

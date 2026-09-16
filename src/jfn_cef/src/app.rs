@@ -1,8 +1,3 @@
-//! `cef::App` implementation. Owns both browser-process and render-process
-//! handlers — CEF re-execs the same binary for child processes, so the same
-//! App is constructed in every process and CEF dispatches based on the
-//! `--type=` switch.
-
 use cef::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -14,21 +9,15 @@ use crate::paint_scheduler::PaintScheduler;
 use crate::state;
 use crate::v8_handler::NativeHandlerBuilder;
 
-// `app://` scheme options. Match CEF_SCHEME_OPTION_* from
-// include/internal/cef_types.h.
 const SCHEME_OPTION_STANDARD: i32 = 1 << 0;
 const SCHEME_OPTION_LOCAL: i32 = 1 << 1;
 const SCHEME_OPTION_SECURE: i32 = 1 << 4;
 const SCHEME_OPTION_CORS_ENABLED: i32 = 1 << 6;
 
-// V8 property attribute. Equivalent to V8_PROPERTY_ATTRIBUTE_READONLY.
 fn readonly_attr() -> V8Propertyattribute {
     V8Propertyattribute::from(sys::cef_v8_propertyattribute_t::V8_PROPERTY_ATTRIBUTE_READONLY)
 }
 
-// Baseline Chromium features disabled in every process (Google services,
-// telemetry, spell check). Merged with all other `disable-features`
-// contributors by `append_merged_features`.
 const DISABLED_FEATURES: &[&str] = &[
     "PushMessaging",
     "BackgroundSync",
@@ -55,8 +44,6 @@ fn split_features(value: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_string)
 }
 
-// A feature-list switch is last-occurrence-wins in Chromium, so it must be
-// appended exactly once with every contributor's features merged in.
 fn append_merged_features(cl: &mut CommandLine, name: &str, mut features: Vec<String>) {
     let key = CefString::from(name);
     if cl.has_switch(Some(&key)) == 1 {
@@ -71,13 +58,6 @@ fn append_merged_features(cl: &mut CommandLine, name: &str, mut features: Vec<St
     );
 }
 
-// ----- App ------------------------------------------------------------------
-
-// Shared profile map. CEF may call `App::render_process_handler()` more than
-// once per process; each call must hand back a handler that shares the same
-// browser-id → injection-profile map. Holding the inner state on JfnApp via
-// Arc lets us clone-cheap on every render_process_handler() invocation while
-// preserving the map across calls.
 type ProfileMap = std::sync::Arc<Mutex<HashMap<i32, ExtraInfo>>>;
 
 #[derive(Clone)]
@@ -106,7 +86,6 @@ wrap_app! {
         ) {
             let Some(cl) = command_line else { return };
 
-            // Disable all Google services.
             for sw in [
                 "disable-background-networking",
                 "disable-client-side-phishing-detection",
@@ -136,17 +115,11 @@ wrap_app! {
                 );
             }
 
-            // Chromium keeps only the last `disable-features` occurrence, so
-            // every contributor merges into one value appended exactly once:
-            // whatever is already on the command line (Chromium forwards the
-            // browser's set to subprocesses), the baseline below, and any
-            // pending switch.
             let mut disable_features: Vec<String> = DISABLED_FEATURES
                 .iter()
                 .map(|f| (*f).to_string())
                 .collect();
 
-            // Browser-process-only switches from CefRuntime::Set*().
             let is_browser_process = process_type
                 .map(|s| s.to_string().is_empty())
                 .unwrap_or(true);
@@ -190,8 +163,6 @@ wrap_app! {
     }
 }
 
-// ----- BrowserProcessHandler ------------------------------------------------
-
 #[derive(Clone)]
 struct JfnBph;
 
@@ -212,12 +183,6 @@ wrap_browser_process_handler! {
         }
     }
 }
-
-// ----- RenderProcessHandler -------------------------------------------------
-//
-// Renderer-local map of browser identifier → injection profile passed through
-// extra_info at CreateBrowser time. Populated in on_browser_created, consumed
-// in on_context_created, erased in on_browser_destroyed.
 
 #[derive(Default, Clone)]
 struct JfnRph {
@@ -256,7 +221,6 @@ wrap_render_process_handler! {
             let (Some(browser), Some(frame), Some(ctx)) = (browser, frame, context) else {
                 return;
             };
-            // Top-frame only. jmpNative + player shim must not pollute iframes.
             if frame.is_main() != 1 {
                 return;
             }
@@ -588,8 +552,6 @@ fn run_user_scripts(profile: &ExtraInfo, frame: &Frame) {
         return;
     }
 
-    // Renderer is a separate process; load settings here for placeholder
-    // substitution.
     ensure_renderer_settings_loaded();
 
     let mut code = String::new();

@@ -1,9 +1,3 @@
-//! Ordered Wayland seat and popup dispatch on the application's display.
-//!
-//! Protocol destinations own input delivery. The content adapter translates
-//! resolved events into the application's input callbacks; popup contents
-//! register their own adapter on the same queue.
-
 use crate::popup_protocol::{PopupCommand, Popups};
 use crate::protocol::{InputTarget, SeatInput};
 use calloop::timer::{TimeoutAction, Timer};
@@ -46,14 +40,8 @@ use jfn_platform_abi::event_flags::{
 use crate::runtime::WlRuntime;
 use jfn_platform_abi::cursor::CursorShape;
 
-/// Input serials published for requests from application callbacks.
 pub struct SeatShared {
-    // Interactive move/resize requires the serial of the pointer press whose
-    // implicit grab drives the drag — a later key press serial would be rejected.
     last_button_serial: AtomicU32,
-    // xdg_popup.grab accepts the serial of any press-type input event; tracking
-    // key presses too keeps the serial fresh for keyboard-opened `<select>`s
-    // (Enter/Space), which grab without any button press to cite.
     last_input_serial: AtomicU32,
 }
 
@@ -96,9 +84,6 @@ pub struct Callbacks {
 unsafe impl Send for Callbacks {}
 unsafe impl Sync for Callbacks {}
 
-// Safety: State is only ever accessed from the input thread after the
-// worker is spawned. xkbcommon's raw pointers are not Send by default; this
-// crate restricts them to the worker thread by construction.
 unsafe impl Send for State {}
 
 pub(crate) struct State {
@@ -119,7 +104,6 @@ pub(crate) struct State {
     popup_commands: Receiver<PopupCommand>,
     pointer_serial: u32,
 
-    // Scroll accumulation across a single pointer frame.
     scroll_dx: f64,
     scroll_dy: f64,
     scroll_v120_x: i32,
@@ -130,20 +114,15 @@ pub(crate) struct State {
     xkb_kmap: Option<xkb::Keymap>,
     modifiers: u32,
 
-    // Latest desired cursor (re-applied on pointer enter).
     cursor_type: Arc<AtomicU32>,
 
     stop: Arc<AtomicBool>,
     signal: Option<LoopSignal>,
     pub(crate) loop_handle: Option<LoopHandle<'static, State>>,
-    /// Bumped by every arm/disarm; a timer whose generation is stale drops
-    /// itself instead of firing, so no source is ever removed mid-dispatch.
     repeat_generation: u64,
     repeat_rate: i32,
     repeat_delay: i32,
     repeat_key: Option<KeyEvent>,
-    /// The last key press, so a `Repeated` event carrying no UTF-8 can stand
-    /// for the text the press carried.
     pressed_key: Option<KeyEvent>,
     pub(crate) selection: crate::selection::SelectionState,
 }
@@ -159,8 +138,6 @@ impl State {
         let cef = CursorShape::from_cef(self.cursor_type.load(Ordering::Relaxed) as i32)
             .unwrap_or(CursorShape::Pointer);
         let Some(pointer) = &self.pointer else { return };
-        // set_cursor/hide_cursor reuse the pointer's last enter serial, so they
-        // are a protocol error until the pointer has entered one of our surfaces.
         if self.pointer_serial == 0 {
             return;
         }
@@ -179,8 +156,6 @@ impl State {
         self.disarm_repeat();
         self.repeat_key = Some(key);
         let generation = self.repeat_generation;
-        // A zero delay would fire the first repeat in the same breath as the
-        // press, so a reported delay/rate of 0 must not reach 0ms.
         let period = Duration::from_millis(u64::from((1000u32 / self.repeat_rate as u32).max(1)));
         let delay = Duration::from_millis(self.repeat_delay.max(1) as u64);
         let Some(handle) = self.loop_handle.clone() else {
@@ -214,9 +189,6 @@ impl State {
         self.protocol.key(event, pressed, self.modifiers);
     }
 
-    /// The [`KeyEvent`] a `Repeated` key event stands for: a version 10
-    /// compositor reports the repeat with no UTF-8, so the pressed key's text
-    /// is substituted when the raw codes match.
     fn repeated(&self, event: KeyEvent) -> KeyEvent {
         if event.utf8.is_some() {
             return event;
@@ -397,7 +369,6 @@ impl PointerHandler for State {
         events: &[PointerEvent],
     ) {
         for event in events {
-            // Axis groups belong to the focus under which they arrived.
             if matches!(
                 event.kind,
                 PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. }
@@ -491,8 +462,6 @@ impl State {
             let scaled_y = -self.scroll_dy * 12.0;
             dx = scaled_x as i32;
             dy = scaled_y as i32;
-            // Carry the sub-step remainder into the next frame; zeroing it
-            // rounds slow continuous scrolling away to nothing.
             self.scroll_dx = -(scaled_x - dx as f64) / 12.0;
             self.scroll_dy = -(scaled_y - dy as f64) / 12.0;
         } else {
@@ -534,8 +503,6 @@ impl KeyboardHandler for State {
     ) {
         self.disarm_repeat();
         self.protocol.keyboard_leave(surface, self.modifiers);
-        // Enter may be in a later event group. A sync on this queue observes
-        // the focus transition without inferring focus from popup close reasons.
         conn.display()
             .sync(qh, FocusBarrier(self.protocol.focus_epoch));
     }
@@ -554,8 +521,6 @@ impl KeyboardHandler for State {
             .store(serial, Ordering::Release);
         self.pressed_key = Some(event.clone());
         self.send_key(&event, true);
-        // A version-10 compositor repeats keys itself and delivers them through
-        // `repeat_key`; arming the timer as well would double every repeat.
         if keyboard.version() < 10 && self.key_repeats(event.raw_code) {
             self.arm_repeat(event);
         }
@@ -669,8 +634,6 @@ pub struct InputThread {
     popup_commands: Sender<PopupCommand>,
 }
 
-// The display fd is shared with other readers; a blocking dispatch here would
-// deadlock them, so the queue is driven through `WaylandSource`.
 fn run_input_loop(
     conn: Connection,
     queue: wayland_client::EventQueue<State>,
@@ -829,8 +792,6 @@ impl InputThread {
         self.ping.ping();
     }
 
-    /// Stop the worker and join it. Idempotent: a second call finds the join
-    /// handle already taken.
     pub(crate) fn shutdown(&self, _rt: &'static WlRuntime) {
         self.stop.store(true, Ordering::Relaxed);
         self.ping.ping();
@@ -840,7 +801,6 @@ impl InputThread {
     }
 }
 
-/// Application encoding lives at the registered content endpoint.
 struct ContentInput {
     cb: Callbacks,
 }

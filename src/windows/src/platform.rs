@@ -1,11 +1,3 @@
-//! Windows platform impl: window init/cleanup, fullscreen toggle helpers,
-//! scale + geometry queries, and the WndProc hook that resamples the window.
-//!
-//! All `g_win` state (HWND, the minimize edge, the maximize-restore flag, the
-//! WndProc hook handle, the input thread JoinHandle) lives in this module
-//! behind a `Mutex<WinState>`. Scale, position, and window mode are not stored
-//! here: they come from Win32, through `crate::window`'s sample.
-
 #![allow(non_snake_case)]
 
 use parking_lot::Mutex;
@@ -60,18 +52,11 @@ fn hwnd_from_raw(raw: usize) -> HWND {
     HWND(raw as *mut c_void)
 }
 
-/// mpv's HWND, or `None` before it has been resolved / after cleanup.
 pub(crate) fn win_hwnd() -> Option<HWND> {
     let raw = STATE.lock().mpv_hwnd_raw;
     (raw != 0).then(|| hwnd_from_raw(raw))
 }
 
-/// The stored HWND, taken from mpv's observed `window-id` on first use. The
-/// boot wait pulls the window snapshot before `win_init` runs, so resolution
-/// cannot wait for init. `None` until mpv's VO has a window.
-///
-/// Reads a cached atomic — no mpv property read, so no thread that pulls the
-/// snapshot can serialize against the mpv core or mpv's VO GUI thread.
 pub(crate) fn win_ensure_hwnd() -> Option<HWND> {
     if let Some(hwnd) = win_hwnd() {
         return Some(hwnd);
@@ -84,13 +69,6 @@ pub(crate) fn win_ensure_hwnd() -> Option<HWND> {
     Some(hwnd_from_raw(raw))
 }
 
-/// True when mpv's window has neither `WS_CAPTION` nor `WS_THICKFRAME`.
-///
-/// Exact for every style mpv sets: `update_style` in
-/// `third_party/mpv/video/out/w32_common.c` keeps `WS_THICKFRAME` in its
-/// borderless-windowed set (NO_FRAME) and clears it only for fullscreen, and
-/// mpv owns a top-level window here (no `--wid`), so the early-out for
-/// embedded windows never applies.
 pub(crate) fn win_is_fullscreen() -> bool {
     let Some(hwnd) = win_hwnd() else {
         return false;
@@ -99,8 +77,6 @@ pub(crate) fn win_is_fullscreen() -> bool {
     (style & WS_CAPTION.0) == 0 && (style & WS_THICKFRAME.0) == 0
 }
 
-/// `GetDpiForWindow`/96 once the window exists, `GetDpiForSystem`/96 before
-/// it does.
 pub(crate) fn win_get_scale() -> jfn_platform_abi::Scale {
     match crate::window::client_scale() {
         Some(scale) => scale,
@@ -259,9 +235,6 @@ pub(crate) fn win_cleanup() {
     STATE.lock().mpv_hwnd_raw = 0;
 }
 
-/// Resolve saved geometry against the primary monitor's working area so the
-/// window never opens larger than the screen or off-screen, and center any
-/// unset axis.
 pub(crate) fn win_clamp_window_geometry(
     w: &mut c_int,
     h: &mut c_int,

@@ -1,14 +1,3 @@
-//! `Platform` trait + global handle held by `jfn_app_main`.
-//!
-//! Each backend crate (`jfn-wayland`, `jfn-x11`, `jfn-macos`, `jfn-windows`)
-//! returns a concrete type implementing this trait via its
-//! `make_*_platform()` factory. The binary installs the chosen backend into
-//! the [`OnceLock`] below via [`install`] / [`get`].
-//!
-//! `JfnRect` stays `#[repr(C)]` because CEF's `OnAcceleratedPaint` accel-paint
-//! info hands it across the C ABI surface; the popup request and other
-//! payloads are plain Rust.
-
 #![allow(non_snake_case)]
 
 use parking_lot::{Condvar, Mutex};
@@ -65,26 +54,7 @@ pub use window_source::{
     subscribe_window_changed,
 };
 
-/// Preserves the process's SIGINT/SIGTERM dispositions across a scope.
-///
-/// `chrome/browser/chrome_browser_main_posix.cc` installs SIGINT/SIGTERM
-/// handlers during `CefInitialize`, and that path is NOT gated by
-/// `disable_signal_handlers`. Snapshot the caller's handlers on
-/// construction and restore them on drop, confining Chromium's installs to
-/// the guarded window. No-op off unix.
 pub use signal::SignalGuard;
-
-// =====================================================================
-// Main-thread park (non-macOS default for run_main_loop/wake_main_loop)
-// =====================================================================
-//
-// Non-macOS backends have no native run loop to block the process main
-// thread on. The default `Platform::run_main_loop` parks here until the
-// shutdown manager calls `wake_main_loop`, at which point main runs the
-// teardown tail. A latching `bool` + `Condvar` is enough — it's a single
-// dedicated blocking wait (not a `poll()` multiplexer), so no fd is needed
-// and there's no `playback`-crate dependency. macOS overrides both methods
-// (`[NSApp run]` / stop-NSApp) and never touches this.
 
 struct MainPark {
     woken: Mutex<bool>,
@@ -96,9 +66,6 @@ static MAIN_PARK: MainPark = MainPark {
     cv: Condvar::new(),
 };
 
-/// Block until [`main_park_signal`] is called. Returns immediately if the
-/// signal already fired (latched), so a wake racing ahead of the wait is
-/// not lost.
 pub fn main_park_wait() {
     let mut woken = MAIN_PARK.woken.lock();
     while !*woken {
@@ -106,15 +73,11 @@ pub fn main_park_wait() {
     }
 }
 
-/// Release [`main_park_wait`]. Idempotent and safe from any thread.
 pub fn main_park_signal() {
     *MAIN_PARK.woken.lock() = true;
     MAIN_PARK.cv.notify_all();
 }
 
-/// Fixed `cef_cursor_type_t` shapes. `CT_CUSTOM` (a bitmap) and the `CT_DND_*`
-/// cursors are excluded — listing them here would map a non-fixed cursor to a
-/// fixed shape.
 pub mod cursor {
     use cef::sys::cef_cursor_type_t as ct;
 
@@ -188,11 +151,6 @@ pub mod cursor {
     }
 }
 
-/// Canonical `cef_event_flags_t` modifier bits — the single source of truth
-/// for the CEF `EVENTFLAG_*` masks that flow through key/mouse dispatch.
-/// Derived from the generated CEF bindings (a newtype with associated
-/// constants) so backends import these instead of hand-copying bit shifts
-/// that can silently drift. Typed `u32` to match the dispatch ABI.
 pub mod event_flags {
     use cef::sys::cef_event_flags_t as ef;
 
@@ -220,7 +178,6 @@ pub enum DisplayBackend {
 }
 
 impl DisplayBackend {
-    /// The modifier that means "application action" in keyboard shortcuts.
     pub fn action_modifier_flag(self) -> u32 {
         match self {
             DisplayBackend::MacOS => event_flags::EVENTFLAG_COMMAND_DOWN,
@@ -228,17 +185,11 @@ impl DisplayBackend {
         }
     }
 
-    /// Whether CEF's browser-process `MainArgs` carries the full argv for
-    /// Chromium to parse. When false the caller hands CEF a clean
-    /// `[argv[0]]` and pushes switches explicitly instead.
     pub fn cef_full_browser_argv(self) -> bool {
         matches!(self, DisplayBackend::Windows)
     }
 }
 
-/// Filesystem locations CEF needs written into `Settings` before
-/// `CefInitialize`, resolved per platform. Each `None` field is left at
-/// CEF's own default rather than cleared.
 #[derive(Default)]
 pub struct CefPaths {
     pub browser_subprocess_path: Option<PathBuf>,
@@ -249,15 +200,12 @@ pub struct CefPaths {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum WindowDecorations {
-    /// Client-side: the app draws its own titlebar in-page.
     Csd,
     Server,
     ServerThemed,
 }
 
 impl WindowDecorations {
-    /// Wire/persistence contract: settings.json, the JS↔Rust IPC, and the web
-    /// settings UI all speak these literals.
     pub fn as_str(self) -> &'static str {
         match self {
             WindowDecorations::Csd => "csd",
@@ -276,22 +224,12 @@ impl WindowDecorations {
     }
 }
 
-/// The decoration mode in effect right now — the app-level projection of
-/// whatever authority the platform has (on Wayland, the compositor's
-/// xdg-decoration verdict). Two-valued and total: protocol lifecycle states
-/// (no such protocol, verdict pending) never cross this boundary.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum EffectiveDecorations {
-    /// The app draws its own titlebar.
     ClientSide,
-    /// The OS/compositor owns decorations; the app draws none.
     ServerSide,
 }
 
-/// The set of decoration modes a backend can actually honor. CSD is a member
-/// of every set — the app can always draw its own titlebar — so only the
-/// server-side modes vary, and resolution against a set is total: anything
-/// the set lacks falls back to CSD, which [`Self::contains`] always accepts.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct DecorationOptions {
     server: bool,
@@ -325,8 +263,6 @@ impl DecorationOptions {
         }
     }
 
-    /// Whether there is anything to choose — a CSD-only set leaves the user
-    /// no decision, so the settings entry is hidden.
     pub fn has_choice(self) -> bool {
         self.server
     }
@@ -343,7 +279,6 @@ impl DecorationOptions {
     }
 }
 
-/// Idle-inhibit level.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum IdleInhibitLevel {
     None,
@@ -351,26 +286,14 @@ pub enum IdleInhibitLevel {
     Display,
 }
 
-/// Backend-allocated per-surface handle: an opaque, backend-defined id.
-///
-/// Callers hold it as a value and pass it back verbatim; no caller may
-/// dereference it. Its representation is one machine word so it round-trips
-/// losslessly through the CEF C++ layer's `void*` slot. Pointer-backed
-/// backends (Wayland/Windows/macOS) bridge through [`SurfaceHandle::from_ptr`]
-/// / [`SurfaceHandle::as_ptr`]; the X11 backend stores a generational id via
-/// [`SurfaceHandle::from_id`] / [`SurfaceHandle::id`] and never treats it as a
-/// pointer.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[repr(transparent)]
 pub struct SurfaceHandle(*mut c_void);
 
-// A word-sized opaque id; the wrapped pointer is never dereferenced by the ABI
-// itself. Backends carry their own `unsafe impl Send` on the state they map it to.
 unsafe impl Send for SurfaceHandle {}
 unsafe impl Sync for SurfaceHandle {}
 
 impl SurfaceHandle {
-    /// The absent handle (allocation failed / no surface).
     pub const NONE: Self = Self(std::ptr::null_mut());
 
     #[must_use]
@@ -378,34 +301,27 @@ impl SurfaceHandle {
         self.0.is_null()
     }
 
-    /// Bridge for pointer-backed backends: wrap a backend surface pointer.
     #[must_use]
     pub fn from_ptr(p: *mut c_void) -> Self {
         Self(p)
     }
 
-    /// Bridge for pointer-backed backends: recover the backend surface pointer.
     #[must_use]
     pub fn as_ptr(self) -> *mut c_void {
         self.0
     }
 
-    /// Bridge for id-backed backends (X11): pack a generational id. The value
-    /// is never dereferenced.
     #[must_use]
     pub fn from_id(id: u64) -> Self {
         Self(id as *mut c_void)
     }
 
-    /// Bridge for id-backed backends (X11): recover the generational id.
     #[must_use]
     pub fn id(self) -> u64 {
         self.0 as u64
     }
 }
 
-/// The gate a backend arms at the physical size a resize transition settles
-/// at. Reachable only through [`Platform::resize_gate`].
 pub trait ResizeGate: Send + Sync {
     fn begin(&self);
 
@@ -416,42 +332,23 @@ pub trait ResizeGate: Send + Sync {
     fn set_expected(&self, size: PhysicalSize);
 }
 
-/// The window controls an app-drawn titlebar drives. Reachable only through
-/// [`Platform::titlebar_controls`].
 pub trait TitlebarControls: Send + Sync {
     fn minimize(&self);
 
     fn toggle_maximize(&self);
 
-    /// Begin an interactive, compositor-driven window move. Must be called in
-    /// response to a pointer button press on the titlebar drag region.
     fn start_move(&self);
 
-    /// Begin an interactive, compositor-driven resize from the given edge.
-    /// `edge` is the xdg_toplevel resize-edge mask: top=1, bottom=2, left=4,
-    /// right=8, corners are the ORs.
     fn start_resize(&self, edge: c_int);
 }
 
-/// Process-wide platform handle.
-///
-/// A default body here expresses shared mechanism or an absence the type
-/// makes total, and nothing else: every method carrying a platform answer is
-/// required, so adding one fails to compile all four backends.
-///
-/// All methods take `&self` — backends keep their own interior mutability
-/// (`Mutex`, `AtomicBool`, etc) where they need it.
 pub trait Platform: Send + Sync {
     fn display(&self) -> DisplayBackend;
 
     fn default_window_decorations(&self) -> WindowDecorations;
 
-    /// Decoration modes this backend can honor.
     fn window_decoration_options(&self) -> DecorationOptions;
 
-    /// Data-only policy, valid before native initialization and after cleanup.
-    /// Implementations may inspect owned configuration/capability snapshots,
-    /// but must not access native resources.
     fn resolve_window_decorations(
         &self,
         configured: Option<WindowDecorations>,
@@ -465,109 +362,65 @@ pub trait Platform: Send + Sync {
     }
 
     fn early_init(&self);
-    /// `mpv` is the opaque libmpv `mpv_handle` — a raw C handle, stays raw.
     fn init(&self, access: &LifecycleAccess, mpv: *mut c_void) -> Result<(), PlatformInitError>;
     fn cleanup(&self, access: &LifecycleAccess);
     fn post_window_cleanup(&self, access: &LifecycleAccess);
 
-    // Per-surface
-    /// The surface starts in `initial`; no surface is born at a default.
     fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle;
     fn free_surface(&self, s: SurfaceHandle);
-    /// Presents `frame`, or hands it back undischarged when this surface has no
-    /// commit stream for it.
     fn surface_present<'a>(
         &self,
         s: SurfaceHandle,
         frame: PaintFrame<'a>,
     ) -> Result<Presented, PaintFrame<'a>>;
-    /// Applies `size` to `s` before returning.
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize);
-    /// The swapchain target for `s`, or `None` until the backend has created
-    /// the surface's window.
-    ///
-    /// Calling it declares that the caller presents to `s` itself: from the
-    /// first call the backend attaches no buffer to `s`, never calls
-    /// [`Platform::surface_present`] on it, grabs no input on it, and gives it
-    /// an empty input region.
     fn surface_window_target(&self, s: SurfaceHandle) -> Option<WindowTarget>;
 
-    /// Notify once the native target can be queried. Synchronous backends
-    /// already have their target when allocation returns. Register before
-    /// querying to avoid losing a concurrent creation notification.
     fn on_surface_target_ready(&self, _s: SurfaceHandle, ready: Box<dyn FnOnce() + Send>) {
         ready();
     }
 
-    /// Issues the commit carrying `visibility` before returning.
     fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit;
 
-    /// Applies the whole order, bottom first, in one transaction, and pins the
-    /// video plane below every named surface.
     fn apply_stack(&self, ordered: &[SurfaceHandle]);
 
-    /// How this backend delivers `kind`; `Host` names the backend's own menu
-    /// host.
     fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery<'_>;
 
     fn osr_popup_surface(&self) -> &dyn OsrPopupSurface {
         &NoOsrPopup
     }
 
-    /// How this platform hosts mpv's lifecycle (env prep, VO wait,
-    /// teardown detach).
     fn mpv_host(&self) -> &dyn MpvHost;
 
-    /// `Some` when the platform drives CEF's message loop itself
-    /// (external pump); `None` runs CEF's multi-threaded message loop.
     fn cef_host(&self) -> Option<&dyn CefHost> {
         None
     }
 
-    /// OS media-session integration. Non-optional — every platform has a
-    /// sink.
     fn media_session(&self) -> &dyn MediaSink;
 
     fn cef_paths(&self) -> CefPaths;
 
-    // Fullscreen
     fn set_fullscreen(&self, v: bool);
     fn toggle_fullscreen(&self);
 
-    /// The controls an app-drawn titlebar drives, or `None` where the OS or
-    /// the window manager draws the app window's titlebar.
     fn titlebar_controls(&self) -> Option<&dyn TitlebarControls>;
 
-    /// The resize-transition gate, or `None` where this backend gates none.
     fn resize_gate(&self) -> Option<&dyn ResizeGate>;
 
-    /// The display scale this backend reports for the app window.
     fn scale(&self) -> Scale;
 
-    /// The display scale this backend reports for the display holding `at`,
-    /// or for its own default display when `at` is `None`.
     fn display_scale(&self, at: Option<WindowPos>) -> Scale;
 
-    /// The window's current position in backing pixels, or `None` when this
-    /// backend has no window position to report.
     fn query_window_position(&self) -> Option<WindowPos>;
 
-    /// Who creates the app window, and the live geometry authority for it.
     fn window_owner(&self) -> WindowOwner<'_>;
 
-    /// Clamp saved geometry to stay on-screen.
     fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry;
 
     fn pump(&self);
-    /// Block the process main thread until [`wake_main_loop`] is called.
-    /// Default parks on the process-wide [`main_park_wait`]; macOS overrides
-    /// with `[NSApp run]`.
     fn run_main_loop(&self) {
         main_park_wait();
     }
-    /// Release [`run_main_loop`] so main can run the teardown tail. Safe from
-    /// any thread. Default signals [`main_park_signal`]; macOS overrides to
-    /// stop the NSApp loop.
     fn wake_main_loop(&self) {
         main_park_signal();
     }
@@ -576,75 +429,41 @@ pub trait Platform: Send + Sync {
     fn set_idle_inhibit(&self, level: IdleInhibitLevel);
     fn set_theme_color(&self, rgb: u32);
 
-    /// Whether the window-decorations setting (client-side vs server-side
-    /// titlebar) applies on this platform. Gates the settings UI entry; the
-    /// entry's option list comes from [`Platform::window_decoration_options`].
     fn window_decorations_supported(&self) -> bool;
-    /// The decoration mode currently in effect. Changes are announced via
-    /// [`notify_decorations_changed`].
     fn effective_decorations(&self) -> EffectiveDecorations;
 
     fn shared_texture_supported(&self) -> bool;
 
-    /// True where `CefInitialize` depends on neither platform init nor a run
-    /// loop the boot wait owns, so CEF's process bring-up may run while mpv's
-    /// core thread creates the VO.
     fn cef_init_precedes_mpv_window(&self) -> bool;
-    /// Revises [`Platform::shared_texture_supported`] to `false` where the
-    /// backend resolves the shared-texture path after init.
     fn set_shared_texture_unsupported(&self);
 
-    /// The OS clipboard's text.
-    /// `None` when it holds no text, or the read failed.
     fn clipboard_read_text_async(&self, on_done: OnText);
 
-    /// Places `text` on the OS clipboard.
-    /// A backend that cannot take the selection leaves the previous contents.
     fn clipboard_write_text(&self, text: &str);
 
-    /// The primary selection, on the backends that serve one.
     fn primary_selection(&self) -> Option<&dyn PrimarySelection> {
         None
     }
 
-    /// Whether the web overlay pastes by reading the OS clipboard and
-    /// injecting the text, rather than by calling `frame.Paste()`.
-    /// Pinned per backend, and unrelated to the shell overlay's clipboard.
     fn web_paste_reads_clipboard(&self) -> bool;
 
     fn open_external_url(&self, url: &str);
 
-    /// Open a filesystem path in the OS file manager.
     fn open_path(&self, path: &Path);
 
-    /// Run `f` to completion without deadlocking work that needs the
-    /// main thread (e.g. mpv's VO uninit doing `DispatchQueue.main.sync`).
-    /// Default runs `f` inline; macOS runs it on a side thread while main
-    /// pumps its run loop.
     fn run_blocking(&self, f: Box<dyn FnOnce() + Send>) -> Result<(), BlockingError> {
         f();
         Ok(())
     }
 
-    /// `on_shutdown` must be async-signal-safe.
     fn install_shutdown_handler(&self, on_shutdown: fn()) {
         process::install_shutdown(on_shutdown);
     }
 }
 
-// =====================================================================
-// Process-wide handle
-// =====================================================================
-
-// `OnceLock<Box<dyn Platform>>` doesn't give us a stable `'static` reference
-// shape that's ergonomic for the existing `unsafe extern "C"` thunks below;
-// store a raw fat pointer instead. Set exactly once during boot.
 static PLATFORM: OnceLock<&'static dyn Platform> = OnceLock::new();
 
-/// Install the platform backend. Must be called exactly once during boot,
-/// before any other code dispatches through [`get`]. Panics if called
-/// twice — there is no "swap backend at runtime" path.
-#[allow(clippy::expect_used)] // boot invariant: install exactly once
+#[allow(clippy::expect_used)]
 pub fn install(p: Box<dyn Platform>) {
     let leaked: &'static dyn Platform = Box::leak(p);
     PLATFORM
@@ -653,41 +472,23 @@ pub fn install(p: Box<dyn Platform>) {
         .expect("install() called twice");
 }
 
-/// Returns the installed platform backend. Panics if [`install`] hasn't
-/// been called yet.
-///
-/// # Safety
-/// The caller must own the platform lifecycle phase or a live dependent lease
-/// for every native operation through this reference. It must not let the
-/// reference escape that authority. Native backends and boot wiring only;
-/// ordinary consumers acquire [`try_lease`] or use an injected lease.
-#[allow(clippy::expect_used)] // every call site is post-boot
+#[allow(clippy::expect_used)]
 pub unsafe fn get() -> &'static dyn Platform {
     *PLATFORM
         .get()
         .expect("jfn_platform_abi::get() called before install()")
 }
 
-/// Like [`get`] but returns `None` before install. Used by jfn_cef's
-/// `OnConsoleMessage` and similar paths that may fire during early CEF
-/// helper-process boot when no platform is installed.
-///
-/// # Safety
-/// The caller must uphold the same phase/lease lifetime contract as [`get`].
 pub unsafe fn try_get() -> Option<&'static dyn Platform> {
     PLATFORM.get().copied()
 }
 
-// Publication and revocation share a lock: a callback cannot acquire a new
-// dependent after cleanup has checked that the runtime is the sole owner.
 static LIVE_PLATFORM: Mutex<Option<PlatformLeaseWeak>> = Mutex::new(None);
 struct PlatformLeaseWeak {
     platform: &'static dyn Platform,
     live: std::sync::Weak<LeaseState>,
 }
 
-/// Acquire native authority only while the initialized runtime remains live.
-/// A successful lease delays cleanup until its work finishes.
 pub fn try_lease() -> Option<PlatformLease> {
     let published = LIVE_PLATFORM.lock();
     let published = published.as_ref()?;
@@ -699,8 +500,6 @@ pub fn try_lease() -> Option<PlatformLease> {
     })
 }
 
-/// Resolve configuration through the backend's data-only policy. This exposes
-/// no native handle and is valid during preparation, before runtime publication.
 #[allow(clippy::expect_used)]
 pub fn resolve_window_decorations(configured: Option<WindowDecorations>) -> WindowDecorations {
     PLATFORM
@@ -709,13 +508,10 @@ pub fn resolve_window_decorations(configured: Option<WindowDecorations>) -> Wind
         .resolve_window_decorations(configured)
 }
 
-/// Titlebar height, logical pixels.
 pub const TITLEBAR_LOGICAL_HEIGHT: c_int = 32;
 
 static ABOUT_HANDLER: OnceLock<fn()> = OnceLock::new();
 
-/// Register the callback that raises the about panel. Single listener,
-/// installed once at boot.
 pub fn set_about_handler(f: fn()) {
     let _ = ABOUT_HANDLER.set(f);
 }
@@ -728,8 +524,6 @@ pub fn request_about() {
 
 static CLIENT_SETTINGS_HANDLER: OnceLock<fn()> = OnceLock::new();
 
-/// Register the callback that raises client settings. Single listener,
-/// installed once at boot.
 pub fn set_client_settings_handler(f: fn()) {
     let _ = CLIENT_SETTINGS_HANDLER.set(f);
 }
@@ -744,7 +538,6 @@ static DECORATIONS_LISTENERS: std::sync::LazyLock<subscriptions::Subscribers> =
     std::sync::LazyLock::new(subscriptions::Subscribers::new);
 pub use subscriptions::Subscription as DecorationsSubscription;
 
-/// Listen while the returned subscription is alive.
 pub fn set_decorations_listener(f: fn()) -> DecorationsSubscription {
     DECORATIONS_LISTENERS.subscribe(f)
 }
@@ -753,12 +546,6 @@ pub fn notify_decorations_changed() {
     DECORATIONS_LISTENERS.notify();
 }
 
-/// Backend lifecycle authority. Only PlatformRuntime can construct this token.
-/// Ordinary platform references cannot initialize or destroy the backend.
-///
-/// ```compile_fail
-/// let access = jfn_platform_abi::LifecycleAccess { _private: () };
-/// ```
 pub struct LifecycleAccess {
     _private: (),
 }
@@ -808,8 +595,6 @@ impl std::error::Error for PlatformInitError {
 }
 
 struct LeaseState {
-    // Includes the runtime's own lease. Unlike Arc::strong_count, this count
-    // can be decremented before notifying waiters in PlatformLease::drop.
     count: Mutex<usize>,
     changed: Condvar,
 }
@@ -826,7 +611,6 @@ impl LeaseState {
     }
 }
 
-/// A dependent keeps the backend alive until its native resources are released.
 pub struct PlatformLease {
     platform: &'static dyn Platform,
     live: std::sync::Arc<LeaseState>,
@@ -847,13 +631,6 @@ impl Drop for PlatformLease {
     }
 }
 impl PlatformLease {
-    /// Native access cannot outlive the lease that keeps its backend alive.
-    ///
-    /// ```compile_fail
-    /// fn escape(lease: &jfn_platform_abi::PlatformLease) -> &'static dyn jfn_platform_abi::Platform {
-    ///     lease.platform()
-    /// }
-    /// ```
     pub fn platform(&self) -> &dyn Platform {
         self.platform
     }
@@ -875,20 +652,11 @@ impl std::fmt::Display for PlatformBusy {
 }
 impl std::error::Error for PlatformBusy {}
 
-/// Thread-confined process owner. Call cleanup after releasing dependent leases.
-/// macOS construction checks the main thread; elsewhere the application chooses
-/// its initialization thread and the non-Send owner keeps teardown on that thread.
-/// Dropping without cleanup deliberately retains native state; the application
-/// startup owner is responsible for ordered rollback, including during unwinding.
 #[must_use = "the initialized platform requires ordered cleanup"]
 pub struct PlatformRuntime {
     lease: PlatformLease,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
-/// Owns early backend setup, including a host window created before mpv.
-/// Initialization failure returns this owner so the caller can terminate mpv
-/// between backend cleanup and post-window cleanup. No dependency lease exists
-/// until initialization succeeds.
 #[must_use = "early platform resources require ordered cleanup"]
 pub struct PreparedPlatform {
     platform: &'static dyn Platform,
@@ -901,7 +669,6 @@ impl PreparedPlatform {
             unsafe extern "C" {
                 fn pthread_main_np() -> std::ffi::c_int;
             }
-            // SAFETY: this query has no initialization requirements.
             if unsafe { pthread_main_np() } == 0 {
                 return Err(PlatformInitError::WrongThread);
             }
@@ -920,9 +687,6 @@ impl PreparedPlatform {
         mpv: *mut c_void,
     ) -> Result<PlatformRuntime, (PlatformInitError, Self)> {
         let access = LifecycleAccess { _private: () };
-        // Keep rollback authority even when a backend unwinds after acquiring
-        // resources. The application still owns mpv and must terminate it
-        // between backend detachment and post-window cleanup.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.platform.init(&access, mpv)
         }));
@@ -967,19 +731,6 @@ impl PlatformRuntime {
     pub fn lease(&self) -> PlatformLease {
         self.lease.clone()
     }
-    /// ```compile_fail
-    /// fn twice(runtime: jfn_platform_abi::PlatformRuntime) {
-    ///     let _ = runtime.cleanup(|| Ok::<(), std::convert::Infallible>(()));
-    ///     let _ = runtime.cleanup(|| Ok::<(), std::convert::Infallible>(()));
-    /// }
-    /// ```
-    ///
-    /// The callback terminates mpv after backend detachment/cleanup and before
-    /// post-window cleanup. It is never called while dependents remain alive.
-    /// A busy result returns both owners, including captures of the termination
-    /// callback, so callers can release dependencies and retry without destroying
-    /// the window prematurely. New global lease admission stops before a bounded
-    /// wait for existing callbacks; a busy result keeps admission retired.
     pub fn cleanup<F, E>(self, terminate_window: F) -> Result<(), PlatformCleanupError<F, E>>
     where
         F: FnOnce() -> Result<(), E>,
@@ -995,8 +746,6 @@ impl PlatformRuntime {
     where
         F: FnOnce() -> Result<(), E>,
     {
-        // Retire admission before waiting: native input threads may still be
-        // running until backend cleanup, but may no longer start new work.
         *LIVE_PLATFORM.lock() = None;
         if *self.lease.live.count.lock() != 1 {
             let live = std::sync::Arc::clone(&self.lease.live);
@@ -1005,8 +754,6 @@ impl PlatformRuntime {
                 let _ = done.send(live.wait_for_dependents(timeout));
             })) {
                 tracing::error!("platform quiescence: {error}");
-                // This pending job owns only the wait state/channel, never a
-                // native resource. Dropping it leaves both native owners here.
                 drop(error);
                 return Err(PlatformCleanupError::Busy {
                     runtime: self,
@@ -1035,8 +782,6 @@ impl PlatformRuntime {
     }
 }
 
-/// Failure retains exactly the phase that can still be retried. A termination
-/// failure must never repeat backend detachment or release the host window.
 pub enum PlatformCleanupError<F, E> {
     Busy {
         runtime: PlatformRuntime,
@@ -1048,16 +793,12 @@ pub enum PlatformCleanupError<F, E> {
     },
 }
 
-/// Backend detachment completed; the host must remain until window termination
-/// is confirmed. Dropping this token deliberately retains native host state.
 #[must_use = "post-window resources require confirmed window termination"]
 pub struct PostWindowCleanup {
     platform: &'static dyn Platform,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl PostWindowCleanup {
-    /// Retry only the remaining termination, without detaching the backend a
-    /// second time. Host cleanup runs only on successful termination.
     pub fn retry<E>(
         self,
         terminate_window: impl FnOnce() -> Result<(), E>,
@@ -1070,13 +811,10 @@ impl PostWindowCleanup {
             Err(error) => Err((error, self)),
         }
     }
-    /// The owner calls this only after successfully running retained window
-    /// termination work. No other backend cleanup operation is repeated.
     pub fn finish(self) {
         self.platform
             .post_window_cleanup(&LifecycleAccess { _private: () });
     }
-    /// Retain the native host until process exit when termination is uncertain.
     pub fn abandon(self) {}
 }
 

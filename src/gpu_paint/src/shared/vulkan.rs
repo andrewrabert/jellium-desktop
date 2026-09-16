@@ -1,5 +1,3 @@
-//! Vulkan dmabuf import for CEF accelerated-paint frames.
-
 use std::ffi::CStr;
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
 
@@ -11,7 +9,6 @@ use crate::error::{Kind, SurfaceLost};
 use crate::shared::{ImportFailed, Imported, Opened};
 use crate::{DmabufFormat, SharedTexture};
 
-/// The DRM render node CEF produces its shared buffers on, as `(major, minor)`.
 pub type ProducerId = (i64, i64);
 
 pub(crate) fn adapter_matches(adapter: &wgpu::Adapter, want: ProducerId) -> bool {
@@ -25,8 +22,6 @@ pub(crate) fn adapter_matches(adapter: &wgpu::Adapter, want: ProducerId) -> bool
         .is_some_and(|node| node == want)
 }
 
-/// Open the device with the dmabuf extensions wgpu-hal does not enable itself,
-/// injected through the device-create callback.
 pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<Opened, SurfaceLost> {
     let limits = adapter.limits();
 
@@ -67,8 +62,6 @@ pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<Opened, SurfaceLost
             &wgpu::DeviceDescriptor {
                 label: Some("jfn_gpu_paint device"),
                 required_features: wgpu::Features::empty(),
-                // Adapter limits — the swapchain may be larger than the
-                // downlevel 2048×2048 cap on modern displays.
                 required_limits: limits,
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -77,8 +70,6 @@ pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<Opened, SurfaceLost
         )?
     };
 
-    // Importing needs the extensions to be advertised *and* live on the
-    // device we actually opened.
     let import_capable = want_import && required_extensions_enabled(&device);
     Ok(Opened {
         device,
@@ -87,7 +78,6 @@ pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<Opened, SurfaceLost
     })
 }
 
-/// Stateless: a dmabuf import is per-frame and owns nothing across frames.
 pub(crate) struct Importer;
 
 impl Importer {
@@ -111,9 +101,6 @@ impl Importer {
 
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
-/// Extensions wgpu-hal does not enable itself; added via the
-/// device-create callback. The `external_memory_fd` /
-/// `external_memory_dma_buf` pair is already added by wgpu-hal.
 const EXTRA_EXTENSIONS: [&CStr; 2] = [
     ext::image_drm_format_modifier::NAME,
     ext::queue_family_foreign::NAME,
@@ -127,7 +114,6 @@ const REQUIRED_EXTENSIONS: [&CStr; 4] = [
 ];
 
 fn ext_name(props: &vk::ExtensionProperties) -> &CStr {
-    // SAFETY: the array is a NUL-terminated C string filled by the driver.
     unsafe { CStr::from_ptr(props.extension_name.as_ptr()) }
 }
 
@@ -138,8 +124,6 @@ fn device_extensions(
     unsafe { instance.enumerate_device_extension_properties(phys) }.unwrap_or_default()
 }
 
-/// Filtered to extensions the device advertises: pushing an unsupported
-/// extension makes `vkCreateDevice` hard-error.
 fn extra_device_extensions(
     instance: &ash::Instance,
     phys: vk::PhysicalDevice,
@@ -165,7 +149,6 @@ fn drm_render_node(instance: &ash::Instance, phys: vk::PhysicalDevice) -> Option
     (drm.has_render == vk::TRUE).then_some((drm.render_major, drm.render_minor))
 }
 
-/// Whether the device advertises every extension the import path needs.
 fn required_extensions_present(instance: &ash::Instance, phys: vk::PhysicalDevice) -> bool {
     let available = device_extensions(instance, phys);
     REQUIRED_EXTENSIONS
@@ -254,13 +237,6 @@ unsafe fn format_importable(
     })
 }
 
-/// Import one CEF dmabuf frame as a sampled `wgpu::Texture`. The returned
-/// raw `VkImage` handle must be passed to [`acquire_barrier`] before
-/// sampling.
-///
-/// # Safety
-/// - `frame.planes()[0].fd` must be a valid dmabuf fd describing a
-///   image of the frame's coded size in `frame.format()`/`frame.modifier()`.
 unsafe fn import(
     device: &wgpu::Device,
     frame: &SharedTexture,
@@ -294,11 +270,6 @@ unsafe fn import(
     Ok((texture, image.as_raw()))
 }
 
-/// Acquire an imported dmabuf image from the foreign producer queue into
-/// our graphics queue and the shader-read layout. Without this the GPU
-/// samples an image it does not own and faults (device lost). Must use the
-/// raw HAL encoding API only: wgpu 29 forbids mixing raw and normal wgpu
-/// commands in the same `CommandEncoder`.
 pub(crate) fn acquire_barrier(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
@@ -347,10 +318,6 @@ unsafe fn import_hal_texture(
     let ash_device = hal_device.raw_device();
     let instance = hal_device.shared_instance().raw_instance();
 
-    // The implicit modifier (`DRM_FORMAT_MOD_INVALID`) has no explicit
-    // tiling to describe, so import with OPTIMAL tiling and let the (same)
-    // driver interpret its own layout; only an explicit modifier may use
-    // the DRM-modifier path.
     let explicit = frame.modifier() != DRM_FORMAT_MOD_INVALID;
     let plane_layouts: Vec<vk::SubresourceLayout> = frame
         .planes()
@@ -447,9 +414,6 @@ unsafe fn import_hal_texture(
     Ok((texture, image))
 }
 
-/// Allocate dedicated memory importing `fd` and matching `image`'s
-/// requirements. Vulkan consumes a dup of `fd` on success; the caller's
-/// fd is untouched.
 unsafe fn import_memory(
     ash_device: &ash::Device,
     instance: &ash::Instance,
@@ -479,7 +443,6 @@ unsafe fn import_memory(
     }
     let mem_type_index = type_bits.trailing_zeros();
 
-    // Vulkan takes ownership of the fd on a successful allocate; hand it a dup.
     let import_fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) })
         .map_err(|_| ImportFailed("dup fd"))?;
     let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
@@ -493,11 +456,9 @@ unsafe fn import_memory(
         .push_next(&mut import_info);
     match unsafe { ash_device.allocate_memory(&alloc_info, None) } {
         Ok(memory) => {
-            // fd consumed by Vulkan — relinquish without closing.
             let _relinquished = import_fd.into_raw_fd();
             Ok(memory)
         }
-        // fd not consumed on failure — dropping the dup closes it.
         Err(_) => Err(ImportFailed("vkAllocateMemory")),
     }
 }

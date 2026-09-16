@@ -26,11 +26,8 @@ use crate::conn_source::X11Source;
 use crate::shm::{shm_alloc, shm_free};
 use crate::x11_state::ShmBuffer;
 
-/// The smallest window `CreateWindow` admits: it answers a zero width or
-/// height with `BadValue`.
 const ARMED_SIZE: PhysicalSize = PhysicalSize { w: 1, h: 1 };
 
-// Preserve the former 40 × 5 ms failure bound, without periodic retries.
 const GRAB_WAIT: Duration = Duration::from_millis(200);
 
 static MENU: OnceLock<SoftwareMenu> = OnceLock::new();
@@ -54,7 +51,6 @@ struct X11PopupSurface {
 }
 
 impl X11PopupSurface {
-    /// False when the op could not be queued for the popup thread.
     fn send(&self, op: Op) -> bool {
         let slot = self.tx.lock();
         let Some(tx) = slot.as_ref() else {
@@ -63,8 +59,6 @@ impl X11PopupSurface {
         tx.send(op).is_ok()
     }
 
-    /// Stops accepting ops, then dismisses every menu left in the queue. `rx` is
-    /// `None` once the event loop owns the channel and it cannot be reclaimed.
     fn close(&self, rx: Option<Channel<Op>>) {
         let doomed: Vec<Generation> = {
             let mut slot = self.tx.lock();
@@ -99,8 +93,6 @@ impl PopupSurface for X11PopupSurface {
         }
     }
 
-    // the grab window is mapped and acquisition started by `Op::Arm`;
-    // there is no second mapping to do
     fn map_armed(&self, _generation: Generation) {}
 
     fn reposition(&self, generation: Generation, place: MenuPlacement) {
@@ -131,8 +123,6 @@ enum Op {
     },
 }
 
-/// Installs the sender and starts the popup thread; on spawn failure the slot
-/// is left empty and menus dismiss on arrival.
 fn spawn_popup(surface: &Arc<X11PopupSurface>) {
     let (tx, rx) = calloop::channel::channel::<Op>();
     let thread_surface = Arc::clone(surface);
@@ -173,9 +163,6 @@ fn popup_thread(surface: &Arc<X11PopupSurface>, rx: Channel<Op>) {
         surface.close(Some(e.inserted));
         return;
     }
-    // XI 2.1 delivers raw releases even while another client owns the grab.
-    // Select before the first attempt, so a release cannot be lost between a
-    // failed grab and arming its wakeup. Selection lasts only while waiting.
     let raw_root = conn
         .xinput_xi_query_version(2, 1)
         .ok()
@@ -261,7 +248,6 @@ impl PopupLoop {
             .is_some_and(|w| w.generation == generation)
     }
 
-    /// Map the grab window and acquire modality, waking on releases if busy.
     fn arm(&mut self, generation: Generation, anchor: LogicalPoint) {
         self.tear_down();
         let Some(window) = self.build(generation, anchor, ARMED_SIZE) else {
@@ -279,9 +265,6 @@ impl PopupLoop {
             .insert_source(Timer::from_duration(GRAB_WAIT), move |_, _, st| {
                 if st.owns(generation) && matches!(st.phase, Phase::Grabbing(_)) {
                     st.grab_timeout = None;
-                    // One final attempt covers owners releasing an explicit grab
-                    // without a button/key event. This is a failure deadline, not
-                    // a recurring poll.
                     st.try_grab();
                     if matches!(st.phase, Phase::Grabbing(_)) {
                         tracing::error!(target: "x11::menu", "grab: deadline expired; dismissing");
@@ -330,7 +313,6 @@ impl PopupLoop {
         self.watch_releases(false);
     }
 
-    /// On `None`, nothing is left on the server for the caller to clean up.
     fn build(
         &mut self,
         generation: Generation,
@@ -381,8 +363,6 @@ impl PopupLoop {
         let _ = self
             .conn
             .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
-        // Round-trip on the grabbing connection before grabbing — the window
-        // must be realized server-side or the grab races into a BadWindow.
         let _ = self
             .conn
             .get_geometry(win)
@@ -397,10 +377,6 @@ impl PopupLoop {
         })
     }
 
-    /// The root-relative top-left of a window of `size` whose anchor is
-    /// `anchor`, kept inside the root.
-    ///
-    /// `None` when the scale does not map the anchor into buffer pixels.
     fn place(&self, snap: &Snap, anchor: LogicalPoint, size: PhysicalSize) -> Option<(i32, i32)> {
         let (w, h) = (size.w, size.h);
         let mut x = snap.parent_x + snap.scale.to_physical(anchor.x)?;
@@ -632,7 +608,6 @@ fn grab_modal(conn: &RustConnection, win: u32) -> GrabAttempt {
         .and_then(|cookie| cookie.reply().ok());
     let keyboard = keyboard.map_or(GrabAttempt::Failed, |reply| grab_status(reply.status));
     if keyboard != GrabAttempt::Ready {
-        // Do not hold half a modal grab while waiting for another owner.
         let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
         let _ = conn.flush();
     }
@@ -724,8 +699,6 @@ mod grab_tests {
 
         assert_eq!(grab_modal(&owner, root), GrabAttempt::Ready);
         assert_eq!(grab_modal(&popup, win), GrabAttempt::Busy);
-        // Raw release must reach the waiting client even while the other
-        // connection owns the pointer. A core ButtonRelease cannot do this.
         owner
             .xtest_fake_input(
                 x11rb::protocol::xproto::BUTTON_PRESS_EVENT,
@@ -770,8 +743,6 @@ mod grab_tests {
             .unwrap()
             .check()
             .unwrap();
-        // The keyboard is still held: a failed keyboard grab must release
-        // the pointer it just acquired, so another client can take it.
         assert_eq!(grab_modal(&popup, win), GrabAttempt::Busy);
         assert_eq!(grab_modal(&owner, root), GrabAttempt::Ready);
         owner

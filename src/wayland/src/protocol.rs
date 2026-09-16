@@ -1,5 +1,3 @@
-//! Seat input ownership. Destinations are registered with protocol objects;
-//! application visibility never participates in event delivery.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,7 +19,6 @@ pub(crate) trait InputTarget: Send + Sync {
 }
 
 struct Destination {
-    // Retaining the full object identity distinguishes reused wire IDs.
     surface: WlSurface,
     parent: Option<ObjectId>,
     target: Arc<dyn InputTarget>,
@@ -76,8 +73,6 @@ impl SeatInput {
     pub(crate) fn retire(&mut self, id: &ObjectId) {
         self.destinations.remove(id);
         self.grabs.retain(|(surface, _)| surface != id);
-        // Keep outstanding sequence records until release. A retired recipient
-        // receives nothing, and its release cannot fall through to a new one.
     }
 
     pub(crate) fn enter(&mut self, surface: &WlSurface, position: (f64, f64), modifiers: u32) {
@@ -134,8 +129,6 @@ impl SeatInput {
         }
     }
 
-    /// xdg_popup owner-events dismissal. Returns roles to destroy, topmost
-    /// first. This is a relationship between protocol objects, not UI types.
     pub(crate) fn outside_press(&self, surface: &WlSurface) -> Vec<Generation> {
         self.grabs
             .iter()
@@ -155,8 +148,6 @@ impl SeatInput {
     ) {
         let owner = if pressed {
             let owner = (!consumed).then(|| surface.id());
-            // A fresh press starts a new sequence even if the compositor ended
-            // an earlier grab without delivering its release.
             self.buttons.insert(button, owner.clone());
             owner
         } else {

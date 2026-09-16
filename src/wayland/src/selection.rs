@@ -1,10 +1,3 @@
-//! Both selections on the app's own seat, served by the input thread.
-//!
-//! The process holds one Wayland connection for its own display and opens
-//! none for the clipboard: the seat's `wl_data_device` carries the clipboard,
-//! and its `zwp_primary_selection_device_v1` the primary selection where the
-//! compositor advertises the manager.
-
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -45,7 +38,6 @@ use jfn_platform_abi::OnText;
 
 use crate::input::State;
 
-/// The mime types the source offers, in the order a read prefers them.
 const TEXT_MIMES: [&str; 5] = [
     "text/plain;charset=utf-8",
     "text/plain",
@@ -54,8 +46,6 @@ const TEXT_MIMES: [&str; 5] = [
     "TEXT",
 ];
 
-/// The globals whose presence means another client can read this seat's
-/// selections without holding focus.
 const DATA_CONTROL_GLOBALS: [&str; 2] = [
     "zwlr_data_control_manager_v1",
     "ext_data_control_manager_v1",
@@ -72,16 +62,12 @@ enum Job {
     Write { kind: Kind, text: String },
 }
 
-/// The seat's `wl_data_device` and, where the compositor advertises the
-/// manager, its `zwp_primary_selection_device_v1`.
 pub(crate) struct Selections {
     jobs: Mutex<VecDeque<Job>>,
     ping: Mutex<Option<Ping>>,
     source: Mutex<Option<PingSource>>,
     primary_available: AtomicBool,
     data_control: AtomicBool,
-    /// Set by [`Selections::cleanup`]; a read queued afterwards resolves with
-    /// no text rather than waiting for a thread that is gone.
     closed: AtomicBool,
 }
 
@@ -104,13 +90,10 @@ impl Selections {
         }
     }
 
-    /// Taken once by the input thread, which serves the queue from its loop.
     pub(crate) fn take_source(&self) -> Option<PingSource> {
         self.source.lock().take()
     }
 
-    /// Queued to the input thread; `on_done` fires there, with `None` for a
-    /// selection that holds no text and for a receive that failed.
     pub(crate) fn read_text_async(&self, kind: Kind, on_done: OnText) {
         let queued = self.queue(Job::Read { kind, on_done });
         if let Some(Job::Read { on_done, .. }) = queued {
@@ -118,9 +101,6 @@ impl Selections {
         }
     }
 
-    /// Queued to the input thread, which offers
-    /// `text/plain;charset=utf-8`, `text/plain`, `UTF8_STRING`, `STRING` and
-    /// `TEXT`, citing the seat's last input serial.
     pub(crate) fn write_text(&self, kind: Kind, text: &str) {
         drop(self.queue(Job::Write {
             kind,
@@ -128,19 +108,14 @@ impl Selections {
         }));
     }
 
-    /// Whether the compositor advertised
-    /// `zwp_primary_selection_device_manager_v1`.
     pub(crate) fn primary_available(&self) -> bool {
         self.primary_available.load(Ordering::Acquire)
     }
 
-    /// Whether the compositor advertised `wlr-data-control-unstable-v1` or
-    /// `ext-data-control-v1`, read off the app's own registry.
     pub(crate) fn data_control_advertised(&self) -> bool {
         self.data_control.load(Ordering::Acquire)
     }
 
-    /// Resolves every queued read with no text.
     pub(crate) fn cleanup(&self) {
         self.closed.store(true, Ordering::Release);
         let jobs: Vec<Job> = self.jobs.lock().drain(..).collect();
@@ -151,8 +126,6 @@ impl Selections {
         }
     }
 
-    /// Queues `job` and wakes the input thread. Returns the job back when
-    /// there is no thread to serve it.
     fn queue(&self, job: Job) -> Option<Job> {
         if self.closed.load(Ordering::Acquire) {
             return Some(job);
@@ -179,8 +152,6 @@ impl Selections {
     }
 }
 
-/// The input thread's half: the devices, the sources this client owns, and the
-/// reads still draining their pipes.
 pub(crate) struct SelectionState {
     manager: Option<DataDeviceManagerState>,
     device: Option<DataDevice>,
@@ -202,7 +173,6 @@ struct Read_ {
     buffer: Vec<u8>,
 }
 
-/// One selection value still draining into a requestor's pipe.
 struct Write_ {
     token: u64,
     data: Vec<u8>,
@@ -210,8 +180,6 @@ struct Write_ {
 }
 
 impl SelectionState {
-    /// Binds both managers on the registry the input thread already opened and
-    /// gets this seat's devices.
     pub(crate) fn bind(
         selections: &'static Selections,
         globals: &GlobalList,
@@ -262,7 +230,6 @@ impl SelectionState {
 }
 
 impl State {
-    /// Serves every job the other threads queued. Runs on the input thread.
     pub(crate) fn serve_selections(&mut self, qh: &QueueHandle<State>) {
         for job in self.rt.selections().take_jobs() {
             match job {
@@ -396,9 +363,6 @@ impl State {
         PostAction::Remove
     }
 
-    /// Queues `text` for the requestor's pipe and serves it from the event
-    /// loop; the input thread never blocks on a requestor that is not reading,
-    /// and a paste of this process's own selection drains its own pipe.
     fn serve_text(&mut self, text: &str, pipe: WritePipe) {
         let fd = OwnedFd::from(pipe);
         if fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).is_err() {
@@ -426,9 +390,6 @@ impl State {
         });
     }
 
-    /// Writes what the pipe will take. The source goes away once the value is
-    /// delivered, the requestor is gone, or the write failed, and closing it is
-    /// the end-of-value the requestor reads.
     fn write_ready(&mut self, token: u64, readiness: Readiness, fd: BorrowedFd<'_>) -> PostAction {
         let Some(index) = self
             .selection
@@ -473,8 +434,6 @@ impl State {
         PostAction::Remove
     }
 
-    /// Resolves every read still draining a pipe, for a thread that is
-    /// stopping.
     pub(crate) fn drain_selection_reads(&mut self) {
         for read in self.selection.reads.drain(..) {
             if let Some(on_done) = read.on_done {
@@ -499,7 +458,6 @@ fn receive_clipboard(offer: &SelectionOffer) -> Option<OwnedFd> {
     offer.receive(mime).ok().map(OwnedFd::from)
 }
 
-/// The first offered mime type this client understands, in preference order.
 fn preferred_mime(offered: &[String]) -> Option<String> {
     TEXT_MIMES
         .into_iter()
@@ -631,8 +589,6 @@ impl PrimarySelectionSourceHandler for State {
     }
 }
 
-/// The primary selection the platform hands out, `Some` only where the
-/// manager is advertised.
 pub(crate) struct WlPrimary {
     pub(crate) rt: &'static crate::runtime::WlRuntime,
 }

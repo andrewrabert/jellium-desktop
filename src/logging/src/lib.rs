@@ -1,14 +1,3 @@
-//! Logging backend.
-//!
-//! Two writers, both wrapped with `tracing_appender::non_blocking`:
-//! - stderr (always)
-//! - size-rotated file (optional, when `path` is non-empty)
-//!
-//! Every emitted line is filtered through the `redact` module so auth tokens
-//! are 'x'-ed out. Anything other code writes to the real stderr (CEF
-//! subprocesses, ffmpeg) is captured by a pipe-and-poll thread and
-//! re-emitted as `[CEF]` debug records.
-
 mod redact;
 
 use parking_lot::Mutex;
@@ -24,8 +13,6 @@ use time::macros::format_description;
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, Registry, filter::LevelFilter, fmt, layer::SubscriberExt};
 
-/// Subsystem a record is attributed to; each maps to one tracing target so
-/// filter directives such as `CEF=off` or `mpv=trace` address it by name.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum Category {
     Main,
@@ -58,10 +45,6 @@ impl Level {
     }
 }
 
-// =====================================================================
-// Rotating file writer
-// =====================================================================
-
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_BACKUPS: usize = 3;
 
@@ -75,8 +58,6 @@ struct RotatingFile {
 
 impl RotatingFile {
     fn open(path: PathBuf, max_bytes: u64, max_backups: usize) -> io::Result<Self> {
-        // Start each run with a fresh file; prior run's contents shift into
-        // the backup chain.
         shift_backups(&path, max_backups);
         let file = File::create(&path)?;
         Ok(Self {
@@ -112,8 +93,6 @@ fn backup_path(path: &Path, n: usize) -> PathBuf {
 }
 
 impl Write for RotatingFile {
-    // Rotates before writing when the buffer would cross `max_bytes`, so a
-    // record never spans two files.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.bytes_written.saturating_add(buf.len() as u64) > self.max_bytes {
             self.rotate()?;
@@ -126,10 +105,6 @@ impl Write for RotatingFile {
         self.file.flush()
     }
 }
-
-// =====================================================================
-// Per-OS console writer + stderr capture
-// =====================================================================
 
 #[cfg(unix)]
 mod imp {
@@ -144,9 +119,6 @@ mod imp {
 
     use jfn_wake_event::WakeEvent;
 
-    // Holds a dup of the original stderr taken before StderrCapture's
-    // dup2 redirect; writing via io::stderr() here would feed each log
-    // line back into the capture pipe.
     pub(super) struct StderrWriter {
         fd: Option<OwnedFd>,
     }
@@ -195,10 +167,6 @@ mod imp {
         }
 
         pub(super) fn stop(&mut self) {
-            // Order: restore STDERR FIRST (so any concurrent writer drains to
-            // the real fd from now on), THEN wake the capture thread, THEN
-            // join. The wake outlives the join: it is dropped with the
-            // StderrCapture, after the thread is gone.
             if let Some(original) = self.original_fd.take() {
                 let _ = dup2_stderr(&original);
             }
@@ -258,9 +226,6 @@ mod imp {
     };
 
     fn enable_vt_mode() {
-        // Best-effort: tell conhost to honor ANSI SGR escapes on stderr.
-        // Win10+ supports ENABLE_VIRTUAL_TERMINAL_PROCESSING; older builds
-        // silently fail and we render with no color.
         unsafe {
             let h = GetStdHandle(STD_ERROR_HANDLE);
             if h.is_null() || h == INVALID_HANDLE_VALUE {
@@ -304,10 +269,6 @@ mod imp {
     }
 }
 
-// =====================================================================
-// State
-// =====================================================================
-
 struct State {
     active_log_path: String,
     _console_guard: WorkerGuard,
@@ -326,12 +287,6 @@ const ISO_FILE_FMT: &[FormatItem<'static>] =
 const CONSOLE_TRACE_FMT: &[FormatItem<'static>] =
     format_description!("[hour]:[minute]:[second].[subsecond digits:3]");
 
-// =====================================================================
-// Emit
-// =====================================================================
-
-// The one place a category maps to a target string; `$mac` is re-invoked
-// with the target literal prepended to its arguments.
 macro_rules! with_category_target {
     ($category:expr, $mac:ident $(, $arg:expr)*) => {
         match $category {
@@ -346,9 +301,6 @@ macro_rules! with_category_target {
     };
 }
 
-// `tracing::event!` requires a literal `target` (it builds a `static`
-// Callsite at the call site), so the level match keeps `target` a literal
-// and materializes one static callsite per (category, level).
 macro_rules! emit_at {
     ($tgt:expr, $lvl:expr, $msg:expr) => {{
         use tracing::Level as L;
@@ -380,8 +332,6 @@ fn emit(category: Category, level: Level, msg: &str) {
     with_category_target!(category, emit_at, level, msg);
 }
 
-/// True if the filter admits any TRACE-level callsite — used to decide
-/// whether to prepend HH:MM:SS.mmm on console lines.
 fn filter_is_trace(filter: &EnvFilter) -> bool {
     filter.max_level_hint() == Some(LevelFilter::TRACE)
 }
@@ -395,8 +345,6 @@ pub fn jfn_log_init(path: &str, filter: &str) {
         filter_str_raw
     };
 
-    // Bail early on second init: dispatcher is already installed and the
-    // capture pipe / guards live in STATE. Mirrors prior behavior.
     {
         let guard = state().lock();
         if guard.is_some() {
@@ -404,9 +352,6 @@ pub fn jfn_log_init(path: &str, filter: &str) {
         }
     }
 
-    // Capture a dup of stderr now so console writes survive the later
-    // dup2() redirect installed by StderrCapture, and aren't fed back into
-    // the capture pipe.
     let (console_writer, is_tty) = imp::make_console_writer();
     let color = is_tty && std::env::var_os("NO_COLOR").is_none();
     let (console_nb, console_guard) = NonBlockingBuilder::default()
@@ -438,9 +383,6 @@ pub fn jfn_log_init(path: &str, filter: &str) {
 
     let subscriber = Registry::default().with(env_filter).with(console_layer);
 
-    // Add file layer conditionally without changing the subscriber type
-    // for the install call. SubscriberExt::with returns a new type each
-    // time, so we use boxed dispatch.
     let dispatch: tracing::Dispatch = if let Some(file_nb) = file_nb {
         let file_layer = fmt::layer()
             .event_format(FileFormat)
@@ -450,9 +392,6 @@ pub fn jfn_log_init(path: &str, filter: &str) {
         subscriber.into()
     };
 
-    // Fail-soft: if a dispatcher was already installed (unlikely given
-    // the STATE.is_some() early-return above, but possible across crate
-    // boundaries in tests), proceed without panicking.
     let _ = tracing::dispatcher::set_global_default(dispatch);
 
     let stderr_capture = imp::StderrCapture::start();
@@ -472,9 +411,6 @@ pub fn jfn_log_shutdown() {
         if let Some(mut cap) = s.stderr_capture.take() {
             cap.stop();
         }
-        // Drop file guard first so the file worker flushes before the
-        // console worker; final console line therefore appears after
-        // file flush completes on exit.
         s._file_guard = None;
         drop(s);
     }
@@ -496,17 +432,12 @@ pub fn active_path() -> String {
         .unwrap_or_default()
 }
 
-// =====================================================================
-// tracing-subscriber FormatEvent impls (commit 2 wires these in)
-// =====================================================================
-
 use tracing::{Event, Subscriber, field::Field};
 use tracing_subscriber::{
     fmt::{FmtContext, FormatEvent, FormatFields, format::Writer},
     registry::LookupSpan,
 };
 
-/// Records only the `"message"` field; ignores any structured fields.
 #[derive(Default)]
 struct MsgVisitor(String);
 
@@ -611,11 +542,6 @@ where
     }
 }
 
-// =====================================================================
-// Redacting MakeWriter — runs `jfn_log_redact::censor` on each event's
-// bytes before they reach the underlying non-blocking writer.
-// =====================================================================
-
 use tracing_subscriber::fmt::MakeWriter;
 
 struct RedactMake<W>(W);
@@ -656,10 +582,6 @@ where
         }
     }
 }
-
-// =====================================================================
-// Tests
-// =====================================================================
 
 #[cfg(test)]
 mod tests {
@@ -714,8 +636,6 @@ mod tests {
 
     #[test]
     fn level_label_padding_matches_file_format() {
-        // FileFormat pads level label to 7 chars via a fill loop.
-        // Sanity-check Level::label widths so padding code stays correct.
         assert_eq!(Level::Trace.label(), "TRACE");
         assert_eq!(Level::Debug.label(), "DEBUG");
         assert_eq!(Level::Info.label(), "INFO");
@@ -739,7 +659,6 @@ mod tests {
 
     #[test]
     fn log_enabled_respects_global_filter() {
-        // "warn" → Info disabled, Warn/Error enabled for any category.
         assert!(!enabled_under("warn", Category::Main, Level::Info));
         assert!(enabled_under("warn", Category::Main, Level::Warn));
         assert!(enabled_under("warn", Category::Main, Level::Error));
@@ -747,7 +666,6 @@ mod tests {
 
     #[test]
     fn log_enabled_respects_target_override() {
-        // Global warn, but mpv=trace → mpv Trace enabled, Main Trace not.
         assert!(enabled_under("warn,mpv=trace", Category::Mpv, Level::Trace));
         assert!(!enabled_under(
             "warn,mpv=trace",
@@ -758,7 +676,6 @@ mod tests {
 
     #[test]
     fn log_enabled_respects_off_directive() {
-        // Global info, CEF=off → CEF Error disabled, Main Error enabled.
         assert!(!enabled_under("info,CEF=off", Category::Cef, Level::Error));
         assert!(enabled_under("info,CEF=off", Category::Main, Level::Error));
     }

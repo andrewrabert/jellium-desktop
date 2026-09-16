@@ -109,9 +109,6 @@ impl Listener {
             Ok(listener) => Self::spawn(listener, handle),
             Err(held) if name_held(&held) => match Self::probe(name).await {
                 Probe::AlreadyRunning => Start::AlreadyRunning,
-                // Windows ignores `try_overwrite`, so this re-bind is the
-                // second opinion that turns a genuine denial back into the
-                // denial itself.
                 Probe::Vacant => match Self::make(name, true) {
                     Ok(listener) => Self::spawn(listener, handle),
                     Err(e) => Start::Failed(e),
@@ -137,7 +134,6 @@ impl Listener {
         match SocketStream::connect(sock).await {
             Ok(_) => Probe::AlreadyRunning,
             Err(e) if name_vacant(&e) => Probe::Vacant,
-            // Unreachable ≠ dead — never classify (and later reclaim) as vacant.
             Err(e) => Probe::Failed(e),
         }
     }
@@ -179,32 +175,21 @@ enum Probe {
     Failed(io::Error),
 }
 
-/// `bind` reports `EADDRINUSE` for a socket file that already exists, whether
-/// or not anything still listens on it. Linux and macOS agree here.
 #[cfg(unix)]
 fn name_held(e: &io::Error) -> bool {
     e.kind() == ErrorKind::AddrInUse
 }
 
-/// The listener instance carries `FILE_FLAG_FIRST_PIPE_INSTANCE`, so
-/// `CreateNamedPipeW` answers every instance after the first with
-/// `ERROR_ACCESS_DENIED` — the same code a real privilege failure reports, so
-/// the probe, not this function, decides which one happened.
 #[cfg(windows)]
 fn name_held(e: &io::Error) -> bool {
     is_win32_error(e, ERROR_ACCESS_DENIED)
 }
 
-/// A socket file whose listener is gone refuses connections.
 #[cfg(unix)]
 fn name_vacant(e: &io::Error) -> bool {
     e.kind() == ErrorKind::ConnectionRefused
 }
 
-/// A named pipe exists only while some instance of it is open, so no pipe of
-/// that name means nothing holds the name and the bind's `ERROR_ACCESS_DENIED`
-/// was a privilege failure. A pipe held under a denying ACL answers
-/// `ERROR_ACCESS_DENIED` here instead and stays `Probe::Failed`.
 #[cfg(windows)]
 fn name_vacant(e: &io::Error) -> bool {
     is_win32_error(e, ERROR_FILE_NOT_FOUND) || is_win32_error(e, ERROR_PATH_NOT_FOUND)

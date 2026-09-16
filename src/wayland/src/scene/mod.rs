@@ -1,16 +1,8 @@
-//! Pure model of the Wayland surface tree's layer stacking order.
-//!
-//! Wayland subsurface placement is parent-double-buffered: every stacking
-//! change must be followed by a [`Effect::CommitParent`] or the new z-order
-//! silently never applies.
-
 pub mod sink;
 
 use crate::wl_state::WlState;
 use sink::SceneSink;
 
-/// Opaque layer identity; in production a `*mut PlatformSurface` address, only
-/// ever compared, never dereferenced by the reducer.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct LayerId(pub usize);
 
@@ -23,19 +15,12 @@ pub struct Scene {
 pub enum SceneEvent {
     LayerAdded(LayerId),
     LayerRemoved(LayerId),
-    /// whole order, bottom first
     Order(Vec<LayerId>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Effect {
-    /// `layer` sits directly above `below`, which is always another layer.
-    PlaceAbove {
-        layer: LayerId,
-        below: LayerId,
-    },
-    /// mpv's video subsurface goes directly above the parent, below every app
-    /// sibling.
+    PlaceAbove { layer: LayerId, below: LayerId },
     PinVideoBottom,
     CommitParent,
 }
@@ -53,8 +38,6 @@ impl Scene {
         let mut prev: Option<LayerId> = None;
         for &id in &self.order {
             match prev {
-                // The bottom app layer is placed by pinning the video below it:
-                // placing it against the parent instead would sink it under mpv.
                 None => out.push(Effect::PinVideoBottom),
                 Some(below) => out.push(Effect::PlaceAbove { layer: id, below }),
             }
@@ -82,8 +65,6 @@ pub fn reduce(scene: &mut Scene, ev: SceneEvent) -> Vec<Effect> {
         }
         SceneEvent::Order(order) => {
             let mut next: Vec<LayerId> = order.into_iter().filter(|id| scene.has(*id)).collect();
-            // A layer the owner did not name keeps its place above the named ones, so
-            // one created between two applications is never deordered.
             for id in &scene.order {
                 if !next.contains(id) {
                     next.push(*id);
@@ -142,8 +123,6 @@ mod tests {
         );
     }
 
-    /// Any event that changes the order must end in exactly one CommitParent,
-    /// else the new z-order never applies (parent-double-buffered placement).
     #[test]
     fn every_order_change_ends_in_single_commit_parent() {
         let mut s = Scene::default();

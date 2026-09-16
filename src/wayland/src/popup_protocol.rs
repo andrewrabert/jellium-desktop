@@ -1,4 +1,3 @@
-//! Popup protocol objects share the seat's event queue and dispatch owner.
 use crate::input::State;
 use crate::protocol::InputTarget;
 use jfn_platform_abi::{Generation, LogicalPoint, LogicalSize, MenuPaint, MenuPlacement};
@@ -43,15 +42,10 @@ impl Popups {
     }
 }
 
-/// Menu-popup requests. Create, paint, reposition and destroy must reach the
-/// compositor in the order they were issued, so they share one queue.
 pub(crate) enum PopupCommand {
     Create {
         generation: Generation,
         anchor: LogicalPoint,
-        /// The press or key serial the grab cites. Captured on the input
-        /// thread at request time; by the time this is applied the seat's last
-        /// serial has moved on.
         serial: u32,
         input: Arc<dyn InputTarget>,
         parent: PopupParent,
@@ -69,9 +63,6 @@ pub(crate) enum PopupCommand {
     },
 }
 
-/// Placement bookkeeping for one menu popup, free of protocol objects: it owns
-/// what the compositor has been given and what it may still be sent, so "never
-/// reposition an unmapped popup" is decided here and nowhere else.
 pub(crate) mod popup_place {
     use super::MenuPlacement;
 
@@ -82,7 +73,6 @@ pub(crate) mod popup_place {
     }
 
     impl Placed {
-        /// A popup armed with no menu on it: the compositor holds no placement.
         pub(crate) fn armed() -> Placed {
             Placed {
                 sent: None,
@@ -98,22 +88,16 @@ pub(crate) mod popup_place {
             }
         }
 
-        /// What an unmapped popup wants next. A want equal to `sent` clears the
-        /// hold, so a placement already on the wire is never re-sent.
         pub(crate) fn hold(&mut self, want: MenuPlacement) {
             self.held = (Some(want) != self.sent).then_some(want);
         }
 
-        /// The placement the mapping commit must be followed with, consumed as
-        /// it is read. `None` when the create-time placement still stands.
         pub(crate) fn on_map(&mut self) -> Option<MenuPlacement> {
             let place = self.held.take()?;
             self.sent = Some(place);
             Some(place)
         }
 
-        /// The placement to put on the wire now; `None` when the compositor
-        /// already holds it.
         pub(crate) fn send(&mut self, want: MenuPlacement) -> Option<MenuPlacement> {
             (Some(want) != self.sent).then(|| {
                 self.sent = Some(want);
@@ -124,7 +108,6 @@ pub(crate) mod popup_place {
 }
 use popup_place::Placed;
 
-/// One live menu popup and everything that names its `wl_surface`.
 struct LivePopup {
     generation: Generation,
     popup: Popup,
@@ -134,8 +117,6 @@ struct LivePopup {
 }
 
 impl LivePopup {
-    /// Crop, attach, damage and commit the menu buffer; the first one maps the
-    /// popup.
     fn attach(&self, buffer: &crate::wl_state::AttachedBuffer, paint: &MenuPaint) {
         let surface = self.popup.wl_surface();
         self.viewport.set_source(
@@ -151,9 +132,6 @@ impl LivePopup {
         surface.commit();
     }
 
-    /// Attach [`ARMED_PIXEL`] and commit: the surface maps holding a grab and
-    /// showing no menu. The viewport crops the one pixel to [`ARMED_SIZE`],
-    /// the size the popup was configured at.
     fn attach_armed(&self, buffer: &crate::wl_state::AttachedBuffer) {
         let surface = self.popup.wl_surface();
         self.viewport.set_source(0.0, 0.0, 1.0, 1.0);
@@ -163,7 +141,6 @@ impl LivePopup {
         surface.commit();
     }
 
-    /// `xdg_popup.reposition`; every caller stands in a mapped state.
     fn reposition(&self, xdg_shell: &XdgShell, place: MenuPlacement) {
         let Some(positioner) = positioner(xdg_shell, place.anchor, place.view.logical()) else {
             return;
@@ -172,17 +149,12 @@ impl LivePopup {
     }
 }
 
-// The viewport names the `wl_surface` that dropping the popup destroys, so it
-// goes first.
 impl Drop for LivePopup {
     fn drop(&mut self) {
         self.viewport.destroy();
     }
 }
 
-/// The menu popup's mapping state: `Unmapped` has no path to
-/// [`LivePopup::reposition`], so a placement requested there is held until the
-/// commit that maps the popup applies it.
 #[derive(Default)]
 enum PopupMapping {
     #[default]
@@ -220,9 +192,6 @@ impl PopupMapping {
         }
     }
 
-    /// Commits the armed buffer, mapping the popup so its grab takes effect,
-    /// then sends whatever placement was held since the arm. A popup already
-    /// mapped keeps the buffer it has.
     fn map_armed(&mut self, xdg_shell: &XdgShell, buffer: crate::wl_state::AttachedBuffer) {
         let mut live = match std::mem::take(self) {
             Self::None => return,
@@ -239,8 +208,6 @@ impl PopupMapping {
         *self = Self::Mapped { live, buffer };
     }
 
-    /// Commits `buffer`, mapping an unmapped popup and then sending whatever
-    /// placement was held since the arm.
     fn paint(
         &mut self,
         xdg_shell: &XdgShell,
@@ -253,8 +220,6 @@ impl PopupMapping {
             Self::Mapped { live, buffer } => (live, Some(buffer)),
         };
         live.attach(&buffer, paint);
-        // Retired only once the replacement is committed, so the surface is
-        // never left naming a destroyed buffer.
         drop(retired);
         if let Some(place) = live.place.on_map() {
             live.reposition(xdg_shell, place);
@@ -263,16 +228,10 @@ impl PopupMapping {
     }
 }
 
-/// The smallest size `xdg_positioner.set_size` admits: it answers a width or
-/// height that is not positive with `invalid_input`.
 const ARMED_SIZE: LogicalSize = LogicalSize { w: 1, h: 1 };
 
-/// One transparent premultiplied BGRA pixel: the buffer whose commit maps the
-/// armed popup.
 const ARMED_PIXEL: [u8; 4] = [0, 0, 0, 0];
 
-/// The positioner for a surface of `size` logical px whose top-left sits at
-/// `anchor`. The anchor rect is one pixel because the anchor is a point.
 fn positioner(
     xdg_shell: &XdgShell,
     anchor: LogicalPoint,
@@ -295,10 +254,6 @@ fn positioner(
 }
 
 impl State {
-    /// Creates the popup that holds the grab, with no menu on it, sized
-    /// [`ARMED_SIZE`]. The grab cites the input thread's last press serial
-    /// (button or key) — valid here only because every app connection shares
-    /// one wl_client.
     pub(crate) fn create_popup(
         &mut self,
         generation: Generation,
@@ -307,9 +262,6 @@ impl State {
         input: Arc<dyn InputTarget>,
         parent: PopupParent,
     ) {
-        // Each generation drives exactly one create, so `<=` (not `<`) also
-        // blocks resurrecting a just-destroyed popup: teardown leaves latest_generation
-        // at its peak.
         if generation.get() <= self.popups.latest_generation || serial == 0 {
             input.dismissed();
             return;
@@ -333,8 +285,6 @@ impl State {
         );
     }
 
-    /// Creates the popup against `positioner` and takes the grab; `place` is
-    /// what the compositor is thereafter considered to hold.
     fn open_popup(
         &mut self,
         generation: Generation,
@@ -356,8 +306,6 @@ impl State {
             .popups
             .viewporter
             .get_viewport(surface.wl_surface(), &self.qh, ());
-        // xdg_popup.grab is only honored before the popup's first commit, so
-        // the grab and the commit below must stay in that order.
         let popup = match Popup::from_surface(
             Some(&parent.xdg_surface),
             positioner,
@@ -392,7 +340,6 @@ impl State {
         };
     }
 
-    /// Drops the request when `generation` no longer owns the popup.
     pub(crate) fn map_popup(&mut self, generation: Generation) {
         if self.popups.current.generation() != Some(generation) {
             return;
@@ -447,9 +394,6 @@ impl State {
             .paint(&self.popups.xdg_shell, buffer, &paint);
     }
 
-    /// Tear the popup down, but only if `generation` still owns it — a newer
-    /// menu may have taken the role in the gap between a stale teardown being
-    /// decided and this call, and must not be torn down by it.
     pub(crate) fn destroy_popup(&mut self, generation: Generation) {
         if self.popups.current.generation() != Some(generation) {
             return;
@@ -480,7 +424,6 @@ impl State {
 }
 
 impl PopupHandler for State {
-    /// SCTK has already acked the serial.
     fn configure(
         &mut self,
         _: &Connection,
@@ -502,8 +445,6 @@ impl PopupHandler for State {
         let Some(generation) = self.popup_generation(popup) else {
             return;
         };
-        // The role and its input destination retire together on this queue.
-        // SCTK releases its callback handle when this method returns.
         self.dismiss_popup(generation);
     }
 }
@@ -531,8 +472,6 @@ impl Dispatch<WpViewport, ()> for State {
     }
 }
 
-// SCTK's XdgShell binding includes toplevel-decoration dispatch bounds. This
-// queue creates popup roles only; root-window roles retain their own handler.
 impl smithay_client_toolkit::shell::xdg::window::WindowHandler for State {
     fn request_close(
         &mut self,

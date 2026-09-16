@@ -1,15 +1,3 @@
-//! Background thread that drains `mpv_wait_event` and delivers owned
-//! [`Event`]s to a consumer.
-//!
-//! libmpv's event queue must be drained from somewhere; the standard pattern
-//! is a dedicated thread blocked in `mpv_wait_event`. This module wraps that
-//! loop so callers see a typed [`Receiver<Event>`] instead of raw FFI.
-//!
-//! The loop exits when:
-//! - libmpv delivers `MPV_EVENT_SHUTDOWN` (forwarded to the consumer first), or
-//! - [`EventLoop::stop`] is called, or
-//! - the consumer drops the receiver (send error breaks the loop).
-
 use crate::event::Event;
 use crate::handle::Handle;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -24,9 +12,6 @@ pub struct EventLoop {
 }
 
 impl EventLoop {
-    /// Spawn the drain thread. Returns the loop owner and a [`Receiver`]
-    /// for typed events. The wakeup callback on `handle` is left untouched —
-    /// `mpv_wait_event(-1)` blocks until libmpv has something to deliver.
     pub fn spawn(handle: Arc<Handle>) -> std::io::Result<(Self, Receiver<Event>)> {
         let (tx, rx) = unbounded();
         let stop = Arc::new(AtomicBool::new(false));
@@ -47,8 +32,6 @@ impl EventLoop {
         ))
     }
 
-    /// Signal the loop to exit and wake `mpv_wait_event` so the next
-    /// iteration observes the flag. Joins the thread.
     pub fn stop(&mut self) {
         if self.thread.is_none() {
             return;
@@ -74,12 +57,9 @@ fn drain(handle: Arc<Handle>, stop: Arc<AtomicBool>, tx: Sender<Event>) {
         }
         let event = handle.wait_event(-1.0);
         match event {
-            // Timeout sentinel; spurious wakeup (e.g. from `Handle::wakeup`).
             Event::None => continue,
-            // Log messages go straight to tracing; consumers never see them.
             Event::LogMessage(ref m) => crate::log::forward_to_tracing(m),
             Event::Shutdown => {
-                // Forward shutdown so consumers can react, then exit.
                 let _ = tx.send(Event::Shutdown);
                 return;
             }

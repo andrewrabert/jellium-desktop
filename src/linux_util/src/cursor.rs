@@ -1,11 +1,6 @@
-//! CEF cursor shape → freedesktop cursor icon, shared by the Wayland and X11
-//! pointer paths.
-
 use cursor_icon::CursorIcon;
 use jfn_platform_abi::cursor::CursorShape;
 
-/// The named cursor a fixed CEF shape maps to; unmapped shapes fall back to
-/// the default arrow.
 pub fn icon_for(shape: CursorShape) -> CursorIcon {
     use CursorShape::*;
     match shape {

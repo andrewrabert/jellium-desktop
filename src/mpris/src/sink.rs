@@ -1,13 +1,3 @@
-//! MPRIS direct sink. A [`QueuedSink`] run by the playback sink harness on
-//! its consumer thread, holding a zbus blocking Connection. Each delivered
-//! PlaybackEvent updates the content/snapshot state and emits
-//! PropertiesChanged + Seeked signals.
-//!
-//! Method/property handlers run inline on zbus's reactor thread; outbound
-//! transport (Play/Pause/Stop/etc.) calls jfn_mpv_* directly. Next/
-//! Previous/Seek/SetPosition route to the JS UI via the registered exec_js
-//! callback.
-
 use async_io::block_on;
 use parking_lot::Mutex;
 use std::borrow::Cow;
@@ -27,13 +17,7 @@ use jfn_playback::{MediaMetadata, PlaybackEvent, PlaybackEventKind, PlaybackSnap
 
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 const BASE_SERVICE_NAME: &str = "org.mpris.MediaPlayer2.JelliumDesktop";
-// MPRIS clients poll Position and every event moves it, so it is never
-// part of a changed set
 const POLLED_PROPERTY: &str = "Position";
-
-// ============================================================================
-// Content + projected view
-// ============================================================================
 
 #[derive(Clone, Debug, Default)]
 struct Content {
@@ -75,7 +59,6 @@ fn insert_value(m: &mut HashMap<String, OwnedValue>, key: &str, v: Value<'_>) {
 
 fn metadata_to_dict(meta: &MediaMetadata) -> HashMap<String, OwnedValue> {
     let mut m = HashMap::new();
-    // mpris:trackid is required by spec.
     if let Ok(track_id) = ObjectPath::try_from("/net/nullsum/JelliumDesktop/track/1") {
         insert_value(&mut m, "mpris:trackid", Value::from(track_id));
     }
@@ -108,11 +91,6 @@ fn metadata_to_dict(meta: &MediaMetadata) -> HashMap<String, OwnedValue> {
     m
 }
 
-// ============================================================================
-// Shared state — accessed by zbus reactor thread (interface impls) and the
-// event-pump thread (worker). Single Mutex; getters are read-only fast paths.
-// ============================================================================
-
 struct State {
     content: Content,
     snapshot: PlaybackSnapshot,
@@ -136,7 +114,6 @@ impl State {
         })
     }
 
-    /// metadata_active=false -> clean transport while nothing is loaded.
     fn visible_metadata(&self) -> HashMap<String, OwnedValue> {
         if self.derived().metadata_active {
             metadata_to_dict(&self.content.metadata)
@@ -145,10 +122,6 @@ impl State {
         }
     }
 }
-
-// ============================================================================
-// D-Bus interface impls
-// ============================================================================
 
 struct Root;
 
@@ -286,18 +259,11 @@ impl Player {
     }
 }
 
-// ============================================================================
-// Queued sink
-// ============================================================================
-
-/// The MPRIS transport the harness drives: connects on `init`, releases the
-/// bus name on `teardown`.
 struct Transport {
     service_name: String,
     bus: Option<Bus>,
 }
 
-/// A live session-bus registration.
 struct Bus {
     conn: Connection,
     state: Arc<Mutex<State>>,
@@ -392,7 +358,6 @@ fn handle_event(
 ) {
     let snap = ev.snapshot.clone();
 
-    // last_snap_ tracks every snapshot so getPosition() reads the latest.
     state.lock().snapshot = snap.clone();
 
     let mut do_recompute = false;
@@ -401,10 +366,6 @@ fn handle_event(
         let mut s = state.lock();
         match ev.kind {
             PlaybackEventKind::MetadataChanged => {
-                // Same-Id dedup: same-Id setMetadata is a semantic no-op
-                // (identical item). Otherwise empty art fields in the
-                // incoming meta would clobber cached art from notifyArtwork
-                // on every variant switch.
                 if ev.metadata.id.is_empty() || ev.metadata.id != s.content.metadata.id {
                     s.content.metadata = ev.metadata.clone();
                     do_recompute = true;
@@ -436,11 +397,7 @@ fn handle_event(
             | PlaybackEventKind::RateChanged => {
                 do_recompute = true;
             }
-            // MPRIS Position is polled, not signaled. Snapshot already
-            // refreshed above so the property getter returns latest value.
             PlaybackEventKind::PositionChanged => {}
-            // Duration ships inside metadata; bare DurationChanged from mpv
-            // isn't surfaced to MPRIS.
             PlaybackEventKind::DurationChanged => {}
             PlaybackEventKind::MediaTypeChanged
             | PlaybackEventKind::FullscreenChanged
@@ -460,8 +417,6 @@ fn handle_event(
     }
 }
 
-/// Every readable Player property, valued by the same getters that answer
-/// `org.freedesktop.DBus.Properties.Get`.
 fn player_properties(iface: &InterfaceRef<Player>) -> zbus::Result<HashMap<String, OwnedValue>> {
     let emitter = iface.signal_emitter();
     let conn = emitter.connection();
@@ -473,7 +428,6 @@ fn player_properties(iface: &InterfaceRef<Player>) -> zbus::Result<HashMap<Strin
     Ok(props)
 }
 
-/// Entries of `next` that are absent from `last` or hold a different value.
 fn changed_properties<'a>(
     last: &HashMap<String, OwnedValue>,
     next: &'a HashMap<String, OwnedValue>,
@@ -488,8 +442,6 @@ fn changed_properties<'a>(
     Ok(changed)
 }
 
-/// One PropertiesChanged carrying every property whose value moved, after
-/// which `last` becomes the new baseline. Emits nothing when nothing moved.
 fn emit_properties_changed(
     iface: &InterfaceRef<Player>,
     last: &mut HashMap<String, OwnedValue>,
@@ -508,13 +460,6 @@ fn emit_properties_changed(
     Ok(())
 }
 
-// ============================================================================
-// start / stop
-// ============================================================================
-
-/// Run the MPRIS sink on the harness thread. `service_suffix` is appended to
-/// the base service name (`org.mpris.MediaPlayer2.JelliumDesktop<suffix>`).
-/// No-op if already running.
 pub(crate) fn start(service_suffix: &str) {
     let suffix = service_suffix.to_owned();
     sink_core::run_sink("mpris-sink", move || Transport::new(&suffix));

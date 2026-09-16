@@ -1,30 +1,18 @@
-//! The process's single owner of z-order.
-//!
-//! Every non-web surface that composites is a plane's occupant. The web
-//! overlay's owner is the only code that can add its handle to the order.
-
 use std::sync::Weak;
 
 use parking_lot::Mutex;
 
 use crate::SurfaceHandle;
 
-/// The composited planes, bottom first. The order is this declaration's order
-/// and is never data a caller supplies.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Plane {
-    /// mpv's video, pinned below every app surface by the backend.
     Video,
     WebOverlay,
     ShellOverlay,
-    /// CEF's off-screen popup.
     WebPopup,
-    /// The native menu popup.
     MenuPopup,
 }
 
-/// Applies an order containing the web overlay without exposing its handle to
-/// the stack registry.
 pub trait WebOverlayStacker: Send + Sync {
     fn apply_web_overlay_stack(&self, lower: &[SurfaceHandle], upper: &[SurfaceHandle]);
 }
@@ -42,35 +30,27 @@ static STATE: Mutex<StackState> = Mutex::new(StackState {
     web_overlay: None,
 });
 
-/// Installs the live web-overlay surface owner and applies the whole order.
 pub fn install_web_overlay_stacker(stacker: Weak<dyn WebOverlayStacker>) {
     let mut state = STATE.lock();
     state.web_overlay = Some(stacker);
     apply(&mut state);
 }
 
-/// Removes the web-overlay surface owner and reapplies the non-web order.
 pub fn remove_web_overlay_stacker() {
     let mut state = STATE.lock();
     state.web_overlay = None;
     apply(&mut state);
 }
 
-/// Installs `s` as `plane`'s occupant, replacing any previous one, and applies
-/// the whole order. The web-overlay plane is owned exclusively through
-/// [`install_web_overlay_stacker`], so its handle is never retained here.
 pub fn occupy(plane: Plane, s: SurfaceHandle) {
     write(plane, (!s.is_none()).then_some(s));
 }
 
-/// Empties `plane` and applies the whole order.
 pub fn vacate(plane: Plane) {
     write(plane, None);
 }
 
 fn write(plane: Plane, occupant: Option<SurfaceHandle>) {
-    // The lock is held across the apply, so two writers cannot interleave and
-    // leave the older order on screen.
     let mut state = STATE.lock();
     match plane {
         Plane::Video => state.lower[0] = occupant,

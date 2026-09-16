@@ -1,5 +1,3 @@
-//! CEF library loading, before subprocess dispatch or browser initialization.
-
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -28,24 +26,12 @@ pub enum LoadError {
     Version(#[from] VersionError),
 }
 
-/// A unique bootstrap capability, confined to its loading thread.
-///
-/// The library stays loaded until process exit: CEF's global thunk table and
-/// native reference-counted objects can outlive application teardown. Dropping
-/// this handle neither unloads the library nor calls CefShutdown.
-///
-/// ```compile_fail
-/// fn move_to_worker(runtime: jfn_cef::LoadedCef) {
-///     std::thread::spawn(move || runtime.version().clone());
-/// }
-/// ```
 #[must_use]
 pub struct LoadedCef {
     version: CefVersion,
     _thread: PhantomData<Rc<()>>,
 }
 
-/// Only this module constructs proof that native entry points are available.
 pub(crate) struct LibraryLoaded {
     _private: (),
 }
@@ -79,15 +65,12 @@ impl LoadedCef {
         }
     }
 
-    /// Load an explicitly located framework binary, including an unpacked CEF
-    /// SDK. Uses the same process and thread restrictions as bundled loading.
     #[cfg(target_os = "macos")]
     pub fn load_framework(path: &std::path::Path) -> Result<Self, LoadError> {
         use std::os::unix::ffi::OsStrExt;
         unsafe extern "C" {
             fn pthread_main_np() -> std::ffi::c_int;
         }
-        // SAFETY: pthread_main_np has no initialization requirements.
         if unsafe { pthread_main_np() } == 0 {
             return Err(LoadError::WrongThread);
         }
@@ -97,13 +80,9 @@ impl LoadedCef {
         })?;
         let path = std::ffi::CString::new(resolved.as_os_str().as_bytes())
             .map_err(|_| LoadError::InvalidPath(resolved.clone()))?;
-        // Claim before mutating CEF's global thunk table. Native load/probe
-        // failures are terminal startup errors; never race or retry loading.
         CLAIMED
             .set(())
             .map_err(|()| LoadError::BootstrapAlreadyClaimed)?;
-        // SAFETY: the path is NUL-terminated and loading is serialized on main.
-        // We deliberately never call unload_library, including on probe failure.
         if unsafe { cef::load_library(Some(&*path.as_ptr().cast())) } != 1 {
             return Err(LoadError::Framework(resolved));
         }
@@ -122,13 +101,11 @@ impl LoadedCef {
     }
 }
 
-/// Outcome of dispatching the process command line through CEF.
 pub enum ProcessDispatch {
     Browser(BrowserCef),
     SubprocessExit(std::os::raw::c_int),
 }
 
-/// Browser process ownership, before initialization.
 #[must_use]
 pub struct BrowserCef {
     loaded: LoadedCef,
@@ -158,7 +135,6 @@ pub enum DebuggingPort {
     Disabled,
     Enabled(DebugPort),
 }
-/// CEF supports explicit debugging ports in 1024..=65535.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DebugPort(u16);
 
@@ -208,8 +184,6 @@ pub enum InitError {
     Readiness,
 }
 
-/// One state machine governs native producer admission, overlay registration,
-/// and revocation. Native operations run outside its short state lock.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionState {
     Active { overlay: bool },
@@ -225,8 +199,6 @@ pub(crate) struct Session {
     idle: parking_lot::Condvar,
     producers: parking_lot::Mutex<Vec<crossbeam_channel::Receiver<std::convert::Infallible>>>,
 }
-/// Native work holds a count, never the lifecycle mutex. Synchronous callbacks
-/// and work on other threads can enter independently until revocation.
 struct DispatchPermit<'a>(&'a Session);
 impl Drop for DispatchPermit<'_> {
     fn drop(&mut self) {
@@ -312,7 +284,6 @@ impl Session {
             _ => SessionState::Closing,
         };
     }
-    /// Stop admission immediately, then wait for the permits already issued.
     pub(crate) fn revoke_until(
         &self,
         deadline: std::time::Instant,
@@ -344,9 +315,6 @@ impl Session {
 #[error("CEF browser drain was not confirmed")]
 pub struct ShutdownError;
 
-/// Initialized CEF remains pinned on abandoned/failed shutdown. Its retained
-/// platform lease prevents backend cleanup. Application rollback calls shutdown
-/// explicitly; arbitrary Drop cannot safely pump and drain native browsers.
 #[must_use = "CEF requires explicit shutdown after confirmed browser drain"]
 pub struct InitializedCef {
     _loaded: LoadedCef,
@@ -380,17 +348,11 @@ impl BrowserCef {
         self.loaded.version()
     }
 
-    /// Borrows the platform, so failure leaves cleanup ownership with the caller.
-    ///
-    /// Native startup pins a platform lease before its first mutation. A reported
-    /// failure releases that lease after rollback; unwinding retains it until exit.
     pub fn initialize(
         self,
         platform: &jfn_platform_abi::PlatformRuntime,
         options: InitOptions,
     ) -> Result<InitializedCef, InitError> {
-        // The guard pins platform dependencies if native startup unwinds before
-        // it can report whether initialization or rollback completed.
         let mut pin = InitializationPin(Some(platform.lease()));
         let result = crate::ffi::jfn_cef_initialize(&self.loaded, platform.platform(), &options);
         let lease = pin.0.take().ok_or(InitError::Native)?;
@@ -405,7 +367,6 @@ impl BrowserCef {
 }
 
 impl InitializedCef {
-    /// Retains ownership on failure so the caller can retry browser drain.
     pub fn try_shutdown(&mut self) -> Result<(), ShutdownError> {
         if self.shutdown_complete {
             return Ok(());
@@ -421,7 +382,6 @@ impl InitializedCef {
         self.shutdown_complete = true;
         Ok(())
     }
-    /// Permanently retain native dependencies when drain cannot be confirmed.
     pub fn abandon(self) {
         drop(self);
     }
@@ -439,15 +399,13 @@ impl Drop for InitializedCef {
         self.session.revoke();
         crate::ready::stop();
         if !self.shutdown_complete {
-            // Native state may still reference the backend. Never falsely release
-            // its dependency when normal shutdown was skipped or drain failed.
             let _ = Box::leak(Box::new(self.platform.clone()));
         }
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Test assertions and bounded synchronization.
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::Session;
     use std::sync::{Arc, mpsc::channel};

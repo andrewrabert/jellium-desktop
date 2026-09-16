@@ -1,23 +1,7 @@
-//! Coalescing scroll accumulator.
-//!
-//! macOS delivers high-frequency wheel/trackpad deltas; firing a CEF scroll
-//! event per `scrollWheel:` floods the renderer. This batches deltas and
-//! drains an integer chunk per runloop flush, carrying the fractional
-//! remainder. It's a pure state machine — the platform keeps the state
-//! and the main-queue scheduling, and just feeds events in and pushes the
-//! drained chunk out. The fixed-point drain math is subtle, so it lives
-//! here where it can be unit-tested on any host.
-
-/// Cocoa non-precise `scrollWheel:` reports line deltas; Chromium maps one
-/// scroll line to 40 CSS pixels.
 const PIXELS_PER_TICK: f32 = 40.0;
 
-/// Fraction of the pending non-precise delta drained per flush — smooths a
-/// burst of line scrolls into several frames.
 const DRAIN: f32 = 0.45;
 
-/// An integer scroll chunk to forward to CEF. Mirrors the arguments of
-/// `jfn_input_dispatch_scroll_precise`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollFlush {
     pub x: i32,
@@ -28,11 +12,6 @@ pub struct ScrollFlush {
     pub precise: bool,
 }
 
-/// Accumulated scroll state. Construct with [`ScrollAccum::new`], feed
-/// [`accumulate`], drain with [`flush`].
-///
-/// [`accumulate`]: ScrollAccum::accumulate
-/// [`flush`]: ScrollAccum::flush
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct ScrollAccum {
     ax: f32,
@@ -60,11 +39,6 @@ impl ScrollAccum {
         }
     }
 
-    /// Accumulate one wheel/trackpad event. `dx`/`dy` are the raw deltas
-    /// (`scrollingDeltaX/Y` when `precise`, the `deltaX/Y` line counts
-    /// otherwise — line counts are scaled to pixels here). Returns `true`
-    /// if a flush needs scheduling (i.e. one wasn't already pending), so
-    /// the caller schedules exactly one main-queue drain per burst.
     pub fn accumulate(
         &mut self,
         x: i32,
@@ -94,13 +68,6 @@ impl ScrollAccum {
         }
     }
 
-    /// Drain one flush worth of integer deltas, carrying the remainder.
-    /// Returns `None` when there's nothing pending or the drained chunk
-    /// rounds to zero this cycle. Clears the "flush scheduled" latch, so a
-    /// stuck sub-integer remainder waits for the next [`accumulate`] to
-    /// reschedule.
-    ///
-    /// [`accumulate`]: ScrollAccum::accumulate
     pub fn flush(&mut self) -> Option<ScrollFlush> {
         self.flush_scheduled = false;
         if !self.pending {

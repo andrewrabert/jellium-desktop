@@ -1,37 +1,19 @@
-//! Window-scoped theme color tracker.
-//!
-//! Owns the current theme-color (`<meta name="theme-color">` updates),
-//! buffers it until the loading overlay dismisses, and switches to the
-//! mpv background color while video is playing so resize letterbox gaps
-//! match mpv exactly.
-//!
-//! The two sink callbacks are installed once at process start:
-//!   * `on_set_theme_color(rgb)` — optional; only set when the user has
-//!     `titlebarThemeColor` enabled, drives the platform titlebar tint.
-//!   * `on_set_bg_hex(c_str)` — required; passes `#RRGGBB` to mpv so its
-//!     background matches the chrome during resize.
-
 use parking_lot::Mutex;
 use std::ffi::c_char;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const DEFAULT_BG_RGB: u32 = 0x101010; // kBgColor
+const DEFAULT_BG_RGB: u32 = 0x101010;
 
-/// The colour `apply` last resolved to. Readable without the instance lock so
-/// the titlebar can paint it from its own thread.
 static CURRENT: AtomicU32 = AtomicU32::new(DEFAULT_BG_RGB);
 
 type ColorListener = Box<dyn Fn(u32) + Send + Sync>;
 
 static LISTENERS: Mutex<Vec<ColorListener>> = Mutex::new(Vec::new());
 
-/// The colour `apply` last resolved to, `0x101010` before the first apply.
 pub fn jfn_theme_color_current() -> u32 {
     CURRENT.load(Ordering::Acquire)
 }
 
-/// Registered once at boot; fired on every applied change, on the applying
-/// thread. A listener must not call back into this module.
 pub fn jfn_theme_color_subscribe<F: Fn(u32) + Send + Sync + 'static>(f: F) {
     LISTENERS.lock().push(Box::new(f));
 }
@@ -89,12 +71,6 @@ fn format_hex_rgb(rgb: u32, out: &mut [u8; 8]) {
 
 static INSTANCE: Mutex<Option<ThemeColor>> = Mutex::new(None);
 
-/// Initialise the process-wide theme color singleton. Calling a second time
-/// replaces the previous state — the new sink callbacks take effect on the
-/// next `apply()`.
-///
-/// # Safety
-/// Callbacks must be valid for the lifetime of the process.
 pub unsafe fn jfn_theme_color_init(
     on_set_theme_color: Option<unsafe extern "C" fn(u32)>,
     on_set_bg_hex: Option<unsafe extern "C" fn(*const c_char)>,

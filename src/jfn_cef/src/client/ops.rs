@@ -1,5 +1,3 @@
-//! Input and navigation operations on the browser the web overlay drives.
-
 use cef::{ImplBrowser, ImplBrowserHost, KeyEvent, MouseButtonType, MouseEvent, sys};
 use std::os::raw::c_int;
 
@@ -33,7 +31,7 @@ impl Inner {
         }
     }
 
-    #[allow(clippy::too_many_arguments)] // mirrors CEF's KeyEvent layout 1:1
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn send_key_event(
         &self,
         type_: c_int,

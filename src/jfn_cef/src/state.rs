@@ -1,6 +1,3 @@
-//! Process-lifetime state for the browser process. The configuration
-//! is published once before initialization; App handlers read the snapshot.
-
 #[derive(Clone)]
 pub struct PendingSwitch {
     pub name: String,
@@ -30,7 +27,6 @@ pub struct Config {
 static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 
 pub fn configure(config: Config) {
-    // BrowserCef is unique and initialize consumes it.
     let _ = CONFIG.set(config);
 }
 

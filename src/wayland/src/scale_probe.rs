@@ -1,12 +1,3 @@
-//! Live fractional-scale probe: open an own `wl_display` connection, read the
-//! outputs' logical (xdg-output) and mode geometry, disconnect. Used before
-//! the surface has entered any output — boot-time `--geometry` correction and
-//! the first-configure fallback — so the output is chosen provisionally: by
-//! containing point when one is given, else the first usable output.
-//!
-//! Output selection and scale calculation are pure ([`select_scale`]) over
-//! [`OutputCandidate`]s; only [`probe_scale`] talks to the live display.
-
 use std::env;
 use std::num::NonZeroU32;
 
@@ -23,32 +14,23 @@ use crate::scale::Scale120;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ScaleProbeError {
-    /// No `WAYLAND_DISPLAY`/`WAYLAND_SOCKET` in the environment.
     #[error("no Wayland session")]
     NoWaylandSession,
-    /// Connecting or round-tripping on the probe connection failed.
     #[error("probe connection failed")]
     Connection,
-    /// No output offered complete, positive geometry to derive a scale from.
     #[error("no usable output")]
     NoUsableOutput,
-    /// The probe thread outlived its deadline (the compositor stalled the
-    /// probe connection's round trips).
     #[error("probe timed out")]
     Timeout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeTarget {
-    /// The output containing this point (compositor logical coordinates).
     Point { x: i32, y: i32 },
-    /// The first usable output, for callers with no better anchor.
     FirstOutput,
 }
 
 impl ProbeTarget {
-    /// The output holding `position`, or the first usable output when the
-    /// caller has no position to anchor to.
     pub(crate) fn at(position: Option<WindowPos>) -> ProbeTarget {
         match position {
             Some(p) => ProbeTarget::Point { x: p.x, y: p.y },
@@ -57,17 +39,11 @@ impl ProbeTarget {
     }
 }
 
-/// One output's geometry as needed for scale derivation. Constructed only
-/// from complete metadata — an output still mid-advertisement is skipped, not
-/// guessed at.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OutputCandidate {
     logical_pos: (i32, i32),
     logical_size: (i32, i32),
-    /// Current mode dimensions, in the panel's native (untransformed) axes.
     mode: (i32, i32),
-    /// Output transform rotates by 90/270°, so the mode's axes are swapped
-    /// relative to the logical size.
     swaps_axes: bool,
 }
 
@@ -92,7 +68,6 @@ impl OutputCandidate {
         x >= lx && x < lx.saturating_add(lw) && y >= ly && y < ly.saturating_add(lh)
     }
 
-    /// physical/logical width as an exact rational, transform-corrected.
     fn scale(&self) -> Option<Scale120> {
         let physical_w = if self.swaps_axes {
             self.mode.1
@@ -105,9 +80,6 @@ impl OutputCandidate {
     }
 }
 
-/// Pure output selection + calculation. A point target falls back to the
-/// first usable output when no output contains the point (the point may be a
-/// stale position from a disconnected output).
 pub(crate) fn select_scale(
     outputs: &[OutputCandidate],
     target: ProbeTarget,
@@ -184,7 +156,6 @@ fn collect_candidates() -> Result<Vec<OutputCandidate>, ScaleProbeError> {
 
     let mut candidates = Vec::new();
     for output in state.output_state.outputs() {
-        // Incomplete metadata skips this output, not the whole probe.
         let Some(info) = state.output_state.info(&output) else {
             continue;
         };
@@ -209,17 +180,10 @@ fn collect_candidates() -> Result<Vec<OutputCandidate>, ScaleProbeError> {
     Ok(candidates)
 }
 
-/// Query the live display and derive the scale for `target`.
 pub(crate) fn probe_scale(target: ProbeTarget) -> Result<Scale120, ScaleProbeError> {
     select_scale(&collect_candidates()?, target)
 }
 
-/// [`probe_scale`] on a throwaway thread, waiting at most `timeout`. The probe
-/// round-trips on a second display connection, which can block indefinitely if
-/// the compositor stops responding; the caller must never do that inline (it
-/// would stall the root event loop), so the blocking part is isolated here and
-/// abandoned on timeout — the orphaned thread holds only its own private
-/// connection and exits with the process.
 pub(crate) fn probe_scale_bounded(
     target: ProbeTarget,
     timeout: std::time::Duration,
@@ -240,13 +204,10 @@ mod tests {
     use super::*;
 
     fn landscape() -> OutputCandidate {
-        // 3840x2160 panel at 1.5: logical 2560x1440 at (0,0).
         OutputCandidate::new((0, 0), (2560, 1440), (3840, 2160), false)
     }
 
     fn portrait() -> OutputCandidate {
-        // Same panel rotated 90°: logical 1440x2560 at (2560,0); mode stays
-        // in native axes, so the logical width maps to the mode HEIGHT.
         OutputCandidate::new((2560, 0), (1440, 2560), (3840, 2160), true)
     }
 
@@ -282,8 +243,6 @@ mod tests {
 
     #[test]
     fn rotated_output_uses_swapped_mode_axis() {
-        // Without transform awareness this would compute 3840/1440 ≈ 2.67
-        // instead of 2160/1440 = 1.5.
         assert_eq!(
             scale_of(select_scale(&[portrait()], ProbeTarget::FirstOutput)),
             ONE_AND_A_HALF
@@ -317,7 +276,6 @@ mod tests {
             select_scale(&[zero_logical, negative_mode], ProbeTarget::FirstOutput),
             Err(ScaleProbeError::NoUsableOutput)
         );
-        // A later healthy output still wins.
         assert_eq!(
             scale_of(select_scale(
                 &[zero_logical, landscape()],
@@ -329,8 +287,6 @@ mod tests {
 
     #[test]
     fn unusable_containing_output_falls_back() {
-        // The point hits an output with broken geometry; selection falls back
-        // to the first usable output instead of failing.
         let broken_at_origin = OutputCandidate::new((0, 0), (2560, 1440), (0, 0), false);
         assert_eq!(
             scale_of(select_scale(

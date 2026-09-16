@@ -1,8 +1,3 @@
-//! Page-derived chrome inputs.
-//!
-//! Held below both jfn-cef, which writes them from jellyfin-web's bindings,
-//! and the application shell, which draws the titlebar from them.
-
 use parking_lot::Mutex;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -31,7 +26,6 @@ pub fn chrome_state() -> ChromeState {
     *STATE.lock()
 }
 
-/// Registered once at boot; fired on every change.
 pub fn subscribe_chrome<F: Fn() + Send + Sync + 'static>(f: F) {
     LISTENERS.lock().push(Box::new(f));
 }

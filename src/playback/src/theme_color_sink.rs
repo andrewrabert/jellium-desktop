@@ -1,8 +1,3 @@
-//! Theme-color sink. Resets ThemeColor video mode on terminal playback
-//! events. Active-true setVideoMode fires from the web_browser path
-//! on metadata arrival; that's not mpv-derived and stays out of the
-//! playback event stream.
-
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 
@@ -15,7 +10,6 @@ fn cb_slot() -> &'static Mutex<Option<SetCb>> {
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
-/// Install the ThemeColor::setVideoMode setter. `cb == None` disables.
 pub fn jfn_playback_set_theme_video_mode_handler(cb: Option<SetCb>) {
     *cb_slot().lock() = cb;
 }

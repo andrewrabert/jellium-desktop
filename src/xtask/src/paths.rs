@@ -4,8 +4,6 @@ use std::sync::OnceLock;
 pub fn repo_root() -> &'static PathBuf {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        // src/xtask → src → repo_root. Falls back to the cwd, which is the
-        // repo root under the usual `cargo xtask` invocation.
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)

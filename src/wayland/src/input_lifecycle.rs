@@ -1,13 +1,4 @@
-// lifecycle_init forwards a wl_display* the app already owns to the
-// unsafe input thread init; the function exists for callers that don't
-// want to mark themselves unsafe just to pass a pointer through.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
-
-//! Lifecycle wrapper around the Wayland input thread.
-//!
-//! Owns the static `InputThread` handle, builds the input thread's
-//! `Callbacks` struct from the input crate's dispatch shims, and exposes
-//! the Platform-vtable cursor setter.
 
 use std::ffi::c_void;
 

@@ -1,5 +1,3 @@
-//! KDE/KWin per-window titlebar color support.
-
 use parking_lot::Mutex;
 use std::ffi::CString;
 use std::fs;
@@ -29,7 +27,6 @@ impl Palette {
 fn write_color_scheme(r: u8, g: u8, b: u8, path: &std::path::Path) -> std::io::Result<()> {
     let bg = format!("{},{},{}", r, g, b);
 
-    // BT.709 luminance — choose readable foreground.
     let lum =
         0.2126 * (r as f64 / 255.0) + 0.7152 * (g as f64 / 255.0) + 0.0722 * (b as f64 / 255.0);
     let active_fg = if lum < 0.5 { "252,252,252" } else { "35,38,41" };

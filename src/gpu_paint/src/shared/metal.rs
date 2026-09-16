@@ -1,5 +1,3 @@
-//! `IOSurface` import for CEF accelerated-paint frames.
-
 use objc2_io_surface::IOSurfaceRef;
 use objc2_metal::{
     MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTextureDescriptor, MTLTextureType,
@@ -11,8 +9,6 @@ use crate::SharedTexture;
 use crate::error::SurfaceLost;
 use crate::shared::{ImportFailed, Imported, Opened};
 
-/// A Mac has one system default Metal device, so there is nothing to name and
-/// nothing to mismatch.
 pub type ProducerId = ();
 
 pub(crate) fn adapter_matches(_adapter: &wgpu::Adapter, _want: ProducerId) -> bool {
@@ -23,8 +19,6 @@ pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<Opened, SurfaceLost
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("jfn_gpu_paint device"),
         required_features: wgpu::Features::empty(),
-        // Adapter limits — the swapchain may be larger than the downlevel
-        // 2048×2048 cap on modern displays.
         required_limits: adapter.limits(),
         experimental_features: wgpu::ExperimentalFeatures::default(),
         memory_hints: wgpu::MemoryHints::Performance,
@@ -37,20 +31,11 @@ pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<Opened, SurfaceLost
     })
 }
 
-/// One-deep cache keyed on the `IOSurfaceRef`'s identity **and extent**: CEF
-/// recycles a small pool of surfaces, so consecutive frames usually arrive on
-/// the one already wrapped.
-///
-/// The extent is part of the key because CEF hands the same address back at a
-/// new size after a relayout; keying on identity alone samples a wrapper built
-/// over the old size.
 pub(crate) struct Importer {
     cached: Option<Cached>,
 }
 
 struct Cached {
-    /// The `IOSurfaceRef` address. Compared, never dereferenced — a surface
-    /// that went away cannot come back at the same address while CEF holds it.
     key: usize,
     size: (u32, u32),
     texture: wgpu::Texture,
@@ -70,8 +55,6 @@ impl Importer {
         if raw.is_null() {
             return Err(ImportFailed("null IOSurface"));
         }
-        // SAFETY: `SharedTexture` only exists for a frame CEF handed us, and
-        // the surface is live for the duration of the paint callback.
         let io_surface: &IOSurfaceRef = unsafe { &*raw.cast::<IOSurfaceRef>() };
         let width = u32::try_from(io_surface.width()).map_err(|_| ImportFailed("bad width"))?;
         let height = u32::try_from(io_surface.height()).map_err(|_| ImportFailed("bad height"))?;
@@ -156,8 +139,6 @@ impl Importer {
     }
 }
 
-/// `'RGBA'`; anything else takes the BGRA path this platform has always
-/// assumed, rather than dropping a frame over an unrecognised tag.
 const IO_SURFACE_RGBA: u32 = u32::from_be_bytes(*b"RGBA");
 
 fn formats(pixel_format: u32) -> (MTLPixelFormat, wgpu::TextureFormat) {
@@ -168,7 +149,6 @@ fn formats(pixel_format: u32) -> (MTLPixelFormat, wgpu::TextureFormat) {
     }
 }
 
-/// Metal has no queue-family ownership to transfer.
 pub(crate) fn acquire_barrier(
     _device: &wgpu::Device,
     _encoder: &mut wgpu::CommandEncoder,

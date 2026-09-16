@@ -1,12 +1,3 @@
-//! macOS NSApplication lifecycle + window/display-link/menu init.
-//!
-//! JellyfinApplication NSApplication subclass conforming to CefAppProtocol,
-//! the application menu bar (App + Edit), the CADisplayLink target that
-//! drives external BeginFrame per browser, and the NSWindow.windowShouldClose:
-//! swizzle that routes the WM close button into `jfn_shutdown_initiate`.
-
-// Platform entry points take raw pointers from the C/Obj-C boundary; the
-// safety contract is the boundary's, matching the wayland/x11 backends.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use parking_lot::Mutex;
@@ -20,45 +11,22 @@ use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, Bool, Sel};
 use objc2::{ClassType, DefinedClass, class, define_class, extern_class, msg_send, sel};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSRect};
 
-// The input NSView is created by the input module; we adopt the
-// +1-retained NSView returned here; ownership moves into INPUT_VIEW.
 use crate::input::jfn_input_macos_create_view;
 
 use jfn_playback::shutdown::{jfn_shutdown_initiate, jfn_shutting_down};
 
 use jfn_mpv::api::jfn_mpv_set_force_window_position;
 
-// Foundation log target for parity with C++ LOG_PLATFORM.
 const LOG_TARGET: &str = "Platform";
 
-// =====================================================================
-// Global window + input view + display link state.
-// =====================================================================
-
 struct InitState {
-    /// `NSWindow*` (mpv's VO window). Retained NS object pointer; we keep
-    /// it as a raw pointer so the Mutex stays `Send`. Lifetime: from
-    /// macos_init through macos_cleanup.
     window: *mut AnyObject,
-    /// `JellyfinInputView*` (NSView subclass owned by Rust input crate).
-    /// `jfn_input_macos_create_view` returns a +1-retained ref; we hold
-    /// it here until cleanup releases.
     input_view: *mut AnyObject,
-    /// `DisplayLinkTarget*` retained instance.
     display_link_target: *mut AnyObject,
-    /// `CADisplayLink*` retained instance.
     display_link: *mut AnyObject,
-    /// `JellyfinAppMenuTarget*` retained for process lifetime.
     app_menu_target: *mut AnyObject,
-    /// `JellyfinWakeTarget*` retained for process lifetime — the
-    /// NSWorkspace/screen-change observer that restarts the display link.
     wake_target: *mut AnyObject,
-    /// `JellyfinLifecycleObserver*` retained for process lifetime —
-    /// receives NSApplication hide/unhide + NSWorkspace sleep/wake.
     lifecycle_observer: *mut AnyObject,
-    /// What a CADisplayLink tick drives. Stored by
-    /// `CefHost::start_frame_driver`, which starts the link in the same call,
-    /// so no tick runs before it is here.
     frame_driver: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -75,20 +43,14 @@ static INIT_STATE: Mutex<InitState> = Mutex::new(InitState {
     frame_driver: None,
 });
 
-/// Returns the `NSWindow*` (non-retaining) for use by other modules.
-/// Null before macos_init or after macos_cleanup.
 pub fn jfn_macos_get_window() -> *mut AnyObject {
     INIT_STATE.lock().window
 }
 
-/// Returns the `JellyfinInputView*` (non-retaining) so `macos_apply_stack`
-/// can re-anchor it on top of the CefLayer subviews after a reorder.
 pub fn jfn_macos_get_input_view() -> *mut AnyObject {
     INIT_STATE.lock().input_view
 }
 
-/// Logical content view size in points. Backs `JfnIngest`'s macOS-only
-/// "use the OS's logical size, not osd-dimensions" branch.
 pub fn jfn_macos_query_logical_content_size(w: *mut c_int, h: *mut c_int) -> bool {
     unsafe {
         let win = INIT_STATE.lock().window;
@@ -106,18 +68,11 @@ pub fn jfn_macos_query_logical_content_size(w: *mut c_int, h: *mut c_int) -> boo
     }
 }
 
-// =====================================================================
-// Theme color apply on main thread. Called from macos_set_theme_color
-// (lib.rs) either inline (already on main) or via dispatch_async_f.
-// =====================================================================
-
 pub fn jfn_macos_apply_theme_color_on_main(rgb: u32) {
     let win = INIT_STATE.lock().window;
     unsafe { apply_theme_color_to_window(win, rgb) };
 }
 
-/// Lock-free body. Callers that already hold `INIT_STATE` must use this
-/// directly with the window they own — re-entering `INIT_STATE` self-deadlocks.
 unsafe fn apply_theme_color_to_window(win: *mut AnyObject, rgb: u32) {
     if win.is_null() {
         return;
@@ -146,18 +101,11 @@ unsafe fn apply_theme_color_to_window(win: *mut AnyObject, rgb: u32) {
     }
 }
 
-// =====================================================================
-// JellyfinApplication — NSApplication subclass conforming to
-// CefAppProtocol. Stores the BOOL `handlingSendEvent_` in a Cell ivar.
-// =====================================================================
-
 #[derive(Default)]
 struct JellyfinAppIvars {
     handling_send_event: Cell<bool>,
 }
 
-// SAFETY: NSApplication runs on the main thread; instance state is only
-// touched from main.
 unsafe impl Send for JellyfinAppIvars {}
 unsafe impl Sync for JellyfinAppIvars {}
 
@@ -200,7 +148,6 @@ define_class!(
 
         #[unsafe(method(handleReopenEvent:withReplyEvent:))]
         unsafe fn handle_reopen(&self, _event: *mut AnyObject, _reply: *mut AnyObject) {
-            // Deminiaturize the first miniaturized window.
             unsafe {
                 let ns_app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
                 let windows: *mut AnyObject = msg_send![ns_app, windows];
@@ -224,22 +171,12 @@ define_class!(
     }
 );
 
-/// Attach the `CefAppProtocol` protocol to the `JellyfinApplication` class
-/// at runtime. The protocol is declared only in CEF's C++ headers; we look
-/// it up by name and add it to the class so
-/// `[NSApp conformsToProtocol:@protocol(CefAppProtocol)]` is true.
 fn attach_cef_app_protocol(cls: &AnyClass) {
     let Some(proto) = AnyProtocol::get(c"CefAppProtocol") else {
         return;
     };
-    // SAFETY: the class is ours and is not yet registered with AppKit.
     let _ = unsafe { class_addProtocol(std::ptr::from_ref(cls).cast_mut(), proto) };
 }
-
-// =====================================================================
-// JellyfinAppMenuTarget — selects the combined overlay's About tab from the
-// native App menu's "About" item.
-// =====================================================================
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -249,26 +186,12 @@ define_class!(
     impl JellyfinAppMenuTarget {
         #[unsafe(method(showAbout:))]
         unsafe fn show_about(&self, _sender: *mut AnyObject) {
-            // The installed shell handler retargets the persistent overlay to
-            // About without replacing its Settings state.
             jfn_platform_abi::request_about();
         }
     }
 
     unsafe impl NSObjectProtocol for JellyfinAppMenuTarget {}
 );
-
-// =====================================================================
-// DisplayLinkTarget — CADisplayLink target that drives external
-// BeginFrame on every browser. Fires on the main runloop at the
-// display's refresh rate.
-// =====================================================================
-
-// =====================================================================
-// Lifecycle observer — bridges NSApplication hide/unhide notifications
-// and NSWorkspace will-sleep/did-wake notifications into the manager
-// FSM (jfn_playback::lifecycle).
-// =====================================================================
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -300,10 +223,7 @@ define_class!(
         unsafe fn window_did_resign_key(&self, _n: *mut AnyObject) {
             jfn_input::jfn_input_dispatch_keyboard_focus(0);
         }
-        /// The window moved to a screen with a different backing scale.
-        /// Republishes the extent from the OS state current at this moment;
-        /// no mpv property is involved.
-        #[unsafe(method(windowDidChangeBackingProperties:))]
+                                #[unsafe(method(windowDidChangeBackingProperties:))]
         unsafe fn window_did_change_backing_properties(&self, _n: *mut AnyObject) {
             jfn_playback::ingest_driver::jfn_playback_rescale_window_extent();
         }
@@ -318,7 +238,6 @@ unsafe fn install_lifecycle_observer() {
             msg_send![JellyfinLifecycleObserver::class(), new];
         let observer_obj: *mut AnyObject = Retained::into_raw(observer) as *mut AnyObject;
 
-        // App-level hide / unhide arrive via the default notification center.
         let nc: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
         for (sel, name) in [
             (sel!(appDidHide:), c"NSApplicationDidHideNotification"),
@@ -347,8 +266,6 @@ unsafe fn install_lifecycle_observer() {
             ];
         }
 
-        // System sleep / wake is published by the shared NSWorkspace's own
-        // notification center, not the default one.
         let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         let ws_nc: *mut AnyObject = msg_send![ws, notificationCenter];
         for (sel, name) in [
@@ -394,16 +311,6 @@ define_class!(
     unsafe impl NSObjectProtocol for JellyfinDisplayLinkTarget {}
 );
 
-// =====================================================================
-// Display link lifecycle.
-// =====================================================================
-
-/// Build a CADisplayLink bound to `window`'s current screen and add it to
-/// the main run loop. Returns `(target, link)` (both +1-retained) on
-/// success, or `None` if the window has no screen / the factory failed.
-/// Does NOT touch `InitState` — callers decide how to install the result,
-/// which lets `restart_display_link` build the replacement before tearing
-/// down the old one.
 unsafe fn build_display_link(window: *mut AnyObject) -> Option<(*mut AnyObject, *mut AnyObject)> {
     unsafe {
         let target: Retained<JellyfinDisplayLinkTarget> =
@@ -427,18 +334,10 @@ unsafe fn build_display_link(window: *mut AnyObject) -> Option<(*mut AnyObject, 
             let _: () = msg_send![target_obj, release];
             return None;
         }
-        // Retain — the result of `-displayLinkWithTarget:selector:` is
-        // autoreleased.
         let _: () = msg_send![link, retain];
 
-        // Force-unpause defensively (NSScreen's factory does NOT document
-        // a default state for paused).
         let _: () = msg_send![link, setPaused: false];
 
-        // Add to the main run loop in common modes AND default mode (belt
-        // and braces — common modes should cover default, but if our
-        // NSString constant doesn't match the runtime's @"kCFRunLoopCommonModes"
-        // identity, default mode is a guaranteed fallback).
         let main_runloop: *mut AnyObject = msg_send![class!(NSRunLoop), mainRunLoop];
         let common_modes_name = c"kCFRunLoopCommonModes";
         let common_ns: *mut AnyObject = msg_send![
@@ -471,14 +370,6 @@ unsafe fn start_display_link(state: &mut InitState) -> bool {
     }
 }
 
-/// Rebuild the display link against the window's current screen. The
-/// CADisplayLink returned by `-[NSScreen displayLinkWithTarget:selector:]`
-/// is bound to one specific display; after display sleep or a screen
-/// reconfiguration that display goes away under it and the link stops
-/// ticking, so external BeginFrame stalls and CEF paints nothing new — the
-/// UI looks frozen and unresponsive. Build the replacement first, and only
-/// swap + invalidate the old link if the new one came up, so a transiently
-/// screen-less window on wake never leaves us with no link at all.
 unsafe fn restart_display_link(state: &mut InitState) {
     unsafe {
         let Some((target_obj, link)) = build_display_link(state.window) else {
@@ -519,17 +410,14 @@ unsafe fn stop_display_link(state: &mut InitState) {
     }
 }
 
-/// Stop frame production and release its callback on the main thread.
 pub fn stop_frame_driver() {
     let mut state = INIT_STATE.lock();
-    // SAFETY: display-link operations are called on the application's main thread.
     unsafe {
         stop_display_link(&mut state);
     }
     state.frame_driver.take();
 }
 
-/// Store the driver before starting CADisplayLink on the main thread.
 pub fn start_frame_driver(driver: std::sync::Arc<dyn Fn() + Send + Sync>) -> bool {
     let mut state = INIT_STATE.lock();
     state.frame_driver = Some(driver);
@@ -539,7 +427,6 @@ pub fn start_frame_driver(driver: std::sync::Arc<dyn Fn() + Send + Sync>) -> boo
     unsafe { start_display_link(&mut state) }
 }
 
-/// Rebuild the link unless shutdown has begun or no window exists.
 fn restart_display_link_locked() {
     if jfn_shutting_down() {
         return;
@@ -550,14 +437,6 @@ fn restart_display_link_locked() {
     }
     unsafe { restart_display_link(&mut state) };
 }
-
-// =====================================================================
-// JellyfinWakeTarget — observer for NSWorkspaceDidWakeNotification and
-// NSApplicationDidChangeScreenParametersNotification. Both leave the
-// screen-bound CADisplayLink stale (the display it was attached to slept
-// or was reconfigured); restarting the link against the window's current
-// screen resumes BeginFrame and restores a responsive UI.
-// =====================================================================
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -578,9 +457,6 @@ define_class!(
     unsafe impl NSObjectProtocol for JellyfinWakeTarget {}
 );
 
-/// Subscribe to the system wake and screen-reconfiguration notifications
-/// that strand the CADisplayLink on a defunct display. Installed once from
-/// `macos_init`; the target is retained for the process lifetime.
 unsafe fn start_wake_observer(state: &mut InitState) {
     unsafe {
         let target: Retained<JellyfinWakeTarget> = msg_send![JellyfinWakeTarget::class(), new];
@@ -589,11 +465,6 @@ unsafe fn start_wake_observer(state: &mut InitState) {
 
         let sel_restart = sel!(displayLinkNeedsRestart:);
 
-        // Wake notifications post on NSWorkspace's own notification center.
-        // System sleep (Apple menu, lid, full idle sleep) posts DidWake;
-        // display-only sleep (screen off, machine awake) posts
-        // ScreensDidWake instead. Either can strand the link, so observe
-        // both — restarting is idempotent.
         let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         let ws_nc: *mut AnyObject = msg_send![ws, notificationCenter];
         for name in [
@@ -611,8 +482,6 @@ unsafe fn start_wake_observer(state: &mut InitState) {
             ];
         }
 
-        // Screen reconfiguration (display added/removed/rearranged) posts
-        // on the default center.
         let nc: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
         let screen_name: *mut AnyObject = msg_send![
             class!(NSString),
@@ -633,31 +502,14 @@ unsafe fn start_wake_observer(state: &mut InitState) {
     }
 }
 
-// =====================================================================
-// macos_pump — re-exported from lib.rs (we need it here to drive the
-// wait-for-window loop in macos_init).
-// =====================================================================
-
 use crate::macos_pump_block;
 use std::time::Instant;
-
-// =====================================================================
-// macos_init — locates mpv's NSWindow, swizzles windowShouldClose:,
-// installs the input view, sets up titlebar/theme, starts the display
-// link.
-// =====================================================================
 
 pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformInitError> {
     tracing::info!(target: LOG_TARGET, "[INIT] macos_init: waiting for mpv window");
 
     let mut state = INIT_STATE.lock();
     unsafe {
-        // Block the main run loop until mpv creates its NSWindow. mpv's
-        // window-creation work runs as a dispatch on the main queue, which
-        // fires a run-loop source — `macos_pump_block` wakes on that source
-        // without polling. The deadline caps total wait at ~5s; each
-        // iteration drains pending events, blocks until *some* source
-        // fires (typically the window dispatch), then re-checks.
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let ns_app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
@@ -671,8 +523,6 @@ pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformIni
                     }
                     let visible: bool = msg_send![w, isVisible];
                     if visible {
-                        // Retain — the returned NSArray entry is owned by
-                        // the array; we promote to a strong ref.
                         let _: () = msg_send![w, retain];
                         state.window = w;
                         break;
@@ -696,23 +546,11 @@ pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformIni
         }
         tracing::info!(target: LOG_TARGET, "[INIT] macos_init: got window={:?}", state.window);
 
-        // Swizzle windowShouldClose: on the actual window class — mpv's
-        // implementation routes through MP_KEY_CLOSE_WIN which we
-        // disable. Replace with a block that initiates shutdown and
-        // returns NO (we tear down via jfn_shutdown_initiate, not by
-        // letting AppKit close the window).
         let cls: *const AnyClass = msg_send![state.window, class];
         if let Some(method) = cls
             .as_ref()
             .and_then(|c| c.instance_method(sel!(windowShouldClose:)))
         {
-            // Build a block that calls jfn_shutdown_initiate and returns NO.
-            // Block layout: { isa, flags, reserved, invoke, descriptor, ... }.
-            // We use std::ops::Fn boxed by `block2` if available; lacking
-            // a dep on block2 here we hand-roll a global block. Since we
-            // only need one process-wide, a static block suffices.
-            // The block signature for the swizzled method is
-            //   BOOL block(id self, NSWindow* win).
             unsafe extern "C" fn close_block_invoke(
                 _block: *mut c_void,
                 _self_: *mut AnyObject,
@@ -721,9 +559,6 @@ pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformIni
                 jfn_shutdown_initiate();
                 Bool::NO
             }
-            // Hand-rolled "global" block — flags = BLOCK_IS_GLOBAL (1<<28),
-            // a single invoke slot. Layout matches the ABI Apple
-            // documents in <Block.h>.
             #[repr(C)]
             struct GlobalBlock {
                 isa: *const c_void,
@@ -747,7 +582,7 @@ pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformIni
             };
             static BLOCK: GlobalBlock = GlobalBlock {
                 isa: unsafe { &_NSConcreteGlobalBlock as *const c_void },
-                flags: 1 << 28, // BLOCK_IS_GLOBAL
+                flags: 1 << 28,
                 reserved: 0,
                 invoke: close_block_invoke,
                 descriptor: &BLOCK_DESC,
@@ -758,11 +593,8 @@ pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformIni
             let _ = method.set_implementation(imp);
         }
 
-        // Clear --force-window-position so subsequent reconfigs don't
-        // re-snap the window back to the saved boot position.
         jfn_mpv_set_force_window_position(false);
 
-        // Dock icon.
         let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
         if !bundle.is_null() {
             let res_path: *mut AnyObject = msg_send![bundle, resourcePath];
@@ -792,12 +624,9 @@ pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformIni
             }
         }
 
-        // Transparent titlebar.
         let _: () = msg_send![state.window, setTitlebarAppearsTransparent: true];
-        // NSWindowTitleHidden == 1.
         let _: () = msg_send![state.window, setTitleVisibility: 1isize];
         let mask: u64 = msg_send![state.window, styleMask];
-        // NSWindowStyleMaskFullSizeContentView == 1 << 15.
         let _: () = msg_send![state.window, setStyleMask: (mask | (1u64 << 15))];
 
         let content_view: *mut AnyObject = msg_send![state.window, contentView];
@@ -808,19 +637,13 @@ pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformIni
             }
         }
 
-        // Cover AppKit fill before CEF delivers its first frame.
-        // kBgColor = 0x101010 matches src/color/src/theme.rs.
         const K_BG_COLOR: u32 = 0x101010;
-        // Apply directly — we're on the main thread here. Use the lock-free
-        // helper since we already hold INIT_STATE.
         apply_theme_color_to_window(state.window, K_BG_COLOR);
 
-        // Adopt the +1-retained NSView returned by the input module.
         state.input_view = jfn_input_macos_create_view() as *mut AnyObject;
         if !state.input_view.is_null() && !content_view.is_null() {
             let bounds: NSRect = msg_send![content_view, bounds];
             let _: () = msg_send![state.input_view, setFrame: bounds];
-            // NSViewWidthSizable | NSViewHeightSizable = (1<<1) | (1<<4).
             let mask: u64 = (1u64 << 1) | (1u64 << 4);
             let _: () = msg_send![state.input_view, setAutoresizingMask: mask];
             let _: () = msg_send![content_view, addSubview: state.input_view];
@@ -829,10 +652,6 @@ pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformIni
         let _: () = msg_send![state.window, setAcceptsMouseMovedEvents: true];
         let _: () = msg_send![state.window, makeFirstResponder: state.input_view];
 
-        // Restart the link on wake / screen reconfiguration — otherwise it
-        // stays bound to a display that slept and stops ticking. The link
-        // itself is added to the run loop by `start_frame_driver`, once there
-        // is a driver for its ticks to reach.
         start_wake_observer(&mut state);
 
         tracing::info!(
@@ -843,11 +662,6 @@ pub fn macos_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformIni
         Ok(())
     }
 }
-
-// =====================================================================
-// macos_cleanup — stop the display link, remove the input view, release
-// retained AppKit handles, tear down the Rust-side compositor.
-// =====================================================================
 
 use crate::compositor::jfn_macos_compositor_cleanup;
 
@@ -871,25 +685,16 @@ pub fn macos_cleanup() {
     }
 }
 
-// =====================================================================
-// macos_early_init — install JellyfinApplication as the NSApp instance,
-// set the activation policy, build the App + Edit menu bar.
-// =====================================================================
-
 pub fn macos_early_init() {
     unsafe {
-        // Attach CefAppProtocol to our subclass before -sharedApplication
-        // is called so CEF's runtime conforms-to check passes.
         attach_cef_app_protocol(JellyfinApplication::class());
 
         let app_obj: *mut AnyObject = msg_send![JellyfinApplication::class(), sharedApplication];
 
-        // Install Apple-event reopen handler (Dock click etc.).
         let ae_mgr: *mut AnyObject =
             msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
-        // kCoreEventClass = 'aevt', kAEReopenApplication = 'rapp'.
-        const K_CORE_EVENT_CLASS: u32 = 0x61_65_76_74; // 'aevt'
-        const K_AE_REOPEN_APPLICATION: u32 = 0x72_61_70_70; // 'rapp'
+        const K_CORE_EVENT_CLASS: u32 = 0x61_65_76_74;
+        const K_AE_REOPEN_APPLICATION: u32 = 0x72_61_70_70;
         let sel = sel!(handleReopenEvent:withReplyEvent:);
         let _: () = msg_send![
             ae_mgr,
@@ -899,19 +704,14 @@ pub fn macos_early_init() {
             andEventID: K_AE_REOPEN_APPLICATION,
         ];
 
-        // Subprocesses (GPU, renderer): hide from Dock and skip menu setup.
         let subproc = std::env::var_os("JELLYFIN_CEF_SUBPROCESS").is_some();
         if subproc {
-            // NSApplicationActivationPolicyProhibited = 2.
             let _: () = msg_send![app_obj, setActivationPolicy: 2isize];
             return;
         }
 
-        // NSApplicationActivationPolicyRegular = 0.
         let _: () = msg_send![app_obj, setActivationPolicy: 0isize];
 
-        // Disable AppKit's automatic Edit-menu inserts (Dictation,
-        // Character Palette) so a plain "e" can't trigger them.
         let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
         for k in [
             c"NSDisabledDictationMenuItem",
@@ -921,21 +721,15 @@ pub fn macos_early_init() {
             let _: () = msg_send![defaults, setBool: true, forKey: ns];
         }
 
-        // Allocate the App menu target (kept alive for process lifetime
-        // via INIT_STATE).
         let mt: Retained<JellyfinAppMenuTarget> = msg_send![JellyfinAppMenuTarget::class(), new];
         let mt_obj: *mut AnyObject = Retained::into_raw(mt) as *mut AnyObject;
         INIT_STATE.lock().app_menu_target = mt_obj;
 
-        // Subscribe to NSApplication hide/unhide and NSWorkspace sleep/wake
-        // so the manager FSM can drive CEF visibility on lifecycle changes.
         install_lifecycle_observer();
 
-        // Build the menu bar.
         let menubar: *mut AnyObject = msg_send![class!(NSMenu), alloc];
         let menubar: *mut AnyObject = msg_send![menubar, init];
 
-        // -- App menu ----------------------------------------------------
         let app_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let app_item: *mut AnyObject = msg_send![app_item, init];
         let _: () = msg_send![menubar, addItem: app_item];
@@ -953,8 +747,6 @@ pub fn macos_early_init() {
         );
         add_separator(app_menu);
         add_menu_item(app_menu, "Hide Jellium Desktop", sel!(hide:), "h", None, 0);
-        // NSEventModifierFlagOption | NSEventModifierFlagCommand
-        // = (1 << 19) | (1 << 20).
         let opt_cmd_mask: u64 = (1u64 << 19) | (1u64 << 20);
         add_menu_item(
             app_menu,
@@ -979,7 +771,6 @@ pub fn macos_early_init() {
         let _: () = msg_send![app_menu, release];
         let _: () = msg_send![app_item, release];
 
-        // -- Edit menu ---------------------------------------------------
         let edit_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let edit_item: *mut AnyObject = msg_send![edit_item, init];
         let _: () = msg_send![menubar, addItem: edit_item];

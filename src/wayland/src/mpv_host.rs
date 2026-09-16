@@ -1,6 +1,3 @@
-//! Wayland [`MpvHost`]: starts the proxy mpv connects to in place of the
-//! compositor, and drives the app-owned root window.
-
 use crate::mpv_proxy::start;
 use crate::runtime::WlRuntime;
 use jfn_platform_abi::{MpvHost, WindowDecorations};
@@ -24,8 +21,6 @@ impl MpvHost for WaylandMpvHost {
         self.rt.window().stated_scale().is_some()
     }
 
-    // the compositor's configure, not the OS, is the authority for this
-    // window's size; mpv's `osd-dimensions` is what ingest reads
     fn logical_content_size(&self) -> Option<jfn_platform_abi::LogicalSize> {
         None
     }

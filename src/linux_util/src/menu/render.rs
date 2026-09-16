@@ -5,11 +5,7 @@ use tiny_skia::{Color as SkColor, FillRule, Paint, PathBuilder, Pixmap, Rect, Tr
 
 use jfn_platform_abi::{MenuItem, Scale};
 
-// Logical (unscaled) metrics; multiplied by the display scale at layout time.
 const FONT_PX: f32 = 13.0;
-/// Row, separator and vertical-padding heights in logical pixels, whole
-/// counts: their physical values are [`Scale::to_physical`] of these, with no
-/// float round-trip.
 const ROW_H: i32 = 28;
 const SEP_H: i32 = 9;
 const PAD_Y: i32 = 4;
@@ -33,7 +29,6 @@ fn sep() -> SkColor {
 const TEXT: Color = Color::rgb(0xe0, 0xe0, 0xe0);
 const TEXT_DISABLED: Color = Color::rgb(0x66, 0x66, 0x66);
 
-/// Geometry in physical pixels relative to the menu's top-left.
 #[derive(Clone)]
 pub struct Row {
     pub item: usize,
@@ -103,8 +98,6 @@ fn with_font_system<R>(
     f(guard.raw())
 }
 
-/// The menu's glyph cache. The font system it shapes through is the process's
-/// one, so the menu thread never runs a font scan of its own.
 pub struct Fonts {
     cache: SwashCache,
 }
@@ -145,8 +138,6 @@ impl Default for Fonts {
     }
 }
 
-/// `None` when the reported scale does not map one of the menu's logical
-/// metrics to a physical one.
 pub fn layout(fonts: &mut Fonts, items: &[MenuItem], scale: Scale) -> Option<Layout> {
     let s = scale.as_f32();
     let font_px = FONT_PX * s;
@@ -356,8 +347,6 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Pat
     pb.finish()
 }
 
-/// Writes premultiplied BGRA (wl_shm ARGB8888 little-endian, X11 ARGB32), and
-/// copies `min(dst.len(), pm.width() * pm.height() * 4)` bytes.
 pub fn blit_bgra(pm: &Pixmap, dst: &mut [u8]) {
     let (out, _) = dst.as_chunks_mut::<4>();
     let (src, _) = pm.data().as_chunks::<4>();

@@ -1,8 +1,3 @@
-//! Window-geometry lifecycle owner: boot restore, live state, exit persist.
-//!
-//! Live state comes from one [`WindowSource`] — Wayland reads native compositor
-//! state, mpv-backed backends (macOS / Windows / X11) read mpv ingest.
-
 use std::sync::OnceLock;
 
 use jfn_platform_abi::{
@@ -14,11 +9,9 @@ use jfn_config::JfnWindowGeometry;
 const DEFAULT_LOGICAL: LogicalSize = LogicalSize { w: 1600, h: 900 };
 
 fn plat() -> &'static dyn Platform {
-    // SAFETY: geometry wiring is owned by the app boot/run/teardown sequence.
     unsafe { jfn_platform_abi::get() }
 }
 
-/// Owns the boot→live→persist lifecycle for window geometry.
 pub struct WindowGeometryController {
     source: &'static dyn WindowSource,
 }
@@ -34,11 +27,6 @@ impl WindowGeometryController {
         self.source
     }
 
-    /// Resolve saved config into typed boot geometry, sourcing the display
-    /// scale + clamp from the platform.
-    ///
-    /// `None` when the saved logical size does not map to a representable
-    /// physical one at the reported scale.
     pub fn boot(&self) -> Option<BootGeometry> {
         let g = jfn_config::window_geometry();
         let at = (g.x >= 0 && g.y >= 0).then_some(jfn_platform_abi::WindowPos { x: g.x, y: g.y });
@@ -46,8 +34,6 @@ impl WindowGeometryController {
         resolve_boot(g, scale, |w| plat().clamp_window_geometry(w))
     }
 
-    /// Read live state and write it back to config. Called at teardown before
-    /// any thread-join that could hang.
     pub fn persist(&self) {
         let was_max_before_fs =
             jfn_playback::browser_sink::jfn_playback_was_maximized_before_fullscreen();
@@ -61,8 +47,6 @@ impl WindowGeometryController {
     }
 }
 
-/// Pure core of [`WindowGeometryController::boot`]: saved config + display scale
-/// + a clamp fn → typed boot geometry. No globals, so it's unit-testable.
 fn resolve_boot(
     g: JfnWindowGeometry,
     scale: Scale,
@@ -82,8 +66,6 @@ fn resolve_boot(
         DEFAULT_LOGICAL
     };
     let physical = logical.to_physical(scale)?;
-    // clamp operates on physical backing pixels; on Wayland it's the identity,
-    // so the logical size we seed the toplevel with is unaffected.
     let clamped = clamp(WindowGeometry::from_raw(physical.w, physical.h, g.x, g.y));
     Some(BootGeometry::from_clamped(
         logical,
@@ -93,9 +75,6 @@ fn resolve_boot(
     ))
 }
 
-/// The logical and physical sizes the saved geometry was written at.
-///
-/// `None` unless it records both, each with two positive axes.
 pub fn saved_sizes(g: &JfnWindowGeometry) -> Option<(LogicalSize, PhysicalSize)> {
     if g.logical_width <= 0 || g.logical_height <= 0 || g.width <= 0 || g.height <= 0 {
         return None;
@@ -117,8 +96,6 @@ pub fn controller() -> &'static WindowGeometryController {
     CONTROLLER.get_or_init(WindowGeometryController::new)
 }
 
-/// Returns `None` when size is unknown, so the caller doesn't overwrite saved
-/// geometry with zeros.
 fn geometry_to_persist(
     ws: &dyn WindowSource,
     saved: JfnWindowGeometry,
@@ -324,7 +301,6 @@ mod tests {
 
     #[test]
     fn maximize_round_trip_preserves_size() {
-        // Live state: maximized; persist keeps the prior (pre-maximize) size.
         let prior = JfnWindowGeometry {
             logical_width: 1280,
             logical_height: 720,
@@ -341,7 +317,6 @@ mod tests {
         };
         assert!(saved.maximized);
 
-        // Next boot off that saved state comes up maximized at the prior size.
         assert_eq!(
             resolve_boot(saved, Scale::ONE, identity_clamp)
                 .map(|boot| (boot.maximized(), boot.logical())),

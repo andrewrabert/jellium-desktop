@@ -1,5 +1,3 @@
-//! Embedded JS shim sources, included at compile time from `src/web/*.js`.
-
 pub fn get(name: &str) -> Option<&'static str> {
     Some(match name {
         "native-shim.js" => include_str!("../../web/native-shim.js"),

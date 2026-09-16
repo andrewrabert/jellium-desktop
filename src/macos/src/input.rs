@@ -1,13 +1,3 @@
-//! macOS input — NSEvent translation + JellyfinInputView NSView subclass.
-//!
-//! The NSView is created by `macos_init` via the
-//! `jfn_input_macos_create_view` extern "C" thunk;
-//! `jfn_input_macos_set_cursor` is wired into the Platform vtable.
-//!
-//! Event dispatch goes through the `jfn_input_dispatch_*` extern "C"
-//! entry points implemented in `src/input/src/lib.rs` (active-browser
-//! lookup, hotkey classification, CEF forwarding).
-
 use parking_lot::Mutex;
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -17,11 +7,6 @@ use objc2::runtime::{AnyObject, Bool};
 use objc2::{AnyThread, DefinedClass, define_class, extern_class, msg_send};
 use objc2_app_kit::NSCursor;
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
-
-// =====================================================================
-// NSView shim — `define_class!(super(NSView))` needs an `AnyThread`
-// superclass; objc2-app-kit's NSView is main-thread-only.
-// =====================================================================
 
 extern_class!(
     #[unsafe(super(NSObject))]
@@ -40,30 +25,22 @@ use jfn_platform_abi::event_flags::{
     EVENTFLAG_SHIFT_DOWN,
 };
 
-// NSEventModifierFlags (NSEvent.h).
 const NSEVENT_MOD_SHIFT: u64 = 1 << 17;
 const NSEVENT_MOD_CONTROL: u64 = 1 << 18;
 const NSEVENT_MOD_OPTION: u64 = 1 << 19;
 const NSEVENT_MOD_COMMAND: u64 = 1 << 20;
 const NSEVENT_MOD_CAPSLOCK: u64 = 1 << 16;
 
-// NSEventType values used.
 const NSEVENT_TYPE_KEYDOWN: u64 = 10;
 const NSEVENT_TYPE_KEYUP: u64 = 11;
 
-// NSEvent buttonNumber for "back"/"forward" side buttons.
 const NS_MOUSE_BUTTON_BACK: isize = 3;
 const NS_MOUSE_BUTTON_FORWARD: isize = 4;
 
-// NSTrackingArea options (NSTrackingArea.h).
 const NS_TRACKING_MOUSE_MOVED: u64 = 0x02;
 const NS_TRACKING_MOUSE_ENTERED_AND_EXITED: u64 = 0x01;
 const NS_TRACKING_ACTIVE_IN_KEY_WINDOW: u64 = 0x20;
 const NS_TRACKING_IN_VISIBLE_RECT: u64 = 0x200;
-
-// =====================================================================
-// Cross-crate entry points
-// =====================================================================
 
 use jfn_input::key::{KeyReport, PhysicalKey};
 use jfn_input::{
@@ -72,10 +49,6 @@ use jfn_input::{
 };
 
 use crate::dispatch::post_to_main;
-
-// =====================================================================
-// Modifier / key translation
-// =====================================================================
 
 fn ns_to_cef_modifiers(flags: u64) -> u32 {
     let mut m = 0u32;
@@ -94,10 +67,8 @@ fn ns_to_cef_modifiers(flags: u64) -> u32 {
     m
 }
 
-/// Windows VK code for CefKeyEvent.windows_key_code.
 fn ns_keycode_to_vkey(kc: u16) -> i32 {
     match kc {
-        // Letters (VK_A = 0x41 .. VK_Z = 0x5A)
         0x00 => b'A' as i32,
         0x0B => b'B' as i32,
         0x08 => b'C' as i32,
@@ -124,7 +95,6 @@ fn ns_keycode_to_vkey(kc: u16) -> i32 {
         0x07 => b'X' as i32,
         0x10 => b'Y' as i32,
         0x06 => b'Z' as i32,
-        // Digits (VK_0 = 0x30 .. VK_9 = 0x39)
         0x1D => b'0' as i32,
         0x12 => b'1' as i32,
         0x13 => b'2' as i32,
@@ -135,7 +105,6 @@ fn ns_keycode_to_vkey(kc: u16) -> i32 {
         0x1A => b'7' as i32,
         0x1C => b'8' as i32,
         0x19 => b'9' as i32,
-        // Function keys (VK_F1 = 0x70 .. VK_F12 = 0x7B)
         0x7A => 0x70,
         0x78 => 0x71,
         0x63 => 0x72,
@@ -148,7 +117,6 @@ fn ns_keycode_to_vkey(kc: u16) -> i32 {
         0x6D => 0x79,
         0x67 => 0x7A,
         0x6F => 0x7B,
-        // Navigation
         0x7B => 0x25,
         0x7E => 0x26,
         0x7C => 0x27,
@@ -157,7 +125,6 @@ fn ns_keycode_to_vkey(kc: u16) -> i32 {
         0x77 => 0x23,
         0x74 => 0x21,
         0x79 => 0x22,
-        // Editing
         0x30 => 0x09,
         0x24 => 0x0D,
         0x35 => 0x1B,
@@ -165,13 +132,11 @@ fn ns_keycode_to_vkey(kc: u16) -> i32 {
         0x75 => 0x2E,
         0x31 => 0x20,
         0x72 => 0x2D,
-        // Modifiers
         0x38 | 0x3C => 0x10,
         0x3B | 0x3E => 0x11,
         0x3A | 0x3D => 0x12,
         0x36 | 0x37 => 0x5B,
         0x39 => 0x14,
-        // OEM punctuation
         0x29 => 0xBA,
         0x18 => 0xBB,
         0x2B => 0xBC,
@@ -187,20 +152,11 @@ fn ns_keycode_to_vkey(kc: u16) -> i32 {
     }
 }
 
-// =====================================================================
-// Cursor state
-// =====================================================================
-
 static G_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 static G_MOUSE_INSIDE: AtomicBool = AtomicBool::new(false);
-/// Pending cursor type from CEF. Updated from any thread; applied on main.
 static G_PENDING_CURSOR: AtomicI32 = AtomicI32::new(CursorShape::Pointer.as_raw());
-/// Mouse-button bits to OR into modifier masks (so CEF sees the buttons
-/// held during drags). Touched only from the main thread.
 static G_MOUSE_BUTTON_MODIFIERS: AtomicU32 = AtomicU32::new(0);
 
-/// AppKit exposes no non-deprecated directional resize cursors; CEF's
-/// cursor set maps onto these.
 #[allow(deprecated)]
 fn ns_cursor_for(shape: CursorShape) -> Retained<NSCursor> {
     use CursorShape::*;
@@ -245,16 +201,10 @@ fn apply_cursor_state() {
     }
 }
 
-/// Platform::set_cursor — safe to call from any thread.
 pub fn jfn_input_macos_set_cursor(t: c_int) {
     G_PENDING_CURSOR.store(t, Ordering::SeqCst);
     post_to_main(apply_cursor_state);
 }
-
-// =====================================================================
-// Scroll accumulator — coalesces wheel/trackpad deltas onto a single
-// flush per runloop cycle. All fields touched from main thread only.
-// =====================================================================
 
 static SCROLL: Mutex<ScrollAccum> = Mutex::new(ScrollAccum::new());
 
@@ -271,10 +221,6 @@ fn flush_scroll_accumulator() {
         );
     }
 }
-
-// =====================================================================
-// JellyfinInputView — transparent NSView capturing input for CEF.
-// =====================================================================
 
 #[derive(Default)]
 struct ViewIvars {
@@ -299,8 +245,6 @@ define_class!(
 
         #[unsafe(method(hitTest:))]
         fn hit_test(&self, point_in_super: NSPoint) -> *mut AnyObject {
-            // Makes the title-bar overlay strip click-through so AppKit's frame view receives the
-            // clicks and natively handles window-drag and double-click-to-zoom.
             unsafe {
                 let window: *mut AnyObject = msg_send![self, window];
                 if !window.is_null() && point_is_in_titlebar(window, point_in_super) {
@@ -339,7 +283,6 @@ define_class!(
             }
         }
 
-        // ---- Mouse buttons ----
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &AnyObject) {
             dispatch_mouse_button(self, event, BTN_LEFT, true);
@@ -374,7 +317,6 @@ define_class!(
             dispatch_mouse_button(self, event, BTN_MIDDLE, false);
         }
 
-        // ---- Mouse move ----
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &AnyObject) { dispatch_mouse_move(self, event, false); }
         #[unsafe(method(mouseDragged:))]
@@ -396,7 +338,6 @@ define_class!(
             dispatch_mouse_move(self, event, true);
         }
 
-        // ---- Scroll ----
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &AnyObject) {
             let loc = mouse_loc_in_view(self, event);
@@ -427,7 +368,6 @@ define_class!(
             }
         }
 
-        // ---- Keyboard ----
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &AnyObject) {
             let (vkey, mods, kc, ch, ch_nomod, logical) = key_event_fields(event);
@@ -465,9 +405,6 @@ define_class!(
         fn flags_changed(&self, event: &AnyObject) {
             let kc: u16 = unsafe { msg_send![event, keyCode] };
             let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
-            // Match each modifier key code to its NS bit so we can derive
-            // pressed-vs-released. character/unmodified_character left at 0
-            // (correct for modifier-key NSEventTypeFlagsChanged path).
             let flag: u64 = match kc {
                 56 | 60 => NSEVENT_MOD_SHIFT,
                 59 | 62 => NSEVENT_MOD_CONTROL,
@@ -492,9 +429,6 @@ define_class!(
             });
         }
 
-        // ---- Edit menu actions ----
-        // Without an Edit menu in the responder chain, AppKit never sends
-        // these. Forward each through the input router.
         #[unsafe(method(undo:))]
         fn undo_action(&self, _sender: *mut AnyObject) {
             jfn_input::jfn_input_undo();
@@ -520,11 +454,7 @@ define_class!(
             jfn_input::jfn_input_select_all();
         }
 
-        /// Enabled by [`jfn_input::field_edit`] while a shell field is
-        /// focused, and enabled unconditionally while it reports none —
-        /// jellyfin-web owns input then, and only the page knows what its
-        /// focused element can do.
-        #[unsafe(method(validateMenuItem:))]
+                                        #[unsafe(method(validateMenuItem:))]
         fn validate_menu_item(&self, item: *mut AnyObject) -> Bool {
             let Some(field) = jfn_input::field_edit() else {
                 return Bool::YES;
@@ -598,22 +528,12 @@ fn dispatch_mouse_move(view: &InputView, event: &AnyObject, leave: bool) {
     jfn_input_dispatch_mouse_move(position.x, position.y, mods, if leave { 1 } else { 0 });
 }
 
-/// AppKit names a function key with a code unit from the private-use block
-/// `NSEvent.h` reserves for them, `NSUpArrowFunctionKey` through the last
-/// defined constant: the arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`,
-/// forward delete and F1 through F35.
 const NS_FUNCTION_KEY_FIRST: u16 = 0xF700;
 const NS_FUNCTION_KEY_LAST: u16 = 0xF7FF;
-/// `NSDeleteCharacter`, the unit the Delete key types. Forward delete names
-/// itself with `NSDeleteFunctionKey`, inside the private-use range above.
 const NS_DELETE_CHARACTER: u16 = 0x7F;
-/// `CR`, the unit Return types.
 const NS_CARRIAGE_RETURN: u16 = 0x0D;
-/// The first unit that is not an ASCII control.
 const NS_FIRST_NON_CONTROL: u16 = 0x20;
 
-/// Whether a code unit is one a key typed rather than one AppKit uses to name
-/// a key the key event already carried.
 fn is_typed(unit: u16) -> bool {
     if (NS_FUNCTION_KEY_FIRST..=NS_FUNCTION_KEY_LAST).contains(&unit) || unit == NS_DELETE_CHARACTER
     {
@@ -622,7 +542,6 @@ fn is_typed(unit: u16) -> bool {
     unit == NS_CARRIAGE_RETURN || unit >= NS_FIRST_NON_CONTROL
 }
 
-/// Every UTF-16 unit of `-characters` a key typed, in order.
 fn dispatch_characters(event: &AnyObject, mods: u32, kc: u16) {
     unsafe {
         let chars: *mut AnyObject = msg_send![event, characters];
@@ -639,8 +558,6 @@ fn dispatch_characters(event: &AnyObject, mods: u32, kc: u16) {
     }
 }
 
-/// Returns (windows_key_code, modifiers, native_keycode, character,
-/// unmodified_character, logical).
 fn key_event_fields(event: &AnyObject) -> (i32, u32, u16, u16, u16, Option<char>) {
     let kc: u16 = unsafe { msg_send![event, keyCode] };
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
@@ -676,13 +593,6 @@ fn key_event_fields(event: &AnyObject) -> (i32, u32, u16, u16, u16, Option<char>
     )
 }
 
-// =====================================================================
-// Public entry — create the input NSView. Called from C++ macos_init
-// after locating mpv's NSWindow.
-// =====================================================================
-
-/// Returns a +1-retained NSView pointer (transfers ownership to the
-/// caller). The caller adds it to the window's content view subtree.
 pub fn jfn_input_macos_create_view() -> *mut c_void {
     let zero_rect = NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
@@ -693,6 +603,5 @@ pub fn jfn_input_macos_create_view() -> *mut c_void {
     };
     let view = InputView::alloc().set_ivars(ViewIvars::default());
     let view: Retained<InputView> = unsafe { msg_send![super(view), initWithFrame: zero_rect] };
-    // Retain across the FFI boundary; caller owns the +1.
     Retained::into_raw(view) as *mut c_void
 }

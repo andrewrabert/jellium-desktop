@@ -1,15 +1,3 @@
-//! X11 geometry thread: the sole writer of ALL overlay + video-host structure.
-//!
-//! It owns every [`StructureSurface`], consumes the [`GeometryCommand`] queue
-//! (create/destroy/visibility/restack), and is the sole sizer of the overlays
-//! and the video host. It publishes the parent's live geometry as an immutable
-//! [`ParentSnapshot`] so all other readers are lock-free.
-//!
-//! Structure (create/size/place/map/restack) runs on the geometry connection;
-//! content (pixel upload) runs on the content connection inside each surface's
-//! [`crate::overlay_actor::OverlayActor`]. No overlay window ever has two
-//! writers.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -60,17 +48,12 @@ impl Handle {
 
 static G: Mutex<Option<Handle>> = Mutex::new(None);
 
-/// Keeps the top-level's connection open past the geometry thread's exit: the
-/// server destroys the top-level and all its children — including mpv's
-/// embedded sub-window — the moment this connection closes, so it must outlive
-/// `mpv_terminate_destroy`. Dropped in `post_window_cleanup`.
 static CONN_HOLD: Mutex<Option<Arc<RustConnection>>> = Mutex::new(None);
 
 pub fn drop_toplevel_connection() {
     *CONN_HOLD.lock() = None;
 }
 
-/// The geometry thread's wake source for command-queue drains and re-mirrors.
 fn x11_geometry_resync_waker() -> Option<&'static WakeEvent> {
     use std::sync::OnceLock;
     static EV: OnceLock<Option<&'static WakeEvent>> = OnceLock::new();
@@ -83,19 +66,11 @@ pub fn request_resync() {
     }
 }
 
-/// App-side fullscreen setter: mirror the requested state onto the WM-managed
-/// top-level, then trigger a reconcile.
 pub fn set_parent_fullscreen(fs: bool) {
     apply_toplevel_fullscreen(fs);
     request_resync();
 }
 
-/// Paints `rgb` behind the app window and the video plane and clears both, so
-/// the strip a resize exposes carries the theme colour rather than the stale
-/// texture beneath it.
-///
-/// Both windows are created at the root's depth, so `rgb` is the pixel value
-/// directly.
 pub fn set_theme_color(rgb: u32) {
     let Some(conn) = crate::x11_state::x11rb_conn() else {
         return;
@@ -109,7 +84,6 @@ pub fn set_theme_color(rgb: u32) {
             continue;
         }
         let _ = conn.change_window_attributes(window, &aux);
-        // A zero width/height clears to the window's far edge.
         let _ = conn.clear_area(false, window, 0, 0, 0, 0);
     }
     let _ = conn.flush();
@@ -125,7 +99,6 @@ fn apply_toplevel_fullscreen(fs: bool) {
     if host.toplevel == 0 {
         return;
     }
-    // data: [action, prop1, prop2, source, 0]; action ADD=1 / REMOVE=0, source=app.
     let ev = ClientMessageEvent::new(
         32,
         host.toplevel,
@@ -141,9 +114,6 @@ fn apply_toplevel_fullscreen(fs: bool) {
     let _ = conn.flush();
 }
 
-// `parent` is the WM-managed app top-level; `video_host` is the app-owned child
-// mpv embeds into (`--wid`). `conn` must be the connection that *created*
-// `parent` — the WM delivers its `WM_DELETE` only to the creating client.
 pub fn start(
     conn: Arc<RustConnection>,
     parent: u32,
@@ -174,10 +144,6 @@ pub fn cleanup() {
     *g = None;
 }
 
-// ===================================================================
-// Geometry-thread working state (owned; no lock)
-// ===================================================================
-
 struct GeoWork {
     parent_x: i32,
     parent_y: i32,
@@ -188,11 +154,8 @@ struct GeoWork {
     scale: jfn_platform_abi::Scale,
     structures: HashMap<SurfaceId, StructureSurface>,
     fsm: HashMap<SurfaceId, OverlayState>,
-    /// The one visibility value each surface has; this map is its owner.
     visibility: HashMap<SurfaceId, Visibility>,
-    /// Bottom-to-top overlay z-order.
     order: Vec<SurfaceId>,
-    /// `_NET_WM_SYNC_REQUEST` counter, or 0 when the protocol was not advertised.
     sync_counter: u32,
     sync_pending: Option<(i32, u32)>,
     sync_armed: bool,
@@ -226,8 +189,6 @@ impl GeoWork {
         self.sync_armed = false;
     }
 
-    /// The counter write tells the WM our configures for this resize are done,
-    /// so it must be queued behind them on the same connection.
     fn commit_resize(&mut self, conn: &RustConnection) {
         let _ = conn.flush();
         if !self.sync_armed {
@@ -251,8 +212,6 @@ impl GeoWork {
         });
     }
 
-    /// Republish the live overlay window ids (bottom-to-top) for the cursor
-    /// thread.
     fn publish_windows(&self) {
         let windows: Vec<u32> = self
             .order
@@ -263,12 +222,6 @@ impl GeoWork {
     }
 }
 
-// ===================================================================
-// Overlay window creation (structure module — the only place overlay
-// ConfigureWindow / create is permitted)
-// ===================================================================
-
-/// `at` is the parent's root-relative geometry the overlay is born into.
 fn create_overlay_window(
     conn: &RustConnection,
     host: &HostServices,
@@ -281,8 +234,6 @@ fn create_overlay_window(
     let aux = CreateWindowAux::new()
         .background_pixel(0)
         .border_pixel(0)
-        // Managed transient when windowed; unmanaged only when born into
-        // fullscreen, where the WM would otherwise strut-clamp it.
         .override_redirect(u32::from(fullscreen))
         .event_mask(EventMask::EXPOSURE)
         .colormap(paint.colormap);
@@ -301,9 +252,6 @@ fn create_overlay_window(
     )
     .ok()?;
 
-    // Tie the overlay to the app top-level so the WM raises/lowers/covers them
-    // together. It stays a separate top-level (not a child): sibling children
-    // don't alpha-blend over the video on X11.
     let _ = conn.change_property32(
         PropMode::REPLACE,
         win,
@@ -328,7 +276,6 @@ fn create_overlay_window(
             host.atoms.net_wm_state_skip_pager,
         ],
     );
-    // Motif hints: flags=MWM_HINTS_DECORATIONS, decorations=0.
     let _ = conn.change_property32(
         PropMode::REPLACE,
         win,
@@ -336,7 +283,6 @@ fn create_overlay_window(
         host.atoms.motif_wm_hints,
         &[2_u32, 0, 0, 0, 0],
     );
-    // WM_HINTS: InputHint set, input=false; focus should stay on mpv.
     let _ = conn.change_property32(
         PropMode::REPLACE,
         win,
@@ -355,7 +301,6 @@ fn create_overlay_window(
     Some(win)
 }
 
-/// Create the content GC on the content connection for `win`.
 fn create_content_gc(win: u32) -> Option<u32> {
     let conn = crate::x11_state::x11rb_conn()?;
     let gc = conn.generate_id().ok()?;
@@ -363,10 +308,6 @@ fn create_content_gc(win: u32) -> Option<u32> {
     let _ = conn.flush();
     Some(gc)
 }
-
-// ===================================================================
-// Command processing
-// ===================================================================
 
 fn handle_create(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId, initial: Visibility) {
     let (Some(host), Some(paint)) = (crate::x11_state::host(), crate::x11_state::paint()) else {
@@ -381,8 +322,6 @@ fn handle_create(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId, initi
     ) else {
         return;
     };
-    // Round-trip so the window exists server-side before the content connection
-    // and the input connection reference it.
     if let Ok(cookie) = conn.get_input_focus() {
         let _ = cookie.reply();
     }
@@ -410,8 +349,6 @@ fn handle_create(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId, initi
     let (structure, content) = split_capabilities(win, gc);
     work.structures.insert(id, structure);
     work.visibility.insert(id, initial);
-    // Born unmapped: the FSM maps it on the next reconcile (and sets
-    // override_redirect stacking if fullscreen).
     work.fsm.insert(
         id,
         OverlayState {
@@ -442,21 +379,16 @@ fn handle_destroy(conn: &RustConnection, work: &mut GeoWork, id: SurfaceId) {
 }
 
 fn handle_set_order(conn: &RustConnection, work: &mut GeoWork, ids: Vec<SurfaceId>) {
-    // Keep only ids we still own; preserve the requested order.
     let mut new_order: Vec<SurfaceId> = ids
         .into_iter()
         .filter(|id| work.structures.contains_key(id))
         .collect();
-    // Append any owned surface the caller omitted (defensive).
     for id in &work.order {
         if !new_order.contains(id) {
             new_order.push(*id);
         }
     }
     work.order = new_order;
-    // Apply the z-order once, on this reorder — not every reconcile (which would
-    // feed our own ConfigureNotify back into a restack loop). Stack bottom-to-top
-    // above the app top-level.
     let Some(toplevel) = crate::x11_state::host().map(|h| h.toplevel) else {
         return;
     };
@@ -470,8 +402,6 @@ fn handle_set_order(conn: &RustConnection, work: &mut GeoWork, ids: Vec<SurfaceI
     let _ = conn.flush();
 }
 
-/// Drain and apply queued structure commands. Returns whether anything changed
-/// (so the caller reconciles + re-asserts stacking).
 fn process_commands(conn: &RustConnection, work: &mut GeoWork) -> u64 {
     let (cmds, mark) = drain_commands();
     if cmds.is_empty() {
@@ -511,10 +441,6 @@ fn process_commands(conn: &RustConnection, work: &mut GeoWork) -> u64 {
     work.publish_windows();
     mark
 }
-
-// ===================================================================
-// Watch / query helpers
-// ===================================================================
 
 fn find_frame(conn: &RustConnection, mut w: Window, root: Window) -> Window {
     loop {
@@ -577,7 +503,6 @@ fn query_geometry(conn: &RustConnection, window: Window, root: Window) -> Option
     ))
 }
 
-/// Read the top-level's `_NET_WM_STATE`: (fullscreen, maximized-both-axes).
 fn read_wm_state(conn: &RustConnection, win: Window) -> (bool, bool) {
     let Some(host) = crate::x11_state::host() else {
         return (false, false);
@@ -606,8 +531,6 @@ fn geometric_fullscreen(conn: &RustConnection, root: Window, geom: Geom) -> bool
     false
 }
 
-/// An empty XShape input region: the window accepts no pointer events of its
-/// own, so everything falls through to the app top-level below it.
 fn set_empty_input_region(conn: &RustConnection, window: Window) {
     let _ = conn.shape_rectangles(
         ShapeSo::SET,
@@ -626,8 +549,6 @@ fn overlay_mapped(conn: &RustConnection, win: Window) -> Option<bool> {
     Some(r.map_state != x11rb::protocol::xproto::MapState::UNMAPPED)
 }
 
-/// Apply the FSM effects for one overlay. `Effect::Place` reasserts position +
-/// size together (the geometry thread is the sole sizer).
 fn apply_overlay_effects(
     conn: &RustConnection,
     structure: &StructureSurface,
@@ -647,7 +568,6 @@ fn apply_overlay_effects(
                 if external {
                     set_empty_input_region(conn, structure.window());
                 } else {
-                    // The passive button grab may not survive the remap — re-grab.
                     crate::input::grab_overlay_input(structure.window());
                 }
                 structure.raise(conn);
@@ -676,14 +596,7 @@ fn activate_parent(conn: &RustConnection, root: Window, parent: Window) {
     let _ = conn.flush();
 }
 
-// ===================================================================
-// Reconcile
-// ===================================================================
-
 impl GeoLoop {
-    /// Snapshot parent truth once, size the video host + every overlay from it
-    /// in one flushed batch. A pending of `Restack` or above re-raises an
-    /// unmanaged overlay over mpv after events that can restack the parent.
     fn reconcile(&mut self, pending: Pending) {
         let reassert_stack = pending >= Pending::Restack;
         let conn = &*self.conn;
@@ -701,9 +614,6 @@ impl GeoLoop {
         let (state_fs, parent_max) = read_wm_state(conn, parent);
         let parent_fs = state_fs || geometric_fullscreen(conn, root, parent_geom);
 
-        // The video host is a child, so it fills the client area in local coords
-        // (0,0). Publish before the ConfigureWindow reaches the server so the proxy
-        // forwards mpv only the ConfigureNotify matching the published size.
         let (fill_w, fill_h) = (parent_geom.2.max(1), parent_geom.3.max(1));
         crate::mpv_proxy::publish_host_geometry(fill_w as u16, fill_h as u16);
         let fill = ConfigureWindowAux::new()
@@ -756,7 +666,6 @@ impl GeoLoop {
                     continue;
                 };
                 let top = record.top_physical.max(0);
-                // Feed the actor the authoritative swapchain target in lockstep.
                 record.actor.resize(parent_geom.2, parent_geom.3 - top);
                 (top, record.external)
             };
@@ -797,7 +706,6 @@ fn is_wm_delete(e: &ClientMessageEvent) -> bool {
     e.type_ == host.atoms.wm_protocols && e.data.as_data32()[0] == host.atoms.wm_delete_window
 }
 
-/// Data layout: `[protocol, timestamp, lo, hi, _]`.
 fn parse_sync_request(e: &ClientMessageEvent) -> Option<(i32, u32)> {
     let host = crate::x11_state::host()?;
     if host.sync_counter == 0 || host.atoms.net_wm_sync_request == 0 {
@@ -833,7 +741,6 @@ struct GeoLoop {
     embed: Option<Window>,
     parent_mapped: bool,
     phase: Phase,
-    /// Highest command ticket drained but not yet applied + round-tripped.
     fence_mark: u64,
     signal: LoopSignal,
 }
@@ -890,8 +797,6 @@ impl GeoLoop {
         self.release_fence();
     }
 
-    /// Round-trip the applied structure changes, then release everyone waiting
-    /// on a command that landed in this pass.
     fn release_fence(&mut self) {
         let mark = std::mem::take(&mut self.fence_mark);
         if mark == 0 {
@@ -926,12 +831,9 @@ impl GeoLoop {
         let _ = self.conn.flush();
         self.phase = Phase::Stopping;
         self.signal.stop();
-        // Nothing will apply another command; strand no waiter.
         publish_applied(u64::MAX);
     }
 
-    /// Republishes on any change; [`Scale`] compares exactly, so there is no
-    /// tolerance to pick.
     fn refresh_display_scale(&mut self) -> Pending {
         let scale = crate::scale::query_display_scale();
         if self.work.scale == scale {
@@ -1084,8 +986,6 @@ fn geometry_thread_body(
     }
 
     if let Some(ev) = x11_shutdown_waker() {
-        // `Drain::Never`: `input.rs` waits on the same eventfd, and
-        // level-triggered-undrained is what lets both threads see one signal.
         let res = handle.insert_source(
             WakeSource::new(ev.fd(), Drain::Never),
             |(), (), state: &mut GeoLoop| state.shutdown(),

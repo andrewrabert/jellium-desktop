@@ -1,11 +1,3 @@
-//! Settings store. Owns the in-memory state, JSON persistence, and the
-//! singleton accessor that the rest of the workspace calls into.
-//!
-//! On-disk schema is [`SettingsFile`]. Missing, unknown, and malformed keys
-//! keep their defaults on load; save suppresses fields that are at their
-//! default (empty strings, sentinel values, zero geometry) so existing config
-//! files round-trip unchanged.
-
 use jfn_mailbox::Mailbox;
 use jfn_platform_abi::WindowDecorations;
 use parking_lot::Mutex;
@@ -84,8 +76,6 @@ impl Default for SettingsData {
     }
 }
 
-/// The settings.json document. Every key is optional on load; a key at its
-/// default is absent on save. Field order is the on-disk key order.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 struct SettingsFile {
@@ -151,8 +141,6 @@ struct SettingsFile {
     device_name: Option<String>,
 }
 
-/// Reads any JSON value and yields `None` unless it deserializes as `T`, so a
-/// key of the wrong type is ignored instead of failing the whole load.
 fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -162,8 +150,6 @@ where
     Ok(T::deserialize(value).ok())
 }
 
-/// Decoration names outside the wire contract are ignored like any other
-/// malformed key.
 fn lenient_decorations<'de, D>(deserializer: D) -> Result<Option<WindowDecorations>, D::Error>
 where
     D: Deserializer<'de>,
@@ -172,7 +158,6 @@ where
     Ok(name.as_deref().and_then(WindowDecorations::parse))
 }
 
-/// Emits the wire literal from `WindowDecorations::as_str`.
 fn serialize_decorations<S>(
     value: &Option<WindowDecorations>,
     serializer: S,
@@ -186,9 +171,6 @@ where
     }
 }
 
-/// The settings blob the web UI parses. `windowDecorations` is absent:
-/// resolving its effective value needs the Platform default, unavailable in
-/// the CEF renderer where this is built.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CliSettings<'a> {
@@ -352,13 +334,6 @@ fn state() -> &'static Mutex<State> {
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
-// Single persistent background save worker. save_async() coalesces into
-// SavePending::data (only the newest snapshot survives); the worker wakes,
-// writes the latest snapshot, then sleeps. Shutdown drains any queued write
-// and joins the thread so nothing is lost at exit.
-
-/// Coalescing slot for the background writer: only the newest snapshot
-/// survives, and `stop` both drains the slot and ends the worker.
 struct SavePending {
     data: Option<SettingsData>,
     path: PathBuf,
@@ -367,7 +342,6 @@ struct SavePending {
 
 struct SaveWorker {
     mailbox: Mailbox<SavePending>,
-    /// `Some` exactly while the worker thread is running; taken by shutdown.
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -385,8 +359,6 @@ fn save_worker() -> &'static SaveWorker {
 }
 
 fn save_worker_loop(w: &'static SaveWorker) {
-    // A stop with a snapshot still queued writes it, then exits on the next
-    // pass with an empty slot.
     while let Some((data, path)) = w.mailbox.wait(
         |p| p.data.is_some() || p.stop,
         |p| p.data.take().map(|d| (d, p.path.clone())),
@@ -404,12 +376,6 @@ fn save_data(path: &Path, data: &SettingsData) -> bool {
     jfn_paths::write_atomic(path, text.as_bytes()).is_ok()
 }
 
-// =====================================================================
-// Public Rust API
-// =====================================================================
-
-/// Initialize the settings store with the on-disk path. Idempotent: only the
-/// first call sets the path; subsequent calls are ignored.
 pub fn settings_init(path: &Path) {
     let mut st = state().lock();
     if st.path.as_os_str().is_empty() {
@@ -417,8 +383,6 @@ pub fn settings_init(path: &Path) {
     }
 }
 
-/// Load settings from the configured path. Missing keys keep their defaults.
-/// Returns false if the file is missing or contains invalid JSON.
 pub fn settings_load() -> bool {
     let mut st = state().lock();
     let path = st.path.clone();
@@ -432,7 +396,6 @@ pub fn settings_load() -> bool {
     true
 }
 
-/// Serialize current state and atomically write to the configured path.
 pub fn settings_save() -> bool {
     let (path, snap) = {
         let st = state().lock();
@@ -441,19 +404,12 @@ pub fn settings_save() -> bool {
     save_data(&path, &snap)
 }
 
-/// Snapshot current state and hand it to the background save worker. Repeated
-/// calls coalesce: only the most recent snapshot is written. The worker is
-/// started lazily on the first call. After [`settings_shutdown_save_worker`]
-/// this becomes a no-op.
 pub fn settings_save_async() {
     let (path, snap) = {
         let st = state().lock();
         (st.path.clone(), st.data.clone())
     };
     let w = save_worker();
-    // Hold `handle` across the spawn so a second caller racing in between the
-    // enqueue and the JoinHandle store can't observe a started worker before
-    // the thread actually exists.
     let mut handle = w.handle.lock();
     let queued = w.mailbox.update(|p| {
         if p.stop {
@@ -468,8 +424,6 @@ pub fn settings_save_async() {
     }
 }
 
-/// Stop the background save worker after draining any pending write. Safe to
-/// call if the worker was never started; safe to call multiple times.
 pub fn settings_shutdown_save_worker() {
     let Some(w) = SAVE_WORKER.get() else {
         return;
@@ -524,8 +478,6 @@ pub fn device_name() -> String {
     state().lock().data.device_name.clone()
 }
 
-/// Clamp to the server's 64-byte DeviceName column, never splitting a
-/// character.
 fn truncate_device_name(s: &mut String) {
     if s.len() <= DEVICE_NAME_MAX {
         return;
@@ -551,10 +503,6 @@ pub fn default_device_name() -> String {
     s
 }
 
-/// Setter for device_name. Trims and collapses whitespace, truncates to the
-/// server's 64-char DeviceName column limit, and clears the override when the
-/// result matches `platform_default` (so hostname changes propagate
-/// automatically on the next launch).
 pub fn set_device_name(raw: &str, platform_default: &str) {
     let cleaned = normalize_device_name(raw, platform_default);
     state().lock().data.device_name = cleaned;
@@ -572,13 +520,10 @@ bool_accessors!(
     transparent_titlebar
 );
 bool_accessors!(force_transcoding, set_force_transcoding, force_transcoding);
-/// The user's explicit decoration choice, unresolved; `None` when unset.
 pub fn configured_window_decorations() -> Option<WindowDecorations> {
     state().lock().data.window_decorations
 }
 
-/// Browser-process only: falls back to the installed `Platform`, which panics
-/// if absent.
 pub fn window_decorations_mode() -> WindowDecorations {
     let configured = state().lock().data.window_decorations;
     jfn_platform_abi::resolve_window_decorations(configured)
@@ -591,7 +536,6 @@ pub fn set_window_decorations(v: Option<&str>) {
     state().lock().data.window_decorations = v.and_then(WindowDecorations::parse);
 }
 
-/// True when the app draws its own (client-side) titlebar.
 pub fn client_side_decorations() -> bool {
     window_decorations_mode() == WindowDecorations::Csd
 }
@@ -614,8 +558,6 @@ pub fn cli_json() -> String {
 }
 
 fn normalize_device_name(raw: &str, platform_default: &str) -> String {
-    // Server's auth header parser preserves whitespace verbatim, so " foo "
-    // would round-trip into the Devices table.
     let mut trimmed = String::with_capacity(raw.len());
     let mut in_space = true;
     for c in raw.chars() {
@@ -648,8 +590,6 @@ mod tests {
 
     const PLATFORM: &str = "platform-host";
 
-    /// Top-level keys in the order they appear in the text; `serde_json::Value`
-    /// would reorder them.
     fn keys(json: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut depth = 0usize;

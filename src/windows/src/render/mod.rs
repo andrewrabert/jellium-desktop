@@ -1,29 +1,3 @@
-//! DirectComposition presenter.
-//!
-//! Every frame CEF produces is presented 1:1 under a composition visual. The
-//! composition target is the mpv HWND, so DWM clips a frame wider or taller
-//! than the window and a frame smaller than it leaves the window's own
-//! background beyond its edges. No frame is judged against a window size, and
-//! the renderer holds no size state at all: a mis-sized frame is a
-//! one-frame-old picture, corrected by the next paint after the window-changed
-//! wakeup resizes CEF.
-//!
-//! Should DWM's window clip ever prove insufficient, the fallback is
-//! `IDCompositionVisual::SetClip2` on the root visual, set to the client rect
-//! from `crate::window::client_extent`.
-//!
-//! Threading. `STATE` is the process's DirectComposition serialization point:
-//! every visual-tree call, every swapchain build, and every present happens
-//! under it, each entry point taking it exactly once. That is only sound
-//! while no window-message thread enters this module — `alloc`, `free`,
-//! `apply_stack`, `set_visibility`, `present` and the popup entry points all
-//! run on the CEF UI thread and are already serialized by it, leaving `init` and
-//! `cleanup` on the app main thread at the process edges as the sole
-//! cross-thread contention, where waiting out an in-flight `configure` costs
-//! nothing. The WndProc hook in `crate::platform` must therefore stay
-//! republish-only; routing any window message into the renderer would put a
-//! GPU wait in front of the window's message queue.
-
 mod device;
 mod layer;
 
@@ -40,25 +14,15 @@ use windows::Win32::Graphics::DirectComposition::IDCompositionVisual;
 use crate::render::device::Devices;
 use crate::render::layer::Layer;
 
-/// Which of a surface's two visuals a call addresses.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Part {
-    /// The browser view, filling the window.
     Content,
-    /// The OSR dropdown, nested under the content visual.
     Popup,
 }
 
-/// A live surface's identity. Handed to CEF packed into a [`SurfaceHandle`]
-/// and never dereferenced; ids start at 1 and are never reused, so a stale
-/// handle resolves to nothing.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct SurfaceId(u64);
 
-/// One CEF surface. The only constructor builds both visuals, nests the popup
-/// under the content visual, and parents the content visual to the root, so
-/// an `Entry` that exists is a surface that is in the tree with its popup
-/// nested — neither is a rule the rest of the module has to keep.
 struct Entry {
     id: SurfaceId,
     content: Layer,
@@ -89,7 +53,6 @@ impl Entry {
         }
     }
 
-    /// Unparents the content visual from `root`; the popup goes with it.
     fn unparent(&mut self, root: &IDCompositionVisual) {
         unsafe {
             let _ = root.RemoveVisual(self.content.visual());
@@ -99,8 +62,6 @@ impl Entry {
 
 struct Registry {
     devices: Option<Devices>,
-    /// Live surfaces, bottom-to-top: exactly the root visual's children, in
-    /// the root's child order.
     surfaces: Vec<Entry>,
     next_id: u64,
 }
@@ -132,19 +93,10 @@ impl Registry {
     }
 }
 
-// SAFETY: `Registry` holds DirectComposition interface pointers, which COM
-// marks apartment-bound. DComp objects are in fact free-threaded (documented
-// "DirectComposition and multithreading": any thread may call them, the
-// device serializing internally), so moving them across threads is sound; the
-// mutual exclusion this module additionally relies on comes from `STATE`'s
-// Mutex plus the threading contract in the module doc — every entry point
-// takes the lock exactly once, and no window-message thread enters.
 unsafe impl Send for Registry {}
 
 static STATE: Mutex<Registry> = Mutex::new(Registry::new());
 
-/// Build the DComp device, HWND target, and root visual. Partial device state
-/// is dropped on failure; errors retain the native operation's cause.
 pub(crate) fn init(hwnd: HWND) -> Result<(), jfn_platform_abi::PlatformInitError> {
     use jfn_platform_abi::PlatformInitError as Error;
     if !jfn_gpu_paint::any_adapter() {
@@ -167,8 +119,6 @@ pub(crate) fn init(hwnd: HWND) -> Result<(), jfn_platform_abi::PlatformInitError
     Ok(())
 }
 
-/// Drop every remaining surface, then the devices. Runs after the WndProc
-/// hook is unhooked and the input thread is joined.
 pub(crate) fn cleanup() {
     let mut st = STATE.lock();
     let Registry {
@@ -184,8 +134,6 @@ pub(crate) fn cleanup() {
     st.devices = None;
 }
 
-/// Allocate a surface: a content visual parented on top of the root and a
-/// popup visual nested under it.
 pub(crate) fn alloc() -> SurfaceHandle {
     let mut st = STATE.lock();
     let id = SurfaceId(st.next_id);
@@ -205,7 +153,6 @@ pub(crate) fn alloc() -> SurfaceHandle {
     SurfaceHandle::from_id(id.0)
 }
 
-/// Unparent and drop a surface, its visuals and its painters.
 pub(crate) fn free(h: SurfaceHandle) {
     let mut st = STATE.lock();
     let id = h.id();
@@ -219,10 +166,6 @@ pub(crate) fn free(h: SurfaceHandle) {
     }
 }
 
-/// Apply the whole z-order to the root's children, bottom-to-top. Live
-/// surfaces `ordered` does not name keep their relative order above those it
-/// does, so every live surface stays parented. Video needs no placing: the
-/// composition target is mpv's own HWND, so every visual is above it.
 pub(crate) fn apply_stack(ordered: &[SurfaceHandle]) {
     let mut st = STATE.lock();
     let Registry {
@@ -263,9 +206,6 @@ pub(crate) fn apply_stack(ordered: &[SurfaceHandle]) {
     st.commit();
 }
 
-/// Set a surface's content visual to `visibility`, publish it, and wait for
-/// the composition engine to process the commit. Nothing here moves the visual
-/// or touches its content binding.
 pub(crate) fn set_visibility(h: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
     let mut st = STATE.lock();
     if let Some(entry) = st.find_mut(h) {
@@ -275,8 +215,6 @@ pub(crate) fn set_visibility(h: SurfaceHandle, visibility: Visibility) -> Visibi
     VisibilityCommit::issued(visibility, Ack::immediate())
 }
 
-/// The extent a frame's content asks the swapchain for, or `None` when the
-/// content carries nothing presentable.
 fn frame_extent(content: &Content<'_>) -> Option<FrameSize> {
     match content {
         Content::Accelerated(tex) => (!tex.handle().is_null()).then(|| tex.coded()),
@@ -288,9 +226,6 @@ fn frame_extent(content: &Content<'_>) -> Option<FrameSize> {
     }
 }
 
-/// Present one frame to `part`. The frame comes back undischarged when the
-/// surface is gone, the content carries no picture, or the layer has no
-/// swapchain to take it.
 pub(crate) fn present<'a>(
     h: SurfaceHandle,
     part: Part,
@@ -326,14 +261,11 @@ pub(crate) fn present<'a>(
         st.commit();
     }
     if !presented {
-        // The surface is fine and the frame never entered a commit stream, so
-        // its producer owes the successor.
         return Err(frame);
     }
     Ok(frame.present(|_content| Presented::issued()))
 }
 
-/// Offsets the content visual by the reserved top inset and sizes it to match.
 pub(crate) fn resize(h: SurfaceHandle, size: SurfaceSize) {
     let mut st = STATE.lock();
     let Some(entry) = st.find_mut(h) else {
@@ -343,17 +275,11 @@ pub(crate) fn resize(h: SurfaceHandle, size: SurfaceSize) {
     st.commit();
 }
 
-/// The content `IDCompositionVisual` for `h`.
-///
-/// The first call marks the surface external: its [`Layer`] builds no painter
-/// and drops every present.
 pub(crate) fn window_target(h: SurfaceHandle) -> Option<WindowTarget> {
     let mut st = STATE.lock();
     st.find_mut(h)?.content.window_target()
 }
 
-/// Place the popup visual at `x`, `y` — logical pixels inside the owning
-/// surface. The popup shows itself with its first frame.
 pub(crate) fn popup_show(h: SurfaceHandle, x: c_int, y: c_int) {
     let scale = crate::platform::win_get_scale();
     let (Some(px), Some(py)) = (scale.to_physical(x), scale.to_physical(y)) else {
@@ -368,8 +294,6 @@ pub(crate) fn popup_show(h: SurfaceHandle, x: c_int, y: c_int) {
     st.commit();
 }
 
-/// Detach the popup visual's content, so reopening it cannot flash the frame
-/// it was closed with.
 pub(crate) fn popup_hide(h: SurfaceHandle) {
     let mut st = STATE.lock();
     let Some(entry) = st.find_mut(h) else {

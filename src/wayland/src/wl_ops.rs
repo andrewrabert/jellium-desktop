@@ -1,10 +1,3 @@
-//! Surface lifecycle + paint ops.
-//!
-//! All entry points run under the runtime's `WlState` mutex. Each
-//! protocol-touching op calls `WlState::flush()` (or `conn.flush()`)
-//! before returning so commits land in compositor order matching the
-//! C++ original.
-
 use jfn_gpu_paint::SharedTexture;
 use jfn_platform_abi::{Ack, Content, PaintFrame, Presented, Visibility, VisibilityCommit};
 use wayland_client::protocol::wl_surface::WlSurface;
@@ -19,12 +12,6 @@ fn core(rt: &WlRuntime) -> Option<parking_lot::MutexGuard<'_, WlState>> {
     rt.try_core().map(parking_lot::Mutex::lock)
 }
 
-// =====================================================================
-// Lifetime helpers
-// =====================================================================
-
-/// The returned pointer is stable for the surface's lifetime; the caller owns
-/// it until `free_surface`.
 fn new_boxed(visibility: Visibility) -> *mut PlatformSurface {
     Box::into_raw(Box::new(PlatformSurface::new(visibility)))
 }
@@ -39,22 +26,15 @@ unsafe fn surface_mut<'a>(p: *mut PlatformSurface) -> &'a mut PlatformSurface {
     unsafe { &mut *p }
 }
 
-// =====================================================================
-// alloc / free / restack
-// =====================================================================
-
 pub(crate) fn alloc_surface(rt: &'static WlRuntime, initial: Visibility) -> *mut PlatformSurface {
-    // Take the lock before allocating: bailing out afterwards would leak the box.
     let Some(mut st) = core(rt) else {
         return std::ptr::null_mut();
     };
     let ptr = new_boxed(initial);
-    // SAFETY: ptr is freshly heap-allocated; no aliases yet.
     let s = unsafe { surface_mut(ptr) };
 
     let surface = st.compositor.create_surface(&st.qh, ());
 
-    // No input region on subsurface — keystrokes/clicks go to parent only.
     if let Some(empty) = st.empty_region() {
         surface.set_input_region(Some(empty.wl_region()));
     }
@@ -83,8 +63,6 @@ pub(crate) fn free_surface(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
         return;
     }
 
-    // Shut the actor down before taking the lock: Vulkan WSI swapchain teardown
-    // dispatches Wayland events, which would deadlock against the held lock.
     {
         let s = unsafe { surface_mut(ptr) };
         if let Some(actor) = s.layer_actor.take() {
@@ -94,19 +72,14 @@ pub(crate) fn free_surface(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
 
     {
         let Some(mut st) = core(rt) else { return };
-        // Drop from stack if still present.
         st.stack.retain(|p| *p != ptr);
 
-        // Update the scene before tearing down wl objects: dismissing a menu
-        // anchored here requires this layer's surface to still be alive.
         crate::scene::dispatch(
             rt,
             &mut st,
             crate::scene::SceneEvent::LayerRemoved(crate::scene::LayerId(ptr as usize)),
         );
 
-        // SAFETY: stack drop above guarantees no aliases via stack;
-        // caller (C++) guarantees no concurrent use of `ptr`.
         let s = unsafe { surface_mut(ptr) };
         if let Some(sub) = s.subsurface.take() {
             sub.destroy();
@@ -119,7 +92,6 @@ pub(crate) fn free_surface(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
     unsafe { drop_boxed(ptr) };
 }
 
-/// Applies the whole order, bottom first, replacing whatever was applied before.
 pub(crate) fn restack(rt: &'static WlRuntime, ordered: &[*mut PlatformSurface]) {
     let Some(mut st) = core(rt) else { return };
     st.stack.clear();
@@ -132,15 +104,6 @@ pub(crate) fn restack(rt: &'static WlRuntime, ordered: &[*mut PlatformSurface]) 
     crate::scene::dispatch(rt, &mut st, crate::scene::SceneEvent::Order(order));
 }
 
-// =====================================================================
-// visibility
-// =====================================================================
-
-/// Writes the surface's one visibility value and hands back the commit carrying
-/// it.
-///
-/// The root read loop takes this lock to dispatch the acknowledgement, so the
-/// commit is returned with the lock released and awaited by the caller.
 pub(crate) fn set_visibility(
     rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
@@ -158,19 +121,11 @@ pub(crate) fn set_visibility(
         return VisibilityCommit::issued(visibility, Ack::immediate());
     };
     let commit = actor.apply_visibility(visibility);
-    // Release the lock before the caller can block on the ack: the actor thread
-    // takes it to reach the runtime while it services the request.
     drop(st);
     rt.root().request_present();
     commit
 }
 
-// =====================================================================
-// resize / window target
-// =====================================================================
-
-/// Positions the subsurface at its reserved top inset and shrinks the
-/// viewport destination by the same amount.
 pub(crate) fn surface_resize(
     rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
@@ -197,13 +152,6 @@ pub(crate) fn surface_resize(
     st.flush();
 }
 
-/// Marks the surface external, desynchronizes it, and hands back its swapchain
-/// target.
-///
-/// Takes the `WlState` lock: every other reader of `PlatformSurface` holds the
-/// same lock. Desync is what makes the surface's own commits reach the
-/// compositor without a parent commit, which is what makes the frame callbacks
-/// a FIFO swapchain throttles on arrive.
 pub(crate) fn window_target(
     rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
@@ -222,13 +170,6 @@ pub(crate) fn window_target(
     target
 }
 
-// =====================================================================
-// Present (dmabuf / software)
-// =====================================================================
-
-/// Identity of the dmabuf behind a frame, for the buffer pool: CEF recycles a
-/// small set of buffers, so the same `(dev, ino)` means the same `wl_buffer`
-/// can be reattached instead of rebuilt. `None` disables pooling for the frame.
 pub(crate) fn dmabuf_pool_key(frame: &SharedTexture) -> Option<(u64, u64)> {
     let plane = frame.planes().first()?;
     nix::sys::stat::fstat(&plane.fd)
@@ -262,8 +203,6 @@ fn build_actor(
     )
 }
 
-/// The published window extent minus `s`'s reserved top inset — the size the
-/// subsurface actually covers.
 fn inset_extent(
     s: &PlatformSurface,
     extent: crate::window_state::WindowExtentSnapshot,
@@ -276,8 +215,6 @@ fn inset_extent(
     )
 }
 
-/// The viewport the published window extent names, or
-/// [`ViewportState::UNPUBLISHED`] before the first publish.
 fn window_viewport(rt: &WlRuntime) -> ViewportState {
     rt.window()
         .window_extent()
@@ -289,16 +226,6 @@ fn window_viewport(rt: &WlRuntime) -> ViewportState {
         })
 }
 
-/// The window extent `content` may be presented against, or `None` when this
-/// surface has no commit stream for it right now.
-///
-/// Everything that can reject a frame is asked here, before the frame is
-/// consumed, so no producer is handed a commit proof for a frame that goes
-/// nowhere. A window that has published no extent rejects every frame: the
-/// frame's own texel size names no scale, and nothing here may name one. A
-/// dmabuf frame additionally needs the protocol and a size the window still
-/// expects; mid-transition frames of the old size would flash the wrong
-/// geometry.
 fn accepts(
     rt: &'static WlRuntime,
     st: &WlState,
@@ -327,8 +254,6 @@ fn accepts(
     .then_some(extent)
 }
 
-/// Hands `frame` to the surface's actor, or back to its producer when this
-/// surface has no commit stream for it.
 pub(crate) fn present<'a>(
     rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
@@ -349,8 +274,6 @@ pub(crate) fn present<'a>(
         return Err(frame);
     };
     actor.resize(lw, lh, pw, ph);
-    // Taken before the frame is consumed: the actor holds a frame the swapchain
-    // could not take, and only the producer named here is owed its successor.
     let source = frame.source();
     Ok(frame.present(|content| {
         match content {

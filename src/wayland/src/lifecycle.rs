@@ -1,24 +1,8 @@
-//! Wayland-backend `Platform::init` / `Platform::cleanup` body.
-//!
-//! Drives the per-process Wayland subsystems in order: read mpv's
-//! wayland-display and -surface handles, prime the cached fullscreen,
-//! wire input, bring up the core state, install mpv's close-cb
-//! trampoline, init EGL, probe dmabuf support, attach the KDE palette
-//! manager, start the input thread, and bring up the clipboard reader.
-
 use std::ffi::c_void;
 
 use jfn_linux_util::egl;
 
-// =====================================================================
-// FFI declarations consumed during init/cleanup.
-// =====================================================================
-
 use jfn_linux_util::dmabuf_probe::jfn_wl_dmabuf_probe;
-
-// =====================================================================
-// Helpers
-// =====================================================================
 
 fn paint_name(mode: crate::paint_override::WlPaintOverride) -> &'static str {
     use crate::paint_override::WlPaintOverride as M;
@@ -36,7 +20,6 @@ struct ProbeDisplay<'a> {
 
 impl ProbeDisplay<'_> {
     fn init(egl: &egl::Egl, native: egl::NativeDisplayType) -> Option<ProbeDisplay<'_>> {
-        // SAFETY: `native` is mpv's live `wl_display`.
         let display = unsafe { egl.get_display(native) }?;
         egl.initialize(display).ok()?;
         Some(ProbeDisplay { egl, display })
@@ -59,10 +42,6 @@ fn dmabuf_available(native_display: *mut c_void) -> bool {
     unsafe { jfn_wl_dmabuf_probe(c"wayland".as_ptr(), probe.display.as_ptr()) }
 }
 
-// =====================================================================
-// init / cleanup
-// =====================================================================
-
 pub(crate) fn init(
     rt: &'static crate::runtime::WlRuntime,
 ) -> Result<(), jfn_platform_abi::PlatformInitError> {
@@ -75,8 +54,6 @@ pub(crate) fn init(
     };
     let display = display.as_ptr();
 
-    // Prepare the input layer first so its xkb context is ready before
-    // any seat_caps wires up keyboard listeners that need xkb.
     crate::input_lifecycle::lifecycle_init(rt, display);
 
     let mut core = match unsafe { crate::wl_state::init(rt, display) } {
@@ -86,8 +63,6 @@ pub(crate) fn init(
         }
     };
 
-    // Seed Rust state with mpv's current fullscreen — first configure
-    // after this point won't start a spurious transition.
     core.was_fullscreen = jfn_playback::ingest_driver::jfn_playback_fullscreen();
 
     use crate::paint_override::WlPaintOverride as Req;
@@ -100,12 +75,10 @@ pub(crate) fn init(
     match entry {
         Req::Shm => {
             tracing::info!("paint: using wl_shm");
-            // SAFETY: backend initialization owns native lifecycle authority.
             unsafe { jfn_platform_abi::get() }.set_shared_texture_unsupported();
         }
         Req::Gpu => {
             tracing::info!("paint: Vulkan WSI pixel-upload");
-            // SAFETY: backend initialization owns native lifecycle authority.
             unsafe { jfn_platform_abi::get() }.set_shared_texture_unsupported();
             want_gpu_paint = true;
             resolved = Req::Gpu;
@@ -116,7 +89,6 @@ pub(crate) fn init(
                 resolved = Req::Dmabuf;
             } else {
                 tracing::info!("paint: EGL dmabuf unavailable; trying gpu");
-                // SAFETY: backend initialization owns native lifecycle authority.
                 unsafe { jfn_platform_abi::get() }.set_shared_texture_unsupported();
                 want_gpu_paint = true;
                 resolved = Req::Gpu;
@@ -161,20 +133,11 @@ pub(crate) fn init(
 }
 
 pub(crate) fn cleanup(rt: &'static crate::runtime::WlRuntime) {
-    // KDE palette: KWin atomically drops the palette object with the
-    // window. The scheme file is unlinked separately via
-    // kde_palette::post_window_cleanup after mpv tears down the surface.
     jfn_linux_util::idle_inhibit::cleanup();
     rt.selections().cleanup();
-    // Must precede root_window::cleanup: the menu's teardown ops go through
-    // the root thread's queue.
     if let Some(menu) = rt.try_menu() {
         jfn_platform_abi::MenuHost::shutdown(menu);
     }
-    // Stop the app-owned toplevel thread before mpv's VO-teardown roundtrip;
-    // otherwise it holds a wl_display read barrier and the roundtrip hangs when
-    // no video ever played (a quiet display never wakes its poll).
     crate::root_window::cleanup(rt);
     crate::input_lifecycle::lifecycle_cleanup(rt);
-    // Rust-side WlState lives until process exit (mirrors C++ globals).
 }

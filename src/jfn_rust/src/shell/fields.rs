@@ -1,6 +1,3 @@
-//! Shell fields are whatever the widget tree reports through
-//! [`iced_core::widget::Operation::custom`], and no view names them.
-
 use std::any::Any;
 
 use iced_core::widget::operation::Focusable;
@@ -12,21 +9,17 @@ use jfn_platform_abi::DisplayBackend;
 use crate::shell::field::{Act, State};
 use crate::shell::theme::Theme;
 
-/// One shell field, as the current widget tree reports it. Window coordinates
-/// throughout.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Snapshot {
     pub id: Id,
     pub bounds: Rectangle,
     pub focused: bool,
-    /// The selected text; `None` when the selection is empty.
     pub selection: Option<String>,
     pub empty: bool,
     pub can_undo: bool,
     pub can_redo: bool,
     pub caret: Point,
     pub selection_bounds: Vec<Rectangle>,
-    /// Bumped by every change that altered the field's selected text.
     pub selection_generation: u64,
 }
 
@@ -68,7 +61,6 @@ impl Snapshot {
     }
 }
 
-/// Every shell field in the widget tree, in traversal order.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Fields(Vec<Snapshot>);
 
@@ -82,8 +74,6 @@ impl Fields {
         Fields(collect.0)
     }
 
-    /// The innermost field containing `at`; fields do not nest, so this is the
-    /// last one whose bounds contain it.
     pub fn at(&self, at: Point) -> Option<&Snapshot> {
         self.0.iter().rev().find(|field| field.bounds.contains(at))
     }
@@ -92,7 +82,6 @@ impl Fields {
         self.0.iter().find(|field| field.focused)
     }
 
-    /// The field carrying `id`, focused or not.
     pub fn named(&self, id: &Id) -> Option<&Snapshot> {
         self.0.iter().find(|field| &field.id == id)
     }
@@ -113,9 +102,6 @@ impl Operation for Collect {
     }
 }
 
-/// Applies one [`Act`] to the field it names, wherever it sits in the tree and
-/// whether or not it holds focus, and moves keyboard focus when it was built
-/// to.
 pub struct Apply {
     id: Id,
     focus: bool,
@@ -124,7 +110,6 @@ pub struct Apply {
 }
 
 impl Apply {
-    /// Leaves keyboard focus where it is.
     pub fn act(id: Id, act: Act) -> Apply {
         Apply {
             id,
@@ -134,8 +119,6 @@ impl Apply {
         }
     }
 
-    /// Takes keyboard focus to the named field and off every other focusable
-    /// widget, and applies `act` when there is one.
     pub fn focus(id: Id, act: Option<Act>) -> Apply {
         Apply {
             id,
@@ -145,8 +128,6 @@ impl Apply {
         }
     }
 
-    /// The text `Cut` and `Copy` produced; `None` for every other act and for
-    /// an empty selection.
     pub fn produced(&self) -> Option<&str> {
         self.produced.as_deref()
     }
@@ -183,18 +164,10 @@ impl Operation for Apply {
     }
 }
 
-/// Whether a right press inside a shell field takes keyboard focus to it, per
-/// ADR 0012. Windows and macOS focus the field whether the press landed inside
-/// the current selection or outside it; Wayland and X11 leave focus, caret and
-/// selection exactly as they were.
 pub fn press_focuses(backend: DisplayBackend) -> bool {
     matches!(backend, DisplayBackend::Windows | DisplayBackend::MacOS)
 }
 
-/// What a right press does to the caret of the field it lands in, per ADR
-/// 0012: Windows places the caret and collapses the selection, macOS selects
-/// the word, and Wayland and X11 leave both alone. A press inside the current
-/// selection leaves it alone everywhere.
 pub fn press_caret(backend: DisplayBackend, field: &Snapshot, at: Point) -> Option<Act> {
     if field.is_over_selection(at) {
         return None;

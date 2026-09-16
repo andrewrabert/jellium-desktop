@@ -1,12 +1,6 @@
-//! `app://` scheme handler.
-//!
-//! Embedded resources are included at compile time from `src/web/*`.
-
 use cef::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-// ---- embedded resources ----------------------------------------------------
 
 struct Embedded {
     bytes: &'static [u8],
@@ -25,7 +19,6 @@ macro_rules! embedded {
     };
 }
 
-// URL key is the path after the `app://` scheme (no leading slash).
 static RESOURCES: &[(&str, Embedded)] = &[
     embedded!("input-plugin.js", "application/javascript"),
     embedded!("mpv-audio-player.js", "application/javascript"),
@@ -36,12 +29,9 @@ static RESOURCES: &[(&str, Embedded)] = &[
 ];
 
 fn lookup(url_path: &str) -> Option<&'static Embedded> {
-    // URL key has the "resources/" prefix; strip it to match RESOURCES.
     let name = url_path.strip_prefix("resources/")?;
     RESOURCES.iter().find(|(n, _)| *n == name).map(|(_, r)| r)
 }
-
-// ---- SchemeHandlerFactory --------------------------------------------------
 
 #[derive(Clone)]
 pub(crate) struct JfnSchemeFactory;
@@ -61,7 +51,6 @@ wrap_scheme_handler_factory! {
             let url_uf = request.url();
             let url = crate::cef_string::userfree_to_string(&url_uf);
 
-            // Strip scheme prefix and query/fragment.
             let after_scheme = url
                 .find("://")
                 .map(|p| &url[p + 3..])
@@ -93,8 +82,6 @@ wrap_scheme_handler_factory! {
         }
     }
 }
-
-// ---- ResourceHandler -------------------------------------------------------
 
 #[derive(Clone)]
 pub(crate) struct JfnResourceHandler {
@@ -160,8 +147,6 @@ wrap_resource_handler! {
         }
     }
 }
-
-// ---- registration ----------------------------------------------------------
 
 pub(crate) fn register() {
     let scheme = CefString::from("app");

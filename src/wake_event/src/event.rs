@@ -8,14 +8,11 @@ pub struct WakeEvent {
     handle: HANDLE,
 }
 
-// Win32 event HANDLEs are kernel objects; concurrent SetEvent/ResetEvent/Wait*
-// are documented thread-safe.
 unsafe impl Send for WakeEvent {}
 unsafe impl Sync for WakeEvent {}
 
 impl WakeEvent {
     pub fn new() -> Option<Self> {
-        // manual-reset, initially non-signaled
         let h = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
         if h.is_null() {
             return None;
@@ -35,8 +32,6 @@ impl WakeEvent {
         }
     }
 
-    /// Block until signaled. Manual-reset, so a `signal()` that lands
-    /// before the call returns immediately.
     pub fn wait(&self) {
         unsafe {
             WaitForSingleObject(self.handle, INFINITE);

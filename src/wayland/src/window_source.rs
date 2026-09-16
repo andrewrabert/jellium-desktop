@@ -1,6 +1,3 @@
-//! Native [`WindowSource`]: the Wayland backend owns the toplevel, so live
-//! geometry comes from compositor state, not mpv ingest.
-
 use jfn_platform_abi::{AppCreatedWindow, BootGeometry, WindowSnapshot, WindowSource};
 
 use crate::runtime::WlRuntime;
@@ -17,7 +14,6 @@ impl WaylandWindowSource {
 
 impl WindowSource for WaylandWindowSource {
     fn snapshot(&self) -> WindowSnapshot {
-        // One snapshot so extent and mode can't span two generations.
         let snap = self.rt.window().window_extent();
         WindowSnapshot {
             extent: snap
@@ -32,8 +28,6 @@ impl WindowSource for WaylandWindowSource {
 }
 
 impl AppCreatedWindow for WaylandWindowSource {
-    /// Only the app window's own geometry uses the boot size; mpv mirrors the
-    /// committed window geometry and never the boot guess.
     fn seed_boot_geometry(&self, g: &BootGeometry) {
         self.rt
             .root()

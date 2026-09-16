@@ -1,5 +1,3 @@
-//! Registry probe for decoration-related globals.
-
 use std::time::Duration;
 
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -9,7 +7,6 @@ use wayland_client::globals::registry_queue_init;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct DecorationGlobals {
-    /// `org_kde_kwin_server_decoration_palette_manager` — SSD can be tinted.
     pub(crate) kde_palette: bool,
 }
 
@@ -47,9 +44,6 @@ fn probe() -> DecorationGlobals {
     }
 }
 
-/// [`probe`] on a throwaway thread, abandoned on timeout: the round trip
-/// blocks indefinitely if the compositor stalls, and this runs inline during
-/// startup.
 pub(crate) fn probe_bounded(timeout: Duration) -> DecorationGlobals {
     let (tx, rx) = crossbeam_channel::bounded::<DecorationGlobals>(1);
     let spawned = std::thread::Builder::new()

@@ -1,11 +1,5 @@
-//! JSON serialization for values embedded directly in JavaScript source.
-
 use serde::Serialize;
 
-/// Serializes `value` as JSON safe to paste into JS source: the U+2028 and
-/// U+2029 code points, which plain JSON leaves raw and a JS string literal
-/// reads as line terminators, are escaped by the formatter below.
-/// `None` when the value's `Serialize` impl fails.
 pub fn to_js_json<T: Serialize + ?Sized>(value: &T) -> Option<String> {
     let mut out = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut out, JsSourceFormatter);

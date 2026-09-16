@@ -1,7 +1,3 @@
-//! Browser playback sink. Forwards UI-affecting events to the embedded
-//! web view via the exec_js callback installed at boot. Reads only
-//! from the event snapshot.
-
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,16 +24,12 @@ fn slot() -> &'static Mutex<Handlers> {
     SLOT.get_or_init(|| Mutex::new(Handlers { set_hz: None }))
 }
 
-/// Install / clear the browsers.setRefreshRate handler.
 pub fn jfn_playback_set_browsers_refresh_rate_handler(cb: Option<SetHzCb>) {
     slot().lock().set_hz = cb;
 }
 
-// Mirrors maximized-before-fullscreen state so the geometry-save tail in
-// main can read it after coordinator shutdown without keeping coord alive.
 static WAS_MAXIMIZED: AtomicBool = AtomicBool::new(false);
 
-/// Geometry-save tail reads this at shutdown.
 pub fn jfn_playback_was_maximized_before_fullscreen() -> bool {
     WAS_MAXIMIZED.load(Ordering::Relaxed)
 }
@@ -64,9 +56,6 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
             }
         }
         PlaybackEventKind::TrackLoaded => {
-            // Variant switch (same Jellyfin Id): JS's playerLoad path doesn't
-            // fire its own pause UI, so drive the pause indicator from here.
-            // Cleared on first-frame Started via the Started → 'playing' emit.
             if snap.variant_switch_pending {
                 call_exec_js("window._nativeEmit('paused')");
             }
@@ -83,8 +72,6 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
             call_exec_js(&format!("window._nativeSetRate({})", snap.rate));
         }
         PlaybackEventKind::FullscreenChanged => {
-            // Mirror was-maximized so the geometry-save tail in main can
-            // read it after coord shutdown without keeping coord alive.
             WAS_MAXIMIZED.store(snap.maximized_before_fullscreen, Ordering::Relaxed);
             call_exec_js(&format!(
                 "window._nativeFullscreenChanged({})",
@@ -113,8 +100,6 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
         | PlaybackEventKind::MetadataChanged
         | PlaybackEventKind::ArtworkChanged
         | PlaybackEventKind::QueueCapsChanged
-        | PlaybackEventKind::Seeked => {
-            // Not surfaced via this sink. JS already owns metadata.
-        }
+        | PlaybackEventKind::Seeked => {}
     }
 }

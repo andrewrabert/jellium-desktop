@@ -1,12 +1,3 @@
-//! macOS Now Playing / MPRemoteCommandCenter sink. The shared
-//! [`jfn_playback::sink_core`] harness owns the event queue and consumer
-//! thread; this crate supplies a [`MacosSink`] whose `deliver` drives
-//! MPNowPlayingInfoCenter. Inbound MPRemoteCommand callbacks dispatch via
-//! [`sink_core::execute`] / [`sink_core::seek_to_ms`].
-//!
-//! All UI updates run on the consumer thread; MPNowPlayingInfoCenter
-//! mutations are performed there.
-
 #![cfg(target_os = "macos")]
 
 use std::ffi::{c_int, c_void};
@@ -39,10 +30,6 @@ fn ns_key(s: &NSString) -> &ProtocolObject<dyn NSCopying> {
     ProtocolObject::from_ref(s)
 }
 
-// =====================================================================
-// Public start/stop entry points.
-// =====================================================================
-
 pub fn jfn_macos_sink_start() {
     sink_core::run_sink("macos-sink", MacosSink::default);
 }
@@ -50,10 +37,6 @@ pub fn jfn_macos_sink_start() {
 pub fn jfn_macos_sink_stop() {
     sink_core::stop();
 }
-
-// =====================================================================
-// Sink state — lives on the consumer thread for the sink's lifetime.
-// =====================================================================
 
 #[derive(Default)]
 struct MacosSink {
@@ -77,10 +60,6 @@ impl QueuedSink for MacosSink {
     }
 }
 
-// =====================================================================
-// MPRemoteCommandCenter delegate (Obj-C class defined via objc2 macro).
-// =====================================================================
-
 define_class!(
     #[unsafe(super(NSObject))]
     #[name = "JfnMediaKeysDelegate"]
@@ -98,9 +77,6 @@ define_class!(
             let next = unsafe { center.nextTrackCommand() };
             let prev = unsafe { center.previousTrackCommand() };
 
-            // MPRemoteCommand identity comparison: each shared center
-            // returns the same retained instance, so pointer equality
-            // is sufficient.
             let cp = (&*command as *const MPRemoteCommand) as *const ();
             let eq = |c: &MPRemoteCommand| (c as *const MPRemoteCommand) as *const () == cp;
             let cmd = if eq(&play) {
@@ -128,8 +104,6 @@ define_class!(
             event: &MPChangePlaybackPositionCommandEvent,
         ) -> MPRemoteCommandHandlerStatus {
             let pos = unsafe { event.positionTime() };
-            // Update Now Playing position immediately for responsive UI;
-            // rate=0 until mpv finishes the seek.
             unsafe {
                 let center = MPNowPlayingInfoCenter::defaultCenter();
                 if let Some(existing) = center.nowPlayingInfo() {
@@ -200,8 +174,6 @@ fn teardown_remote_command_center() {
     }
 }
 
-/// The program image and everything loaded with it; MediaPlayer's
-/// `extern NSString* const` keys resolve out of it.
 static PROGRAM_IMAGE: OnceLock<ProgramImage> = OnceLock::new();
 
 fn mp_const(name: &str) -> Retained<NSString> {
@@ -210,22 +182,14 @@ fn mp_const(name: &str) -> Retained<NSString> {
         return NSString::from_str(name);
     };
     let image = PROGRAM_IMAGE.get_or_init(ProgramImage::this);
-    // SAFETY: the symbol is read, not called.
     let Ok(sym) = (unsafe { image.get::<*const *const NSString>(cname.as_c_str()) }) else {
-        // The Media keys are not interned, so a constructed NSString won't
-        // match the framework's lookup; unreachable on a real macOS.
         return NSString::from_str(name);
     };
-    // SAFETY: the symbol is `NSString * const`, i.e. a pointer to a pointer.
     match unsafe { Retained::retain((**sym).cast_mut()) } {
         Some(s) => s,
         None => NSString::from_str(name),
     }
 }
-
-// =====================================================================
-// Private MediaRemote framework (NowPlaying visibility / origin).
-// =====================================================================
 
 struct MediaRemoteSyms {
     set_visibility: Option<unsafe extern "C" fn(*mut c_void, c_int)>,
@@ -240,7 +204,6 @@ fn media_remote() -> Option<&'static MediaRemoteSyms> {
     MEDIA_REMOTE
         .get_or_init(|| {
             let path = "/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote";
-            // SAFETY: an Apple system framework with no initialiser of ours.
             let lib = match unsafe { Library::new(path) } {
                 Ok(lib) => lib,
                 Err(e) => {
@@ -251,7 +214,6 @@ fn media_remote() -> Option<&'static MediaRemoteSyms> {
                     return None;
                 }
             };
-            // SAFETY: each signature matches the private API it names.
             let set_visibility = unsafe {
                 lib.get::<unsafe extern "C" fn(*mut c_void, c_int)>(
                     c"MRMediaRemoteSetNowPlayingVisibility",
@@ -307,10 +269,6 @@ fn media_remote_set_visibility_for_phase(phase: Phase) {
         }
     }
 }
-
-// =====================================================================
-// Event delivery.
-// =====================================================================
 
 fn convert_state(phase: Phase) -> MPNowPlayingPlaybackState {
     match phase {

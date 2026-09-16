@@ -1,14 +1,4 @@
-//! Wayland backend impl of [`jfn_platform_abi::Platform`].
-//!
-//! This is the crate's ABI adapter: raw pointers, `c_int` dimensions, and
-//! opaque `SurfaceHandle`s from the Platform trait are converted here into
-//! the crate's domain types before reaching any internal module. The factory
-//! returns the concrete type; `jfn_app_main` boxes it as `Box<dyn Platform>`
-//! before handing it to `jfn_platform_abi::install`.
-
 #![allow(non_snake_case)]
-// The Platform trait carries raw pointers for non-paint entry points;
-// trait impls forward them unchanged to unsafe FFI fns.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_int, c_void};
@@ -25,11 +15,6 @@ pub use jfn_platform_abi::{
     WindowOwner,
 };
 
-// =====================================================================
-// Backend
-// =====================================================================
-
-/// The compositor-driven window controls the app-drawn titlebar reaches.
 pub struct WaylandTitlebar {
     rt: &'static WlRuntime,
 }
@@ -84,8 +69,6 @@ impl Platform for WaylandPlatform {
         DisplayBackend::Wayland
     }
 
-    /// A preference among the available options only — availability itself is
-    /// protocol-derived in [`Self::window_decoration_options`].
     fn default_window_decorations(&self) -> WindowDecorations {
         jfn_linux_util::default_window_decorations()
     }
@@ -165,9 +148,6 @@ impl Platform for WaylandPlatform {
     }
 
     fn apply_stack(&self, ordered: &[SurfaceHandle]) {
-        // SAFETY: a `&[SurfaceHandle]` (i.e. `&[*mut c_void]`) and a
-        // `&[*mut PlatformSurface]` have identical layout; each handle was
-        // minted by this backend's `alloc_surface`.
         let typed: &[*mut crate::wl_state::PlatformSurface] = unsafe {
             std::slice::from_raw_parts(
                 ordered.as_ptr() as *const *mut crate::wl_state::PlatformSurface,
@@ -196,12 +176,10 @@ impl Platform for WaylandPlatform {
         jfn_linux_util::cef_paths()
     }
 
-    // the compositor creates nothing; the app owns the app window
     fn window_owner(&self) -> WindowOwner<'_> {
         WindowOwner::App(&self.window_source)
     }
 
-    // the compositor's configure is the one authority for the window's size
     fn resize_gate(&self) -> Option<&dyn ResizeGate> {
         None
     }
@@ -210,8 +188,6 @@ impl Platform for WaylandPlatform {
         Some(&self.titlebar)
     }
 
-    // the compositor places and sizes the window; nothing client-side
-    // constrains saved geometry
     fn clamp_window_geometry(
         &self,
         g: jfn_platform_abi::WindowGeometry,
@@ -219,12 +195,8 @@ impl Platform for WaylandPlatform {
         g
     }
 
-    // the Wayland event loop runs on its own thread; the app main thread has
-    // nothing to drain
     fn pump(&self) {}
 
-    // platform init resolves shared-texture support, so CEF's bring-up cannot
-    // precede mpv's window here
     fn cef_init_precedes_mpv_window(&self) -> bool {
         false
     }
@@ -241,9 +213,6 @@ impl Platform for WaylandPlatform {
         self.rt().window().scale()
     }
 
-    /// The output containing `at`, else the first usable output. When the
-    /// probe names no output this backend answers with the scale it reports
-    /// for its own window, logging the probe's error.
     fn display_scale(&self, at: Option<jfn_platform_abi::WindowPos>) -> jfn_platform_abi::Scale {
         let target = crate::scale_probe::ProbeTarget::at(at);
         match crate::scale_probe::probe_scale(target) {
@@ -259,7 +228,6 @@ impl Platform for WaylandPlatform {
         }
     }
 
-    // the compositor tells no client where its window is
     fn query_window_position(&self) -> Option<jfn_platform_abi::WindowPos> {
         None
     }
@@ -281,7 +249,6 @@ impl Platform for WaylandPlatform {
 
         #[cfg(feature = "kde-palette")]
         {
-            // hex string "#RRGGBB\0".
             let mut hex: [u8; 8] = [0; 8];
             hex[0] = b'#';
             let hexdigit = |c: u8| if c < 10 { b'0' + c } else { b'a' + (c - 10) };
@@ -333,9 +300,6 @@ impl Platform for WaylandPlatform {
             .then_some(&self.primary as &dyn jfn_platform_abi::PrimarySelection)
     }
 
-    /// jellyfin-web pastes by injection only where another client may read
-    /// this seat's clipboard without focus; elsewhere `frame.Paste()` is the
-    /// only path that reaches the page.
     fn web_paste_reads_clipboard(&self) -> bool {
         self.rt().selections().data_control_advertised()
     }
@@ -349,8 +313,6 @@ impl Platform for WaylandPlatform {
     }
 }
 
-/// Build a boxed Wayland platform. Called from jfn_app_main on Linux when
-/// the selected backend is Wayland.
 pub fn make_wayland_platform(paint_request: Option<WlPaintOverride>) -> Box<dyn Platform> {
     Box::new(WaylandPlatform::new(paint_request))
 }

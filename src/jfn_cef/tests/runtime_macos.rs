@@ -1,5 +1,3 @@
-//! Runs on the process main thread instead of libtest's worker threads.
-
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use jfn_cef::{LoadError, LoadedCef};
@@ -26,11 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let formatted = version.to_string();
         (version, formatted)
     };
-    // A real native call after dropping the bootstrap verifies library pinning.
     unsafe extern "C" {
         fn cef_version_info(entry: std::ffi::c_int) -> std::ffi::c_int;
     }
-    // SAFETY: successful load above pins the framework for the entire process.
     assert_eq!(
         unsafe { cef_version_info(0) },
         i32::try_from(version.major)?

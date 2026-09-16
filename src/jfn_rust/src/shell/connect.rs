@@ -1,11 +1,3 @@
-//! The connect screen's view.
-//!
-//! It renders [`crate::connection::Screen`] and holds nothing else: no URL, no probe,
-//! no navigation, and no clock that retires it.
-//!
-//! Ported from the former `web/overlay.html`, `web/overlay.js` and
-//! `web/connectivityHelper.js`.
-
 use std::time::Instant;
 
 use iced_core::widget::Id;
@@ -28,7 +20,6 @@ pub enum Message {
 }
 
 pub struct Connect {
-    /// Owned here so a widget-cache rebuild does not restart the turn.
     spinner_started: Instant,
 }
 
@@ -118,8 +109,6 @@ impl Connect {
         .into()
     }
 
-    /// `chrome` opaque while the screen is up, faded to zero alpha across the
-    /// retirement, so the page appears through it rather than after it.
     pub fn backdrop(&self, chrome: Color, screen: &Screen) -> Color {
         Color {
             a: opacity(screen),
@@ -127,7 +116,6 @@ impl Connect {
         }
     }
 
-    /// The spinner's next frame, when a refresh interval is available.
     pub fn deadline(&self, screen: &Screen) -> Deadline {
         let spinning = matches!(screen, Screen::Working { .. } | Screen::Retiring { .. });
         match (spinning, jfn_gpu_paint::refresh_interval()) {
@@ -136,14 +124,11 @@ impl Connect {
         }
     }
 
-    /// The URL field, for the caller to focus after every widget-tree rebuild.
-    /// `None` once the field is gone.
     pub fn focus_target(&self, screen: &Screen) -> Option<Id> {
         matches!(screen, Screen::Form { .. }).then_some(URL_FIELD)
     }
 }
 
-/// 1.0 except across the retirement, where it runs to zero over [`FADE`].
 fn opacity(screen: &Screen) -> f32 {
     match screen {
         Screen::Retiring { fade_from } => {

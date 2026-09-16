@@ -10,7 +10,6 @@ use jfn_gpu_paint::WindowTarget;
 
 use crate::wl_state::{Acked, Callbacks, DispatchState, FrameBuffer};
 
-/// Proof that the layer's surface was committed, minted at the commit.
 pub(crate) struct Committed(());
 
 impl Committed {
@@ -30,10 +29,6 @@ pub(crate) enum PresentError {
 }
 
 impl PresentError {
-    /// Only a lost surface degrades. Every other GPU failure names what its
-    /// producer still owes — a deferred frame is presented again, a failed
-    /// shared import has no CPU fallback to degrade to — and the backend stays
-    /// put.
     pub(crate) fn is_degrading(&self) -> bool {
         matches!(
             self,
@@ -51,12 +46,6 @@ pub(crate) struct ViewportState {
 }
 
 impl ViewportState {
-    /// The viewport of a surface created before the window published an
-    /// extent: no source and no destination.
-    ///
-    /// [`LayerSurface::set_viewport`] sends neither for a non-positive axis,
-    /// and `wl_ops::accepts` refuses every frame until the first publish, so
-    /// nothing is presented against it.
     pub(crate) const UNPUBLISHED: ViewportState = ViewportState {
         lw: 0,
         lh: 0,
@@ -111,9 +100,6 @@ impl LayerSurface {
         self.surface.commit();
     }
 
-    /// Commits the surface and arms the acknowledgement this commit has: the
-    /// frame callback when it carries a buffer, the display sync when it
-    /// empties the surface.
     pub(crate) fn commit_acked(
         &self,
         callbacks: &'static Callbacks,
@@ -121,15 +107,11 @@ impl LayerSurface {
         carries_buffer: bool,
     ) -> Acked {
         if carries_buffer {
-            // Requested before the commit: a `wl_surface.frame` applies to the
-            // commit that follows it.
             let acked = callbacks.arm(&self.surface.frame(qh, ()));
             self.surface.commit();
             return acked;
         }
         self.surface.commit();
-        // An emptied surface is never painted again, so it has no frame
-        // callback; the display round-trip is what tells us the commit landed.
         callbacks.arm(&self.conn.display().sync(qh, ()))
     }
 
@@ -149,8 +131,6 @@ pub(crate) struct FrameCommit<'a> {
 }
 
 impl<'a> FrameCommit<'a> {
-    /// Clamps `src_*` to the buffer dimensions: a `wp_viewport` source larger
-    /// than the attached buffer is a fatal protocol error that kills the client.
     pub(crate) fn new(
         buf: FrameBuffer<'a>,
         buf_w: i32,

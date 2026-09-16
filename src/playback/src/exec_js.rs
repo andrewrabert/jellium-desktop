@@ -1,7 +1,3 @@
-//! Reverse-FFI exec_js callback. C++ installs a single global handler;
-//! Rust-side sinks (browser_sink, the jfn-mpris sink) call it to forward JS into
-//! the embedded web view.
-
 use parking_lot::Mutex;
 use std::ffi::CString;
 use std::os::raw::c_char;
@@ -23,7 +19,6 @@ pub(crate) fn call(js: &str) {
     }
 }
 
-/// Install / clear the exec_js callback. `cb == None` clears.
 pub fn jfn_playback_set_web_exec_js_handler(cb: Option<ExecJsCb>) {
     *slot().lock() = cb;
 }

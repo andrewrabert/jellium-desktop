@@ -1,14 +1,3 @@
-//! One content actor per overlay surface: the sole owner of pixel upload.
-//!
-//! One thread + mailbox (mirroring `jfn_wayland::layer_actor`). It holds a
-//! [`ContentSurface`] and so CANNOT configure geometry — the geometry thread is
-//! the sole structure writer. Degradation (GPU present failure → SHM) happens
-//! INSIDE the actor; there is no CEF-thread fallback.
-//!
-//! The content surface is attached after the geometry thread creates the
-//! window ([`OverlayActor::attach_content`]); a frame that arrives before then
-//! stays owed until it has.
-
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -40,18 +29,12 @@ enum PendingFrame {
 
 struct OverlayState {
     pending: Option<PendingFrame>,
-    /// The producer that owes the pending frame's successor, held so a frame
-    /// the swapchain could not take can ask for the one that replaces it.
     source: Option<Arc<dyn FrameSource>>,
-    /// Handed over once the geometry thread has created the window.
     content: Option<ContentSurface>,
-    /// Desired swapchain target extent (parent-derived); the geometry thread is
-    /// the authority for it.
     target_size: (u32, u32),
     shutdown: bool,
 }
 
-/// X11 content presenter for one overlay. See the module docs.
 pub(crate) struct OverlayActor {
     mailbox: Mailbox<OverlayState>,
     thread: Option<JoinHandle<()>>,
@@ -74,13 +57,10 @@ impl OverlayActor {
         Self { mailbox, thread }
     }
 
-    /// Hand the freshly-created window's content capability to the actor.
     pub(crate) fn attach_content(&self, content: ContentSurface) {
         self.mailbox.update(|s| s.content = Some(content));
     }
 
-    /// Desired swapchain target extent, set by the geometry thread in lockstep
-    /// with the overlay window size.
     pub(crate) fn resize(&self, w: i32, h: i32) {
         if w <= 0 || h <= 0 {
             return;
@@ -89,7 +69,6 @@ impl OverlayActor {
             .update(|s| s.target_size = (w as u32, h as u32));
     }
 
-    /// `pixels` must cover `width * height` BGRA (the caller checked it).
     pub(crate) fn present_software(
         &self,
         dirty: &[JfnRect],
@@ -122,8 +101,6 @@ impl OverlayActor {
         });
     }
 
-    /// Deterministic teardown: signal shutdown and join the worker, which frees
-    /// the content GC + SHM segments + GPU resources on its own thread.
     pub(crate) fn shutdown(mut self) {
         self.signal_shutdown();
         if let Some(thread) = self.thread.take() {
@@ -141,17 +118,12 @@ impl OverlayActor {
 
 impl Drop for OverlayActor {
     fn drop(&mut self) {
-        // Safety net for a dropped-without-shutdown actor.
         self.signal_shutdown();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
-
-// ===================================================================
-// Worker
-// ===================================================================
 
 #[derive(Default)]
 struct ShmState {
@@ -172,14 +144,9 @@ fn initial_backend() -> Backend {
     }
 }
 
-/// What one iteration did with the frame it took.
 enum Outcome {
-    /// The frame reached the surface's commit stream.
     Committed,
-    /// Nothing could take the frame yet — no texture, or no painter for a
-    /// shared frame — and it is owed again at this instant.
     Deferred(PendingFrame, Option<Instant>),
-    /// The GPU path is done: the actor degrades to SHM and keeps the frame.
     Degraded(PendingFrame),
 }
 
@@ -207,8 +174,6 @@ fn run_worker(mailbox: Mailbox<OverlayState>) {
             Some(at) => mailbox.wait_until(at, ready, take),
             None => Some(mailbox.wait(ready, take)),
         };
-        // Nothing arrived before the held frame came due: present it against
-        // the window the mailbox still names.
         let (frame, content_window, content_gc, target_size, shutdown) =
             taken.unwrap_or_else(|| {
                 mailbox.peek(|s| {
@@ -225,8 +190,6 @@ fn run_worker(mailbox: Mailbox<OverlayState>) {
         }
         let frame = retry.take(frame);
         let (Some(window), Some(gc)) = (content_window, content_gc) else {
-            // The geometry thread has not created the window yet; the frame
-            // stays owed until it has.
             if let Some((frame, source)) = frame {
                 retry.defer(frame, source, jfn_gpu_paint::Deferred::new().retry_at());
             }
@@ -246,8 +209,6 @@ fn run_worker(mailbox: Mailbox<OverlayState>) {
         ) {
             Outcome::Committed => {}
             Outcome::Deferred(frame, at) => retry.defer(frame, source, at),
-            // The degraded backend is SHM now, so the frame it kept goes out
-            // through it in the same iteration.
             Outcome::Degraded(frame) => {
                 if let (Backend::Shm(state), Some(conn)) = (&mut backend, content_conn.as_deref()) {
                     present_shm(state, conn, window, gc, frame);
@@ -274,9 +235,6 @@ fn present_frame(
                 Gpu::Committed => Outcome::Committed,
                 Gpu::Deferred(at) => Outcome::Deferred(frame, at),
                 Gpu::Degrade => {
-                    // Take the painter out and shut it down BEFORE switching —
-                    // wgpu's swapchain and hand-rolled SHM must never both be
-                    // writing this window.
                     if let Backend::Gpu(p) = backend
                         && let Some(p) = p.take()
                     {
@@ -296,21 +254,16 @@ fn present_frame(
     }
 }
 
-/// What the GPU path did with the frame it was shown.
 enum Gpu {
     Committed,
     Deferred(Option<Instant>),
     Degrade,
 }
 
-/// The frame is owed again one refresh from now.
 fn owed_again() -> Gpu {
     Gpu::Deferred(jfn_gpu_paint::Deferred::new().retry_at())
 }
 
-/// Present through the GPU surface. Only a lost surface asks the caller to
-/// degrade to SHM. A shared frame never does — dmabuf has no CPU fallback, so
-/// degrading would strand the surface with no output at all.
 fn present_gpu(
     painter: &mut Option<Box<jfn_gpu_paint::Surface<'static>>>,
     window: xproto::Window,
@@ -331,8 +284,6 @@ fn present_gpu(
             screen: crate::x11_state::host().map_or(0, |h| h.screen_num),
             visual: paint.argb_visual,
         };
-        // Seed with the parent-derived target extent so the first configure
-        // already matches the window the geometry thread sized.
         let init = PhysicalSize {
             w: target_size.0.max(1) as i32,
             h: target_size.1.max(1) as i32,
@@ -340,9 +291,6 @@ fn present_gpu(
         match gpu.new_surface(target, init) {
             Ok(p) => *painter = Some(Box::new(p)),
             Err(e) => {
-                // Degrading a shared frame strands the surface: SHM cannot
-                // present it, so it would be dropped here and so would every
-                // frame after it. Stay on GPU and retry creation next frame.
                 if matches!(frame, PendingFrame::Shared(_)) {
                     tracing::warn!("[x11] overlay actor gpu init failed: {e}; frame stays owed");
                     return owed_again();
@@ -385,8 +333,6 @@ fn present_gpu(
     match outcome {
         Ok(_presented) => Gpu::Committed,
         Err(PresentFailed::Deferred(deferred)) => Gpu::Deferred(deferred.retry_at()),
-        // The surface is fine and the producer owes the successor; nothing here
-        // can conjure one, so this frame goes nowhere.
         Err(e @ (PresentFailed::Import | PresentFailed::Kind)) => {
             tracing::debug!("[x11] overlay actor frame not presented: {e}");
             owed_again()
@@ -413,8 +359,6 @@ fn present_shm(
         stride,
     } = frame
     else {
-        // Shared frames never reach the SHM backend: a shared failure is not
-        // fatal, so it never degrades.
         return;
     };
     let depth = crate::x11_state::paint().map_or(32, |p| p.argb_depth);
@@ -484,7 +428,6 @@ fn teardown(
             }
         }
     }
-    // Free the content GC on the content connection.
     if let Some(conn) = content_conn {
         mailbox.peek(|s| {
             if let Some(content) = s.content.as_ref() {

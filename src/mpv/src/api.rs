@@ -1,27 +1,3 @@
-//! Post-init mpv handle accessors used by sibling crates.
-//!
-//! All entry points borrow the global handle published by
-//! [`crate::boot::jfn_mpv_handle_init`]. They no-op silently if the
-//! handle has not yet been initialized or has already been terminated.
-//!
-//! Property writes and commands go through libmpv's async API
-//! (`reply_userdata == 0`, fire-and-forget). Property reads are
-//! synchronous and must only be issued from non-event contexts; observed
-//! properties should be read from the `jfn_playback_*` atomics instead.
-//!
-//! Stateful helpers — `LoadFile` / `ApplyPendingTrackSelectionAndPlay`
-//! / `SetAspectMode` — live here too. The pending-track state is
-//! single-threaded by usage but guarded by a Mutex so callers from any
-//! thread stay safe.
-//!
-//! # Safety
-//!
-//! Every `pub unsafe fn` in this module accepts raw C-string / raw struct
-//! pointers preserved from the original FFI surface. Callers must ensure
-//! all `*const c_char` arguments point to NUL-terminated UTF-8 (or are
-//! null where the function documents tolerance), and that struct
-//! pointers reference live values for the duration of the call.
-
 #![allow(clippy::missing_safety_doc)]
 
 use parking_lot::Mutex;
@@ -29,10 +5,6 @@ use std::ffi::{CStr, CString, c_char};
 use std::os::raw::c_void;
 
 use crate::sys;
-
-// =============================================================================
-// Internal helpers
-// =============================================================================
 
 fn raw() -> *mut sys::mpv_handle {
     crate::boot::current_raw_handle().unwrap_or(std::ptr::null_mut())
@@ -46,12 +18,6 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a CStr> {
     }
 }
 
-// =============================================================================
-// Generic property R/W + command
-// =============================================================================
-
-/// Async (`reply_userdata == 0`) flag write. No-op if the handle is
-/// missing or `name` is NULL.
 pub unsafe fn jfn_mpv_set_property_flag_async(name: *const c_char, value: bool) {
     let h = raw();
     if h.is_null() {
@@ -135,9 +101,6 @@ pub unsafe fn jfn_mpv_set_property_string_async(name: *const c_char, value: *con
     }
 }
 
-/// Sync int property read. Writes the value into `*out` and returns
-/// libmpv's error code (0 on success, negative on failure). NULL `out`
-/// or missing handle returns `MPV_ERROR_INVALID_PARAMETER` (-4).
 pub unsafe fn jfn_mpv_get_property_int(name: *const c_char, out: *mut i64) -> i32 {
     let h = raw();
     if h.is_null() || out.is_null() {
@@ -156,8 +119,6 @@ pub unsafe fn jfn_mpv_get_property_int(name: *const c_char, out: *mut i64) -> i3
     }
 }
 
-/// Sync string property read. Returns a malloc'd UTF-8 C string the
-/// caller must free with [`jfn_mpv_free_string`], or NULL on failure.
 pub unsafe fn jfn_mpv_get_property_string(name: *const c_char) -> *mut c_char {
     let h = raw();
     if h.is_null() {
@@ -170,8 +131,6 @@ pub unsafe fn jfn_mpv_get_property_string(name: *const c_char) -> *mut c_char {
     if p.is_null() {
         return std::ptr::null_mut();
     }
-    // libmpv owns p (mpv_free required). Copy into a Rust-allocated
-    // CString so the caller's free pairs with `jfn_mpv_free_string`.
     let out = unsafe { CStr::from_ptr(p) }.to_owned();
     unsafe { sys::mpv_free(p as *mut c_void) };
     out.into_raw()
@@ -183,9 +142,6 @@ pub unsafe fn jfn_mpv_free_string(s: *mut c_char) {
     }
 }
 
-/// Async command. `args` is a `const char* const*` table of length `n`
-/// (no NULL terminator required — the wrapper appends one). No-op on
-/// missing handle, empty argv, or NULL entries.
 pub unsafe fn jfn_mpv_command_async(args: *const *const c_char, n: usize) {
     let h = raw();
     if h.is_null() || args.is_null() || n == 0 {
@@ -200,10 +156,6 @@ pub unsafe fn jfn_mpv_command_async(args: *const *const c_char, n: usize) {
     unsafe { sys::mpv_command_async(h, 0, argv.as_ptr() as *mut _) };
 }
 
-// =============================================================================
-// Event drain (wait_event / wakeup).
-// =============================================================================
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum WaitEvent {
     None,
@@ -211,9 +163,6 @@ pub enum WaitEvent {
     Event(crate::Event),
 }
 
-/// Pumps libmpv's event queue. Returns the raw `mpv_event*` libmpv owns;
-/// valid only until the next call on the same handle. NULL if the handle
-/// is missing.
 pub fn jfn_mpv_wait_event(timeout: f64) -> *mut sys::mpv_event {
     let h = raw();
     if h.is_null() {
@@ -222,7 +171,6 @@ pub fn jfn_mpv_wait_event(timeout: f64) -> *mut sys::mpv_event {
     unsafe { sys::mpv_wait_event(h, timeout) }
 }
 
-/// A missing handle and `MPV_EVENT_NONE` both collapse to [`WaitEvent::None`].
 pub fn wait_event_owned(timeout: f64) -> WaitEvent {
     let ev = jfn_mpv_wait_event(timeout);
     if ev.is_null() {
@@ -242,13 +190,6 @@ pub fn jfn_mpv_wakeup() {
     }
 }
 
-/// Install a C-style wakeup callback against the singleton mpv handle. The
-/// callback fires from a foreign thread whenever libmpv queues a new
-/// event; per the libmpv docs it must return promptly and call no
-/// blocking API.
-///
-/// # Safety
-/// `cb` must remain valid for as long as the mpv handle is in use.
 pub unsafe fn jfn_mpv_set_wakeup_callback(
     cb: unsafe extern "C" fn(*mut std::ffi::c_void),
     data: *mut std::ffi::c_void,
@@ -259,18 +200,12 @@ pub unsafe fn jfn_mpv_set_wakeup_callback(
     }
 }
 
-/// Clear any previously-installed wakeup callback. After this call libmpv
-/// will not fire a foreign-thread notification on new events.
 pub fn jfn_mpv_clear_wakeup_callback() {
     let h = raw();
     if !h.is_null() {
         unsafe { sys::mpv_set_wakeup_callback(h, None, std::ptr::null_mut()) };
     }
 }
-
-// =============================================================================
-// Player API — convenience wrappers over property writes / commands.
-// =============================================================================
 
 unsafe fn set_flag(name: &CStr, v: bool) {
     unsafe { jfn_mpv_set_property_flag_async(name.as_ptr(), v) };
@@ -321,9 +256,6 @@ pub fn jfn_mpv_set_start_position(s: f64) {
     unsafe { set_double(c"start", s) };
 }
 
-/// Track id sentinel: 0 = disabled. >=1 = explicit mpv track id.
-/// Mpv's auto-track-selection is globally disabled (boot applies
-/// `track-auto-selection=no`); jellyfin-web is the authority.
 const TRACK_DISABLE: i64 = 0;
 
 fn track_to_mpv_str(id: i64) -> CString {
@@ -358,11 +290,6 @@ pub unsafe fn jfn_mpv_audio_add(url: *const c_char) {
     cmd(&[c"audio-add", u, c"select"]);
 }
 
-// =============================================================================
-// LoadFile + deferred track selection (stateful)
-// =============================================================================
-
-/// Load options for `LoadFile`. NULL string pointers are treated as empty.
 #[repr(C)]
 pub struct JfnMpvLoadOptions {
     pub start_secs: f64,
@@ -419,13 +346,6 @@ pub unsafe fn jfn_mpv_load_file(path: *const c_char, opts: *const JfnMpvLoadOpti
     let defer_audio =
         o.is_infinite_stream && o.audio_track == TRACK_DISABLE && ext_audio.is_empty();
 
-    // Track selection is owned by Jellyfin. With track-auto-selection=no,
-    // mpv silently drops aid/vid/sid in loadfile options (loadfile.c
-    // skips select_default_track entirely). Load the file *paused* with
-    // no selectors, stash the intended ids, and apply them via property
-    // writes after FILE_LOADED. The async writes + final pause=false are
-    // FIFO-ordered on mpv's core thread, so playback only begins after
-    // track-switch reinits land.
     {
         let mut s = pending_slot().lock();
         s.vid = o.video_track;
@@ -439,9 +359,6 @@ pub unsafe fn jfn_mpv_load_file(path: *const c_char, opts: *const JfnMpvLoadOpti
 
     let mut opts_str = format!("start={},pause=yes", o.start_secs);
     if defer_audio {
-        // Per-file enable so mpv's demuxer picks the format-correct
-        // audio track (HLS DEFAULT=YES, MPEG-TS first PMT, etc.). We
-        // explicitly write `sid=no` after FILE_LOADED to keep subs off.
         opts_str.push_str(",track-auto-selection=yes");
     }
     let opts_c = CString::new(opts_str).unwrap_or_default();
@@ -471,9 +388,6 @@ pub fn jfn_mpv_apply_pending_track_selection_and_play() {
     let vid_s = track_to_mpv_str(vid);
     unsafe { set_str(c"vid", &vid_s) };
     if !defer_audio {
-        // Normal path: jellyfin-web is authoritative. Skipped only for
-        // the unprobed-live case (track-auto-selection=yes was set
-        // per-file in load_file so mpv's demuxer already picked).
         let aid_s = track_to_mpv_str(aid);
         unsafe { set_str(c"aid", &aid_s) };
     }
@@ -494,10 +408,6 @@ pub fn jfn_mpv_apply_pending_track_selection_and_play() {
     unsafe { set_flag(c"pause", false) };
 }
 
-// =============================================================================
-// Aspect-mode helper
-// =============================================================================
-
 pub unsafe fn jfn_mpv_set_aspect_mode(mode: *const c_char) {
     let Some(m) = (unsafe { cstr(mode) }) else {
         return;
@@ -507,17 +417,12 @@ pub unsafe fn jfn_mpv_set_aspect_mode(mode: *const c_char) {
         b"cover" => (true, 1.0),
         b"fill" => (false, 0.0),
         _ => {
-            // Unknown mode — silently ignore (matches legacy log-and-skip).
             return;
         }
     };
     unsafe { set_flag(c"keepaspect", keepaspect) };
     unsafe { set_double(c"panscan", panscan) };
 }
-
-// =============================================================================
-// Window / display
-// =============================================================================
 
 pub fn jfn_mpv_set_fullscreen(v: bool) {
     unsafe { set_flag(c"fullscreen", v) };
@@ -541,15 +446,8 @@ pub unsafe fn jfn_mpv_set_geometry(g: *const c_char) {
     unsafe { set_str(c"geometry", g) };
 }
 
-/// Reply id carried by the [`crate::Event::GetPropertyReply`] answering
-/// [`jfn_mpv_request_background_color`].
 pub const BACKGROUND_COLOR_REPLY: crate::event::ReplyUserdata = 1;
 
-/// Enqueues an async read of mpv's `background-color` on the core dispatch
-/// queue; never parks the caller on mpv's core lock. No-op without a live
-/// handle. The answer arrives as a `GetPropertyReply` tagged
-/// [`BACKGROUND_COLOR_REPLY`]; decode it with
-/// [`background_color_from_reply`].
 pub fn jfn_mpv_request_background_color() {
     let h = raw();
     if h.is_null() {
@@ -565,8 +463,6 @@ pub fn jfn_mpv_request_background_color() {
     };
 }
 
-/// Packed 0x00RRGGBB parsed from a [`BACKGROUND_COLOR_REPLY`] payload.
-/// `None` when the reply carried no string value.
 pub fn background_color_from_reply(value: &crate::PropertyValue) -> Option<u32> {
     match value {
         crate::PropertyValue::String(s) => Some(crate::color::parse(s)),

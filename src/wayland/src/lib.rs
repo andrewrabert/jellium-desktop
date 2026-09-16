@@ -1,8 +1,3 @@
-//! Wayland subsystem: clipboard, input, KDE decoration palette, output-scale probe.
-//!
-//! Subsystem state is owned by [`runtime::WlRuntime`] and passed to the code
-//! that needs it; nothing reaches its state through a module-level `static`.
-
 #![cfg(target_os = "linux")]
 
 pub(crate) mod app_conn;
@@ -52,9 +47,6 @@ mod source_guard {
         }
     }
 
-    /// State belongs to `WlRuntime`, which is passed to whoever needs it. A new
-    /// `static` here would reintroduce exactly the ambient reachability that
-    /// ownership removed, so it has to be argued for rather than typed.
     #[test]
     fn no_module_statics() {
         let mut files = Vec::new();

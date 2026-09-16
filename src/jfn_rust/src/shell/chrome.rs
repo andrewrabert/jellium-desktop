@@ -1,5 +1,3 @@
-//! The titlebar view and the state the rest of the process pushes into it.
-
 use parking_lot::Mutex;
 
 use crate::shell::state::ChromeInputs;
@@ -19,17 +17,14 @@ pub fn inputs() -> ChromeInputs {
     *INPUTS.lock()
 }
 
-/// Registered once by `shell_start`; fired on every change.
 pub fn set_listener(f: Listener) {
     *LISTENER.lock() = Some(f);
 }
 
-/// jellyfin-web's video OSD visibility, pushed from `jfn_playback::chrome`.
 pub fn set_osd_visible(visible: bool) {
     update(|i| i.osd_visible = visible);
 }
 
-/// jellyfin-web is playing video, pushed from `jfn_playback::chrome`.
 pub fn set_video_active(active: bool) {
     update(|i| i.video_active = active);
 }
@@ -62,18 +57,12 @@ use iced_widget::{button, container, row, space};
 
 use crate::shell::theme::{self, Theme};
 
-/// `csd.js`'s `button { width: 46px }`.
 const CONTROL_WIDTH: f32 = 46.0;
 
-/// Logical width of the minimize/maximize/close strip, published into
-/// [`jfn_input::ShellState`] so the router can tell a control press from a
-/// drag.
 pub const CONTROLS_LOGICAL_WIDTH: i32 = 3 * CONTROL_WIDTH as i32;
 
-/// The icons' `viewBox="0 0 11 11"`, drawn at `svg { width: 11px }`.
 const ICON: f32 = 11.0;
 
-/// `svg { stroke-width: 1.2 }`.
 const ICON_STROKE: f32 = 1.2;
 
 #[derive(Clone, Copy, Debug)]
@@ -90,9 +79,6 @@ enum Icon {
     Close,
 }
 
-/// The widget tree holds only the three window controls, which act on release
-/// like every button. Dragging and resizing are press gestures and never reach
-/// the tree — `jfn_input::ShellInput::window_gesture` performs them.
 #[derive(Default)]
 pub struct Titlebar;
 

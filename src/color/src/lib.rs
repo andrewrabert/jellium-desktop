@@ -1,8 +1,3 @@
-//! CSS- and mpv-form color string parsing. Both parsers pack the result
-//! into a 24-bit RGB integer and use 0 (black) for malformed input.
-//!
-//! Also hosts the window-scoped ThemeColor tracker (see [`theme`]).
-
 pub mod theme;
 
 use std::ffi::{CStr, c_char};
@@ -29,8 +24,6 @@ fn pack(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-/// Parse a `<meta name="theme-color">` value: `#RGB` or `#RRGGBB`. Returns 0
-/// on malformed input.
 pub fn parse_cef(s: &[u8]) -> u32 {
     if s.first() != Some(&b'#') {
         return 0;
@@ -87,9 +80,6 @@ fn scale(v: f64) -> u8 {
     (v * 255.0).round() as u8
 }
 
-/// Parse any form mpv emits or accepts (third_party/mpv/options/m_option.c
-/// :2079-2147). mpv's `print_color` emits `#AARRGGBB` — alpha first. Does NOT
-/// accept CSS `#RGB`. Returns 0 on malformed input.
 pub fn parse_mpv(s: &[u8]) -> u32 {
     if s.is_empty() {
         return 0;
@@ -134,8 +124,6 @@ pub fn parse_mpv(s: &[u8]) -> u32 {
     if n == 0 {
         return 0;
     }
-    // mpv rules: 1 = gray, 2 = gray+alpha, 3 = r/g/b, 4 = r/g/b/a. Alpha
-    // is always dropped.
     if n <= 2 {
         let g = scale(comp[0]);
         pack(g, g, g)
@@ -151,14 +139,10 @@ unsafe fn cstr_bytes<'a>(s: *const c_char) -> &'a [u8] {
     unsafe { CStr::from_ptr(s) }.to_bytes()
 }
 
-/// # Safety
-/// `s` must be NUL-terminated or null.
 pub unsafe fn jfn_cef_parse_color(s: *const c_char) -> u32 {
     parse_cef(unsafe { cstr_bytes(s) })
 }
 
-/// # Safety
-/// `s` must be NUL-terminated or null.
 pub unsafe fn jfn_mpv_parse_color(s: *const c_char) -> u32 {
     parse_mpv(unsafe { cstr_bytes(s) })
 }
@@ -251,22 +235,17 @@ mod tests {
 
     #[test]
     fn mpv_slash_form() {
-        // 3 components: r/g/b
         assert_eq!(mpv("1/0/0"), 0xFF0000);
         assert_eq!(mpv("0/1/0"), 0x00FF00);
         assert_eq!(mpv("0/0/1"), 0x0000FF);
         assert_eq!(mpv("0.5/0.5/0.5"), pack(128, 128, 128));
-        // 4 components: r/g/b/a, alpha dropped
         assert_eq!(mpv("1/0/0/0.5"), 0xFF0000);
-        // 1 = gray
-        assert_eq!(mpv("0.5"), 0); // no slash -> error
-        assert_eq!(mpv("0.5/"), 0); // empty tok
+        assert_eq!(mpv("0.5"), 0);
+        assert_eq!(mpv("0.5/"), 0);
     }
 
     #[test]
     fn mpv_slash_gray_forms() {
-        // single value with trailing slash isn't valid (empty 2nd tok)
-        // 2 components: gray+alpha (alpha dropped, value used as gray)
         assert_eq!(mpv("1/0"), 0xFFFFFF);
         assert_eq!(mpv("0/1"), 0x000000);
     }

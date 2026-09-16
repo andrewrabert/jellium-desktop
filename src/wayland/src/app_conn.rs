@@ -5,10 +5,6 @@ use std::ptr::NonNull;
 use parking_lot::Mutex;
 use wayland_backend::client::Backend;
 
-/// The app-side `wl_display`. Sharing the raw pointer across threads is sound:
-/// libwayland's display is internally synchronized and the app already drives it
-/// from the root thread. Callers take the raw pointer only at the FFI boundary
-/// via [`AppDisplay::as_ptr`], keeping the ownership contract in the type.
 #[derive(Clone, Copy)]
 pub(crate) struct AppDisplay(NonNull<c_void>);
 unsafe impl Send for AppDisplay {}
@@ -20,14 +16,8 @@ impl AppDisplay {
     }
 }
 
-/// `Unattempted` retries on the next call; `Failed` does not. Only a missing
-/// fd (proxy hasn't published the client fd yet) stays `Unattempted` — once
-/// `Backend::connect` runs it has consumed the fd, so its result is terminal
-/// either way.
 enum DisplayState {
     Unattempted,
-    /// The backend owns the connection for the process lifetime; dropping it
-    /// would disconnect the display CEF and mpv hold pointers to.
     Connected {
         display: AppDisplay,
         _backend: Backend,

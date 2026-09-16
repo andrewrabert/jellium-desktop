@@ -1,11 +1,3 @@
-//! A CEF accelerated-paint texture, selected statically per platform.
-//!
-//! CEF reclaims the resources backing a frame when the paint callback returns.
-//! The Linux constructor therefore receives already-duplicated plane fds;
-//! Windows and macOS consume their borrowed handles inline during the callback.
-
-/// Integer texture extent used by the paint crate without depending on the
-/// platform ABI's geometry types.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FrameSize {
     pub w: i32,
@@ -22,8 +14,6 @@ pub enum DmabufFormat {
     Rgba8,
 }
 
-/// One plane of a dmabuf. Owns its fd, closed on drop; an importer that needs
-/// to hand the fd to a driver consumes a dup of it.
 #[cfg(target_os = "linux")]
 pub struct DmabufPlane {
     pub fd: OwnedFd,
@@ -42,7 +32,6 @@ pub struct SharedTexture {
 
 #[cfg(target_os = "linux")]
 impl SharedTexture {
-    /// `planes` must already own their fds — see the module docs.
     pub fn new(
         coded: FrameSize,
         visible_rect: FrameSize,

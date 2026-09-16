@@ -16,13 +16,6 @@ use crate::menu::render::{self, Fonts, Layout, blit_bgra};
 
 const WHEEL_DETENT: f32 = 120.0;
 
-/// Proof that the surface holding the menu's generation has been configured.
-///
-/// [`SurfaceOp::MapArmed`] attaches that surface's first buffer, which a
-/// compositor answers with `xdg_surface.error.unconfigured_buffer` before it
-/// has configured the surface. Mintable only inside [`SoftwareMenu::on_ready`],
-/// the configure callback, and carried by [`Phase::Armed`] for the configure
-/// that arrives before the layout.
 mod configured {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) struct Configured(());
@@ -33,17 +26,12 @@ mod configured {
 }
 use configured::Configured;
 
-/// A pointer position relative to the menu's top-left, in the unit the backend
-/// delivers it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MenuPoint {
-    /// Physical (buffer) pixels.
     Physical { x: c_int, y: c_int },
-    /// Logical (surface) pixels.
     Logical { x: c_int, y: c_int },
 }
 
-/// Content input addressed to a particular menu lifetime.
 pub enum MenuInputEvent {
     Pointer { at: MenuPoint, press: bool },
     Key(u32),
@@ -77,9 +65,6 @@ impl SoftwareMenu {
         }
     }
 
-    /// Starts a requested menu and captures its input serial in the same
-    /// state transaction. The backend receives creation only after the menu
-    /// exists, so an immediate configure/dismissal cannot precede installation.
     pub fn open_triggered(&self, req: MenuRequest, serial: u32) {
         self.open_impl(req, Some(serial));
     }
@@ -143,8 +128,6 @@ impl SoftwareMenu {
         self.thread.lock().is_some()
     }
 
-    /// `serial` must still be grab-worthy at the call. No-op when the render
-    /// thread is absent.
     pub fn arm(&self, x: c_int, y: c_int, serial: u32) {
         if !self.render_thread_alive() {
             return;
@@ -189,8 +172,6 @@ impl SoftwareMenu {
                     s.phase = Phase::Armed(configured);
                 }
                 Phase::AwaitMenu => {
-                    // The placement the arm (or `begin_menu`) carried still
-                    // stands; only the pixels are missing.
                     s.phase = Phase::Shown;
                     request_paint(s);
                 }
@@ -209,12 +190,10 @@ impl SoftwareMenu {
         });
     }
 
-    /// Ignored unless a layout exists to hit-test against.
     pub fn motion(&self, at: MenuPoint) {
         self.pointer(at, false);
     }
 
-    /// Ignored unless a layout exists to hit-test against.
     pub fn press(&self, at: MenuPoint) {
         self.pointer(at, true);
     }
@@ -227,7 +206,6 @@ impl SoftwareMenu {
         self.input_impl(None, MenuInputEvent::Key(keysym));
     }
 
-    /// Stale events from a retired native object cannot affect its successor.
     pub fn input(&self, generation: Generation, event: MenuInputEvent) {
         self.input_impl(Some(generation), event);
     }
@@ -273,7 +251,6 @@ impl SoftwareMenu {
         });
     }
 
-    /// Accepted whenever the menu is active, layout or not.
     pub fn dismiss(&self) {
         self.emitter.update(|s| {
             if !s.active {
@@ -292,7 +269,6 @@ impl SoftwareMenu {
         });
     }
 
-    /// ±120 per detent, positive = wheel up.
     pub fn scroll(&self, dy: c_int) {
         self.input_impl(None, MenuInputEvent::Scroll(dy));
     }
@@ -319,8 +295,6 @@ impl MenuHost for SoftwareMenu {
 
     fn hide(&self) {
         self.emitter.update(|s| {
-            // A hide can be the tail of a previous cycle arriving after the
-            // next press already armed a fresh popup.
             s.menu.as_ref()?;
             close_current(s, MenuClose::Finished)
         });
@@ -337,8 +311,6 @@ impl MenuHost for SoftwareMenu {
     }
 }
 
-/// The one ordered path from menu state to the surface: every op is queued
-/// under the state lock and drained in FIFO order by one leader at a time.
 struct Emitter {
     surface: Arc<dyn PopupSurface>,
     mailbox: Mailbox<MenuState>,
@@ -352,15 +324,11 @@ impl Emitter {
         })
     }
 
-    /// Runs `f` under the state lock, then flushes what it queued.
     fn update(&self, f: impl FnOnce(&mut MenuState) -> Option<Resolve>) {
         let resolve = self.mailbox.update(f);
         self.flush(resolve);
     }
 
-    /// Drains [`MenuState::pending`] to the surface in issue order, then fires
-    /// `resolve` with no lock held. A surface call that re-enters here queues
-    /// and returns; the leader emits what it queued.
     fn flush(&self, resolve: Option<Resolve>) {
         let leader = self
             .mailbox
@@ -380,7 +348,6 @@ impl Emitter {
     }
 }
 
-/// A selection to settle once the state lock is released.
 struct Resolve {
     selection: MenuSelection,
     id: c_int,
@@ -404,7 +371,6 @@ enum Phase {
     #[default]
     Idle,
     AwaitArmed,
-    /// The surface is configured and holds the grab, with no menu on it.
     Armed(Configured),
     AwaitMenu,
     Shown,
@@ -416,30 +382,20 @@ enum RenderJob {
     Shape,
 }
 
-/// What one layout pass settled: the laid-out menu, the metrics the surface
-/// reported for it, and the sizes those two name. Written only by
-/// [`on_layout`], so no site above the surface names a scale or a size the
-/// surface did not.
 struct Laid {
     layout: Arc<Layout>,
     metrics: MenuMetrics,
-    /// Full content size, physical px.
     content: PhysicalSize,
-    /// Visible height, physical px; never above `content.h`.
     view_ph: c_int,
-    /// Scroll offset into the content, physical px, `0..=content.h - view_ph`.
     scroll: c_int,
 }
 
 struct Menu {
     items: Arc<Vec<MenuItem>>,
     fsm: FsmState,
-    /// `None` until [`on_layout`] delivers the surface's metrics.
     laid: Option<Laid>,
-    /// Desired logical width; `<= 0` is content-sized.
     width: c_int,
     on_selected: Option<MenuSelection>,
-    /// Anchor in logical (view) coordinates.
     anchor: LogicalPoint,
 }
 
@@ -451,11 +407,7 @@ struct MenuState {
     active: bool,
     menu: Option<Menu>,
     job: Option<RenderJob>,
-    /// Surface ops in issue order, drained by [`Emitter::flush`]; independent of
-    /// the session, so a queued teardown survives `clear_menu`.
     pending: VecDeque<SurfaceOp>,
-    /// A flush owns `pending`; cleared only when the queue is observed empty
-    /// under the same lock.
     draining: bool,
     shutdown: bool,
 }
@@ -541,11 +493,6 @@ fn request_paint(state: &mut MenuState) {
     );
 }
 
-/// The extent the menu's presented size names: the full content width and the
-/// visible height, in both spaces.
-///
-/// `None` when the reported scale does not map that physical size to a logical
-/// one, or when it is below two pixels on an axis.
 fn view(laid: &Laid) -> Option<WindowExtent> {
     let scale = laid.metrics.scale;
     let physical = PhysicalSize {
@@ -555,9 +502,6 @@ fn view(laid: &Laid) -> Option<WindowExtent> {
     WindowExtent::new(physical, scale, physical.to_logical(scale)?)
 }
 
-/// The placement the menu's anchor and presented size name.
-///
-/// `None` before a layout, and when the presented size names no extent.
 fn placement(menu: &Menu) -> Option<MenuPlacement> {
     Some(MenuPlacement {
         anchor: menu.anchor,
@@ -565,10 +509,6 @@ fn placement(menu: &Menu) -> Option<MenuPlacement> {
     })
 }
 
-/// Closes the menu and resolves its selection as dismissed, logging `what`
-/// beside the menu's own size and reported scale. The one answer to a menu
-/// the engine cannot place; without it the grab stands over an empty
-/// surface.
 fn close_unplaceable(state: &mut MenuState, what: &'static str) -> Option<Resolve> {
     if let Some(laid) = state.menu.as_ref().and_then(|m| m.laid.as_ref()) {
         tracing::error!(
@@ -582,10 +522,6 @@ fn close_unplaceable(state: &mut MenuState, what: &'static str) -> Option<Resolv
     close_current(state, MenuClose::Finished)
 }
 
-/// Buffer coordinates, physical px including the scroll offset. `None` before
-/// a layout gives the menu a presented size.
-///
-/// Logical input converts through the scale the surface reported.
 fn buffer_point(menu: &Menu, at: MenuPoint) -> Option<(c_int, c_int)> {
     let laid = menu.laid.as_ref()?;
     let scale = laid.metrics.scale;
@@ -661,8 +597,6 @@ fn on_layout(
                 SurfaceOp::Arm {
                     generation,
                     anchor,
-                    // 0: no triggering press; the surface substitutes whatever
-                    // serial it still has.
                     serial: 0,
                 },
             );
@@ -703,9 +637,6 @@ fn on_pixels(state: &mut MenuState, generation: Generation, pixels: Vec<u8>) -> 
     None
 }
 
-/// Maps the armed surface, activating the grab before the menu has pixels,
-/// then places the menu on it. The one constructor of [`SurfaceOp::MapArmed`],
-/// so no buffer is committed to a surface the compositor has not configured.
 fn begin_menu(state: &mut MenuState, configured: Configured) -> Option<Resolve> {
     let Configured { .. } = configured;
     let generation = state.generation?;
@@ -715,7 +646,6 @@ fn begin_menu(state: &mut MenuState, configured: Configured) -> Option<Resolve> 
     };
     state.active = true;
     state.phase = Phase::AwaitMenu;
-    // Maps the armed surface, activating the grab before the menu has pixels.
     queue(state, SurfaceOp::MapArmed { generation });
     queue(state, SurfaceOp::Reposition { generation, place });
     None
@@ -754,8 +684,6 @@ fn step(state: &mut MenuState, ev: MenuEvent) -> Option<Resolve> {
     None
 }
 
-/// Clears the session, queues the surface teardown and returns the pending
-/// selection, resolved as [`MENU_DISMISSED`].
 fn close_current(state: &mut MenuState, reason: MenuClose) -> Option<Resolve> {
     let generation = state.generation;
     let resolve = clear_menu(state).map(Resolve::dismissed);
@@ -892,8 +820,6 @@ mod tests {
         }
     }
 
-    /// Queues a `Destroy` from inside `arm`, i.e. while the leader is
-    /// draining.
     #[derive(Default)]
     struct ReentrantSurface {
         seen: Mutex<Vec<&'static str>>,
@@ -996,8 +922,6 @@ mod tests {
         }
     }
 
-    /// Marks the session live the way a delivered layout would, without a
-    /// render thread.
     fn force_active(menu: &SoftwareMenu) {
         menu.emitter.update(|s| {
             s.active = true;
@@ -1005,7 +929,6 @@ mod tests {
         });
     }
 
-    /// Feeds a layout the way the render thread's `Shape` job would.
     fn deliver_layout_sized(menu: &SoftwareMenu, w: i32, h: i32) {
         menu.emitter.update(|s| {
             let generation = s.generation?;
@@ -1025,7 +948,6 @@ mod tests {
         deliver_layout_sized(menu, 100, 40);
     }
 
-    /// Acknowledges the popup the way the compositor's first configure would.
     fn deliver_ready(menu: &SoftwareMenu) {
         if let Some(generation) = menu.emitter.mailbox.peek(|s| s.generation) {
             menu.on_ready(generation);

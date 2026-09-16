@@ -1,17 +1,9 @@
-//! Linux-only CLI arguments, flattened into the binary's top-level `Cli`.
-
 use clap::{Args, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Paint {
-    /// Zero-copy dmabuf shared-texture path: EGL/GBM subsurface on
-    /// Wayland, Vulkan external-memory import on X11. Falls back to gpu
-    /// then shm if the device can't import dmabufs.
     Dmabuf,
-    /// Vulkan pixel-upload via `jfn_gpu_paint`. Falls back to shm when no
-    /// Vulkan adapter is usable.
     Gpu,
-    /// CPU upload (`wl_shm` / MIT-SHM). The floor of the fallback chain.
     Shm,
 }
 
@@ -23,12 +15,9 @@ pub enum PlatformArg {
 
 #[derive(Args, Debug)]
 pub struct LinuxArgs {
-    /// Force the display backend (Linux only).
     #[arg(long, value_enum)]
     pub platform: Option<PlatformArg>,
 
-    /// Preferred paint path (Linux only); falls back dmabuf→gpu→shm.
-    /// Values not available on the active backend degrade gracefully.
     #[arg(long, value_enum)]
     pub platform_paint: Option<Paint>,
 }

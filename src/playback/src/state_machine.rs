@@ -1,5 +1,3 @@
-//! Pure deterministic state machine. No threads, globals, or I/O.
-
 use crate::types::*;
 
 pub struct PlaybackStateMachine {
@@ -46,9 +44,6 @@ impl PlaybackStateMachine {
         self.s.phase = PlaybackPhase::Starting;
         self.s.seeking = false;
         self.s.buffering = self.paused_for_cache || self.core_idle;
-        // variant_switch_pending intentionally NOT cleared — mpv loads
-        // paused after FILE_LOADED and the flag must span until the new
-        // variant's first frame promotes to Playing.
         self.pending_load = false;
         self.pause_requested = false;
         self.frame_available = false;
@@ -128,10 +123,6 @@ impl PlaybackStateMachine {
             out.push(e);
         }
 
-        // Track-switch path: pending_load means a fresh loadfile is in
-        // flight. Eat the EOF/cancel so consumers don't see a Stopped
-        // flicker between tracks. Errors still terminate so failures
-        // surface to the user.
         if self.pending_load && reason != EndReason::Error {
             self.pending_load = false;
             self.s.presence = PlayerPresence::Present;
@@ -228,8 +219,6 @@ impl PlaybackStateMachine {
         }
         self.s.media_type = ty;
         let mut out = vec![PlaybackEvent::new(PlaybackEventKind::MediaTypeChanged)];
-        // Switching to Audio relaxes the frame-available gate; promote
-        // now if the rest of the conditions are met.
         if self.s.phase == PlaybackPhase::Starting
             && self.pause_requested
             && !self.s.buffering

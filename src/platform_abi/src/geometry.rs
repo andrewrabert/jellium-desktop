@@ -1,34 +1,18 @@
-//! Window-geometry value types + on-screen clamping.
-//!
-//! The clamp algorithm was byte-identical in `macos_clamp_window_geometry`
-//! and `win_clamp_window_geometry`; only the OS bounds query differed
-//! (`NSScreen.visibleFrame * scale` vs `SPI_GETWORKAREA`). That query stays
-//! platform-side and hands the resolved [`Bounds`] in, so the shared logic
-//! is testable on any host.
-
 use std::cmp::Ordering;
 use std::ffi::c_int;
 use std::num::NonZeroU64;
 
-/// Physical pixels per logical pixel, exact.
-///
-/// Held as a reduced rational so a backend's own unit — 120ths, half-steps,
-/// DPI/96, a backing factor — survives with no error, and so the conversions
-/// below are integer arithmetic.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Scale {
     numerator: NonZeroU64,
     denominator: NonZeroU64,
 }
 
-/// `floor(num / den)` for a strictly positive `den`.
 fn floor_div(num: i128, den: i128) -> i128 {
     let q = num / den;
     if num % den != 0 && num < 0 { q - 1 } else { q }
 }
 
-/// `floor(num / den + 1/2)` for a strictly positive `den`: round-half-up,
-/// monotone over the whole input range.
 fn div_round_half_up(num: i128, den: i128) -> i128 {
     floor_div(num * 2 + den, den * 2)
 }
@@ -42,7 +26,6 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
-/// `value / divisor`, where `divisor` divides `value`.
 const fn reduce(value: NonZeroU64, divisor: u64) -> NonZeroU64 {
     match NonZeroU64::new(value.get() / divisor) {
         Some(reduced) => reduced,
@@ -56,7 +39,6 @@ impl Scale {
         denominator: NonZeroU64::MIN,
     };
 
-    /// `numerator / denominator`, reduced by their greatest common divisor.
     pub const fn from_nonzero_ratio(numerator: NonZeroU64, denominator: NonZeroU64) -> Scale {
         let g = gcd(numerator.get(), denominator.get());
         Scale {
@@ -65,8 +47,6 @@ impl Scale {
         }
     }
 
-    /// `numerator / denominator`, reduced by their greatest common divisor.
-    /// `None` for a zero numerator.
     pub fn from_ratio(numerator: u64, denominator: NonZeroU64) -> Option<Scale> {
         Some(Scale::from_nonzero_ratio(
             NonZeroU64::new(numerator)?,
@@ -74,9 +54,6 @@ impl Scale {
         ))
     }
 
-    /// The exact value of `value`, which is a dyadic rational. `None` when
-    /// `value` is not finite and greater than zero, or when its exact
-    /// numerator or denominator exceeds `u64`.
     pub fn from_f64(value: f64) -> Option<Scale> {
         if !value.is_finite() || value <= 0.0 {
             return None;
@@ -110,22 +87,17 @@ impl Scale {
         self.numerator.get() as f64 / self.denominator.get() as f64
     }
 
-    /// `logical * scale`, integer round-half-up. `None` when the result does
-    /// not fit `c_int`.
     pub fn to_physical(self, logical: c_int) -> Option<c_int> {
         let num = i128::from(logical) * i128::from(self.numerator.get());
         c_int::try_from(div_round_half_up(num, i128::from(self.denominator.get()))).ok()
     }
 
-    /// `physical / scale`, integer round-half-up. `None` when the result does
-    /// not fit `c_int`.
     pub fn to_logical(self, physical: c_int) -> Option<c_int> {
         let num = i128::from(physical) * i128::from(self.denominator.get());
         c_int::try_from(div_round_half_up(num, i128::from(self.numerator.get()))).ok()
     }
 }
 
-/// `value`, which is not zero.
 const fn nz(value: u64) -> NonZeroU64 {
     match NonZeroU64::new(value) {
         Some(v) => v,
@@ -133,9 +105,6 @@ const fn nz(value: u64) -> NonZeroU64 {
     }
 }
 
-/// The display scales this project covers end to end, as
-/// `dev/requirements/the-display-scale-every-consumer-overrules.md` records
-/// them: 0.5, 0.75, 1.0, 1.25, 1.5, 2.0.
 pub const COVERED_SCALES: [Scale; 6] = [
     Scale::from_nonzero_ratio(nz(1), nz(2)),
     Scale::from_nonzero_ratio(nz(3), nz(4)),
@@ -165,16 +134,12 @@ impl std::fmt::Display for Scale {
     }
 }
 
-/// Window size in logical (DIP) pixels — the coordinate space the compositor
-/// uses for the toplevel; the display scale maps it to physical pixels.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LogicalSize {
     pub w: c_int,
     pub h: c_int,
 }
 
-/// Window size in physical (backing) pixels — what mpv's `--geometry` takes and
-/// what gets persisted as `windowWidth/Height`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalSize {
     pub w: c_int,
@@ -182,7 +147,6 @@ pub struct PhysicalSize {
 }
 
 impl LogicalSize {
-    /// `None` when either axis of the result does not fit `c_int`.
     pub fn to_physical(self, scale: Scale) -> Option<PhysicalSize> {
         Some(PhysicalSize {
             w: scale.to_physical(self.w)?,
@@ -192,7 +156,6 @@ impl LogicalSize {
 }
 
 impl PhysicalSize {
-    /// `None` when either axis of the result does not fit `c_int`.
     pub fn to_logical(self, scale: Scale) -> Option<LogicalSize> {
         Some(LogicalSize {
             w: scale.to_logical(self.w)?,
@@ -201,16 +164,12 @@ impl PhysicalSize {
     }
 }
 
-/// A point in physical (backing) pixels, relative to the window's client
-/// origin — what Win32 mouse messages and X11 pointer events carry.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalPoint {
     pub x: c_int,
     pub y: c_int,
 }
 
-/// A point in logical (DIP) pixels — the space [`WindowExtent::logical`]
-/// names, and the space CEF's view coordinates are in.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LogicalPoint {
     pub x: c_int,
@@ -218,10 +177,6 @@ pub struct LogicalPoint {
 }
 
 impl LogicalPoint {
-    /// The point a view reports in its own logical coordinate space.
-    ///
-    /// Each axis is truncated toward zero and saturates at the [`c_int`]
-    /// bounds; a non-finite axis names zero.
     pub fn from_view(x: f64, y: f64) -> LogicalPoint {
         LogicalPoint {
             x: view_axis(x),
@@ -230,8 +185,6 @@ impl LogicalPoint {
     }
 }
 
-/// `v` truncated toward zero, saturating at the [`c_int`] bounds. A
-/// non-finite `v` names zero.
 fn view_axis(v: f64) -> c_int {
     if !v.is_finite() {
         return 0;
@@ -246,7 +199,6 @@ fn view_axis(v: f64) -> c_int {
     truncated as c_int
 }
 
-/// A coherent (logical, physical, scale) triple.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct WindowExtent {
     logical: LogicalSize,
@@ -255,14 +207,6 @@ pub struct WindowExtent {
 }
 
 impl WindowExtent {
-    /// The extent `physical`, `scale` and `logical` name.
-    ///
-    /// `logical` is the size its producer supplied; nothing here re-derives
-    /// it.
-    ///
-    /// `None` when either axis of either size is below two pixels: a
-    /// one-pixel axis has no second endpoint for
-    /// [`WindowExtent::to_logical_point`] to map onto.
     pub fn new(physical: PhysicalSize, scale: Scale, logical: LogicalSize) -> Option<Self> {
         if physical.w < 2 || physical.h < 2 || logical.w < 2 || logical.h < 2 {
             return None;
@@ -286,12 +230,6 @@ impl WindowExtent {
         self.scale
     }
 
-    /// Map a pointer position into the space this extent's logical size names.
-    ///
-    /// Maps each axis endpoint-to-endpoint through this extent's own
-    /// logical:physical pair, so the last physical row or column is the last
-    /// logical one at every scale — including a producer's exact logical
-    /// size, which division by [`WindowExtent::scale`] cannot reproduce.
     pub fn to_logical_point(&self, p: PhysicalPoint) -> LogicalPoint {
         LogicalPoint {
             x: map_axis(p.x, self.logical.w, self.physical.w),
@@ -300,36 +238,22 @@ impl WindowExtent {
     }
 }
 
-/// `v * (logical - 1) / (physical - 1)`, integer round-half-up, saturating
-/// at the `c_int` bounds.
-///
-/// Total: [`WindowExtent`] admits no axis below two pixels, so neither
-/// difference is zero. Monotone over the whole `c_int` range, so a point
-/// dragged past the client origin stays monotone.
 fn map_axis(v: c_int, logical: c_int, physical: c_int) -> c_int {
     let num = i128::from(v) * i128::from(logical - 1);
     let mapped = div_round_half_up(num, i128::from(physical - 1));
     mapped.clamp(i128::from(c_int::MIN), i128::from(c_int::MAX)) as c_int
 }
 
-/// Fully-resolved boot geometry: one typed value computed once from saved
-/// config, consumed by `WindowOwner::apply_boot_geometry`: it seeds an
-/// app-created window (logical) or hands mpv its `--geometry` (physical).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BootGeometry {
     logical: LogicalSize,
     physical: PhysicalSize,
     scale: Scale,
-    /// `None` ⇒ let the window center (Wayland ignores position entirely).
     position: Option<WindowPos>,
     maximized: bool,
 }
 
 impl BootGeometry {
-    /// The one constructor: `physical` and `position` are both taken from a
-    /// single already-clamped [`WindowGeometry`], so they cannot disagree with
-    /// each other or be set independently of the clamp. `scale` is the factor
-    /// that produced `clamped` from `logical`.
     pub fn from_clamped(
         logical: LogicalSize,
         scale: Scale,
@@ -368,7 +292,6 @@ impl BootGeometry {
         self.maximized
     }
 
-    /// mpv `--geometry`: `"<W>x<H>"` or `"<W>x<H>+<X>+<Y>"`, physical pixels.
     pub fn mpv_geometry_string(&self) -> String {
         let mut s = format!("{}x{}", self.physical.w, self.physical.h);
         if let Some(p) = self.position {
@@ -382,17 +305,12 @@ impl BootGeometry {
     }
 }
 
-/// Working-area dimensions — excludes the menu bar / dock / taskbar — in the
-/// same pixel space (backing pixels) as the geometry being clamped.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Bounds {
     pub w: c_int,
     pub h: c_int,
 }
 
-/// Saved window geometry: size plus an optional top-left position. `None`
-/// position asks [`clamp_to_bounds`] to center the window (mpv's own centering
-/// misbehaves when only the width/height are overridden).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WindowGeometry {
     pub w: c_int,
@@ -401,8 +319,6 @@ pub struct WindowGeometry {
 }
 
 impl WindowGeometry {
-    /// Build from raw coordinates where a negative `x` or `y` means "unset".
-    /// The single home for that OS/config-facing sentinel convention.
     pub fn from_raw(w: c_int, h: c_int, x: c_int, y: c_int) -> Self {
         Self {
             w,
@@ -411,36 +327,24 @@ impl WindowGeometry {
         }
     }
 
-    /// Raw coordinates for OS APIs that take a sentinel; `(-1, -1)` when unset.
     pub fn raw_position(&self) -> (c_int, c_int) {
         self.position.map_or((-1, -1), |p| (p.x, p.y))
     }
 }
 
-/// A window's top-left position, in the coordinate space the backend
-/// reports (backing pixels relative to the working area). Returned by
-/// `Platform::query_window_position`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WindowPos {
     pub x: c_int,
     pub y: c_int,
 }
 
-/// A surface's own coherent size, the scale it is presented at, and the strip
-/// of the window above it.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SurfaceSize {
     pub extent: WindowExtent,
-    /// Offset of the surface's top edge from the window's top edge.
     pub logical_top: c_int,
     pub physical_top: c_int,
 }
 
-/// The physical size mpv's window is resized to at boot.
-///
-/// `None` when `locked`, when the saved logical size does not map to a
-/// representable physical one, and when the size it maps to is the one the
-/// saved geometry already records.
 pub(crate) fn mpv_reconcile_size(
     reported: Scale,
     saved_logical: LogicalSize,
@@ -454,9 +358,6 @@ pub(crate) fn mpv_reconcile_size(
     (physical != saved_physical).then_some(physical)
 }
 
-/// `g`'s size shrunk to fit `bounds`; its position is untouched.
-///
-/// An axis whose bound is not positive is left alone.
 pub fn clamp_size_to_bounds(g: WindowGeometry, bounds: Bounds) -> WindowGeometry {
     WindowGeometry {
         w: if bounds.w > 0 { g.w.min(bounds.w) } else { g.w },
@@ -465,10 +366,6 @@ pub fn clamp_size_to_bounds(g: WindowGeometry, bounds: Bounds) -> WindowGeometry
     }
 }
 
-/// Clamp `g` so the window stays fully within `bounds`: shrink oversized
-/// dimensions, center any unset (negative) axis, pull a past-the-edge window
-/// back in-bounds, then floor at the origin. Byte-for-byte the former
-/// per-platform clamp.
 pub fn clamp_to_bounds(g: &mut WindowGeometry, bounds: Bounds) {
     let vw = bounds.w;
     let vh = bounds.h;
@@ -478,7 +375,6 @@ pub fn clamp_to_bounds(g: &mut WindowGeometry, bounds: Bounds) {
     if g.h > vh {
         g.h = vh;
     }
-    // Center an unset position; otherwise start from the requested one.
     let (mut x, mut y) = match g.position {
         Some(p) => (p.x, p.y),
         None => ((vw - g.w) / 2, (vh - g.h) / 2),

@@ -1,13 +1,7 @@
-//! One single-slot coalescing mailbox, shared by every actor in the workspace
-//! that hands work to a dedicated thread.
-
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Shared, cloneable handle to one actor's state: a `parking_lot` mutex plus
-/// the condvar its consumer blocks on. Coalescing is the state's own business
-/// — the mailbox owns only the lock, the wake, and the blocking wait.
 pub struct Mailbox<S> {
     inner: Arc<Shared<S>>,
 }
@@ -35,9 +29,6 @@ impl<S> Mailbox<S> {
         }
     }
 
-    /// Run `f` under the lock, then wake every blocked waiter. The wake is a
-    /// broadcast: several waiters can be parked on distinct predicates, and
-    /// waking only one would let it swallow another's wakeup.
     pub fn update<R>(&self, f: impl FnOnce(&mut S) -> R) -> R {
         let mut state = self.inner.state.lock();
         let out = f(&mut state);
@@ -46,13 +37,10 @@ impl<S> Mailbox<S> {
         out
     }
 
-    /// Run `f` under the lock and wake nobody.
     pub fn peek<R>(&self, f: impl FnOnce(&S) -> R) -> R {
         f(&self.inner.state.lock())
     }
 
-    /// Block until `ready` holds of the state, then run `take` under the same
-    /// lock without releasing it in between.
     pub fn wait<R>(&self, ready: impl Fn(&S) -> bool, take: impl FnOnce(&mut S) -> R) -> R {
         let mut state = self.inner.state.lock();
         while !ready(&state) {
@@ -61,9 +49,6 @@ impl<S> Mailbox<S> {
         take(&mut state)
     }
 
-    /// Block until `ready` holds of the state or `deadline` passes, then run
-    /// `take` under the same lock. `None` when the deadline passed with `ready`
-    /// still false.
     pub fn wait_until<R>(
         &self,
         deadline: Instant,
@@ -72,9 +57,6 @@ impl<S> Mailbox<S> {
     ) -> Option<R> {
         let mut state = self.inner.state.lock();
         while !ready(&state) {
-            // The timeout is only decisive once the predicate has been asked
-            // again under the reacquired lock: a wake and the deadline can land
-            // together.
             if self.inner.cv.wait_until(&mut state, deadline).timed_out() && !ready(&state) {
                 return None;
             }

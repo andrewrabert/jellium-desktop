@@ -1,11 +1,3 @@
-//! Owned Rust mirror of `mpv_node`.
-//!
-//! libmpv hands out `mpv_node` trees via `mpv_get_property(..., MPV_FORMAT_NODE)`
-//! and `mpv_event_property` payloads. Both forms reference memory owned by
-//! libmpv that must be freed with `mpv_free_node_contents`. Rather than carry
-//! that lifetime, `Node::from_raw` copies the tree into owned Rust values so
-//! the caller can drop libmpv's allocation immediately.
-
 use crate::sys;
 use std::ffi::CStr;
 
@@ -25,12 +17,6 @@ pub type NodeArray = Vec<Node>;
 pub type NodeMap = Vec<(String, Node)>;
 
 impl Node {
-    /// Deep-copy a raw `mpv_node` (from libmpv) into an owned `Node`. The
-    /// caller still owns the raw node and must free it via
-    /// `mpv_free_node_contents` if libmpv handed it out.
-    ///
-    /// # Safety
-    /// `raw` must point to a valid `mpv_node` as produced by libmpv.
     pub unsafe fn from_raw(raw: *const sys::mpv_node) -> Self {
         if raw.is_null() {
             return Node::None;
@@ -145,7 +131,6 @@ impl Node {
         }
     }
 
-    /// Lookup a key in a `Node::Map`. Returns `None` for non-maps or missing keys.
     pub fn get(&self, key: &str) -> Option<&Node> {
         self.as_map()?
             .iter()
@@ -207,7 +192,6 @@ mod tests {
 
     #[test]
     fn map_decodes_keys_and_values() -> Result<(), std::ffi::NulError> {
-        // { "w": 1920, "h": 1080 }
         let mut values = vec![raw_int(1920), raw_int(1080)];
         let key_w = CString::new("w")?;
         let key_h = CString::new("h")?;

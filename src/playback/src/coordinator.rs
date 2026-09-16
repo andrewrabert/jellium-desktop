@@ -1,8 +1,3 @@
-//! Coordinator: owns the single mutable state machine, worker thread, and
-//! sink fanout. Producers post inputs from any thread; the worker drains
-//! a finite batch of queued inputs, runs transitions, publishes the canonical
-//! snapshot, and invokes a stable set of sink callbacks without holding locks.
-
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -45,8 +40,6 @@ pub enum Input {
 }
 
 struct Shared {
-    /// Producer end, cleared by `stop` so the worker's `recv` disconnects
-    /// even while handles remain alive.
     tx: Mutex<Option<Sender<Input>>>,
     snapshot: Mutex<PlaybackSnapshot>,
     sinks: Mutex<Sinks>,
@@ -55,8 +48,6 @@ struct Shared {
 type SharedEventSink = Arc<dyn Fn(&PlaybackEvent) + Send + Sync>;
 type SharedActionSink = Arc<dyn Fn(&PlaybackAction) + Send + Sync>;
 
-/// All registrations share one boundary: changes during dispatch take effect
-/// on the next batch. Shared ownership lets callbacks run without this lock.
 #[derive(Clone, Default)]
 struct Sinks {
     events: Vec<SharedEventSink>,
@@ -68,8 +59,6 @@ struct Sinks {
 pub struct PlaybackCoordinator {
     pub(crate) window_subscription: Option<jfn_platform_abi::WindowSubscription>,
     shared: Arc<Shared>,
-    /// Handed to the worker by `start`; `None` afterwards, which makes a
-    /// second `start` a no-op.
     rx: Option<Receiver<Input>>,
     join: Option<JoinHandle<()>>,
 }
@@ -195,16 +184,12 @@ fn worker(rx: Receiver<Input>, shared: Arc<Shared>) {
     }
 }
 
-/// Capture the queued count once so producers cannot extend this batch
-/// indefinitely and starve snapshot publication and sink delivery.
 fn pending_batch(rx: &Receiver<Input>, first: Input) -> impl Iterator<Item = Input> + '_ {
     std::iter::once(first).chain(rx.try_iter().take(rx.len()))
 }
 
 fn dispatch(shared: &Shared, events: &[PlaybackEvent], actions: &[PlaybackAction]) {
     let sinks = shared.sinks.lock().clone();
-    // Preserve registration order and external-before-builtin delivery.
-    // Callbacks must not block; sinks own their own queue + consumer thread.
     for sink in &sinks.events {
         for event in events {
             sink(event);
@@ -251,8 +236,6 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
         Input::BufferedRanges(r) => sm.on_buffered_ranges(r),
         Input::DisplayHz(h) => sm.on_display_hz(h),
         Input::Metadata(m) => {
-            // Route media_type through the SM so snapshot.media_type
-            // tracks metadata changes (idle inhibit reads it).
             let mut events = sm.on_media_type(m.media_type);
             let mut ev = PlaybackEvent::new(PlaybackEventKind::MetadataChanged);
             ev.metadata = m;
@@ -316,7 +299,6 @@ mod tests {
         coord.add_event_sink(Box::new(move |_| {
             recorded.lock().push("event");
             let coord = weak.upgrade().expect("coordinator alive");
-            // Fail instead of deadlocking if dispatch retains the registry lock.
             assert!(coord.shared.sinks.try_lock().is_some());
             if !registered.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let recorded = Arc::clone(&recorded);
@@ -324,7 +306,6 @@ mod tests {
                     recorded.lock().push("late action");
                 }));
             }
-            // Callbacks can also read the published state and enqueue work.
             let _ = coord.snapshot();
             coord.enqueue(Input::Position(7));
         }));
@@ -389,9 +370,6 @@ mod tests {
     fn worker_updates_snapshot_after_input() {
         let mut coord = PlaybackCoordinator::new();
         coord.start();
-        // Register a sink BEFORE enqueuing so the first dispatched batch
-        // signals the channel. Sinks fire on the worker thread after the
-        // snapshot is published, so receiving = snapshot is up-to-date.
         let (tx, rx) = mpsc::sync_channel::<()>(1);
         coord.add_event_sink(Box::new(move |_ev| {
             let _ = tx.try_send(());

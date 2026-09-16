@@ -1,6 +1,3 @@
-//! Scoped registrations for display refresh changes.
-//! Publishers release the registry lock before invoking a recipient.
-
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +22,6 @@ struct Registry {
     callbacks: BTreeMap<u64, Arc<Callback>>,
 }
 
-/// A set of independent registrations, including duplicate callback functions.
 #[derive(Default)]
 pub(crate) struct Subscribers {
     registry: Arc<Mutex<Registry>>,
@@ -42,7 +38,6 @@ impl Subscribers {
             call: Box::new(callback),
         });
         let mut registry = self.registry.lock();
-        // Exhausting IDs must never replace an existing registration.
         #[allow(clippy::expect_used)]
         let id = registry
             .next_id
@@ -65,9 +60,6 @@ impl Subscribers {
     }
 }
 
-/// Dropping this token revokes queued notifications and removes only its own
-/// registration. A callback already executing may finish; recipients that own
-/// native resources must additionally serialize revocation with their work.
 #[must_use = "dropping the subscription unregisters its callback"]
 pub struct Subscription {
     id: u64,

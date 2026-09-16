@@ -1,18 +1,6 @@
-//! What the web overlay is sized to.
-//!
-//! A pure function of the window snapshot and the strip the shell overlay
-//! reserves above it: no display server, no GPU, no CEF process.
-
 use jfn_platform_abi::{LogicalSize, PhysicalSize, SurfaceSize, WindowExtent, WindowSnapshot};
 use std::ffi::c_int;
 
-/// The size handed to CEF: one coherent extent carrying the scale CEF is told
-/// about, and the offset of its top edge from the window's — the strip the
-/// shell overlay reserves.
-///
-/// `None` when the snapshot has no extent, when either extent is non-positive,
-/// when the reserved strip leaves no content height, or when what is left
-/// names no extent.
 pub fn view_size(snapshot: &WindowSnapshot, reserved_strip: c_int) -> Option<SurfaceSize> {
     let extent = snapshot.extent?;
     let logical = extent.logical();
@@ -60,8 +48,6 @@ mod tests {
 
     #[test]
     fn exact_logical_wins_over_division() {
-        // 1497 / 2.5 rounds to 599 — the compositor's exact 598 must win
-        // over re-derivation.
         let extent = Scale::from_f64(2.5).and_then(|s| {
             WindowExtent::new(
                 PhysicalSize { w: 1497, h: 843 },

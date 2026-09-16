@@ -1,13 +1,3 @@
-//! Per-user filesystem locations.
-//!
-//! - Linux: XDG Base Directory (config/cache/state) with `$HOME` fallback.
-//! - macOS: `~/.config` for config (matches existing installs), `~/Library`
-//!   for cache/logs.
-//! - Windows: `%APPDATA%` for config, `%LOCALAPPDATA%` for cache/logs.
-//!
-//! Each directory getter creates the directory (and parents) if missing
-//! before returning.
-
 use parking_lot::{Mutex, MutexGuard};
 use std::fs;
 use std::io;
@@ -74,7 +64,6 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// `Ok(false)` means another process won the race and created `path` first.
 pub fn write_atomic_noclobber(path: &Path, bytes: &[u8]) -> io::Result<bool> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
@@ -122,10 +111,6 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
     )))
 }
 
-/// `/tmp` is world-writable and the name is predictable, so a squatter can
-/// pre-create the directory and then own every socket placed inside it.
-/// Accept the path only if we just created it 0700, or it is still a real
-/// directory owned by us that nobody else can reach into.
 #[cfg(unix)]
 fn private_dir(path: PathBuf) -> io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -160,9 +145,6 @@ pub fn log_path() -> PathBuf {
     log_dir().join(LOG_FILE_NAME)
 }
 
-/// Where logs go when no log file was requested explicitly. Linux: `None` —
-/// stderr/journalctl is the norm. macOS/Windows: GUI processes have no
-/// user-visible stderr, so default to the platform log file.
 pub fn default_log_file() -> Option<PathBuf> {
     imp::DEFAULT_LOG_TO_FILE.then(log_path)
 }

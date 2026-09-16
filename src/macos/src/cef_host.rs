@@ -1,6 +1,3 @@
-//! macOS [`CefHost`]: external message pump on the
-//! main CFRunLoop + CADisplayLink-driven BeginFrame.
-
 use jfn_platform_abi::CefHost;
 
 pub struct MacosCefHost;

@@ -5,14 +5,11 @@ use super::Inner;
 use crate::paint_scheduler::Verdict;
 use crate::platform_ops::{PaintFrame, PhysicalSize, Superseded};
 
-/// Borrow CEF's `OnPaint` buffer as pixels. `None` when the frame is unusable.
 fn software_pixels<'a>(buffer: *const u8, w: i32, h: i32) -> Option<&'a [u8]> {
     if buffer.is_null() || w <= 0 || h <= 0 {
         return None;
     }
     let len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
-    // SAFETY: CEF guarantees `buffer` covers `w * h * 4` bytes for the
-    // duration of this callback.
     Some(unsafe { std::slice::from_raw_parts(buffer, len) })
 }
 
@@ -24,8 +21,6 @@ impl Inner {
         )
     }
 
-    /// The scale and logical view size CEF's `GetScreenInfo` answers with, or
-    /// `None` before a size has been applied.
     pub(crate) fn screen_info_values(&self) -> Option<(jfn_platform_abi::Scale, i32, i32)> {
         let scale = self.scale.load()?;
         Some((
@@ -94,8 +89,6 @@ impl Inner {
                 return;
             }
             let (popup_width, popup_height) = self.popup_rect();
-            // Acquire last: this dups a fd per plane, and every gate above drops
-            // frames.
             let Some(texture) = super::accel::acquire(info) else {
                 return;
             };
@@ -109,8 +102,6 @@ impl Inner {
             };
             return;
         }
-        // Acquire last: this dups a fd per plane, and every gate above drops
-        // frames.
         let Some(texture) = super::accel::acquire(info) else {
             return;
         };

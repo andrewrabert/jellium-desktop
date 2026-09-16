@@ -1,6 +1,3 @@
-//! An isolated process exercises failed backend acquisition without creating a
-//! display connection: the X11 backend rejects a missing host before connecting.
-
 #[cfg(target_os = "linux")]
 #[test]
 fn failed_backend_returns_its_cleanup_owner() -> Result<(), Box<dyn std::error::Error>> {

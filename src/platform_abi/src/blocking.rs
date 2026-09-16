@@ -1,5 +1,3 @@
-//! Blocking work keeps ownership until a worker has actually been acquired.
-
 pub type Work = Box<dyn FnOnce() + Send>;
 
 pub struct BlockingError {
@@ -10,7 +8,6 @@ impl BlockingError {
     pub fn into_work(self) -> Work {
         self.work
     }
-    /// Preserve pending native work and everything it owns until process exit.
     pub fn abandon(self) {
         let _ = Box::leak(Box::new(self));
     }
@@ -33,8 +30,6 @@ impl std::error::Error for BlockingError {
     }
 }
 
-/// `spawn` acquires a worker for the supplied job. Rejection returns the exact
-/// original work, including native owners captured by it, to the caller.
 pub fn spawn_preserving(
     work: Work,
     spawn: impl FnOnce(Work) -> std::io::Result<std::thread::JoinHandle<()>>,
@@ -49,7 +44,7 @@ pub fn spawn_preserving(
     })) {
         Ok(worker) => Ok(worker),
         Err(source) => {
-            #[allow(clippy::expect_used)] // A rejected worker never executes its job.
+            #[allow(clippy::expect_used)]
             let work = slot
                 .lock()
                 .take()

@@ -1,5 +1,3 @@
-//! Headless app control-plane thread.
-
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -30,7 +28,7 @@ struct Manager {
     boot_wake: WakeEvent,
 }
 
-#[allow(clippy::expect_used)] // boot invariant: wake eventfd alloc is fatal if it fails
+#[allow(clippy::expect_used)]
 fn manager() -> &'static Manager {
     static MANAGER: OnceLock<&'static Manager> = OnceLock::new();
     MANAGER.get_or_init(|| {
@@ -50,7 +48,6 @@ pub enum ManagerError {
     ThreadPanicked,
 }
 
-/// Prepare outside signal context, before producers or OS shutdown hooks exist.
 pub fn prepare_shutdown() {
     let _ = manager();
     jfn_playback::jfn_shutdown_set_handler(Some(jfn_manager_notify_shutdown));
@@ -61,19 +58,16 @@ pub fn prepare_shutdown() {
     );
 }
 
-/// Acquires the worker before any browser exists. A failed thread spawn cannot
-/// leave an overlay needing the main loop to drain.
 pub struct PreparedManager {
     sender: Option<std::sync::mpsc::SyncSender<jfn_cef::WebOverlay>>,
     worker: Option<JoinHandle<Result<(), ManagerError>>>,
 }
 impl PreparedManager {
-    #[allow(clippy::expect_used)] // Each field is consumed exactly once here or in Drop.
+    #[allow(clippy::expect_used)]
     pub fn activate(
         mut self,
         overlay: jfn_cef::WebOverlay,
     ) -> JoinHandle<Result<(), ManagerError>> {
-        // The worker only waits for this value before entering application code.
         self.sender
             .take()
             .expect("unactivated manager")
@@ -121,8 +115,6 @@ pub fn jfn_manager_notify_shutdown() {
     manager().wake.signal();
 }
 
-/// Forwards the signal-safe wake into mpv while startup owns event ingestion.
-/// The worker is joined before playback ingestion or native teardown can start.
 pub struct BootShutdownWake {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -249,8 +241,6 @@ mod tests {
     #[test]
     fn dropping_unactivated_manager_joins_without_entering_runtime() -> std::io::Result<()> {
         let manager = jfn_manager_prepare()?;
-        // There is no installed platform or CEF session in this unit test.
-        // Entering manager_loop or its wake callback would violate that setup.
         drop(manager);
         Ok(())
     }
