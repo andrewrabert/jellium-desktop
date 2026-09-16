@@ -81,6 +81,10 @@ struct MpvShell {
     serial: u32,
 }
 
+/// mpv's xdg objects, present only once mpv has created its toplevel. Holding
+/// both together makes "emit a configure without a toplevel" unrepresentable:
+/// a configure can only be sent through an `MpvConfigurator`, which exists only
+/// after `get_toplevel`.
 #[derive(Clone)]
 struct MpvConfigurator {
     toplevel: Rc<XdgToplevel>,
@@ -209,6 +213,8 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
         seen_gen: 0,
         signal: event_loop.get_signal(),
     };
+    // `run` calls its callback only after a dispatch, so settle once here or a
+    // size published before the loop started would wait for the first event.
     mpv.settle();
     if let Err(e) = event_loop.run(None, &mut mpv, MpvLoop::settle) {
         eprintln!("proxy: S_mpv event loop: {e}");
@@ -224,6 +230,10 @@ struct MpvLoop {
 
 impl MpvLoop {
     fn settle(&mut self) {
+        // Reconcile before every sleep, not only after dispatch: a size raised
+        // before the wake was published delivers no ping, so servicing it here is
+        // the only thing that keeps it from sleeping out an otherwise-idle
+        // connection's infinite timeout.
         apply_window_size_mpv(&self.ctx, &mut self.seen_gen);
         if let Err(e) = self.state.before_poll() {
             eprintln!("proxy: S_mpv before_poll: {}", Report::new(e));
@@ -247,13 +257,20 @@ fn apply_window_size_mpv(ctx: &MpvCtx, seen_gen: &mut u32) {
     let Some(published) = ctx.rt.proxy().window_size_since(*seen_gen) else {
         return;
     };
+    // Advance the marker only once a configure is actually emitted; before mpv's
+    // toplevel exists this defers (retried each tick), it never guesses.
     if emit_mpv_configure(ctx, published.size) {
         *seen_gen = published.generation;
     }
 }
 
+/// MAXIMIZED puts mpv in `locked_size`, so mpv holds the size we hand it instead
+/// of re-deriving its geometry from the video.
 const LOCKED_STATES: [u8; size_of::<u32>()] = XdgToplevelState::MAXIMIZED.0.to_ne_bytes();
 
+/// Emit a configure to mpv iff its toplevel exists, returning whether one was
+/// sent. A configure can only be built from an `MpvConfigurator`, so a
+/// toplevel-less emit is unrepresentable rather than guarded.
 fn emit_mpv_configure(ctx: &MpvCtx, size: WindowSize) -> bool {
     let emit = ctx.with_shell(|sh| {
         let cfg = sh.configurator.clone()?;
@@ -341,10 +358,18 @@ impl WpViewporterHandler for ClientViewporterH {
 struct ClientViewportH;
 impl WpViewportHandler for ClientViewportH {
     fn handle_set_destination(&mut self, slf: &Rc<WpViewport>, width: i32, height: i32) {
+        // Virtualizing mpv's shell means it can size a viewport before it has a
+        // real geometry, emitting a transient set_destination(0,0) — an instant
+        // protocol error that would kill the shared connection. Drop non-positive
+        // destinations (the unset form is -1,-1); mpv re-sizes once it has
+        // geometry from our synthesized configure.
         let unset = width == -1 && height == -1;
         if !unset && (width <= 0 || height <= 0) {
             return;
         }
+        // Forward mpv's own destination rect unchanged: mpv is pinned to our
+        // window size by the locked-state configure and letterboxes internally,
+        // so overriding this rect with the window size stretches the video.
         log_send(
             "wp_viewport.set_destination",
             slf.try_send_set_destination(width, height),
@@ -387,6 +412,8 @@ impl XdgWmBaseHandler for MpvWmBaseH {
             "get_xdg_surface: demoting mpv surface server_id={:?}",
             surface.server_id()
         );
+        // mpv's surface must stay role-free upstream so we can give it the
+        // subsurface role; never forward get_xdg_surface.
         id.set_forward_to_server(false);
         id.set_handler(MpvSurfaceH {
             ctx: self.ctx.clone(),
@@ -409,12 +436,19 @@ impl XdgSurfaceHandler for MpvSurfaceH {
                 xdg_surface: slf.clone(),
             });
         });
+        // Configure now if the window size is already known (mpv connected after
+        // the host was configured — the common case); otherwise the size feed
+        // emits once the host publishes. mpv only ever receives real geometry.
         if let Some(size) = self.ctx.rt.proxy().window_size() {
             emit_mpv_configure(&self.ctx, size);
         }
     }
 }
 
+/// mpv blocks waiting for a configure in reply to its state-change request (e.g.
+/// unset_maximized from VOCTRL_SET_UNFS_WINDOW_SIZE). We never honor the request
+/// — the host owns geometry — but must answer it, or mpv stalls on the dropped
+/// message.
 fn reassert_mpv_state(ctx: &MpvCtx) {
     if let Some(size) = ctx.rt.proxy().window_size() {
         emit_mpv_configure(ctx, size);

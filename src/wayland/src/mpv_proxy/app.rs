@@ -55,6 +55,11 @@ struct AppShell {
     mpv_subsurface: Option<SyncSubsurface>,
 }
 
+/// A subsurface kept permanently in Wayland synchronized mode: its buffer,
+/// viewport and position apply atomically on the parent surface's commit. The
+/// raw object never escapes and no `set_desync` is exposed, so a desynchronized
+/// video layer — one that could present a size the window does not have — is
+/// unrepresentable.
 struct SyncSubsurface(Rc<WlSubsurface>);
 
 impl SyncSubsurface {
@@ -64,6 +69,7 @@ impl SyncSubsurface {
         parent: &Rc<WlSurface>,
     ) -> Result<Self, ObjectError> {
         let sub = subcompositor.create_child::<WlSubsurface>();
+        // Born synchronized (the protocol default); never desynced.
         subcompositor.try_send_get_subsurface(&sub, surface, parent)?;
         Ok(Self(sub))
     }
@@ -133,6 +139,8 @@ impl AppMpv {
 
 impl Drop for AppMpv {
     fn drop(&mut self) {
+        // The worker exits only once its end of the bridge sees EOF, so every
+        // reference to the mpv client has to go before the join below.
         let (shell_client, subsurface) = self
             .ctx
             .with_shell(|sh| (sh.mpv_client.take(), sh.mpv_subsurface.take()));
@@ -411,6 +419,9 @@ fn maybe_build_root(ctx: &AppCtx) {
     }
 }
 
+/// Serves a pin request raised by the host's stack owner. Before the splice
+/// there is nothing to place, so the request is put back and the splice — which
+/// pins as part of establishing the subsurface — serves it instead.
 fn apply_pin_video_bottom(ctx: &AppCtx) {
     if !ctx.rt.proxy().take_pin_video_bottom() {
         return;
@@ -423,6 +434,8 @@ fn apply_pin_video_bottom(ctx: &AppCtx) {
         if let Err(e) = sub.place_above(root) {
             tracing::error!(target: "MpvProxy", "pin video place_above: {}", Report::new(&e));
         }
+        // Subsurface placement is parent-double-buffered, so without a commit
+        // the new order never applies.
         if let Err(e) = root.try_send_commit() {
             tracing::error!(target: "MpvProxy", "pin video root commit: {}", Report::new(&e));
         }
@@ -462,6 +475,10 @@ fn splice_mpv_under_host_root(ctx: &AppCtx, mpv_surface: Rc<WlSurface>) {
         return;
     };
 
+    // Gating call: without the subsurface role nothing below applies, so on
+    // failure bail without marking spliced — maybe_build_root retries next tick.
+    // The subsurface is born synchronized and is never desynced, so mpv's buffer
+    // applies atomically with the host root's geometry.
     let sub = match SyncSubsurface::create(&subcompositor, &mpv_surface, &host_root) {
         Ok(s) => s,
         Err(e) => {
@@ -472,10 +489,16 @@ fn splice_mpv_under_host_root(ctx: &AppCtx, mpv_surface: Rc<WlSurface>) {
     if let Err(e) = sub.set_position(0, 0) {
         tracing::error!(target: "MpvProxy", "splice set_position: {}", Report::new(&e));
     }
+    // Pin mpv to the bottom of the root's subsurface stack (place_above the
+    // parent = lowest sibling position). The CEF overlay is a sibling subsurface
+    // on a different client, so creation order can't keep it above the video.
     if let Err(e) = sub.place_above(&host_root) {
         tracing::error!(target: "MpvProxy", "splice place_above: {}", Report::new(&e));
     }
 
+    // mpv's synchronized subsurface only displays when the root commits. Each mpv
+    // commit requests a present from the single root-commit owner, so every video
+    // frame applies in one transaction with the window's current geometry.
     mpv_surface.set_handler(ChildPresentH { rt: ctx.rt });
 
     let region = compositor.create_child::<WlRegion>();
@@ -489,6 +512,9 @@ fn splice_mpv_under_host_root(ctx: &AppCtx, mpv_surface: Rc<WlSurface>) {
         tracing::error!(target: "MpvProxy", "splice region destroy: {}", Report::new(&e));
     }
 
+    // Adding the subsurface only takes effect on the parent's next commit; force
+    // one now so a late splice (after the app already mapped) still becomes
+    // visible.
     if let Err(e) = host_root.try_send_commit() {
         tracing::error!(target: "MpvProxy", "splice root commit: {}", Report::new(&e));
     }
@@ -537,6 +563,7 @@ impl WlRegistryHandler for ProxyRegistryH {
 struct ProxyWmBaseH;
 impl XdgWmBaseHandler for ProxyWmBaseH {
     fn handle_ping(&mut self, slf: &Rc<XdgWmBase>, serial: u32) {
+        // The compositor pings our own wm_base; mpv can't pong it, so we must.
         log_send("xdg_wm_base.pong", slf.try_send_pong(serial));
     }
 }
@@ -558,6 +585,10 @@ impl WlCallbackHandler for RoundtripCb {
     }
 }
 
+/// Installed on mpv's video surface: mpv's commit caches its (synchronized)
+/// buffer, then a present is requested from the single root-commit owner
+/// (`root_window`), which applies it atomically with the window geometry. mpv
+/// never commits the root itself — the owner is the sole root committer.
 struct ChildPresentH {
     rt: &'static WlRuntime,
 }

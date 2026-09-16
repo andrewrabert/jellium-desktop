@@ -4,6 +4,10 @@ pub struct X11MpvHost;
 
 impl MpvHost for X11MpvHost {
     fn prepare(&self, _configured: Option<WindowDecorations>) {
+        // Resolve the paint tier — creating the app's Vulkan instance — before
+        // the proxy repoints DISPLAY and before mpv init, so NVIDIA's ICD lazy
+        // global init runs against the real server and beats mpv's VO thread to
+        // the loader scan. See `crate::paint`.
         crate::paint::resolve_and_store();
         if !crate::mpv_proxy::start() {
             tracing::error!(target: "Main", "x11 mpv proxy failed to start; mpv will connect directly");
@@ -20,6 +24,8 @@ impl MpvHost for X11MpvHost {
         crate::x11_state::host().map(|h| i64::from(h.video_host))
     }
 
+    // mpv is embedded and passive here; its `osd-dimensions` is the authority
+    // for the size ingest reads
     fn logical_content_size(&self) -> Option<jfn_platform_abi::LogicalSize> {
         None
     }

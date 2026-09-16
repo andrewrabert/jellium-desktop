@@ -3,6 +3,7 @@
         return mediaSource.MediaStreams.filter(s => s.Type === 'Audio');
     }
 
+    // Convert Jellyfin global MediaStream.Index to 1-based type-relative index
     function getRelativeIndexByType(mediaStreams, jellyIndex, streamType) {
         let relIndex = 1;
         for (const source of mediaStreams) {
@@ -48,6 +49,7 @@
             this._currentPlayOptions = undefined;
             this._endedPending = false;
 
+            // Support jellyfin-web v10.10.7
             this._currentAspectRatio = undefined;
 
             this.handlers.onPlaying = () => {
@@ -55,10 +57,12 @@
                     this._started = true;
                     this.loading.hide();
                     const dlg = this._videoDialog;
+                    // Remove poster so video shows through from subsurface
                     if (dlg) {
                         const poster = dlg.querySelector('.mpvPoster');
                         if (poster) poster.remove();
                     }
+                    // "fullscreen" = fills entire web content area, not the actual screen
                     if (this._currentPlayOptions?.fullscreen) {
                         this.appRouter.showVideoOsd();
                         if (dlg) dlg.style.zIndex = 'unset';
@@ -96,11 +100,12 @@
             this._currentTime = null;
             this._endedPending = false;
             if (options.resetSubtitleOffset !== false) this.resetSubtitleOffset();
-            if (options.fullscreen) this.loading.show();  
+            if (options.fullscreen) this.loading.show();  // fills entire web content area, not the actual screen
             await this.createMediaElement(options);
             console.debug(`[Media] [${this.logTag}] createMediaElement done, calling setCurrentSrc`);
             const result = await this.setCurrentSrc(options);
 
+            // needed when only audio is single external
             const externalAudio = options.mediaSource?.MediaStreams?.find(s => s.Type === 'Audio' && s.IsExternal);
             if (externalAudio && options.playMethod !== 'Transcode') {
                 this.setAudioStreamIndex(externalAudio.Index);
@@ -121,9 +126,17 @@
                 if (fallback) defaultAudioIdx = fallback.Index;
             }
 
+            // Mirror jellyfin-web's UI selection exactly: feed mpv the relative
+            // index for DefaultAudioStreamIndex, or TRACK_DISABLE if none is selected.
+            // mpv auto track selection is completely disabled as it conflicts with
+            // the fact that jellyfin-web is ultimately responsible for that.
             let audioParam = MpvPlayerBase.TRACK_DISABLE;
             let externalAudioUrl = null;
             if (options.playMethod === 'Transcode') {
+                // Server bakes the chosen audio into the transcoded output
+                // (single audio track in the m3u8). Source MediaStreams indexing
+                // doesn't apply — see htmlVideoPlayer/plugin.js:514 for the same
+                // logic. Don't audio-add either; audio is already in the stream.
                 audioParam = 1;
             } else if (defaultAudioIdx >= 0) {
                 const audioStream = getStreamByIndex(streams, defaultAudioIdx);
@@ -195,6 +208,11 @@
             const streams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
             const stream = getStreamByIndex(streams, index);
             if (stream?.IsExternal) {
+                // External audio isn't part of the source container and the server
+                // doesn't pre-publish a DeliveryUrl for it, so we can't audio-add
+                // client-side. Re-enter playbackManager with canSetAudioStreamIndex
+                // forced false so it routes through changeStream — the server then
+                // regenerates the playback URL with the external audio attached.
                 this._forceServerReload = true;
                 try {
                     this.playbackManager.setAudioStreamIndex(index, this);
@@ -241,6 +259,7 @@
             this.removeMediaDialog();
             this.disconnectSignals();
 
+            // Support jellyfin-web v10.10.7
             this._currentAspectRatio = undefined;
         }
 
@@ -252,7 +271,7 @@
                 dlg = document.createElement('div');
                 dlg.classList.add('videoPlayerContainer');
                 dlg.style.cssText = 'position:fixed;top:0;bottom:0;left:0;right:0;display:flex;align-items:center;background:transparent;';
-                if (options.fullscreen) dlg.style.zIndex = 1000;  
+                if (options.fullscreen) dlg.style.zIndex = 1000;  // fills entire web content area, not the actual screen
                 document.body.insertBefore(dlg, document.body.firstChild);
                 this._videoDialog = dlg;
 
@@ -284,7 +303,7 @@
             if (isNewDlg) ready.then(() => this.setTransparency(2));
             dlg.appendChild(poster);
 
-            if (options.fullscreen) document.body.classList.add('hide-scroll');  
+            if (options.fullscreen) document.body.classList.add('hide-scroll');  // fills entire web content area, not the actual screen
             return ready;
         }
 
@@ -326,6 +345,7 @@
         getAspectRatio() {
             const aspectRatio = typeof this.appSettings.aspectRatio === 'function'
                 ? this.appSettings.aspectRatio()
+                // Support jellyfin-web v10.10.7
                 : this._currentAspectRatio;
 
             return aspectRatio || 'auto';
@@ -334,6 +354,7 @@
             if (typeof this.appSettings.aspectRatio === 'function') {
                 this.appSettings.aspectRatio(value);
             } else {
+                // Support jellyfin-web v10.10.7
                 this._currentAspectRatio = value;
             }
             window.api.player.setAspectMode(value);

@@ -1,3 +1,5 @@
+//! CEF process bootstrap.
+
 use cef::*;
 #[cfg(not(windows))]
 use std::ffi::CString;
@@ -12,6 +14,25 @@ use jfn_platform_abi::DisplayBackend;
 use crate::app::{JfnApp, JfnAppBuilder};
 use crate::state;
 
+// jfn constructs Chromium's `MainArgs` itself. Two entry points:
+//
+// * Browser process (`jfn_cef_initialize`): `MainArgs` is `[argv[0]]` —
+//   see `browser_main_args`. Chromium's `base::CommandLine` parses only
+//   the program name; no jfn CLI flag is ever in there.
+// * Subprocess (`jfn_cef_start`): Chromium spawned this binary with an
+//   argv it authored itself (`--type=renderer …` etc.). That argv is
+//   forwarded to `execute_process` so CEF can dispatch on `--type=`.
+//
+// Initialization builds one immutable switch snapshot for App callbacks.
+// Chromium switch names are mapped explicitly, never passed through from CLI.
+//
+// CEF refcounts the App; constructing a fresh one in each FFI call is
+// safe because the underlying object outlives the local once CEF has
+// captured its reference.
+
+/// Subprocess dispatch + browser-process App construction.
+/// Returns -1 in the browser process (continue startup); returns the
+/// subprocess exit code otherwise.
 pub(crate) fn jfn_cef_start(_runtime: &crate::LoadedCef) -> c_int {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = args::Args::new();
@@ -31,6 +52,8 @@ fn platform_switches(backend: DisplayBackend) -> Vec<state::PendingSwitch> {
                 "ozone-platform",
                 "wayland",
             ));
+            // OSR honors GetScreenInfo device_scale_factor only without the
+            // fractional-scale protocol.
             c.pending_switches.push(state::PendingSwitch::with_value(
                 "disable-features",
                 "WaylandFractionalScaleV1",
@@ -51,6 +74,8 @@ fn platform_switches(backend: DisplayBackend) -> Vec<state::PendingSwitch> {
         DisplayBackend::Windows => {
             c.pending_switches
                 .push(state::PendingSwitch::with_value("use-angle", "d3d11"));
+            // The LUID is a Windows-only concept; the arm itself compiles
+            // everywhere because `DisplayBackend` does.
             #[cfg(windows)]
             if let Some(luid) =
                 jfn_gpu_paint::surfaces().and_then(jfn_gpu_paint::Surfaces::adapter_luid)
@@ -65,6 +90,7 @@ fn platform_switches(backend: DisplayBackend) -> Vec<state::PendingSwitch> {
     c.pending_switches
 }
 
+/// Builds CefSettings and calls `CefInitialize` once for the browser owner.
 pub(crate) fn jfn_cef_initialize(
     _runtime: &crate::LoadedCef,
     platform: &dyn jfn_platform_abi::Platform,
@@ -76,6 +102,8 @@ pub(crate) fn jfn_cef_initialize(
     }
     state::configure(state::Config { pending_switches });
 
+    // Settings.json singleton must be initialized before the renderer
+    // process reads it during OnContextCreated.
     let settings_path = jfn_paths::config_dir().join("settings.json");
     jfn_config::settings_init(&settings_path);
 
@@ -102,10 +130,17 @@ pub(crate) fn jfn_cef_initialize(
 
     fill_paths(&mut settings, platform);
 
+    // An external pump must install its run-loop hooks before
+    // CefInitialize so the first OnScheduleMessagePumpWork (fired
+    // synchronously during init) finds them ready.
     if let Some(host) = cef_host {
         host.pump_init();
     }
 
+    // chrome/browser/chrome_browser_main_posix.cc installs SIGINT/SIGTERM
+    // handlers during CefInitialize and that path is not gated by
+    // disable_signal_handlers. Snapshot the caller's handlers and restore
+    // afterward so Chromium's installs are confined to the init window.
     let _sig_guard = jfn_platform_abi::SignalGuard::new();
 
     let mut app = JfnAppBuilder::new(JfnApp::new());
@@ -113,6 +148,9 @@ pub(crate) fn jfn_cef_initialize(
     let main_args = if full_argv {
         args::Args::new().as_main_args().clone()
     } else {
+        // Windows `MainArgs` carries an HINSTANCE, not argv, and always
+        // takes the `full_argv` path above — `browser_main_args` is
+        // unbuildable there.
         #[cfg(not(windows))]
         {
             browser_main_args()
@@ -146,12 +184,18 @@ pub(crate) fn jfn_cef_initialize(
     Ok(())
 }
 
+// Construct Chromium's browser-process `MainArgs` as `[argv[0]]`. The
+// CString + pointer Vec are leaked into process-lifetime statics because
+// CEF retains the raw pointers past the `initialize()` call (and across
+// the lifetime of the run loop on some code paths).
 #[cfg(not(windows))]
 fn browser_main_args() -> MainArgs {
     struct CleanArgv {
         argc: c_int,
         argv: *mut *mut c_char,
     }
+    // The pointers are valid for the process lifetime (leaked) and we
+    // only hand them to CEF, which treats them as immutable input.
     unsafe impl Send for CleanArgv {}
     unsafe impl Sync for CleanArgv {}
 
@@ -162,6 +206,7 @@ fn browser_main_args() -> MainArgs {
             .unwrap_or_else(|| "jellium-desktop".to_string());
         let cstr = CString::new(program).unwrap_or_default();
         let cstr_ptr = cstr.as_ptr() as *mut c_char;
+        // Keep the backing buffer alive for the process lifetime.
         Box::leak(Box::new(cstr));
         let argv_vec: Vec<*mut c_char> = vec![cstr_ptr];
         let leaked: &'static mut Vec<*mut c_char> = Box::leak(Box::new(argv_vec));
@@ -177,11 +222,14 @@ fn browser_main_args() -> MainArgs {
 }
 
 pub(crate) fn jfn_cef_shutdown(runtime: &crate::InitializedCef) {
+    // Gate further external-pump dispatches before tearing down CEF state.
     if let Some(host) = runtime.platform().cef_host() {
         host.pump_shutdown();
     }
     shutdown();
 }
+
+// ---- helpers ---------------------------------------------------------------
 
 fn fill_paths(settings: &mut Settings, platform: &dyn jfn_platform_abi::Platform) {
     let paths = platform.cef_paths();

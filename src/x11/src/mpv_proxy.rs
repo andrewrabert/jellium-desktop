@@ -1,3 +1,45 @@
+//! X11 proxy mpv connects to instead of the real server.
+//!
+//! It binds a fresh display socket, points mpv's `DISPLAY` at it (via env,
+//! before `mpv_create`), and forwards every byte — and every `SCM_RIGHTS` fd —
+//! to the real server. Forwarding ancillary fds is mandatory: mpv's gpu VO
+//! (DRI3/Present) and MIT-SHM pass dmabuf/shm fds over the socket, so a
+//! byte-only splice would break video.
+//!
+//! Both directions are framed. The app is the sole windowing authority; mpv
+//! keeps only rendering, and the proxy enforces that:
+//!
+//! Client→server ([`ReqParser`]) — enforcement:
+//! - capture mpv's embed sub-window from `CreateWindow` parented to the
+//!   app's video host, solely to key the rewrites below (the geometry
+//!   thread discovers the window independently, via `CreateNotify` on the
+//!   video host, and sizes it in the same batch as the host and overlays);
+//! - neutralize `ConfigureWindow`/`CirculateWindow` on the embed sub-window
+//!   (this includes mpv's raise — stack mode is a `ConfigureWindow` value),
+//!   so only the app sizes and stacks it;
+//! - strip the `cursor` value from `ChangeWindowAttributes` and neutralize
+//!   XFixes `HideCursor`/`ShowCursor`, so the video area inherits the
+//!   app-controlled host cursor (a cursor attribute applies whenever the
+//!   pointer is over the window, regardless of event selection).
+//!
+//! Client→server — defensive backstop (mpv runs embedded and skips all WM
+//! interaction, so in normal operation none of these fire):
+//! - force `override_redirect` on a root-parented `CreateWindow`, so the WM
+//!   never manages an mpv top-level (not even a taskbar-entry flash);
+//! - neutralize mpv's `SetInputFocus` to `NoOperation`, so mpv can't steal
+//!   keyboard focus from the app top-level;
+//! - neutralize `ConfigureWindow` on a root-parented mpv window, so only
+//!   the app ever moves/resizes toplevel geometry;
+//! - neutralize `_NET_WM_STATE` traffic (`ChangeProperty` on an mpv
+//!   top-level, fullscreen `SendEvent` client messages), so fullscreen flows
+//!   only through the app's toplevel path.
+//!
+//! Server→client ([`EventFramer`]) — coalescing: drop a video-host
+//! `ConfigureNotify` whose size differs from the geometry the app last
+//! published ([`publish_host_geometry`]). Every reconcile publishes and then
+//! resizes the host, so a matching notify always follows; mpv sees one
+//! settled notify per reconcile instead of the full drag burst.
+
 use std::borrow::Cow;
 use std::io::{self, IoSlice, IoSliceMut, Write};
 use std::net::TcpStream;
@@ -36,8 +78,12 @@ use x11rb::reexports::x11rb_protocol::x11_utils::{
 };
 use x11rb::reexports::x11rb_protocol::xauth::{Family, get_auth};
 
+/// The kernel caps `SCM_RIGHTS` at this many fds per message; a cmsg buffer
+/// sized for it can never truncate fds.
 const MAX_FDS_PER_MSG: usize = 253;
 const CHUNK: usize = 64 * 1024;
+/// `FamilyLocal` in the `.Xauthority` on-wire format (a `u16`, unlike the
+/// core-protocol `Family` which is a `u8`).
 const FAMILY_LOCAL: u16 = 256;
 
 #[derive(Clone)]
@@ -47,15 +93,26 @@ enum UpstreamAddr {
     Tcp(String, u16),
 }
 
+/// Which server `DISPLAY`/`XAUTHORITY` currently point at. The proxy repoints
+/// the environment to itself only for mpv's connect; app connections made in
+/// [`DisplayEpoch::Proxy`] must target the real server explicitly (via
+/// [`real_display`]) since they'd otherwise route through the proxy.
 #[derive(PartialEq, Eq)]
 enum DisplayEpoch {
+    /// Repointed to the proxy; mpv connects here.
     Proxy,
+    /// Restored to the real server after mpv has connected.
     RealRestored,
 }
 
+/// Sockets, temp files, and the accept thread are cleaned up on `Drop`, so an
+/// unwinding path can't leak them. The `DISPLAY`/`XAUTHORITY` restore is *not*
+/// a drop-time concern: it happens mid-life, once mpv has connected, via
+/// [`restore_real_display`].
 struct ProxyState {
     accept_thread: Option<JoinHandle<()>>,
     stop: calloop::ping::Ping,
+    /// Filesystem socket to unlink (dropping the listener does not).
     fs_socket_path: PathBuf,
     xauth_temp: Option<PathBuf>,
     orig_display: Option<String>,
@@ -85,11 +142,14 @@ struct EmbedContext {
     video_host: u32,
     net_wm_state: u32,
     xfixes_opcode: Option<u8>,
+    /// The video host size (width, height) the app last committed; the event
+    /// framer forwards only `ConfigureNotify` matching it.
     published: (u16, u16),
 }
 
 struct SharedEmbed {
     ctx: Mutex<Option<EmbedContext>>,
+    /// mpv's embed sub-window XID, captured from `CreateWindow`; 0 = unknown.
     embed_window: AtomicU32,
 }
 
@@ -104,6 +164,8 @@ impl SharedEmbed {
 
 static EMBED: SharedEmbed = SharedEmbed::new();
 
+/// Hand the proxy the app's windowing context. Must run before mpv connects
+/// (i.e. before mpv init); `width`/`height` seed the published host size.
 pub fn set_embed_context(
     video_host: u32,
     net_wm_state: u32,
@@ -119,13 +181,23 @@ pub fn set_embed_context(
     });
 }
 
+/// Publish the video host size the app is about to commit. Must be called
+/// before the `ConfigureWindow` that applies it reaches the server, so the
+/// resulting `ConfigureNotify` is never mistaken for a stale one and dropped.
 pub fn publish_host_geometry(width: u16, height: u16) {
     if let Some(ctx) = EMBED.ctx.lock().as_mut() {
         ctx.published = (width, height);
     }
 }
 
+/// Start the proxy and repoint `DISPLAY`/`XAUTHORITY` at it. Returns `false`
+/// (leaving the environment untouched) if it cannot bind or resolve the
+/// upstream server. Idempotent.
 pub fn start() -> bool {
+    // Repointing DISPLAY here must come *after* the app has created its Vulkan
+    // instance on the real server; otherwise NVIDIA's ICD lazy global init
+    // routes its internal XOpenDisplay through the proxy and races mpv's VO
+    // thread. `crate::paint::resolve_and_store` runs first in `prepare`.
     debug_assert!(
         crate::paint::is_resolved(),
         "paint tier must resolve before the proxy repoints DISPLAY",
@@ -145,6 +217,9 @@ pub fn start() -> bool {
     };
     let upstream = upstream_addresses(&parsed);
 
+    // Root window IDs of the real server, one per screen: the request parser
+    // classifies a CreateWindow as an mpv top-level by parent ∈ roots (mpv
+    // normally embeds into the app's video host and never hits this).
     let roots: Arc<[u32]> = match x11rb::rust_connection::RustConnection::connect(None) {
         Ok((c, _)) => c.setup().roots.iter().map(|s| s.root).collect(),
         Err(e) => {
@@ -209,6 +284,10 @@ pub fn start() -> bool {
     true
 }
 
+/// The display string of the real server while the proxy has `DISPLAY`
+/// repointed, or `None` when the proxy isn't active (callers then fall back
+/// to the environment). App-side connections that may run before
+/// [`restore_real_display`] use this so they never route through the proxy.
 pub fn real_display() -> Option<String> {
     let guard = state().lock();
     let st = guard.as_ref()?;
@@ -218,6 +297,9 @@ pub fn real_display() -> Option<String> {
     st.orig_display.clone()
 }
 
+/// Put `DISPLAY`/`XAUTHORITY` back to the real server so the app's own
+/// connections bypass the proxy. Must not run until mpv has connected (i.e.
+/// after `mpv_initialize`); idempotent.
 pub fn restore_real_display() {
     let mut guard = state().lock();
     let Some(st) = guard.as_mut() else {
@@ -238,7 +320,12 @@ pub fn restore_real_display() {
     }
 }
 
+/// Stop accepting new connections and clean up the socket + temp auth files
+/// (via [`ProxyState`]'s `Drop`). Established relays drain on their own when mpv
+/// closes its connection.
 pub fn stop() {
+    // Take out of the lock first, then drop outside it so the thread join in
+    // `Drop` never runs while holding the state mutex.
     let taken = state().lock().take();
     drop(taken);
 }
@@ -250,6 +337,8 @@ struct BoundListeners {
     number: u32,
 }
 
+/// Find a display number free on both the abstract and filesystem X sockets and
+/// bind both, so libxcb (abstract-first on Linux) and legacy path clients agree.
 fn bind_listeners() -> Option<BoundListeners> {
     for number in 64u32..1024 {
         let name = format!("/tmp/.X11-unix/X{number}");
@@ -340,6 +429,9 @@ fn handle_conn(client: UnixStream, upstream: Vec<UpstreamAddr>, roots: Arc<[u32]
     let client: OwnedFd = client.into();
     let cf = client.as_raw_fd();
     let uf = up.as_raw_fd();
+    // Shared parse-desync flag: byte order and stream health are properties
+    // of the connection, so once either direction goes blind (verbatim relay)
+    // the other must too — its length fields would misparse the same way.
     let blind = Arc::new(AtomicBool::new(false));
     let blind2 = blind.clone();
     thread::scope(|s| {
@@ -348,6 +440,9 @@ fn handle_conn(client: UnixStream, upstream: Vec<UpstreamAddr>, roots: Arc<[u32]
     });
 }
 
+/// Build the ordered upstream-address candidates from a parsed `DISPLAY`,
+/// reusing x11rb's resolution and prepending the Linux abstract socket (which
+/// x11rb does not try) for local servers.
 fn upstream_addresses(parsed: &ParsedDisplay) -> Vec<UpstreamAddr> {
     let candidates: Vec<ConnectAddress<'_>> = parsed.connect_instruction().collect();
     let mut addrs = Vec::new();
@@ -393,6 +488,9 @@ fn connect_upstream(upstream: &[UpstreamAddr]) -> io::Result<OwnedFd> {
     Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no upstream address")))
 }
 
+/// Client→server pump: frames the X11 request stream so [`ReqParser`] can
+/// rewrite requests. Only whole requests are forwarded; a request split
+/// across reads (and any fds it carries) is held until complete.
 fn pump_requests(from: RawFd, to: RawFd, roots: Arc<[u32]>, blind: Arc<AtomicBool>) {
     let mut buf = vec![0u8; CHUNK];
     let mut cmsg = nix::cmsg_space!([RawFd; MAX_FDS_PER_MSG]);
@@ -413,6 +511,9 @@ fn pump_requests(from: RawFd, to: RawFd, roots: Arc<[u32]>, blind: Arc<AtomicBoo
                     held = data;
                     continue;
                 }
+                // Flush all pending fds now: fds must reach the server no later
+                // than the request that consumes them, and delivering them with
+                // an earlier send is harmless (the server queues them in order).
                 let fds_out = std::mem::take(&mut held_fds);
                 if let Err(e) = send_with_fds(to, &out, fds_out) {
                     tracing::debug!(target: "x11-proxy", "relay send failed: {e}");
@@ -430,6 +531,9 @@ fn pump_requests(from: RawFd, to: RawFd, roots: Arc<[u32]>, blind: Arc<AtomicBoo
     let _ = shutdown(to, Shutdown::Both);
 }
 
+/// Server→client pump: frames the reply/event/error stream so [`EventFramer`]
+/// can drop stale video-host `ConfigureNotify` events. Only whole units are
+/// forwarded; a unit split across reads is held until complete.
 fn pump_replies(from: RawFd, to: RawFd, blind: Arc<AtomicBool>) {
     let mut buf = vec![0u8; CHUNK];
     let mut cmsg = nix::cmsg_space!([RawFd; MAX_FDS_PER_MSG]);
@@ -448,6 +552,9 @@ fn pump_replies(from: RawFd, to: RawFd, blind: Arc<AtomicBool>) {
                 let consumed = framer.process(&data, &mut out);
                 held = data.split_off(consumed);
                 if out.is_empty() {
+                    // Nothing forwarded (partial unit, or every complete unit
+                    // was dropped) — keep any fds held; they belong to a reply
+                    // that has not been sent yet, never to a dropped event.
                     continue;
                 }
                 let fds_out = std::mem::take(&mut held_fds);
@@ -466,8 +573,12 @@ fn pump_replies(from: RawFd, to: RawFd, blind: Arc<AtomicBool>) {
     let _ = shutdown(to, Shutdown::Both);
 }
 
+/// Ceiling on a single request's or reply's byte length; past it we assume a
+/// parse desync and fall back to a verbatim relay rather than buffer unbounded.
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
+/// Same-length rewrite to `NoOperation`, which accepts any request length and
+/// has no reply, so sequence numbers stay intact.
 fn emit_noop(raw: &[u8], out: &mut Vec<u8>) {
     let start = out.len();
     out.extend_from_slice(raw);
@@ -476,7 +587,9 @@ fn emit_noop(raw: &[u8], out: &mut Vec<u8>) {
 
 struct ReqParser<'a> {
     setup_done: bool,
+    /// Root window IDs of the real server, one per screen.
     roots: Arc<[u32]>,
+    /// Root-parented windows mpv created (would-be top-levels).
     toplevels: std::collections::HashSet<u32>,
     embed: &'a SharedEmbed,
     video_host: Option<u32>,
@@ -504,6 +617,9 @@ impl<'a> ReqParser<'a> {
         self.blind.store(true, Ordering::Relaxed);
     }
 
+    /// Append the leading complete requests of `input` to `out` (rewritten
+    /// where needed) and return how many `input` bytes were consumed. A
+    /// trailing partial request is left for the next call.
     fn process(&mut self, input: &[u8], out: &mut Vec<u8>) -> usize {
         if self.blind.load(Ordering::Relaxed) {
             out.extend_from_slice(input);
@@ -512,6 +628,7 @@ impl<'a> ReqParser<'a> {
 
         let mut off = 0;
         if !self.setup_done {
+            // x11rb-protocol silently misparses non-native byte order.
             let native = if cfg!(target_endian = "little") {
                 b'l'
             } else {
@@ -540,6 +657,8 @@ impl<'a> ReqParser<'a> {
 
         while off < input.len() {
             let avail = &input[off..];
+            // A zero length field can only be a BIG-REQUESTS length, so
+            // `Enabled` is correct without tracking the extension handshake.
             let (header, body) = match parse_request_header(avail, BigRequests::Enabled) {
                 Ok(v) => v,
                 Err(ParseError::InsufficientData) => break,
@@ -600,6 +719,10 @@ impl<'a> ReqParser<'a> {
             return;
         };
         if Some(req.parent) == self.video_host {
+            // mpv's embed sub-window, captured only to key this parser's
+            // rewrites. The lock-free store needs no synchronization: mpv sends
+            // this CreateWindow before any request naming the wid, so the
+            // capture always precedes the requests it neutralizes.
             self.embed.embed_window.store(req.wid, Ordering::Relaxed);
             out.extend_from_slice(raw);
             return;
@@ -616,6 +739,9 @@ impl<'a> ReqParser<'a> {
         }
     }
 
+    /// The app owns the cursor: strip the `cursor` value so the video area
+    /// inherits the host cursor (a cursor attribute applies whenever the
+    /// pointer is over the window, regardless of event selection).
     fn emit_change_attributes(
         &self,
         header: RequestHeader,
@@ -671,6 +797,12 @@ impl<'a> ReqParser<'a> {
     }
 }
 
+/// Server→client framer: walks the setup reply, then reply/error/event units,
+/// dropping a video-host `ConfigureNotify` whose size differs from the
+/// app-published geometry. Every reconcile publishes and then resizes the
+/// host, so a matching notify always follows a dropped stale one; mpv reads
+/// live parent geometry on notify (not the event fields), so intermediates
+/// carry nothing it needs.
 struct EventFramer<'a> {
     setup_done: bool,
     embed: &'a SharedEmbed,
@@ -690,6 +822,9 @@ impl<'a> EventFramer<'a> {
         self.blind.store(true, Ordering::Relaxed);
     }
 
+    /// Append the leading complete units of `input` to `out` (minus dropped
+    /// events) and return how many `input` bytes were consumed. A trailing
+    /// partial unit is left for the next call.
     fn process(&mut self, input: &[u8], out: &mut Vec<u8>) -> usize {
         if self.blind.load(Ordering::Relaxed) {
             out.extend_from_slice(input);
@@ -701,6 +836,8 @@ impl<'a> EventFramer<'a> {
             if input.len() < 8 {
                 return 0;
             }
+            // Setup replies (failed=0, success=1, authenticate=2) all carry an
+            // additional-data length in 4-byte units at offset 6.
             if input[0] > 2 {
                 self.go_blind();
                 out.extend_from_slice(input);
@@ -722,6 +859,8 @@ impl<'a> EventFramer<'a> {
                 break;
             }
             let code = avail[0] & 0x7f;
+            // Replies (byte 0 == 1) and GenericEvents carry extra length in
+            // 4-byte units at offset 4; errors and core events are 32 bytes.
             let total = if avail[0] == 1 || code == GE_GENERIC_EVENT {
                 let words = u32::from_ne_bytes([avail[4], avail[5], avail[6], avail[7]]) as usize;
                 let Some(total) = words
@@ -779,6 +918,8 @@ fn recv_with_fds(fd: RawFd, buf: &mut [u8], cmsg: &mut [u8]) -> io::Result<(usiz
     Ok((msg.bytes, fds))
 }
 
+/// The fds attach to `buf`'s first byte: delivered whole on the first
+/// `sendmsg`, so a short send finishes with plain `send`s.
 fn send_with_fds(fd: RawFd, buf: &[u8], fds: Vec<OwnedFd>) -> io::Result<()> {
     if buf.is_empty() {
         return Ok(());
@@ -809,6 +950,10 @@ fn send_with_fds(fd: RawFd, buf: &[u8], fds: Vec<OwnedFd>) -> io::Result<()> {
     Ok(())
 }
 
+/// Provision an auth cookie for the proxy's display number so mpv's connection
+/// is accepted. Reads the real display's cookie via x11rb and writes a single
+/// re-keyed entry into a private, jellium-owned runtime dir. Returns `None` when
+/// the server has no cookie (e.g. an unauthenticated `xhost +local:` session).
 fn provision_auth(display: u16, proxy_number: u32) -> io::Result<Option<PathBuf>> {
     let host = gethostname::gethostname().into_encoded_bytes();
     let (name, data) = match get_auth(Family::LOCAL, &host, display) {
@@ -820,6 +965,11 @@ fn provision_auth(display: u16, proxy_number: u32) -> io::Result<Option<PathBuf>
         }
     };
 
+    // mpv reaches the proxy over a local socket, so the entry it looks up is
+    // keyed by FamilyLocal + this host, under the proxy's display number. A
+    // second entry re-keys the same cookie under the real display number so
+    // app connections made while `XAUTHORITY` is repointed (via
+    // [`real_display`]) still authenticate against the real server.
     let mut out = Vec::new();
     write_xauth_entry(
         &mut out,
@@ -914,6 +1064,7 @@ mod tests {
         .serialize()
     }
 
+    /// Feed a whole buffer and assert it is fully consumed.
     fn feed(parser: &mut ReqParser<'_>, bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         assert_eq!(parser.process(bytes, &mut out), bytes.len());
@@ -1092,6 +1243,7 @@ mod tests {
             assert_eq!(feed(&mut p, &raw)[0], NO_OPERATION_REQUEST);
         }
 
+        // Unknown opcode without a provisioned XFixes opcode stays verbatim.
         let embed = shared(None);
         let mut p = started(&embed);
         let mut raw = vec![140, HIDE_CURSOR_REQUEST];
@@ -1183,6 +1335,7 @@ mod tests {
         assert_eq!(f.process(&settled, &mut out), settled.len());
         assert_eq!(out, settled);
 
+        // Another window's notify is never the host's — always forwarded.
         let other = configure_notify(999, 500, 400);
         let mut out = Vec::new();
         assert_eq!(f.process(&other, &mut out), other.len());

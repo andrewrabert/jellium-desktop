@@ -38,6 +38,7 @@
             this.setVolume(this.getSavedVolume() * 100, false);
         }
 
+        // Signal management
         connectSignals() {
             if (this._hasConnection) return;
             this._hasConnection = true;
@@ -79,9 +80,17 @@
                 : Promise.resolve({});
         }
 
+        // Subclasses set this; used as the metadata.type passed to the native loader.
         get mediaType() { return null; }
 
-        _resolveTracks() {
+        // Subclasses override to compute video/audio/subtitle track params from
+        // the media source. Default (audio): single baked-in audio track, no
+        // video, no subs. Video must stay disabled for audio playback — mp3s
+        // with embedded cover art expose an mjpeg "Image" stream that mpv
+        // would otherwise treat as a sparse video and end the file early
+        // (player/video.c last-frame draining), causing every track to skip
+        // after a fraction of a second.
+        _resolveTracks(/* options */) {
             return {
                 videoParam: MpvPlayerBase.TRACK_DISABLE,
                 audioParam: 1,
@@ -91,7 +100,8 @@
             };
         }
 
-        _beforeLoad() {}
+        // Subclass hook for any pre-load native calls (e.g. setAspectMode for video).
+        _beforeLoad(/* options */) {}
 
         setCurrentSrc(options) {
             return new Promise((resolve) => {
@@ -121,6 +131,7 @@
             });
         }
 
+        // Shared tail of onPlaying: clear paused flag (firing unpause if needed) and emit playing.
         _emitPlaying() {
             if (this._paused) {
                 this._paused = false;
@@ -130,11 +141,13 @@
             console.debug(`[Media] [${this.logTag}] playing event triggered`);
         }
 
+        // Playback control
         pause() { window.api.player.pause(); }
         resume() { this._paused = false; window.api.player.play(); }
         unpause() { window.api.player.play(); }
         paused() { return this._paused; }
 
+        // Time
         currentTime(val) {
             if (val != null) {
                 this._currentTime = val;
@@ -152,6 +165,7 @@
         seekable() { return Boolean(this._duration); }
         getBufferedRanges() { return window._bufferedRanges || []; }
 
+        // Playback rate
         setPlaybackRate(value) {
             this._playRate = value;
             window.api.player.setPlaybackRate(value * 1000);
@@ -171,6 +185,7 @@
             return this.appSettings.get('volume') || 1;
         }
 
+        // Volume
         setVolume(val, save = true) {
             val = Number(val);
             if (!isNaN(val)) {
@@ -196,7 +211,8 @@
         isMuted() { return this._muted; }
     }
 
-    MpvPlayerBase.TRACK_DISABLE = 0;  
+    // mpv track selection (1-based track indices)
+    MpvPlayerBase.TRACK_DISABLE = 0;  // disable track (sid=0, aid=0)
 
     window.MpvPlayerBase = MpvPlayerBase;
 })();
