@@ -30,7 +30,7 @@ use crate::dispatch::{post_to_main, run_on_main_async, wake_main_queue};
 use crate::init::{jfn_macos_apply_theme_color_on_main, jfn_macos_get_window};
 
 /// Tint AppKit fills behind mpv's CAMetalLayer / NSWindow root so the
-/// resize-gap stale-texture window (which CLAUDE.md explicitly accepts
+/// resize-gap stale-texture window (which AGENTS.md explicitly accepts
 /// over stretching) matches mpv's own background — no visible flash.
 /// Hops to the main queue when called from another thread.
 pub fn macos_set_theme_color(rgb: u32) {
