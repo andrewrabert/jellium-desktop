@@ -17,7 +17,7 @@ nix.workspace = true
 
 # macOS keeps its own derivation, so `dirs` is gated off it.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-dirs = "6"
+dirs = "7"
 
 [lints]
 workspace = true
