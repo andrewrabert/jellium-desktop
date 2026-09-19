@@ -51,7 +51,7 @@ iced_wgpu = { git = "https://github.com/iced-rs/iced", rev = "2cffa99b395d84fe46
 gix = { version = "0.85", default-features = false, features = ["status", "sha1"] }
 interprocess = { version = "2", features = ["tokio"] }
 libc = "0.2"
-nix = { version = "0.30", features = ["event", "fs", "poll", "signal", "socket", "time", "uio", "user"] }
+nix = { version = "0.31", features = ["event", "fs", "poll", "signal", "socket", "time", "uio", "user"] }
 objc2 = "0.6"
 parking_lot = "0.12"
 objc2-app-kit = "0.3"
