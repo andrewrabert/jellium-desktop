@@ -87,6 +87,8 @@ fn platform_switches(backend: DisplayBackend) -> Vec<state::PendingSwitch> {
             }
         }
     };
+    #[cfg(target_os = "linux")]
+    skip_chrome_first_run(&mut c.pending_switches);
     c.pending_switches
 }
 
@@ -129,6 +131,12 @@ pub(crate) fn jfn_cef_initialize(
     }
 
     fill_paths(&mut settings, platform);
+    // Must exist before CefInitialize: Chrome checks it synchronously inside
+    // CefInitialize (PreMainMessageLoopRunImpl -> ShowEulaDialog), and if it
+    // is missing that call blocks in the dialog's nested loop and never
+    // returns, so there is no later point to write it.
+    #[cfg(target_os = "linux")]
+    write_chrome_eula_sentinel();
 
     // An external pump must install its run-loop hooks before
     // CefInitialize so the first OnScheduleMessagePumpWork (fired
@@ -230,6 +238,35 @@ pub(crate) fn jfn_cef_shutdown(runtime: &crate::InitializedCef) {
 }
 
 // ---- helpers ---------------------------------------------------------------
+
+/// Chrome on Linux shows a Views EULA from `PreMainMessageLoopRunImpl` when
+/// `IsChromeFirstRun()` is true (`chrome/browser/chrome_browser_main.cc`).
+/// The dialog runs a nested loop until accepted. Nothing in jellium's
+/// windowless shell presents that widget, so `CefInitialize` never returns.
+/// `--no-first-run` makes `IsChromeFirstRun()` false, which is the gate.
+#[cfg(target_os = "linux")]
+fn skip_chrome_first_run(switches: &mut Vec<state::PendingSwitch>) {
+    switches.push(state::PendingSwitch::flag("no-first-run"));
+}
+
+/// Sentinel `ShowEulaDialog` writes after a click
+/// (`chrome/browser/first_run/first_run_internal_linux.cc`, file name
+/// `"EULA Accepted"` in the user-data dir). Creating it up front covers a
+/// CEF build that still enters the dialog despite `--no-first-run`.
+#[cfg(target_os = "linux")]
+fn write_chrome_eula_sentinel() {
+    let sentinel = jfn_paths::cache_dir().join("EULA Accepted");
+    if sentinel.exists() {
+        return;
+    }
+    if let Err(error) = std::fs::write(&sentinel, b"") {
+        jfn_logging::log(
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Warn,
+            &format!("could not write Chrome EULA sentinel: {error}"),
+        );
+    }
+}
 
 fn fill_paths(settings: &mut Settings, platform: &dyn jfn_platform_abi::Platform) {
     let paths = platform.cef_paths();
