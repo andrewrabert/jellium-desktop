@@ -376,7 +376,7 @@ mod presentation {
                 } else if mode.uses_floating_restore() {
                     floating
                 } else {
-                    cur
+                    cur.or(floating)
                 }
             };
         let w = pick(pending.0, cur.map(|s| s.w()), floating.map(|s| s.w()))?;
@@ -1350,24 +1350,22 @@ mod tests {
     }
 
     #[test]
-    fn maximized_without_compositor_size_defers() {
+    fn maximized_without_any_size_uses_floating() {
         assert_eq!(
             resolve_logical_size(NONE, None, size(1280, 720), WindowMode::Maximized),
-            None
+            size(1280, 720)
         );
         assert_eq!(
             resolve_logical_size(NONE, None, size(1280, 720), WindowMode::Fullscreen),
-            None
+            size(1280, 720)
         );
     }
 
     #[test]
-    fn tiled_defers_like_maximized_not_floating() {
-        // Tiled is compositor-dictated: without a compositor size it must defer,
-        // not fall back to the saved floating size.
+    fn tiled_without_any_size_uses_floating() {
         assert_eq!(
             resolve_logical_size(NONE, None, size(1280, 720), WindowMode::Tiled),
-            None
+            size(1280, 720)
         );
         assert!(!WindowMode::Tiled.uses_floating_restore());
     }
