@@ -29,15 +29,17 @@ use smithay_client_toolkit::seat::keyboard::{
 use smithay_client_toolkit::seat::pointer::{
     PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer,
 };
+use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_backend::client::Backend;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
+use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface, wl_touch};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use xkbcommon::xkb;
 
+use jfn_input::TouchPhase;
 use jfn_input::buttons::{BTN_BACK, BTN_EXTRA, BTN_FORWARD, BTN_SIDE};
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_ALT_DOWN, EVENTFLAG_CONTROL_DOWN, EVENTFLAG_SHIFT_DOWN,
@@ -48,8 +50,9 @@ use jfn_platform_abi::cursor::CursorShape;
 
 /// Input serials published for requests from application callbacks.
 pub struct SeatShared {
-    // Interactive move/resize requires the serial of the pointer press whose
-    // implicit grab drives the drag — a later key press serial would be rejected.
+    // Interactive move/resize requires the serial of the pointer press or
+    // touch down whose implicit grab drives the drag — a later key press
+    // serial would be rejected.
     last_button_serial: AtomicU32,
     // xdg_popup.grab accepts the serial of any press-type input event; tracking
     // key presses too keeps the serial fresh for keyboard-opened `<select>`s
@@ -81,6 +84,7 @@ pub type HistoryNavFn = fn(forward: c_int);
 pub type KbFocusFn = fn(gained: c_int);
 pub type KeyFn = fn(keysym: u32, native_code: u32, mods: u32, pressed: c_int);
 pub type CharFn = fn(codepoint: u32, mods: u32, native_code: u32);
+pub type TouchFn = fn(id: i32, phase: TouchPhase, x: f64, y: f64, mods: u32);
 
 #[derive(Clone, Copy)]
 pub struct Callbacks {
@@ -91,6 +95,7 @@ pub struct Callbacks {
     pub kb_focus: Option<KbFocusFn>,
     pub key: Option<KeyFn>,
     pub char_: Option<CharFn>,
+    pub touch: Option<TouchFn>,
 }
 
 unsafe impl Send for Callbacks {}
@@ -111,6 +116,7 @@ pub(crate) struct State {
     shm: Shm,
     pointer: Option<ThemedPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    touch: Option<wl_touch::WlTouch>,
 
     pub(crate) qh: QueueHandle<Self>,
     pub(crate) seat: wl_seat::WlSeat,
@@ -283,6 +289,13 @@ impl SeatHandler for State {
             Capability::Keyboard if self.keyboard.is_none() => {
                 self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
             }
+            Capability::Touch if self.touch.is_none() => {
+                self.touch = self
+                    .seat_state
+                    .get_touch(qh, &seat)
+                    .inspect_err(|e| tracing::error!(target: "Main", "input: touch: {e}"))
+                    .ok();
+            }
             _ => {}
         }
     }
@@ -317,6 +330,14 @@ impl SeatHandler for State {
                     keyboard.release();
                 }
             }
+            Capability::Touch => {
+                self.protocol.cancel_touch(self.modifiers);
+                if let Some(touch) = self.touch.take()
+                    && touch.version() >= 3
+                {
+                    touch.release();
+                }
+            }
             _ => {}
         }
     }
@@ -326,6 +347,7 @@ impl SeatHandler for State {
             self.disarm_repeat();
             self.protocol.cancel_pointer(self.modifiers);
             self.protocol.cancel_keyboard(self.modifiers);
+            self.protocol.cancel_touch(self.modifiers);
             self.reconcile_keyboard_focus();
         }
     }
@@ -506,6 +528,87 @@ impl State {
             return;
         }
         self.protocol.scroll(dx, dy, self.modifiers);
+    }
+}
+
+impl TouchHandler for State {
+    fn down(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        serial: u32,
+        _: u32,
+        surface: wl_surface::WlSurface,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        self.rt
+            .seat()
+            .last_button_serial
+            .store(serial, Ordering::Release);
+        self.rt
+            .seat()
+            .last_input_serial
+            .store(serial, Ordering::Release);
+        let dismiss = self.protocol.outside_press(&surface);
+        let consumed = !dismiss.is_empty();
+        for generation in dismiss {
+            self.dismiss_popup(generation);
+        }
+        self.protocol
+            .touch_down(&surface, id, position, consumed, self.modifiers);
+        self.drain_popup_commands();
+    }
+
+    fn up(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: u32,
+        _: u32,
+        id: i32,
+    ) {
+        self.protocol.touch_up(id, self.modifiers);
+        self.drain_popup_commands();
+    }
+
+    fn motion(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: u32,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        self.protocol.touch_motion(id, position, self.modifiers);
+    }
+
+    fn shape(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: i32,
+        _: f64,
+        _: f64,
+    ) {
+    }
+
+    fn orientation(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: i32,
+        _: f64,
+    ) {
+    }
+
+    fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch) {
+        self.protocol.cancel_touch(self.modifiers);
     }
 }
 
@@ -728,6 +831,7 @@ fn run_input_loop(
     }
     state.protocol.cancel_pointer(state.modifiers);
     state.protocol.cancel_keyboard(state.modifiers);
+    state.protocol.cancel_touch(state.modifiers);
     state.drain_selection_reads();
 }
 
@@ -773,6 +877,7 @@ fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Opt
         shm,
         pointer: None,
         keyboard: None,
+        touch: None,
         qh: qh.clone(),
         seat: seat.clone(),
         popups: Popups::new(xdg_shell, viewporter, pool),
@@ -875,6 +980,11 @@ impl InputTarget for ContentInput {
     fn scroll(&self, position: (f64, f64), dx: i32, dy: i32, modifiers: u32) {
         if let Some(f) = self.cb.scroll {
             f(position.0 as i32, position.1 as i32, dx, dy, modifiers);
+        }
+    }
+    fn touch(&self, id: i32, phase: TouchPhase, position: (f64, f64), modifiers: u32) {
+        if let Some(f) = self.cb.touch {
+            f(id, phase, position.0, position.1, modifiers);
         }
     }
     fn key(&self, event: &KeyEvent, pressed: bool, modifiers: u32) {
