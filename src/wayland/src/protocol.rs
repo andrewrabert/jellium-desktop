@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use jfn_input::TouchPhase;
 use jfn_input::buttons::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use jfn_platform_abi::Generation;
 use jfn_platform_abi::event_flags::{
@@ -18,6 +19,29 @@ pub(crate) trait InputTarget: Send + Sync {
     fn button(&self, _button: u32, _pressed: bool, _position: (f64, f64), _modifiers: u32) {}
     fn scroll(&self, _position: (f64, f64), _dx: i32, _dy: i32, _modifiers: u32) {}
     fn key(&self, _event: &KeyEvent, _pressed: bool, _modifiers: u32) {}
+    /// A touch point. A destination without touch input takes it as its left
+    /// button.
+    fn touch(&self, _id: i32, phase: TouchPhase, position: (f64, f64), modifiers: u32) {
+        match phase {
+            TouchPhase::Pressed => {
+                self.motion(position, modifiers, false);
+                self.button(
+                    BTN_LEFT,
+                    true,
+                    position,
+                    modifiers | EVENTFLAG_LEFT_MOUSE_BUTTON,
+                );
+            }
+            TouchPhase::Moved => {
+                self.motion(position, modifiers | EVENTFLAG_LEFT_MOUSE_BUTTON, false);
+            }
+            TouchPhase::Released => {
+                self.button(BTN_LEFT, false, position, modifiers);
+                self.motion(position, modifiers, true);
+            }
+            TouchPhase::Cancelled => self.motion(position, modifiers, true),
+        }
+    }
 }
 
 struct Destination {
@@ -35,6 +59,9 @@ pub(crate) struct SeatInput {
     keyboard: Option<ObjectId>,
     buttons: HashMap<u32, Option<ObjectId>>,
     keys: HashMap<u32, (ObjectId, KeyEvent)>,
+    /// Each live touch point's owner, `None` when its press was consumed, and
+    /// its last position: a release reports none of its own.
+    touches: HashMap<i32, (Option<ObjectId>, (f64, f64))>,
     grabs: Vec<(ObjectId, Generation)>,
     pub(crate) focus_epoch: u64,
     pub(crate) focused: bool,
@@ -202,6 +229,63 @@ impl SeatInput {
                         _ => 0,
                     }
             })
+    }
+
+    pub(crate) fn touch_down(
+        &mut self,
+        surface: &WlSurface,
+        id: i32,
+        position: (f64, f64),
+        consumed: bool,
+        modifiers: u32,
+    ) {
+        // A down under a live id means the compositor ended the old sequence
+        // without an up; its owner is told it was cancelled.
+        self.touch_end(id, TouchPhase::Cancelled, modifiers);
+        let owner = (!consumed).then(|| surface.id());
+        self.touches.insert(id, (owner.clone(), position));
+        self.touch_deliver(owner.as_ref(), id, TouchPhase::Pressed, position, modifiers);
+    }
+
+    pub(crate) fn touch_motion(&mut self, id: i32, position: (f64, f64), modifiers: u32) {
+        let Some((owner, last)) = self.touches.get_mut(&id) else {
+            return;
+        };
+        *last = position;
+        let owner = owner.clone();
+        self.touch_deliver(owner.as_ref(), id, TouchPhase::Moved, position, modifiers);
+    }
+
+    pub(crate) fn touch_up(&mut self, id: i32, modifiers: u32) {
+        self.touch_end(id, TouchPhase::Released, modifiers);
+    }
+
+    fn touch_end(&mut self, id: i32, phase: TouchPhase, modifiers: u32) {
+        if let Some((owner, position)) = self.touches.remove(&id) {
+            self.touch_deliver(owner.as_ref(), id, phase, position, modifiers);
+        }
+    }
+
+    fn touch_deliver(
+        &self,
+        owner: Option<&ObjectId>,
+        id: i32,
+        phase: TouchPhase,
+        position: (f64, f64),
+        modifiers: u32,
+    ) {
+        if let Some(destination) = owner.and_then(|owner| self.destinations.get(owner)) {
+            destination.target.touch(id, phase, position, modifiers);
+        }
+    }
+
+    /// wl_touch.cancel, or the touch capability going away: every live point
+    /// is cancelled at its owner.
+    pub(crate) fn cancel_touch(&mut self, modifiers: u32) {
+        let ids: Vec<_> = self.touches.keys().copied().collect();
+        for id in ids {
+            self.touch_end(id, TouchPhase::Cancelled, modifiers);
+        }
     }
 
     pub(crate) fn keyboard_enter(&mut self, surface: &WlSurface) {
