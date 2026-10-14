@@ -5,7 +5,7 @@
 
 use std::os::raw::c_int;
 
-use jfn_input::{TouchPhase, WebInput};
+use jfn_input::{WebInput, WebTouch};
 
 struct WebSink;
 
@@ -59,9 +59,9 @@ impl WebInput for WebSink {
         });
     }
 
-    fn send_touch_event(&self, id: c_int, x: f32, y: f32, modifiers: u32, phase: TouchPhase) {
+    fn send_touch_event(&self, touch: WebTouch) {
         crate::web_overlay::with_current_client(|client| {
-            client.send_touch_event(id, x, y, modifiers, phase);
+            client.send_touch_event(&touch);
         });
     }
 

@@ -23,7 +23,7 @@ pub use sink::{
     install_shell, install_web, on_shell_state_scoped, publish_field_edit, publish_shell_state,
     shell_state, web_became_live,
 };
-pub use touch::TouchPhase;
+pub use touch::{Contact, PointerKind, TouchPhase, TouchPoint, WebTouch};
 
 use route::{is_text, route_key, route_pointer, to_web_point};
 use sink::{with_shell, with_web};
@@ -158,27 +158,37 @@ fn dispatch_scroll(x: i32, y: i32, dx: i32, dy: i32, mods: u32) {
 
 static TOUCHES: parking_lot::Mutex<touch::Touches> = parking_lot::Mutex::new(touch::Touches::new());
 
-/// One event of touch point `id` at window-space `(x, y)`; a release or
-/// cancel carries the point's last position. Each point is routed on its press
-/// by [`route::hit`] and stays with that owner: jellyfin-web takes the point as
-/// a touch event, the shell overlay as its left button, and a press on the
-/// titlebar's drag region or a resize grip starts that window gesture.
-pub fn jfn_input_dispatch_touch(id: i32, phase: TouchPhase, x: f64, y: f64, mods: u32) {
+/// One event of a touch point; a release or cancel carries the point's last
+/// position. Each point is routed on its press by [`route::hit`] and stays with
+/// that owner: jellyfin-web takes the point as a touch or pen event, the shell
+/// overlay as its left button, and a press on the titlebar's drag region or a
+/// resize grip starts that window gesture.
+pub fn jfn_input_dispatch_touch(point: TouchPoint, phase: TouchPhase, mods: u32) {
     let p = LogicalPoint {
-        x: x as i32,
-        y: y as i32,
+        x: point.x as i32,
+        y: point.y as i32,
     };
     let state = sink::shell_state();
-    let delivery = TOUCHES
-        .lock()
-        .route(id, phase, state.map(|state| route::hit(state, p)));
+    let delivery = TOUCHES.lock().route(
+        point.contact,
+        phase,
+        state.map(|state| route::hit(state, p)),
+    );
     match delivery {
-        touch::Delivery::Web(phase) => {
+        touch::Delivery::Web(phase, id) => {
             let Some(state) = state else {
                 return;
             };
-            let y = y - f64::from(state.reserved_strip);
-            with_web(|b| b.send_touch_event(id, x as f32, y as f32, mods, phase));
+            let touch = WebTouch {
+                id,
+                x: point.x as f32,
+                y: (point.y - f64::from(state.reserved_strip)) as f32,
+                pressure: point.pressure,
+                kind: point.kind,
+                phase,
+                modifiers: mods,
+            };
+            with_web(|b| b.send_touch_event(touch));
         }
         touch::Delivery::ShellButton(phase) => with_shell(|s| match phase {
             TouchPhase::Pressed => {

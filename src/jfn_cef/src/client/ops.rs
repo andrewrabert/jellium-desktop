@@ -4,7 +4,7 @@ use cef::{
     ImplBrowser, ImplBrowserHost, KeyEvent, MouseButtonType, MouseEvent, PointerType, TouchEvent,
     TouchEventType, sys,
 };
-use jfn_input::TouchPhase;
+use jfn_input::{PointerKind, TouchPhase, WebTouch};
 use std::os::raw::c_int;
 
 use super::Inner;
@@ -110,31 +110,30 @@ impl Inner {
         host.send_mouse_wheel_event(Some(&me), dx, dy);
     }
 
-    /// Contact shape, rotation and pressure are not forwarded and stay zero.
-    pub(crate) fn send_touch_event(
-        &self,
-        id: c_int,
-        x: f32,
-        y: f32,
-        modifiers: u32,
-        phase: TouchPhase,
-    ) {
+    /// Contact shape and rotation are not forwarded and stay zero.
+    pub(crate) fn send_touch_event(&self, touch: &WebTouch) {
         let Some(host) = self.host() else {
             return;
         };
-        let type_ = match phase {
+        let type_ = match touch.phase {
             TouchPhase::Pressed => sys::cef_touch_event_type_t::CEF_TET_PRESSED,
             TouchPhase::Moved => sys::cef_touch_event_type_t::CEF_TET_MOVED,
             TouchPhase::Released => sys::cef_touch_event_type_t::CEF_TET_RELEASED,
             TouchPhase::Cancelled => sys::cef_touch_event_type_t::CEF_TET_CANCELLED,
         };
+        let pointer_type = match touch.kind {
+            PointerKind::Touch => sys::cef_pointer_type_t::CEF_POINTER_TYPE_TOUCH,
+            PointerKind::Pen => sys::cef_pointer_type_t::CEF_POINTER_TYPE_PEN,
+            PointerKind::Eraser => sys::cef_pointer_type_t::CEF_POINTER_TYPE_ERASER,
+        };
         let ev = TouchEvent {
-            id,
-            x,
-            y,
+            id: touch.id,
+            x: touch.x,
+            y: touch.y,
+            pressure: touch.pressure,
             type_: TouchEventType::from(type_),
-            modifiers,
-            pointer_type: PointerType::from(sys::cef_pointer_type_t::CEF_POINTER_TYPE_TOUCH),
+            modifiers: touch.modifiers,
+            pointer_type: PointerType::from(pointer_type),
             ..TouchEvent::default()
         };
         host.send_touch_event(Some(&ev));
