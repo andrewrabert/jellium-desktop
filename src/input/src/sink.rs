@@ -32,6 +32,15 @@ pub trait WebInput: Send + Sync {
     );
     fn send_mouse_move(&self, x: c_int, y: c_int, modifiers: u32, leave: bool);
     fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int);
+    /// One event of touch point `id`, in the web overlay's coordinates.
+    fn send_touch_event(
+        &self,
+        id: c_int,
+        x: f32,
+        y: f32,
+        modifiers: u32,
+        phase: crate::touch::TouchPhase,
+    );
     fn set_focus(&self, focus: bool);
     fn navigate_history(&self, forward: bool);
     fn undo(&self);
@@ -325,6 +334,16 @@ mod tests {
             _modifiers: u32,
             _delta_x: c_int,
             _delta_y: c_int,
+        ) {
+        }
+
+        fn send_touch_event(
+            &self,
+            _id: c_int,
+            _x: f32,
+            _y: f32,
+            _modifiers: u32,
+            _phase: crate::touch::TouchPhase,
         ) {
         }
 
