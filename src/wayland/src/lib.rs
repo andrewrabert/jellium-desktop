@@ -27,6 +27,7 @@ pub(crate) mod scale;
 pub(crate) mod scale_probe;
 pub(crate) mod scene;
 pub(crate) mod selection;
+pub(crate) mod tablet;
 pub(crate) mod window_source;
 pub(crate) mod window_state;
 pub(crate) mod wl_ops;

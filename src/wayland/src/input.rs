@@ -29,16 +29,18 @@ use smithay_client_toolkit::seat::keyboard::{
 use smithay_client_toolkit::seat::pointer::{
     PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer,
 };
+use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_backend::client::Backend;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
+use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface, wl_touch};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use xkbcommon::xkb;
 
 use jfn_input::buttons::{BTN_BACK, BTN_EXTRA, BTN_FORWARD, BTN_SIDE};
+use jfn_input::{Contact, PointerKind, TouchPhase, TouchPoint};
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_ALT_DOWN, EVENTFLAG_CONTROL_DOWN, EVENTFLAG_SHIFT_DOWN,
 };
@@ -48,8 +50,9 @@ use jfn_platform_abi::cursor::CursorShape;
 
 /// Input serials published for requests from application callbacks.
 pub struct SeatShared {
-    // Interactive move/resize requires the serial of the pointer press whose
-    // implicit grab drives the drag — a later key press serial would be rejected.
+    // Interactive move/resize requires the serial of the pointer press or
+    // touch down whose implicit grab drives the drag — a later key press
+    // serial would be rejected.
     last_button_serial: AtomicU32,
     // xdg_popup.grab accepts the serial of any press-type input event; tracking
     // key presses too keeps the serial fresh for keyboard-opened `<select>`s
@@ -81,6 +84,7 @@ pub type HistoryNavFn = fn(forward: c_int);
 pub type KbFocusFn = fn(gained: c_int);
 pub type KeyFn = fn(keysym: u32, native_code: u32, mods: u32, pressed: c_int);
 pub type CharFn = fn(codepoint: u32, mods: u32, native_code: u32);
+pub type TouchFn = fn(point: TouchPoint, phase: TouchPhase, mods: u32);
 
 #[derive(Clone, Copy)]
 pub struct Callbacks {
@@ -91,6 +95,7 @@ pub struct Callbacks {
     pub kb_focus: Option<KbFocusFn>,
     pub key: Option<KeyFn>,
     pub char_: Option<CharFn>,
+    pub touch: Option<TouchFn>,
 }
 
 unsafe impl Send for Callbacks {}
@@ -111,6 +116,8 @@ pub(crate) struct State {
     shm: Shm,
     pointer: Option<ThemedPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    touch: Option<wl_touch::WlTouch>,
+    pub(crate) tablet: crate::tablet::Tablets,
 
     pub(crate) qh: QueueHandle<Self>,
     pub(crate) seat: wl_seat::WlSeat,
@@ -128,7 +135,7 @@ pub(crate) struct State {
 
     xkb_ctx: xkb::Context,
     xkb_kmap: Option<xkb::Keymap>,
-    modifiers: u32,
+    pub(crate) modifiers: u32,
 
     // Latest desired cursor (re-applied on pointer enter).
     cursor_type: Arc<AtomicU32>,
@@ -283,6 +290,13 @@ impl SeatHandler for State {
             Capability::Keyboard if self.keyboard.is_none() => {
                 self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
             }
+            Capability::Touch if self.touch.is_none() => {
+                self.touch = self
+                    .seat_state
+                    .get_touch(qh, &seat)
+                    .inspect_err(|e| tracing::error!(target: "Main", "input: touch: {e}"))
+                    .ok();
+            }
             _ => {}
         }
     }
@@ -317,6 +331,14 @@ impl SeatHandler for State {
                     keyboard.release();
                 }
             }
+            Capability::Touch => {
+                self.protocol.cancel_touch(is_finger, self.modifiers);
+                if let Some(touch) = self.touch.take()
+                    && touch.version() >= 3
+                {
+                    touch.release();
+                }
+            }
             _ => {}
         }
     }
@@ -326,6 +348,7 @@ impl SeatHandler for State {
             self.disarm_repeat();
             self.protocol.cancel_pointer(self.modifiers);
             self.protocol.cancel_keyboard(self.modifiers);
+            self.protocol.cancel_touch(|_| true, self.modifiers);
             self.reconcile_keyboard_focus();
         }
     }
@@ -506,6 +529,113 @@ impl State {
             return;
         }
         self.protocol.scroll(dx, dy, self.modifiers);
+    }
+}
+
+impl State {
+    /// A press that is not a pointer button's: its serial is what an
+    /// interactive move/resize or a popup grab started by it must cite.
+    pub(crate) fn note_press(&self, serial: u32) {
+        let seat = self.rt.seat();
+        seat.last_button_serial.store(serial, Ordering::Release);
+        seat.last_input_serial.store(serial, Ordering::Release);
+    }
+
+    /// Dismisses the popups a press on `surface` lies outside of, as a
+    /// pointer press does; `true` when the press was consumed doing so.
+    pub(crate) fn dismiss_outside(&mut self, surface: &wl_surface::WlSurface) -> bool {
+        let dismiss = self.protocol.outside_press(surface);
+        let consumed = !dismiss.is_empty();
+        for generation in dismiss {
+            self.dismiss_popup(generation);
+        }
+        consumed
+    }
+}
+
+fn is_finger(contact: &Contact) -> bool {
+    matches!(contact, Contact::Finger(_))
+}
+
+/// wl_touch reports no pressure.
+fn finger(id: i32, position: (f64, f64)) -> TouchPoint {
+    TouchPoint {
+        contact: Contact::Finger(id),
+        kind: PointerKind::Touch,
+        x: position.0,
+        y: position.1,
+        pressure: 0.0,
+    }
+}
+
+impl TouchHandler for State {
+    fn down(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        serial: u32,
+        _: u32,
+        surface: wl_surface::WlSurface,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        self.note_press(serial);
+        let consumed = self.dismiss_outside(&surface);
+        self.protocol
+            .touch_down(&surface, finger(id, position), consumed, self.modifiers);
+        self.drain_popup_commands();
+    }
+
+    fn up(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: u32,
+        _: u32,
+        id: i32,
+    ) {
+        self.protocol.touch_up(Contact::Finger(id), self.modifiers);
+        self.drain_popup_commands();
+    }
+
+    fn motion(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: u32,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        self.protocol
+            .touch_motion(finger(id, position), self.modifiers);
+    }
+
+    fn shape(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: i32,
+        _: f64,
+        _: f64,
+    ) {
+    }
+
+    fn orientation(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: i32,
+        _: f64,
+    ) {
+    }
+
+    fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch) {
+        self.protocol.cancel_touch(is_finger, self.modifiers);
     }
 }
 
@@ -728,6 +858,7 @@ fn run_input_loop(
     }
     state.protocol.cancel_pointer(state.modifiers);
     state.protocol.cancel_keyboard(state.modifiers);
+    state.protocol.cancel_touch(|_| true, state.modifiers);
     state.drain_selection_reads();
 }
 
@@ -773,6 +904,8 @@ fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Opt
         shm,
         pointer: None,
         keyboard: None,
+        touch: None,
+        tablet: crate::tablet::Tablets::bind(&globals, &qh, &seat),
         qh: qh.clone(),
         seat: seat.clone(),
         popups: Popups::new(xdg_shell, viewporter, pool),
@@ -877,6 +1010,11 @@ impl InputTarget for ContentInput {
             f(position.0 as i32, position.1 as i32, dx, dy, modifiers);
         }
     }
+    fn touch(&self, point: TouchPoint, phase: TouchPhase, modifiers: u32) {
+        if let Some(f) = self.cb.touch {
+            f(point, phase, modifiers);
+        }
+    }
     fn key(&self, event: &KeyEvent, pressed: bool, modifiers: u32) {
         if let Some(f) = self.cb.key {
             f(
@@ -933,7 +1071,7 @@ impl State {
         }
     }
 
-    fn drain_popup_commands(&mut self) {
+    pub(crate) fn drain_popup_commands(&mut self) {
         while let Ok(command) = self.popup_commands.try_recv() {
             match command {
                 PopupCommand::Create {
