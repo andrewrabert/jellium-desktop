@@ -50,7 +50,12 @@ if (-not $env:LIBCLANG_PATH) {
         if (-not $env:BINDGEN_EXTRA_CLANG_ARGS) {
             $env:BINDGEN_EXTRA_CLANG_ARGS = "--target=$Triple"
         }
-        $env:PATH = "$env:PATH;$MsysBin"
+        # Prepend, not append: LoadLibraryExW resolves libclang.dll's mingw
+        # dependencies (libLLVM, libc++, libxml2, libzstd, zlib1) through PATH.
+        # Another mingw/LLVM toolchain earlier on PATH (e.g. a WinLibs mingw64
+        # installed via winget) shadows them with incompatible copies and bindgen
+        # then dies with "LoadLibraryExW failed" (ERROR_MOD_NOT_FOUND).
+        $env:PATH = "$MsysBin;$env:PATH"
     } else {
         Write-Host "libclang.dll not found at $MsysBin" -ForegroundColor Red
         Write-Host "Run 'just deps' or install mingw-w64-clang-*-llvm via MSYS2 pacman."
