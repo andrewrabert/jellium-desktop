@@ -46,6 +46,11 @@ test: build
 test: build
     . 'dev/windows/env.ps1'; cargo test --manifest-path src/Cargo.toml --workspace
 
+# Run the JS unit tests (node only; not part of `just test`, which is cargo)
+[group('test')]
+test-js:
+    node --test src/web/input-plugin.test.js
+
 # Format workspace
 [group('lint')]
 fmt:
