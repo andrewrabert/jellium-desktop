@@ -22,7 +22,7 @@ pollster = "1.0"
 [target.'cfg(target_os = "linux")'.dependencies]
 nix.workspace = true
 raw-window-handle = "0.6"
-wgpu-hal = { version = "=29.0.4", features = ["vulkan"] }
+wgpu-hal = { version = "=30.0.1", features = ["vulkan"] }
 ash = "0.38"
 
 [target.'cfg(windows)'.dependencies]
