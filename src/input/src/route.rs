@@ -34,7 +34,7 @@ pub struct ShellState {
     /// Width of the minimize/maximize/close strip at the titlebar's right edge.
     pub controls_w: c_int,
     /// Logical height of the strip the shell overlay reserves above the web
-    /// overlay. Held across video and OSD transitions.
+    /// overlay. Held across decoration and fullscreen transitions.
     pub reserved_strip: c_int,
 }
 

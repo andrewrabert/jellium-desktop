@@ -187,7 +187,6 @@ pub fn shell_start(
     let refresh = jfn_gpu_paint::refresh::subscribe(refresh_changed);
     jfn_input::install_shell(Box::new(router_sink::ShellSink));
     chrome::set_listener(Box::new(|inputs| post(Work::Chrome(inputs))));
-    jfn_playback::chrome::subscribe_chrome(push_playback_chrome);
     jfn_color::theme::jfn_theme_color_subscribe(|rgb| {
         post(Work::ChromeBackground(theme::from_rgb(rgb)));
     });
@@ -195,7 +194,6 @@ pub fn shell_start(
     let window = jfn_platform_abi::subscribe_window_changed(push_window_state);
     push_decorations();
     push_window_state();
-    push_playback_chrome();
 
     shell.subscriptions = Some(Subscriptions {
         _window: window,
@@ -387,12 +385,6 @@ pub(crate) fn post(work: Work) {
 /// now has a cadence to animate the spinner on.
 fn refresh_changed() {
     post(Work::Redraw);
-}
-
-fn push_playback_chrome() {
-    let state = jfn_playback::chrome::chrome_state();
-    chrome::set_video_active(state.video_active);
-    chrome::set_osd_visible(state.osd_visible);
 }
 
 fn push_decorations() {

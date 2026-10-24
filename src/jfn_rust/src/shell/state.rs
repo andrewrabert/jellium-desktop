@@ -4,14 +4,12 @@ use jfn_platform_abi::TITLEBAR_LOGICAL_HEIGHT;
 pub struct ChromeInputs {
     pub client_side_decorations: bool,
     pub fullscreen: bool,
-    pub video_active: bool,
-    pub osd_visible: bool,
 }
 
+/// Window chrome depends only on decoration mode and fullscreen. Playback and
+/// its OSD never hide the controls.
 pub fn titlebar_shown(inputs: ChromeInputs) -> bool {
-    inputs.client_side_decorations
-        && !inputs.fullscreen
-        && (!inputs.video_active || inputs.osd_visible)
+    inputs.client_side_decorations && !inputs.fullscreen
 }
 
 pub fn overlay_visible(modal_occupied: bool, titlebar_shown: bool) -> bool {
@@ -21,8 +19,8 @@ pub fn overlay_visible(modal_occupied: bool, titlebar_shown: bool) -> bool {
 /// The strip reserved above the web overlay, in logical pixels.
 ///
 /// Reserved whenever decorations are client-side and the window is not
-/// fullscreen, so the strip is held constant across every video and OSD
-/// transition and Chromium is never resized by one.
+/// fullscreen, so the strip is held constant across every decoration and
+/// fullscreen transition and Chromium is never resized by one.
 pub fn reserved_strip(inputs: ChromeInputs) -> i32 {
     if inputs.client_side_decorations && !inputs.fullscreen {
         TITLEBAR_LOGICAL_HEIGHT
@@ -60,8 +58,6 @@ mod tests {
     const CSD: ChromeInputs = ChromeInputs {
         client_side_decorations: true,
         fullscreen: false,
-        video_active: false,
-        osd_visible: false,
     };
 
     #[test]
@@ -77,19 +73,6 @@ mod tests {
     fn fullscreen_hides_titlebar() {
         assert!(!titlebar_shown(ChromeInputs {
             fullscreen: true,
-            ..CSD
-        }));
-    }
-
-    #[test]
-    fn video_hides_titlebar_unless_osd_is_up() {
-        assert!(!titlebar_shown(ChromeInputs {
-            video_active: true,
-            ..CSD
-        }));
-        assert!(titlebar_shown(ChromeInputs {
-            video_active: true,
-            osd_visible: true,
             ..CSD
         }));
     }
@@ -152,21 +135,5 @@ mod tests {
         );
         let state = shell_state(extent, CSD, false);
         assert_eq!((state.window_w, state.window_h), (598, 337));
-    }
-
-    #[test]
-    fn the_reserved_strip_survives_video_and_osd_transitions() {
-        for video_active in [false, true] {
-            for osd_visible in [false, true] {
-                assert_eq!(
-                    reserved_strip(ChromeInputs {
-                        video_active,
-                        osd_visible,
-                        ..CSD
-                    }),
-                    TITLEBAR_LOGICAL_HEIGHT
-                );
-            }
-        }
     }
 }

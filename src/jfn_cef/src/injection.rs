@@ -47,7 +47,6 @@ pub(crate) enum NativeFunction {
     AppExit,
     SetSettingValue,
     ThemeColor,
-    SetOsdVisible,
     ToggleFullscreen,
 }
 
@@ -83,7 +82,6 @@ impl NativeFunction {
             "appExit" => Self::AppExit,
             "setSettingValue" => Self::SetSettingValue,
             "themeColor" => Self::ThemeColor,
-            "setOsdVisible" => Self::SetOsdVisible,
             "toggleFullscreen" => Self::ToggleFullscreen,
             _ => return None,
         })
@@ -120,7 +118,6 @@ impl NativeFunction {
             Self::AppExit => "appExit",
             Self::SetSettingValue => "setSettingValue",
             Self::ThemeColor => "themeColor",
-            Self::SetOsdVisible => "setOsdVisible",
             Self::ToggleFullscreen => "toggleFullscreen",
         }
     }
@@ -197,7 +194,6 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::AppExit,
     NativeFunction::SetSettingValue,
     NativeFunction::ThemeColor,
-    NativeFunction::SetOsdVisible,
     NativeFunction::ToggleFullscreen,
 ];
 

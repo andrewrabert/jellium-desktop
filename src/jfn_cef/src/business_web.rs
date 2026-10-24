@@ -178,7 +178,6 @@ fn handle_player_load(args: &ListValue) {
 
     if !metadata_json.is_empty() {
         jfn_theme_color_set_video_mode(meta.media_type == MT_VIDEO);
-        jfn_playback::chrome::set_video_active(meta.media_type == MT_VIDEO);
         post_metadata(&meta);
     }
 
@@ -331,13 +330,9 @@ fn handle_message(message: BrowserMessage) -> bool {
                 jfn_theme_color_on_color(rgb);
             }
         }),
-        "setOsdVisible" => with_args(args, |a| {
-            jfn_playback::chrome::set_osd_visible(a.bool(0) != 0);
-        }),
         "notifyMetadata" => with_args(args, |a| {
             let meta = parse_metadata_json(&list_string(a, 0));
             jfn_theme_color_set_video_mode(meta.media_type == MT_VIDEO);
-            jfn_playback::chrome::set_video_active(meta.media_type == MT_VIDEO);
             post_metadata(&meta);
         }),
         "notifyArtwork" => with_args(args, |a| {
