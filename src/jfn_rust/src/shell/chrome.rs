@@ -152,9 +152,12 @@ fn control(
     class: theme::ButtonClass,
 ) -> Element<'static, Message, Theme, iced_wgpu::Renderer> {
     button(
-        Canvas::new(icon)
-            .width(Length::Fixed(ICON))
-            .height(Length::Fixed(ICON)),
+        container(
+            Canvas::new(icon)
+                .width(Length::Fixed(ICON))
+                .height(Length::Fixed(ICON)),
+        )
+        .center(Length::Fill),
     )
     .on_press(message)
     .width(Length::Fixed(CONTROL_WIDTH))
