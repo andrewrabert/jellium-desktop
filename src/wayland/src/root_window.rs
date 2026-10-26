@@ -369,6 +369,12 @@ mod presentation {
         floating: Option<WindowSize>,
         mode: WindowMode,
     ) -> Option<WindowSize> {
+        // A zero (absent) configure extent means the client picks its own size
+        // (xdg_toplevel.configure). Non-floating modes keep the last presented
+        // size across such a configure, but before the first present there is
+        // none — and a compositor that sends its real size only after map (dwl:
+        // 0x0 + tiled on the initial configure) would wait on us forever — so
+        // fall back to the floating size.
         let pick =
             |pending: Option<NonZeroI32>, cur: Option<i32>, floating: Option<i32>| -> Option<i32> {
                 if let Some(p) = pending {
@@ -376,7 +382,7 @@ mod presentation {
                 } else if mode.uses_floating_restore() {
                     floating
                 } else {
-                    cur
+                    cur.or(floating)
                 }
             };
         let w = pick(pending.0, cur.map(|s| s.w()), floating.map(|s| s.w()))?;
@@ -1350,26 +1356,28 @@ mod tests {
     }
 
     #[test]
-    fn maximized_without_compositor_size_defers() {
-        assert_eq!(
-            resolve_logical_size(NONE, None, size(1280, 720), WindowMode::Maximized),
-            None
-        );
-        assert_eq!(
-            resolve_logical_size(NONE, None, size(1280, 720), WindowMode::Fullscreen),
-            None
-        );
+    fn unsized_initial_configure_uses_floating_in_every_mode() {
+        // Nothing presented yet and no compositor extent: the client picks, so
+        // a tiled/maximized/fullscreen initial configure must not wait forever.
+        for mode in [
+            WindowMode::Tiled,
+            WindowMode::Maximized,
+            WindowMode::Fullscreen,
+        ] {
+            assert_eq!(
+                resolve_logical_size(NONE, None, size(1280, 720), mode),
+                size(1280, 720)
+            );
+        }
+        assert!(!WindowMode::Tiled.uses_floating_restore());
     }
 
     #[test]
-    fn tiled_defers_like_maximized_not_floating() {
-        // Tiled is compositor-dictated: without a compositor size it must defer,
-        // not fall back to the saved floating size.
+    fn tiled_bare_configure_keeps_cur_not_floating() {
         assert_eq!(
-            resolve_logical_size(NONE, None, size(1280, 720), WindowMode::Tiled),
-            None
+            resolve_logical_size(NONE, size(1920, 1080), size(800, 600), WindowMode::Tiled),
+            size(1920, 1080)
         );
-        assert!(!WindowMode::Tiled.uses_floating_restore());
     }
 
     #[test]
