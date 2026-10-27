@@ -38,7 +38,7 @@ publish = false
 arc-swap = "1"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
-cef = { version = "=152", default-features = false }
+cef = { version = "=156", default-features = false }
 crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
 dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
