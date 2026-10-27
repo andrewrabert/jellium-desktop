@@ -91,6 +91,13 @@ pub fn sdk_proxy(real_dir: &Path) -> Result<(tempfile::TempDir, PathBuf)> {
             .with_context(|| format!("link {} in cef-sdk-proxy", name.to_string_lossy()))?;
     }
 
+    // Arch's cef package keeps the headers outside the runtime dir; cef-dll-sys reads include/cef_api_versions.h.
+    let include = proxy.join("include");
+    let system = Path::new("/usr/include/cef/include");
+    if !include.exists() && system.join("cef_api_versions.h").is_file() {
+        create_link(system, &include).context("link include in cef-sdk-proxy")?;
+    }
+
     let cef_version = download_cef::default_version(&version::cef_package_version()?);
     std::fs::write(
         proxy.join("archive.json"),
