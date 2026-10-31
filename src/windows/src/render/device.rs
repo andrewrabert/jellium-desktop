@@ -3,14 +3,17 @@
 use jfn_gpu_paint::Surfaces;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::DirectComposition::{
-    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+    DCompositionCreateDevice3, IDCompositionDesktopDevice, IDCompositionTarget, IDCompositionVisual,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows_core::{IUnknown, Interface};
 
 /// The DComp device, the HWND composition target, and the root visual every
 /// surface parents into.
+///
+/// A desktop device, not a `DCompositionCreateDevice` one: only its visuals
+/// implement `IDCompositionVisual3`, which `Layer::set_visible` needs.
 pub(crate) struct Devices {
-    device: IDCompositionDevice,
+    device: IDCompositionDesktopDevice,
     // Keep-alive, never read: dropping the target unbinds the visual tree
     // from the HWND.
     _target: IDCompositionTarget,
@@ -20,9 +23,9 @@ pub(crate) struct Devices {
 impl Devices {
     pub(crate) fn create(hwnd: HWND) -> windows_core::Result<Devices> {
         unsafe {
-            let device: IDCompositionDevice = DCompositionCreateDevice(None::<&IDXGIDevice>)?;
+            let device: IDCompositionDesktopDevice = DCompositionCreateDevice3(None::<&IUnknown>)?;
             let target = device.CreateTargetForHwnd(hwnd, false)?;
-            let root = device.CreateVisual()?;
+            let root: IDCompositionVisual = device.CreateVisual()?.cast()?;
             target.SetRoot(&root)?;
             device.Commit()?;
             Ok(Devices {
@@ -38,7 +41,7 @@ impl Devices {
     }
 
     pub(crate) fn new_visual(&self) -> windows_core::Result<IDCompositionVisual> {
-        unsafe { self.device.CreateVisual() }
+        unsafe { self.device.CreateVisual()?.cast() }
     }
 
     /// Publishes every tree change since the last call, including the
