@@ -11,6 +11,12 @@ impl MpvHost for WindowsMpvHost {
         }
     }
 
+    /// `win_init` resolves the HWND from the observed `window-id`; mpv
+    /// creates that window on its own VO thread.
+    fn init_needs_mpv_window(&self) -> bool {
+        true
+    }
+
     /// Windows publishes no exact logical size; mpv's `osd-dimensions` is the
     /// authority here.
     fn logical_content_size(&self) -> Option<jfn_platform_abi::LogicalSize> {

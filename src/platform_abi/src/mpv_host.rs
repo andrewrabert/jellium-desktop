@@ -40,6 +40,14 @@ pub trait MpvHost: Send + Sync {
         None
     }
 
+    /// Whether platform init attaches to mpv's own window and so needs its
+    /// observed `window-id` first. Startup drains mpv events until it is.
+    /// Hosts whose mpv window creation runs on the native main loop must
+    /// leave this false: that wait blocks the main thread in mpv.
+    fn init_needs_mpv_window(&self) -> bool {
+        false
+    }
+
     /// Drain pending events and return Break when application startup ends.
     /// Event may block in mpv; Drain must return promptly so native main-loop
     /// sources can run. Publish readiness before waking this wait. Backends
