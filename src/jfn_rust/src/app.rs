@@ -275,12 +275,14 @@ fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
     unsafe { jfn_mpv::boot::jfn_mpv_handle_init(&boot as *const _) }
 }
 
-/// Returns the completed boot state or the reason startup stopped.
-fn wait_for_vo_window(mut boot: BackgroundCapture) -> Result<ReadyBoot, BootError> {
+/// Drains boot events until `ready` yields, or returns the reason startup
+/// stopped first.
+fn pump_boot_events<T>(
+    boot: &mut BackgroundCapture,
+    mut ready: impl FnMut(&BackgroundCapture) -> Option<T>,
+) -> Result<T, BootError> {
     use std::ops::ControlFlow::{Break, Continue};
     let _shutdown_wake = crate::manager::BootShutdownWake::start()?;
-    tracing::info!(target: "Main", "Waiting for mpv window...");
-    let started = std::time::Instant::now();
     let mut outcome = Err(BootError::MpvTerminated);
     plat().mpv_host().run_vo_wait(&mut |wait| {
         if jfn_playback::shutdown::jfn_shutting_down() {
@@ -288,19 +290,19 @@ fn wait_for_vo_window(mut boot: BackgroundCapture) -> Result<ReadyBoot, BootErro
             return Break(());
         }
         loop {
-            match consume_boot_event(&mut boot, jfn_mpv::api::wait_event_owned(0.0)) {
+            match consume_boot_event(boot, jfn_mpv::api::wait_event_owned(0.0)) {
                 BootEvent::Idle => break,
                 BootEvent::Fatal => return Break(()),
                 BootEvent::Consumed => {}
             }
         }
-        if let Some(ready) = boot_progress(&boot) {
-            outcome = Ok(ready);
+        if let Some(value) = ready(boot) {
+            outcome = Ok(value);
             return Break(());
         }
         if wait == jfn_platform_abi::VoWait::Event
             && matches!(
-                consume_boot_event(&mut boot, jfn_mpv::api::wait_event_owned(-1.0)),
+                consume_boot_event(boot, jfn_mpv::api::wait_event_owned(-1.0)),
                 BootEvent::Fatal
             )
         {
@@ -308,6 +310,23 @@ fn wait_for_vo_window(mut boot: BackgroundCapture) -> Result<ReadyBoot, BootErro
         }
         Continue(())
     });
+    outcome
+}
+
+/// Blocks until mpv's `window-id` is observed, for hosts whose platform init
+/// attaches to mpv's own window. mpv notifies `window-id` when its VO window
+/// comes up, so the wait parks on mpv events.
+fn wait_for_mpv_window_id(boot: &mut BackgroundCapture) -> Result<(), BootError> {
+    pump_boot_events(boot, |_| {
+        jfn_playback::ingest_driver::jfn_playback_window_id().map(drop)
+    })
+}
+
+/// Returns the completed boot state or the reason startup stopped.
+fn wait_for_vo_window(mut boot: BackgroundCapture) -> Result<ReadyBoot, BootError> {
+    tracing::info!(target: "Main", "Waiting for mpv window...");
+    let started = std::time::Instant::now();
+    let outcome = pump_boot_events(&mut boot, boot_progress);
     if outcome.is_ok() {
         tracing::info!(target: "Main", "mpv window ready in {} ms", started.elapsed().as_millis());
     }
@@ -1044,7 +1063,17 @@ fn run_app(
 
     resources.native.get_mut().mpv.window_wake = Some(wake_mpv_on_window_change());
 
-    let boot = BackgroundCapture::Pending;
+    let mut boot = BackgroundCapture::Pending;
+
+    // Nothing has drained mpv events yet, so a host whose init attaches to
+    // mpv's own window has no observed `window-id` until this wait.
+    if plat().mpv_host().init_needs_mpv_window()
+        && let Err(error) = wait_for_mpv_window_id(&mut boot)
+    {
+        let code = error.exit_code();
+        tracing::info!(target: "Main", "{error}");
+        return code;
+    }
 
     // Platform init precedes both the shell overlay and `CefInitialize`: the
     // overlay's surface needs the backend's compositor devices, and the
