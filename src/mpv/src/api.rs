@@ -580,3 +580,30 @@ pub unsafe fn jfn_mpv_set_background_color_hex(hex: *const c_char) {
     };
     unsafe { set_str(c"background-color", h) };
 }
+
+/// Reply id carried by the [`crate::Event::SetPropertyReply`] answering
+/// [`jfn_mpv_set_startup_background_color_hex`].
+pub const STARTUP_BACKGROUND_SET_REPLY: crate::event::ReplyUserdata = 2;
+
+/// Async `background-color` write; mpv answers with a `SetPropertyReply`
+/// tagged [`STARTUP_BACKGROUND_SET_REPLY`] once it has been applied. Returns
+/// `false` when nothing was queued, so no reply will follow.
+pub unsafe fn jfn_mpv_set_startup_background_color_hex(hex: *const c_char) -> bool {
+    let h = raw();
+    let Some(v) = (unsafe { cstr(hex) }) else {
+        return false;
+    };
+    if h.is_null() {
+        return false;
+    }
+    let mut ptr = v.as_ptr();
+    unsafe {
+        sys::mpv_set_property_async(
+            h,
+            STARTUP_BACKGROUND_SET_REPLY,
+            c"background-color".as_ptr(),
+            sys::mpv_format::MPV_FORMAT_STRING,
+            &mut ptr as *mut _ as *mut c_void,
+        ) >= 0
+    }
+}
