@@ -42,6 +42,7 @@ const STARTUP_BG_HEX: &str = "#101010";
 
 enum BackgroundCapture {
     Pending,
+    Applying { user_video_bg: u32 },
     Applied { user_video_bg: u32 },
 }
 
@@ -1170,6 +1171,15 @@ fn consume_boot_event(boot: &mut BackgroundCapture, event: jfn_mpv::api::WaitEve
             apply_startup_background(boot, value);
             BootEvent::Consumed
         }
+        jfn_mpv::api::WaitEvent::Event(jfn_mpv::Event::SetPropertyReply {
+            reply: jfn_mpv::api::STARTUP_BACKGROUND_SET_REPLY,
+            ..
+        }) => {
+            if let BackgroundCapture::Applying { user_video_bg } = *boot {
+                *boot = BackgroundCapture::Applied { user_video_bg };
+            }
+            BootEvent::Consumed
+        }
         jfn_mpv::api::WaitEvent::Event(event) => {
             jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(&event, plat());
             BootEvent::Consumed
@@ -1181,8 +1191,13 @@ fn consume_boot_event(boot: &mut BackgroundCapture, event: jfn_mpv::api::WaitEve
 fn apply_startup_background(boot: &mut BackgroundCapture, value: &jfn_mpv::PropertyValue) {
     let user_video_bg = jfn_mpv::api::background_color_from_reply(value).unwrap_or(0);
     let startup_bg = cs(STARTUP_BG_HEX);
-    unsafe { jfn_mpv::api::jfn_mpv_set_background_color_hex(startup_bg.as_ptr()) };
-    *boot = BackgroundCapture::Applied { user_video_bg };
+    let queued =
+        unsafe { jfn_mpv::api::jfn_mpv_set_startup_background_color_hex(startup_bg.as_ptr()) };
+    *boot = if queued {
+        BackgroundCapture::Applying { user_video_bg }
+    } else {
+        BackgroundCapture::Applied { user_video_bg }
+    };
 }
 
 /// Produces startup evidence from the current window and captured background.
