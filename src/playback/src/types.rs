@@ -30,6 +30,13 @@ pub enum PlaybackPhase {
     Stopped = 3,
 }
 
+impl PlaybackPhase {
+    /// Whether media is loaded: every phase but `Stopped`.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Playing | Self::Paused)
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndReason {

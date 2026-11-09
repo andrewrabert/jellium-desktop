@@ -160,7 +160,7 @@ impl PlaybackStateMachine {
     }
 
     pub fn on_seeking_changed(&mut self, seeking: bool) -> Vec<PlaybackEvent> {
-        if !is_active_phase(self.s.phase) {
+        if !self.s.phase.is_active() {
             return vec![];
         }
         if self.s.seeking == seeking {
@@ -177,7 +177,7 @@ impl PlaybackStateMachine {
             return vec![];
         }
         self.paused_for_cache = pfc;
-        if !is_active_phase(self.s.phase) {
+        if !self.s.phase.is_active() {
             return vec![];
         }
         apply_buffering_change(
@@ -194,7 +194,7 @@ impl PlaybackStateMachine {
             return vec![];
         }
         self.core_idle = core_idle;
-        if !is_active_phase(self.s.phase) {
+        if !self.s.phase.is_active() {
             return vec![];
         }
         apply_buffering_change(
@@ -302,13 +302,6 @@ impl PlaybackStateMachine {
         self.s.display_hz = hz;
         vec![PlaybackEvent::new(PlaybackEventKind::DisplayHzChanged)]
     }
-}
-
-fn is_active_phase(p: PlaybackPhase) -> bool {
-    matches!(
-        p,
-        PlaybackPhase::Starting | PlaybackPhase::Playing | PlaybackPhase::Paused
-    )
 }
 
 fn ready_to_play(ty: MediaType, frame_available: bool) -> bool {

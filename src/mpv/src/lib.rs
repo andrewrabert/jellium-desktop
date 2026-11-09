@@ -17,7 +17,6 @@ mod event_loop;
 mod handle;
 mod log;
 mod node;
-mod options;
 mod property;
 
 pub mod api;
@@ -33,5 +32,4 @@ pub use event_loop::EventLoop;
 pub use handle::{Handle, WakeupCallback};
 pub use log::{LogLevel, forward_to_tracing as forward_log_to_tracing};
 pub use node::{Node, NodeArray, NodeMap};
-pub use options::{HWDEC_DEFAULT, hwdec_options, is_valid_hwdec};
 pub use property::Format;

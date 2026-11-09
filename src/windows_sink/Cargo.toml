@@ -24,7 +24,6 @@ windows = { workspace = true, features = [
     "Foundation_Collections",
 ] }
 windows-core.workspace = true
-windows-future = "0.3"
 
 [lints]
 workspace = true

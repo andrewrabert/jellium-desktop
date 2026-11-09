@@ -14,12 +14,6 @@ use sink::SceneSink;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct LayerId(pub usize);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Above {
-    Parent,
-    Layer(LayerId),
-}
-
 #[derive(Default)]
 pub struct Scene {
     order: Vec<LayerId>,
@@ -29,12 +23,20 @@ pub struct Scene {
 pub enum SceneEvent {
     LayerAdded(LayerId),
     LayerRemoved(LayerId),
-    Restack(Vec<LayerId>),
+    /// whole order, bottom first
+    Order(Vec<LayerId>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Effect {
-    PlaceAbove { layer: LayerId, above: Above },
+    /// `layer` sits directly above `below`, which is always another layer.
+    PlaceAbove {
+        layer: LayerId,
+        below: LayerId,
+    },
+    /// mpv's video subsurface goes directly above the parent, below every app
+    /// sibling.
+    PinVideoBottom,
     CommitParent,
 }
 
@@ -47,14 +49,15 @@ impl Scene {
         if self.order == self.applied {
             return Vec::new();
         }
-        let mut out = Vec::with_capacity(self.order.len() + 1);
+        let mut out = Vec::with_capacity(self.order.len() + 2);
         let mut prev: Option<LayerId> = None;
         for &id in &self.order {
-            let above = match prev {
-                None => Above::Parent,
-                Some(p) => Above::Layer(p),
-            };
-            out.push(Effect::PlaceAbove { layer: id, above });
+            match prev {
+                // The bottom app layer is placed by pinning the video below it:
+                // placing it against the parent instead would sink it under mpv.
+                None => out.push(Effect::PinVideoBottom),
+                Some(below) => out.push(Effect::PlaceAbove { layer: id, below }),
+            }
             prev = Some(id);
         }
         if !out.is_empty() {
@@ -77,9 +80,16 @@ pub fn reduce(scene: &mut Scene, ev: SceneEvent) -> Vec<Effect> {
             scene.order.retain(|&l| l != id);
             scene.restack_effects()
         }
-        SceneEvent::Restack(order) => {
-            let known: Vec<LayerId> = order.into_iter().filter(|id| scene.has(*id)).collect();
-            scene.order = known;
+        SceneEvent::Order(order) => {
+            let mut next: Vec<LayerId> = order.into_iter().filter(|id| scene.has(*id)).collect();
+            // A layer the owner did not name keeps its place above the named ones, so
+            // one created between two applications is never deordered.
+            for id in &scene.order {
+                if !next.contains(id) {
+                    next.push(*id);
+                }
+            }
+            scene.order = next;
             scene.restack_effects()
         }
     }
@@ -108,19 +118,10 @@ mod tests {
     }
 
     #[test]
-    fn add_layer_stacks_above_parent_and_commits() {
+    fn add_layer_pins_video_below_it_and_commits() {
         let mut s = Scene::default();
         let e = add(&mut s, MAIN);
-        assert_eq!(
-            e,
-            vec![
-                Effect::PlaceAbove {
-                    layer: MAIN,
-                    above: Above::Parent
-                },
-                Effect::CommitParent,
-            ]
-        );
+        assert_eq!(e, vec![Effect::PinVideoBottom, Effect::CommitParent]);
     }
 
     #[test]
@@ -131,13 +132,10 @@ mod tests {
         assert_eq!(
             e,
             vec![
-                Effect::PlaceAbove {
-                    layer: MAIN,
-                    above: Above::Parent
-                },
+                Effect::PinVideoBottom,
                 Effect::PlaceAbove {
                     layer: ABOUT,
-                    above: Above::Layer(MAIN)
+                    below: MAIN
                 },
                 Effect::CommitParent,
             ]
@@ -152,7 +150,7 @@ mod tests {
         for ev in [
             SceneEvent::LayerAdded(MAIN),
             SceneEvent::LayerAdded(ABOUT),
-            SceneEvent::Restack(vec![ABOUT, MAIN]),
+            SceneEvent::Order(vec![ABOUT, MAIN]),
             SceneEvent::LayerRemoved(ABOUT),
         ] {
             let e = reduce(&mut s, ev);
@@ -163,30 +161,27 @@ mod tests {
     }
 
     #[test]
-    fn restack_to_unchanged_order_is_noop() {
+    fn order_matching_the_applied_one_is_noop() {
         let mut s = Scene::default();
         add(&mut s, MAIN);
         add(&mut s, ABOUT);
-        let e = reduce(&mut s, SceneEvent::Restack(vec![MAIN, ABOUT]));
+        let e = reduce(&mut s, SceneEvent::Order(vec![MAIN, ABOUT]));
         assert_eq!(e, vec![]);
     }
 
     #[test]
-    fn restack_reorders_and_commits() {
+    fn order_reorders_and_commits() {
         let mut s = Scene::default();
         add(&mut s, MAIN);
         add(&mut s, ABOUT);
-        let e = reduce(&mut s, SceneEvent::Restack(vec![ABOUT, MAIN]));
+        let e = reduce(&mut s, SceneEvent::Order(vec![ABOUT, MAIN]));
         assert_eq!(
             e,
             vec![
-                Effect::PlaceAbove {
-                    layer: ABOUT,
-                    above: Above::Parent
-                },
+                Effect::PinVideoBottom,
                 Effect::PlaceAbove {
                     layer: MAIN,
-                    above: Above::Layer(ABOUT)
+                    below: ABOUT
                 },
                 Effect::CommitParent,
             ]

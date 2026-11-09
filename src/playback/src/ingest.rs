@@ -2,10 +2,10 @@
 //!
 //! Consumes [`mpv::Event`] values from the Rust event loop and produces
 //! coordinator [`Input`]s plus a couple of side outputs that don't fit
-//! the [`Input`] vocabulary (display-scale callback fanout, raw OSD
-//! pixel-dim mirror for the geometry-save cache).
+//! the [`Input`] vocabulary (the window-extent mirror for the
+//! geometry-save cache).
 //!
-//! Per-process state (fullscreen, window_max, display_scale, display_hz)
+//! Per-process state (fullscreen, window_max, display_hz)
 //! lives in [`IngestState`] so multiple
 //! ingest calls observe the same change-suppression behavior.
 
@@ -30,7 +30,6 @@ pub mod observe_id {
     pub const DISPLAY_FPS: u64 = 9;
     pub const CACHE_STATE: u64 = 10;
     pub const WINDOW_MAX: u64 = 11;
-    pub const DISPLAY_SCALE: u64 = 12;
     pub const PAUSED_FOR_CACHE: u64 = 13;
     pub const CORE_IDLE: u64 = 14;
     pub const VIDEO_FRAME_INFO: u64 = 15;
@@ -39,22 +38,15 @@ pub mod observe_id {
 
 const MAX_BUFFERED_RANGES: usize = 8;
 
-/// Caller-provided platform hooks. Matches the surface the C++ digest
-/// reached out to (`g_platform.get_scale`, `macos_platform::
-/// query_logical_content_size`). Implementations stay outside this
-/// crate so jfn-playback doesn't grow a platform dep.
+/// Caller-provided platform hooks. Implementations stay outside this crate so
+/// jfn-playback doesn't grow a platform dep.
 pub trait IngestCtx {
-    /// Current device pixel scale. `0.0` is treated as unknown and
-    /// substituted with `1.0` by [`ingest`].
-    fn scale(&self) -> f32;
+    /// The display scale the platform reports.
+    fn scale(&self) -> Scale;
 
-    /// macOS-only logical content size override. When `Some`, the OSD
-    /// dim emitted to the coordinator uses this for `lw`/`lh` and back-
-    /// computes `pw`/`ph` from `scale`. Returns `None` on every other
-    /// platform.
-    fn macos_logical_size(&self) -> Option<(i32, i32)> {
-        None
-    }
+    /// The app window's logical size where the OS, not mpv's
+    /// `osd-dimensions`, is the authority for it.
+    fn os_logical_size(&self) -> Option<LogicalSize>;
 }
 
 /// One ingest-loop output. Most map to coordinator inputs; the two side
@@ -73,8 +65,8 @@ pub(crate) enum IngestOut {
 
 /// Shared atomic cache mirroring the prior C++ `s_*` statics. Holds
 /// last-observed values so digest functions can suppress duplicate
-/// emissions (display-scale, display-fps) and so external readers
-/// (`fullscreen`, `window_maximized`, `display_scale`, `display_hz`)
+/// emissions (display-fps) and so external readers
+/// (`fullscreen`, `window_maximized`, `display_hz`)
 /// see the current state without round-tripping through the
 /// coordinator snapshot.
 #[derive(Debug, Default)]
@@ -84,7 +76,6 @@ pub struct IngestState {
     /// Last known window extent, written whole by the osd-dimensions
     /// digest.
     extent: AtomicCell<Option<WindowExtent>>,
-    display_scale: AtomicCell<f64>,
     display_hz: AtomicCell<f64>,
     /// mpv's native window handle; `0` until the VO has a window.
     window_id: AtomicI64,
@@ -104,8 +95,8 @@ impl IngestState {
     pub fn window_extent(&self) -> Option<WindowExtent> {
         self.extent.load()
     }
-    pub fn display_scale(&self) -> f64 {
-        self.display_scale.load()
+    pub(crate) fn set_window_extent(&self, extent: WindowExtent) {
+        self.extent.store(Some(extent));
     }
     pub fn display_hz(&self) -> f64 {
         self.display_hz.load()
@@ -233,24 +224,6 @@ fn digest_property<C: IngestCtx>(
             }
             Vec::new()
         }
-        DISPLAY_SCALE => {
-            let Some(new_scale) = as_double(value) else {
-                return Vec::new();
-            };
-            if state.display_scale.swap(new_scale) == new_scale {
-                return Vec::new();
-            }
-            match state.extent.load() {
-                Some(e) => {
-                    state.extent.store(Some(WindowExtent::new(
-                        e.physical(),
-                        Scale(new_scale as f32),
-                    )));
-                    vec![IngestOut::WindowExtentChanged]
-                }
-                None => Vec::new(),
-            }
-        }
         DISPLAY_FPS => {
             let Some(fps) = as_double(value) else {
                 return Vec::new();
@@ -279,32 +252,37 @@ fn digest_osd_dims<C: IngestCtx>(
     if w <= 0 || h <= 0 {
         return Vec::new();
     }
-    let mut pw = w as i32;
-    let mut ph = h as i32;
-    let scale = {
-        let s = ctx.scale();
-        if s > 0.0 { s } else { 1.0 }
-    };
-    let mut lw = (pw as f32 / scale) as i32;
-    let mut lh = (ph as f32 / scale) as i32;
-    if let Some((qlw, qlh)) = ctx.macos_logical_size()
-        && qlw > 0
-        && qlh > 0
-    {
-        lw = qlw;
-        lh = qlh;
-        pw = (qlw as f32 * scale) as i32;
-        ph = (qlh as f32 * scale) as i32;
-    }
-    if lw <= 0 || lh <= 0 {
+    let (Ok(w), Ok(h)) = (i32::try_from(w), i32::try_from(h)) else {
         return Vec::new();
-    }
-    state.extent.store(Some(WindowExtent::with_logical(
-        PhysicalSize { w: pw, h: ph },
-        Scale(scale),
-        LogicalSize { w: lw, h: lh },
-    )));
+    };
+    let physical = PhysicalSize { w, h };
+    let scale = ctx.scale();
+    let extent = match ctx.os_logical_size().filter(|l| l.w > 0 && l.h > 0) {
+        Some(logical) => extent_at(scale, logical),
+        None => extent_of(scale, physical),
+    };
+    let Some(extent) = extent else {
+        return Vec::new();
+    };
+    state.set_window_extent(extent);
     vec![IngestOut::WindowExtentChanged]
+}
+
+/// The extent a reported scale and an exact logical content size name; the
+/// physical size is the single conversion of the logical one.
+pub(crate) fn extent_at(scale: Scale, logical: LogicalSize) -> Option<WindowExtent> {
+    WindowExtent::new(logical.to_physical(scale)?, scale, logical)
+}
+
+/// The extent a reported scale and mpv's exact pixel size name.
+///
+/// mpv's pixel size is carried through verbatim; the logical size is the
+/// single conversion of it.
+///
+/// `None` when the division names no logical size, or when either axis is
+/// below two pixels.
+pub(crate) fn extent_of(scale: Scale, physical: PhysicalSize) -> Option<WindowExtent> {
+    WindowExtent::new(physical, scale, physical.to_logical(scale)?)
 }
 
 fn digest_cache_state(value: &PropertyValue) -> Vec<IngestOut> {
@@ -357,21 +335,26 @@ fn as_double(v: &PropertyValue) -> Option<f64> {
 mod tests {
     use super::*;
     use jfn_mpv::Node;
+    use jfn_platform_abi::COVERED_SCALES;
 
     struct TestCtx {
-        scale: f32,
-        mac: Option<(i32, i32)>,
+        scale: Scale,
+        mac: Option<LogicalSize>,
     }
     impl IngestCtx for TestCtx {
-        fn scale(&self) -> f32 {
+        fn scale(&self) -> Scale {
             self.scale
         }
-        fn macos_logical_size(&self) -> Option<(i32, i32)> {
+        fn os_logical_size(&self) -> Option<LogicalSize> {
             self.mac
         }
     }
 
-    fn ctx(scale: f32) -> TestCtx {
+    fn ratio(numerator: u64, denominator: u64) -> Option<Scale> {
+        Scale::from_ratio(numerator, std::num::NonZeroU64::new(denominator)?)
+    }
+
+    fn ctx(scale: Scale) -> TestCtx {
         TestCtx { scale, mac: None }
     }
 
@@ -389,7 +372,7 @@ mod tests {
         let out = ingest(
             &prop(observe_id::PAUSE, PropertyValue::Flag(true)),
             &state,
-            &ctx(1.0),
+            &ctx(Scale::ONE),
         );
         assert_eq!(out.len(), 1);
         matches!(out[0], IngestOut::Input(Input::PauseChanged(true)));
@@ -401,7 +384,7 @@ mod tests {
         let out = ingest(
             &prop(observe_id::TIME_POS, PropertyValue::Double(1.5)),
             &state,
-            &ctx(1.0),
+            &ctx(Scale::ONE),
         );
         let IngestOut::Input(Input::Position(p)) = &out[0] else {
             panic!("expected Position");
@@ -416,12 +399,12 @@ mod tests {
         let _ = ingest(
             &prop(observe_id::WINDOW_MAX, PropertyValue::Flag(true)),
             &state,
-            &ctx(1.0),
+            &ctx(Scale::ONE),
         );
         let out = ingest(
             &prop(observe_id::FULLSCREEN, PropertyValue::Flag(true)),
             &state,
-            &ctx(1.0),
+            &ctx(Scale::ONE),
         );
         let IngestOut::Input(Input::Fullscreen {
             fullscreen,
@@ -437,7 +420,7 @@ mod tests {
         let out = ingest(
             &prop(observe_id::FULLSCREEN, PropertyValue::Flag(false)),
             &state,
-            &ctx(1.0),
+            &ctx(Scale::ONE),
         );
         let IngestOut::Input(Input::Fullscreen {
             fullscreen,
@@ -451,7 +434,7 @@ mod tests {
         assert!(!state.fullscreen());
     }
 
-    fn digest_dims(state: &IngestState, w: i64, h: i64, scale: f32) {
+    fn digest_dims(state: &IngestState, w: i64, h: i64, scale: Scale) {
         let node = Node::Map(vec![("w".into(), Node::Int(w)), ("h".into(), Node::Int(h))]);
         let _ = ingest(
             &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
@@ -461,29 +444,17 @@ mod tests {
     }
 
     #[test]
-    fn display_scale_suppresses_duplicates() {
-        let state = IngestState::new();
-        digest_dims(&state, 1280, 720, 1.0);
-        let v = PropertyValue::Double(2.0);
-        let out = ingest(
-            &prop(observe_id::DISPLAY_SCALE, v.clone()),
-            &state,
-            &ctx(1.0),
-        );
-        assert!(matches!(out[0], IngestOut::WindowExtentChanged));
-        assert_eq!(state.display_scale(), 2.0);
-        let out = ingest(&prop(observe_id::DISPLAY_SCALE, v), &state, &ctx(1.0));
-        assert!(out.is_empty());
-    }
-
-    #[test]
     fn display_fps_suppresses_duplicates() {
         let state = IngestState::new();
         let v = PropertyValue::Double(60.0);
-        let out = ingest(&prop(observe_id::DISPLAY_FPS, v.clone()), &state, &ctx(1.0));
+        let out = ingest(
+            &prop(observe_id::DISPLAY_FPS, v.clone()),
+            &state,
+            &ctx(Scale::ONE),
+        );
         matches!(out[0], IngestOut::Input(Input::DisplayHz(_)));
         assert_eq!(state.display_hz(), 60.0);
-        let out = ingest(&prop(observe_id::DISPLAY_FPS, v), &state, &ctx(1.0));
+        let out = ingest(&prop(observe_id::DISPLAY_FPS, v), &state, &ctx(Scale::ONE));
         assert!(out.is_empty());
     }
 
@@ -494,71 +465,113 @@ mod tests {
             ("w".into(), Node::Int(3840)),
             ("h".into(), Node::Int(2160)),
         ]);
-        let out = ingest(
-            &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
-            &state,
-            &ctx(2.0),
+        let observed = ratio(2, 1).map(|two| {
+            let out = ingest(
+                &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
+                &state,
+                &ctx(two),
+            );
+            (
+                out.len(),
+                state
+                    .window_extent()
+                    .map(|e| (e.physical(), e.logical(), e.scale())),
+            )
+        });
+        assert_eq!(
+            observed,
+            ratio(2, 1).map(|two| (
+                1,
+                Some((
+                    PhysicalSize { w: 3840, h: 2160 },
+                    LogicalSize { w: 1920, h: 1080 },
+                    two
+                ))
+            ))
         );
-        assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], IngestOut::WindowExtentChanged));
-        let Some(extent) = state.window_extent() else {
-            panic!("expected extent");
-        };
-        assert_eq!(extent.physical(), PhysicalSize { w: 3840, h: 2160 });
-        assert_eq!(extent.logical(), LogicalSize { w: 1920, h: 1080 });
-        assert_eq!(extent.scale(), Scale(2.0));
     }
 
     #[test]
     fn osd_dims_uses_macos_logical_override() {
         let state = IngestState::new();
-        let mut c = ctx(2.0);
-        c.mac = Some((1280, 720));
         let node = Node::Map(vec![
             ("w".into(), Node::Int(3840)),
             ("h".into(), Node::Int(2160)),
         ]);
-        let out = ingest(
-            &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
-            &state,
-            &c,
+        let observed = ratio(2, 1).map(|two| {
+            let mut c = ctx(two);
+            c.mac = Some(LogicalSize { w: 1280, h: 720 });
+            let _ = ingest(
+                &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
+                &state,
+                &c,
+            );
+            state.window_extent().map(|e| (e.logical(), e.physical()))
+        });
+        assert_eq!(
+            observed,
+            Some(Some((
+                LogicalSize { w: 1280, h: 720 },
+                PhysicalSize { w: 2560, h: 1440 }
+            )))
         );
-        assert!(matches!(out[0], IngestOut::WindowExtentChanged));
-        let Some(extent) = state.window_extent() else {
-            panic!("expected extent");
-        };
-        assert_eq!(extent.logical(), LogicalSize { w: 1280, h: 720 });
-        assert_eq!(extent.physical(), PhysicalSize { w: 2560, h: 1440 });
     }
 
     #[test]
-    fn display_scale_change_rewrites_extent_coherently() {
-        let state = IngestState::new();
-        digest_dims(&state, 3840, 2160, 2.0);
-        let out = ingest(
-            &prop(observe_id::DISPLAY_SCALE, PropertyValue::Double(1.5)),
-            &state,
-            &ctx(1.0),
+    fn the_extent_carries_the_reported_scale_at_every_covered_scale() {
+        let logical = LogicalSize { w: 1280, h: 720 };
+        let observed: Vec<Option<(Scale, LogicalSize)>> = COVERED_SCALES
+            .into_iter()
+            .map(|scale| {
+                let physical = logical.to_physical(scale)?;
+                let state = IngestState::new();
+                digest_dims(&state, i64::from(physical.w), i64::from(physical.h), scale);
+                state.window_extent().map(|e| (e.scale(), e.logical()))
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            COVERED_SCALES.map(|s| Some((s, logical))).to_vec()
         );
-        assert!(matches!(out[0], IngestOut::WindowExtentChanged));
-        let Some(extent) = state.window_extent() else {
-            panic!("expected extent");
-        };
-        assert_eq!(extent.physical(), PhysicalSize { w: 3840, h: 2160 });
-        assert_eq!(extent.scale(), Scale(1.5));
-        assert_eq!(extent.logical(), LogicalSize { w: 2560, h: 1440 });
+    }
+
+    #[test]
+    fn the_extent_carries_the_host_s_logical_size_verbatim() {
+        let logical = LogicalSize { w: 1281, h: 721 };
+        let observed: Vec<Option<LogicalSize>> = COVERED_SCALES
+            .into_iter()
+            .map(|scale| extent_at(scale, logical).map(|e| e.logical()))
+            .collect();
+        assert_eq!(observed, vec![Some(logical); COVERED_SCALES.len()]);
+    }
+
+    #[test]
+    fn mpv_s_pixel_size_survives_a_scale_that_does_not_divide_it() {
+        // 1497 / 2.5 rounds to 599; mpv's own 1497 must reach the extent.
+        let physical = PhysicalSize { w: 1497, h: 843 };
+        let observed = Scale::from_f64(2.5).map(|scale| {
+            let state = IngestState::new();
+            digest_dims(&state, i64::from(physical.w), i64::from(physical.h), scale);
+            state.window_extent().map(|e| e.physical())
+        });
+        assert_eq!(observed, Some(Some(physical)));
     }
 
     #[test]
     fn later_digest_overwrites_earlier() {
         let state = IngestState::new();
-        digest_dims(&state, 1600, 900, 1.0);
-        digest_dims(&state, 1196, 636, 2.0);
-        let Some(extent) = state.window_extent() else {
-            panic!("expected extent");
-        };
-        assert_eq!(extent.physical(), PhysicalSize { w: 1196, h: 636 });
-        assert_eq!(extent.scale(), Scale(2.0));
+        let observed = ratio(2, 1).map(|two| {
+            digest_dims(&state, 1600, 900, Scale::ONE);
+            digest_dims(&state, 1196, 636, two);
+            (
+                state.window_extent().map(|e| (e.physical(), e.scale())),
+                two,
+            )
+        });
+        assert_eq!(
+            observed,
+            ratio(2, 1).map(|two| (Some((PhysicalSize { w: 1196, h: 636 }, two)), two))
+        );
     }
 
     #[test]
@@ -571,7 +584,7 @@ mod tests {
         let out = ingest(
             &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
             &state,
-            &ctx(1.0),
+            &ctx(Scale::ONE),
         );
         assert!(out.is_empty());
     }
@@ -590,7 +603,7 @@ mod tests {
         let out = ingest(
             &prop(observe_id::CACHE_STATE, PropertyValue::Node(root)),
             &state,
-            &ctx(1.0),
+            &ctx(Scale::ONE),
         );
         let IngestOut::Input(Input::BufferedRanges(ref r)) = out[0] else {
             panic!("expected BufferedRanges");
@@ -603,7 +616,7 @@ mod tests {
     #[test]
     fn shutdown_event_returns_terminal() {
         let state = IngestState::new();
-        let out = ingest(&Event::Shutdown, &state, &ctx(1.0));
+        let out = ingest(&Event::Shutdown, &state, &ctx(Scale::ONE));
         assert!(matches!(out[0], IngestOut::Shutdown));
     }
 
@@ -613,7 +626,7 @@ mod tests {
         let out = ingest(
             &Event::EndFile(jfn_mpv::EndFileReason::Eof),
             &state,
-            &ctx(1.0),
+            &ctx(Scale::ONE),
         );
         let IngestOut::Input(Input::EndFile { reason, .. }) = &out[0] else {
             panic!();
@@ -624,7 +637,7 @@ mod tests {
     #[test]
     fn file_loaded_emits_input() {
         let state = IngestState::new();
-        let out = ingest(&Event::FileLoaded, &state, &ctx(1.0));
+        let out = ingest(&Event::FileLoaded, &state, &ctx(Scale::ONE));
         assert!(matches!(out[0], IngestOut::Input(Input::FileLoaded)));
     }
 }

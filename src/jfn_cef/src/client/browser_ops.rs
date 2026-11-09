@@ -4,15 +4,13 @@ use cef::{
     process_message_create, sys,
 };
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
-use crate::paint_scheduler::PaintMode;
-
-use super::{DEFAULT_FRAME_RATE, Inner, PAINT_MODE};
+use super::Inner;
+use crate::frame_rate::FrameRate;
 
 impl Inner {
     pub(super) fn browser_clone(&self) -> Option<Browser> {
-        self.browser.lock().clone()
+        self.browser.lock().browser.clone()
     }
 
     pub(super) fn host(&self) -> Option<BrowserHost> {
@@ -90,55 +88,41 @@ impl Inner {
         );
     }
 
-    pub(super) fn cef_create_browser(self: &Arc<Self>, url: &str) {
-        let shared = PAINT_MODE
-            .get_or_init(|| PaintMode::new(false))
-            .shared_textures();
+    pub(super) fn cef_create_browser(self: &Arc<Self>, url: &str) -> bool {
+        let shared = self.paint_mode.shared_textures();
         let parent: sys::cef_window_handle_t = unsafe { std::mem::zeroed() };
         let mut wi = WindowInfo::default().set_as_windowless(parent);
         wi.shared_texture_enabled = if shared { 1 } else { 0 };
-        let external_bf = jfn_platform_abi::try_get()
-            .and_then(|p| p.cef_host())
-            .is_some_and(|h| h.external_begin_frame());
+        let external_bf = jfn_platform_abi::try_lease()
+            .is_some_and(|p| p.cef_host().is_some_and(|h| h.external_begin_frame()));
         wi.external_begin_frame_enabled = if external_bf { 1 } else { 0 };
 
-        let fr_layer = self.frame_rate.load(Ordering::Acquire);
-        let fr_default = DEFAULT_FRAME_RATE.load(Ordering::Acquire);
-        let fr = if fr_layer > 0 { fr_layer } else { fr_default };
+        // Zero is CEF's own default.
+        let fr = self.frame_rate.load().map_or(0, FrameRate::get);
         let bs = BrowserSettings {
             background_color: 0,
-            windowless_frame_rate: if fr > 0 { fr } else { 60 },
+            windowless_frame_rate: fr,
             ..BrowserSettings::default()
         };
+        jfn_logging::log(
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Debug,
+            &format!("create browser windowless_frame_rate={fr} shared_textures={shared}"),
+        );
 
-        let kind = self.injection_kind.lock().clone();
-        let extra = crate::injection::build_for_kind(&kind, shared);
+        let extra = crate::injection::build_web(shared);
 
         let mut client = crate::client_impl::make_client(Arc::clone(self));
         let url_cef = CefString::from(url);
-        let mut extra_opt = extra.and_then(crate::injection::ExtraInfo::into_dictionary);
-        let _ = browser_host_create_browser(
+        let mut extra_opt = extra.into_dictionary();
+        browser_host_create_browser(
             Some(&wi),
             Some(&mut client),
             Some(&url_cef),
             Some(&bs),
             extra_opt.as_mut(),
             None,
-        );
-    }
-
-    pub(super) fn cef_close_browser(&self) {
-        if let Some(h) = self.host() {
-            h.close_browser(1);
-        }
-    }
-
-    pub(super) fn cef_load_url(&self, url: &str) {
-        let Some(b) = self.browser_clone() else {
-            return;
-        };
-        let Some(f) = b.main_frame() else { return };
-        f.load_url(Some(&CefString::from(url)));
+        ) != 0
     }
 
     pub(super) fn exec_js_focused(&self, js: &str) {
@@ -151,43 +135,43 @@ impl Inner {
         f.execute_java_script(Some(&code), Some(&url), 0);
     }
 
-    pub(super) fn frame_paste(&self) {
+    pub(crate) fn frame_paste(&self) {
         if let Some(f) = self.focused_or_main() {
             f.paste();
         }
     }
 
-    pub(super) fn frame_undo(&self) {
+    pub(crate) fn frame_undo(&self) {
         if let Some(f) = self.focused_or_main() {
             f.undo();
         }
     }
 
-    pub(super) fn frame_redo(&self) {
+    pub(crate) fn frame_redo(&self) {
         if let Some(f) = self.focused_or_main() {
             f.redo();
         }
     }
 
-    pub(super) fn frame_cut(&self) {
+    pub(crate) fn frame_cut(&self) {
         if let Some(f) = self.focused_or_main() {
             f.cut();
         }
     }
 
-    pub(super) fn frame_copy(&self) {
+    pub(crate) fn frame_copy(&self) {
         if let Some(f) = self.focused_or_main() {
             f.copy();
         }
     }
 
-    pub(super) fn frame_select_all(&self) {
+    pub(crate) fn frame_select_all(&self) {
         if let Some(f) = self.focused_or_main() {
             f.select_all();
         }
     }
 
     pub(crate) fn browser_alive(&self) -> bool {
-        self.browser.lock().is_some() && !self.closed.load(Ordering::Acquire)
+        self.browser.lock().browser.is_some()
     }
 }

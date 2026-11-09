@@ -9,21 +9,21 @@
 use jfn_platform_abi::{DisplayBackend, Platform};
 
 /// Install the backend on OSes with a single compile-time backend
-/// (Windows, macOS). Must run before `jfn_cef_start`: CEF subprocesses
+/// (Windows, macOS). Must run before CEF subprocess dispatch: CEF subprocesses
 /// bail out of the browser-process flow but may still query the
 /// platform. No-op on Linux ([`install_from_cli`] runs there instead).
 pub fn install_early() {
     #[cfg(target_os = "windows")]
     {
-        let p = jfn_windows::make_windows_platform();
-        p.early_init();
-        jfn_platform_abi::install(p);
+        jfn_platform_abi::install(jfn_windows::make_windows_platform());
+        // SAFETY: installation is process-owner wiring before runtime acquisition.
+        unsafe { jfn_platform_abi::get() }.early_init();
     }
     #[cfg(target_os = "macos")]
     {
-        let p = jfn_macos::make_macos_platform();
-        p.early_init();
-        jfn_platform_abi::install(p);
+        jfn_platform_abi::install(jfn_macos::make_macos_platform());
+        // SAFETY: installation is process-owner wiring before runtime acquisition.
+        unsafe { jfn_platform_abi::get() }.early_init();
     }
 }
 
@@ -68,8 +68,9 @@ pub fn install_from_cli(cli: &crate::cli::Cli) {
             DisplayBackend::X11 => jfn_x11::make_platform::make_x11_platform(),
             _ => unreachable!(),
         };
-        p.early_init();
         jfn_platform_abi::install(p);
+        // SAFETY: installation is process-owner wiring before runtime acquisition.
+        unsafe { jfn_platform_abi::get() }.early_init();
         tracing::info!(target: "Main", "Display backend: {}",
             if backend == DisplayBackend::Wayland { "wayland" } else { "x11" });
     }

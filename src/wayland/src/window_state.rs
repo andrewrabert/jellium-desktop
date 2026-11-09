@@ -1,6 +1,6 @@
 //! The single owner of Wayland window geometry/scale state. Everything lives
-//! in ONE `RwLock<Inner>`: the last fed scale (with its provenance) and the
-//! last published extent. Readers that need several fields coherently take a
+//! in ONE `RwLock<Inner>`: the scale the compositor stated and the last
+//! published extent. Readers that need several fields coherently take a
 //! single [`WindowState::window_extent`] snapshot; the per-field accessors read
 //! one field each and must not be composed into a geometry that spans two
 //! generations.
@@ -8,6 +8,8 @@
 use parking_lot::RwLock;
 
 use crate::runtime::WlRuntime;
+use jfn_platform_abi::Scale;
+
 use crate::scale::Scale120;
 use crate::wl_ops;
 
@@ -47,27 +49,11 @@ impl WindowMode {
     }
 }
 
-/// Where the current scale came from. A provisional scale (output probe, or
-/// the unit fallback when the compositor offers no fractional-scale protocol)
-/// is a stand-in until the compositor's authoritative `preferred_scale`
-/// arrives; an authoritative scale is never displaced by a provisional one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScaleProvenance {
-    Provisional,
-    Authoritative,
-}
-
-#[derive(Clone, Copy)]
-struct KnownScale {
-    scale: Scale120,
-    provenance: ScaleProvenance,
-}
-
 #[derive(Clone, Copy)]
 struct WindowExtent {
     logical: WindowSize,
     physical: WindowSize,
-    scale: KnownScale,
+    scale: Scale120,
     generation: u64,
     mode: WindowMode,
 }
@@ -75,11 +61,15 @@ struct WindowExtent {
 impl WindowExtent {
     fn build(
         logical: WindowSize,
-        scale: KnownScale,
+        scale: Scale120,
         mode: WindowMode,
         generation: u64,
     ) -> Option<Self> {
-        let physical = scale.scale.physical_size(logical)?;
+        let reported = scale.scale();
+        let physical = WindowSize::new(
+            reported.to_physical(logical.w())?,
+            reported.to_physical(logical.h())?,
+        )?;
         Some(Self {
             logical,
             physical,
@@ -91,7 +81,8 @@ impl WindowExtent {
 }
 
 struct Inner {
-    scale: Option<KnownScale>,
+    scale: Option<Scale120>,
+    unstated: crate::scale::UnstatedLog,
     extent: Option<WindowExtent>,
     generation: u64,
 }
@@ -105,7 +96,7 @@ pub(crate) struct WindowState {
 pub(crate) struct WindowExtentSnapshot {
     logical: WindowSize,
     physical: WindowSize,
-    scale: f32,
+    scale: Scale,
     mode: WindowMode,
 }
 
@@ -114,7 +105,7 @@ impl WindowExtentSnapshot {
         Self {
             logical: e.logical,
             physical: e.physical,
-            scale: e.scale.scale.ratio_f32(),
+            scale: e.scale.scale(),
             mode: e.mode,
         }
     }
@@ -127,7 +118,7 @@ impl WindowExtentSnapshot {
         self.physical
     }
 
-    pub(crate) fn scale(&self) -> f32 {
+    pub(crate) fn scale(&self) -> Scale {
         self.scale
     }
 
@@ -141,6 +132,7 @@ impl WindowState {
         Self {
             inner: RwLock::new(Inner {
                 scale: None,
+                unstated: crate::scale::UnstatedLog::new(),
                 extent: None,
                 generation: 0,
             }),
@@ -155,87 +147,121 @@ impl WindowState {
         self.extent().map(|e| WindowExtentSnapshot::from_extent(&e))
     }
 
-    pub(crate) fn known_scale(&self) -> Option<Scale120> {
-        self.inner.read().scale.map(|k| k.scale)
+    pub(crate) fn stated_scale(&self) -> Option<Scale120> {
+        self.inner.read().scale
     }
 
-    pub(crate) fn scale_known(&self) -> bool {
-        self.known_scale().is_some()
+    /// The scale this backend reports: the one the compositor has stated, else
+    /// [`crate::scale::unstated`], whose log flag rides in the same lock as
+    /// the absent scale.
+    pub(crate) fn scale(&self) -> Scale {
+        let stated = {
+            let st = self.inner.read();
+            st.extent.map(|e| e.scale).or(st.scale)
+        };
+        match stated {
+            Some(scale) => scale.scale(),
+            None => {
+                let mut st = self.inner.write();
+                crate::scale::unstated(&mut st.unstated).scale()
+            }
+        }
     }
 
-    pub(crate) fn cached_scale(&self) -> f32 {
-        let st = self.inner.read();
-        st.extent
-            .map(|e| e.scale.scale)
-            .or(st.scale.map(|k| k.scale))
-            .map_or(1.0, Scale120::ratio_f32)
+    /// Records [`crate::scale::unstated`] as the scale this backend states, for
+    /// the one session where no source will ever state one: no
+    /// `wp_fractional_scale_manager_v1` to send `preferred_scale`, and an
+    /// output probe that answered nothing.
+    ///
+    /// [`WindowState::stated_scale`] and [`WindowState::publish`] read the
+    /// scale, not the absence, so this is where the absence stops for them.
+    /// Records nothing when a scale is already held.
+    pub(crate) fn resolve_unstated_scale(&self) {
+        let mut st = self.inner.write();
+        if st.scale.is_some() {
+            return;
+        }
+        st.scale = Some(crate::scale::unstated(&mut st.unstated));
     }
 
+    /// Publishes the extent `logical`, `mode` and the stated scale name.
+    ///
+    /// Publishes nothing while no scale is stated; the present that the first
+    /// stated scale drives re-publishes the configure that arrived before it.
+    /// An extent the scale cannot build leaves the published extent and its
+    /// generation untouched, and says so.
+    ///
     /// The consumer notifications below read the value back through the
     /// accessors, so they must run after the write lock is released or they
     /// deadlock.
     pub(crate) fn publish(&self, rt: &'static WlRuntime, logical: WindowSize, mode: WindowMode) {
-        let Some(extent) = ({
+        let built = {
             let mut st = self.inner.write();
             let Some(scale) = st.scale else {
                 return;
             };
-            st.generation += 1;
-            let extent = WindowExtent::build(logical, scale, mode, st.generation);
-            if let Some(e) = extent {
-                st.extent = Some(e);
+            let built = WindowExtent::build(logical, scale, mode, st.generation + 1);
+            if let Some(extent) = built {
+                st.generation = extent.generation;
+                st.extent = Some(extent);
             }
-            extent
-        }) else {
-            return;
+            built.ok_or(scale)
+        };
+        let extent = match built {
+            Ok(extent) => extent,
+            Err(scale) => {
+                tracing::error!(
+                    target: "Main",
+                    "window extent {}x{} at scale {scale} is unrepresentable; the published extent stands",
+                    logical.w(),
+                    logical.h()
+                );
+                return;
+            }
         };
         tracing::debug!(
             target: "Main",
             "window extent gen={} logical={}x{} physical={}x{} scale={}",
             extent.generation, extent.logical.w, extent.logical.h,
-            extent.physical.w, extent.physical.h, extent.scale.scale
+            extent.physical.w, extent.physical.h, extent.scale
         );
 
         let fullscreen = mode == WindowMode::Fullscreen;
-        rt.root()
-            .sync_maximized_command_state(mode == WindowMode::Maximized);
         if rt.try_core().is_some() {
             wl_ops::on_configure(rt, fullscreen);
         }
         jfn_platform_abi::notify_window_changed();
     }
 
-    /// Satisfy the boot scale gate when no `wp_fractional_scale_manager_v1`
-    /// exists, so it doesn't wait forever for a `preferred_scale` that never
-    /// arrives.
-    pub(crate) fn feed_unit_scale(&self) {
-        self.feed_scale(Scale120::UNIT, ScaleProvenance::Provisional);
-    }
-
-    /// Record a scale, subject to [`scale_displaces`].
-    pub(crate) fn feed_scale(&self, scale: Scale120, provenance: ScaleProvenance) {
+    /// The compositor's `wp_fractional_scale_v1.preferred_scale`: the
+    /// authoritative scale, recorded whatever is already held.
+    pub(crate) fn report_scale(&self, scale: Scale120) {
         let first = {
             let mut st = self.inner.write();
             let first = st.scale.is_none();
-            if !scale_displaces(st.scale.map(|k| k.provenance), provenance) {
-                return;
-            }
-            st.scale = Some(KnownScale { scale, provenance });
+            st.scale = Some(scale);
             first
         };
         if first {
-            tracing::info!(target: "Main", "scale known: {scale}");
+            tracing::info!(target: "Main", "scale stated: {scale}");
         }
     }
-}
 
-/// Pure arbitration: an authoritative scale always wins; a provisional one
-/// never displaces an authoritative one (a late probe result must not clobber
-/// the compositor's `preferred_scale`).
-pub(crate) fn scale_displaces(current: Option<ScaleProvenance>, incoming: ScaleProvenance) -> bool {
-    match (current, incoming) {
-        (None, _) | (Some(_), ScaleProvenance::Authoritative) => true,
-        (Some(cur), ScaleProvenance::Provisional) => cur == ScaleProvenance::Provisional,
+    /// The output probe's scale, recorded only while none is held: a probe
+    /// result that lands after the compositor has spoken is stale.
+    pub(crate) fn seed_scale(&self, scale: Scale120) {
+        let seeded = {
+            let mut st = self.inner.write();
+            if st.scale.is_some() {
+                false
+            } else {
+                st.scale = Some(scale);
+                true
+            }
+        };
+        if seeded {
+            tracing::info!(target: "Main", "scale seeded from the output probe: {scale}");
+        }
     }
 }
 
@@ -247,33 +273,58 @@ pub(crate) fn feed_suspended(suspended: bool) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn any_scale_fills_an_empty_slot() {
-        assert!(scale_displaces(None, ScaleProvenance::Provisional));
-        assert!(scale_displaces(None, ScaleProvenance::Authoritative));
+    fn wire(raw: u32) -> Option<Scale120> {
+        Scale120::from_wire(raw)
     }
 
     #[test]
-    fn authoritative_always_displaces() {
-        assert!(scale_displaces(
-            Some(ScaleProvenance::Provisional),
-            ScaleProvenance::Authoritative
-        ));
-        assert!(scale_displaces(
-            Some(ScaleProvenance::Authoritative),
-            ScaleProvenance::Authoritative
-        ));
+    fn a_probe_seed_never_displaces_a_compositor_scale() {
+        let st = WindowState::new();
+        let (Some(stated), Some(probed)) = (wire(180), wire(120)) else {
+            return;
+        };
+        st.report_scale(stated);
+        st.seed_scale(probed);
+        assert_eq!(st.stated_scale(), Some(stated));
     }
 
     #[test]
-    fn provisional_corrects_provisional_but_never_authoritative() {
-        assert!(scale_displaces(
-            Some(ScaleProvenance::Provisional),
-            ScaleProvenance::Provisional
-        ));
-        assert!(!scale_displaces(
-            Some(ScaleProvenance::Authoritative),
-            ScaleProvenance::Provisional
-        ));
+    fn a_compositor_scale_displaces_a_probe_seed() {
+        let st = WindowState::new();
+        let (Some(probed), Some(stated)) = (wire(120), wire(180)) else {
+            return;
+        };
+        st.seed_scale(probed);
+        assert_eq!(st.stated_scale(), Some(probed));
+        st.report_scale(stated);
+        assert_eq!(st.stated_scale(), Some(stated));
+    }
+
+    #[test]
+    fn a_session_that_will_state_no_scale_reports_and_publishes_one() {
+        let st = WindowState::new();
+        assert_eq!(st.stated_scale(), None);
+        st.resolve_unstated_scale();
+        let resolved = st.stated_scale();
+        assert_eq!(resolved.map(Scale120::scale), Some(st.scale()));
+        assert!(resolved.is_some());
+        let Some(logical) = WindowSize::new(1280, 720) else {
+            return;
+        };
+        let Some(scale) = resolved else {
+            return;
+        };
+        assert!(WindowExtent::build(logical, scale, WindowMode::Floating, 1).is_some());
+    }
+
+    #[test]
+    fn a_resolved_absence_never_displaces_a_stated_scale() {
+        let st = WindowState::new();
+        let Some(stated) = wire(180) else {
+            return;
+        };
+        st.report_scale(stated);
+        st.resolve_unstated_scale();
+        assert_eq!(st.stated_scale(), Some(stated));
     }
 }

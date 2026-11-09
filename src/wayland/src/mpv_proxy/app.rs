@@ -234,6 +234,7 @@ pub(super) fn run_app_state(
         }
         ensure_root(&ctx);
         maybe_build_root(&ctx);
+        apply_pin_video_bottom(&ctx);
     }
 }
 
@@ -415,6 +416,33 @@ fn maybe_build_root(ctx: &AppCtx) {
     }
     if let Some(mpv) = find_mpv_surface(ctx) {
         splice_mpv_under_host_root(ctx, mpv);
+    }
+}
+
+/// Serves a pin request raised by the host's stack owner. Before the splice
+/// there is nothing to place, so the request is put back and the splice — which
+/// pins as part of establishing the subsurface — serves it instead.
+fn apply_pin_video_bottom(ctx: &AppCtx) {
+    if !ctx.rt.proxy().take_pin_video_bottom() {
+        return;
+    }
+    let pinned = ctx.with_shell(|sh| {
+        let (Some(sub), Some(root)) = (sh.mpv_subsurface.as_ref(), sh.host_root_surface.as_ref())
+        else {
+            return false;
+        };
+        if let Err(e) = sub.place_above(root) {
+            tracing::error!(target: "MpvProxy", "pin video place_above: {}", Report::new(&e));
+        }
+        // Subsurface placement is parent-double-buffered, so without a commit
+        // the new order never applies.
+        if let Err(e) = root.try_send_commit() {
+            tracing::error!(target: "MpvProxy", "pin video root commit: {}", Report::new(&e));
+        }
+        true
+    });
+    if !pinned {
+        ctx.rt.proxy().pin_video_bottom();
     }
 }
 

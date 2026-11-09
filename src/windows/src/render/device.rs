@@ -1,8 +1,6 @@
 //! The DirectComposition objects and the process's wgpu device.
 
-use std::sync::OnceLock;
-
-use jfn_gpu_paint::{SharedTexture, Surfaces};
+use jfn_gpu_paint::Surfaces;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
@@ -54,17 +52,20 @@ impl Devices {
             tracing::error!(target: "platform", "DirectComposition Commit failed: {e:?}");
         }
     }
+
+    /// Commits and blocks until the composition engine has processed it, so
+    /// the change is on screen before the caller returns.
+    pub(crate) fn commit_and_wait(&self) {
+        self.commit();
+        if let Err(e) = unsafe { self.device.WaitForCommitCompletion() } {
+            tracing::error!(target: "platform", "DirectComposition WaitForCommitCompletion failed: {e:?}");
+        }
+    }
 }
 
-static GPU: OnceLock<Option<Surfaces>> = OnceLock::new();
-
-/// The process's wgpu device, opened on the adapter that produced `sample` —
-/// on Windows a shared handle carries the LUID of its creating adapter and
-/// nothing else names it.
-///
-/// One-shot in both directions: a painter borrows the device for `'static`,
-/// so it can never be replaced, and a failure to open it means this machine
-/// has no adapter that can take CEF's buffers, which no later frame changes.
-pub(crate) fn gpu(sample: Option<&SharedTexture>) -> Option<&'static Surfaces> {
-    GPU.get_or_init(|| Surfaces::init(sample, None)).as_ref()
+/// The process's wgpu device, opened at boot on the adapter this app picked.
+/// Chromium's GPU process is pinned to the same adapter on the command line,
+/// so no frame ever has to name it.
+pub(crate) fn gpu() -> Option<&'static Surfaces> {
+    Surfaces::init(None)
 }

@@ -6,16 +6,18 @@
 //! INSIDE the actor; there is no CEF-thread fallback.
 //!
 //! The content surface is attached after the geometry thread creates the
-//! window ([`OverlayActor::attach_content`]); frames that arrive before then
-//! are dropped (the surface has nowhere to land yet).
+//! window ([`OverlayActor::attach_content`]); a frame that arrives before then
+//! stays owed until it has.
 
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use jfn_gpu_paint::{
-    Frame, FrameSize as PhysicalSize, Pixels, Presented, SharedTexture, WindowTarget,
+    FrameSize as PhysicalSize, Pixels, PresentFailed, SharedTexture, WindowTarget,
 };
 use jfn_mailbox::Mailbox;
-use jfn_platform_abi::JfnRect;
+use jfn_platform_abi::{FrameRetry, FrameSource, JfnRect};
 use x11rb::connection::Connection;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xproto;
@@ -38,12 +40,14 @@ enum PendingFrame {
 
 struct OverlayState {
     pending: Option<PendingFrame>,
+    /// The producer that owes the pending frame's successor, held so a frame
+    /// the swapchain could not take can ask for the one that replaces it.
+    source: Option<Arc<dyn FrameSource>>,
     /// Handed over once the geometry thread has created the window.
     content: Option<ContentSurface>,
     /// Desired swapchain target extent (parent-derived); the geometry thread is
     /// the authority for it.
     target_size: (u32, u32),
-    visible: bool,
     shutdown: bool,
 }
 
@@ -54,12 +58,12 @@ pub(crate) struct OverlayActor {
 }
 
 impl OverlayActor {
-    pub(crate) fn new(visible: bool) -> Self {
+    pub(crate) fn new() -> Self {
         let mailbox = Mailbox::new(OverlayState {
             pending: None,
+            source: None,
             content: None,
             target_size: (1, 1),
-            visible,
             shutdown: false,
         });
         let worker_mailbox = mailbox.clone();
@@ -85,54 +89,37 @@ impl OverlayActor {
             .update(|s| s.target_size = (w as u32, h as u32));
     }
 
-    pub(crate) fn set_visible(&self, visible: bool) {
-        self.mailbox.update(|s| {
-            s.visible = visible;
-            if !visible {
-                s.pending = None;
-            }
-        });
-    }
-
+    /// `pixels` must cover `width * height` BGRA (the caller checked it).
     pub(crate) fn present_software(
         &self,
         dirty: &[JfnRect],
         pixels: &[u8],
         width: i32,
         height: i32,
-    ) -> bool {
-        if width <= 0 || height <= 0 {
-            return false;
-        }
+        source: Arc<dyn FrameSource>,
+    ) {
         let stride = (width as usize).saturating_mul(4);
-        let Some(len) = (height as usize).checked_mul(stride) else {
-            return false;
+        let len = (height as usize).saturating_mul(stride);
+        let Some(pixels) = pixels.get(..len) else {
+            return;
         };
-        if pixels.len() < len {
-            return false;
-        }
         self.mailbox.update(|s| {
-            if !s.visible {
-                return;
-            }
             s.pending = Some(PendingFrame::Pixels {
-                pixels: pixels[..len].to_vec(),
+                pixels: pixels.to_vec(),
                 dirty: dirty.to_vec(),
                 width,
                 height,
                 stride,
             });
+            s.source = Some(source);
         });
-        true
     }
 
-    pub(crate) fn present_shared(&self, frame: SharedTexture) -> bool {
+    pub(crate) fn present_shared(&self, frame: SharedTexture, source: Arc<dyn FrameSource>) {
         self.mailbox.update(|s| {
-            if s.visible {
-                s.pending = Some(PendingFrame::Shared(Box::new(frame)));
-            }
+            s.pending = Some(PendingFrame::Shared(Box::new(frame)));
+            s.source = Some(source);
         });
-        true
     }
 
     /// Deterministic teardown: signal shutdown and join the worker, which frees
@@ -185,51 +172,88 @@ fn initial_backend() -> Backend {
     }
 }
 
+/// What one iteration did with the frame it took.
+enum Outcome {
+    /// The frame reached the surface's commit stream.
+    Committed,
+    /// Nothing could take the frame yet — no texture, or no painter for a
+    /// shared frame — and it is owed again at this instant.
+    Deferred(PendingFrame, Option<Instant>),
+    /// The GPU path is done: the actor degrades to SHM and keeps the frame.
+    Degraded(PendingFrame),
+}
+
 fn run_worker(mailbox: Mailbox<OverlayState>) {
     let mut backend = initial_backend();
     let content_conn = crate::x11_state::x11rb_conn();
+    let mut retry = FrameRetry::default();
 
     loop {
-        let (frame, content_window, content_gc, visible, target_size, shutdown) = mailbox.wait(
-            |s| s.pending.is_some() || s.shutdown,
-            |s| {
-                let (win, gc) = s
-                    .content
-                    .as_ref()
-                    .map_or((None, None), |c| (Some(c.window()), Some(c.gc())));
-                (
-                    s.pending.take(),
-                    win,
-                    gc,
-                    s.visible,
-                    s.target_size,
-                    s.shutdown,
-                )
-            },
-        );
+        let ready = |s: &OverlayState| s.pending.is_some() || s.shutdown;
+        let take = |s: &mut OverlayState| {
+            let (win, gc) = s
+                .content
+                .as_ref()
+                .map_or((None, None), |c| (Some(c.window()), Some(c.gc())));
+            (
+                s.pending.take().zip(s.source.take()),
+                win,
+                gc,
+                s.target_size,
+                s.shutdown,
+            )
+        };
+        let taken = match retry.due() {
+            Some(at) => mailbox.wait_until(at, ready, take),
+            None => Some(mailbox.wait(ready, take)),
+        };
+        // Nothing arrived before the held frame came due: present it against
+        // the window the mailbox still names.
+        let (frame, content_window, content_gc, target_size, shutdown) =
+            taken.unwrap_or_else(|| {
+                mailbox.peek(|s| {
+                    let (win, gc) = s
+                        .content
+                        .as_ref()
+                        .map_or((None, None), |c| (Some(c.window()), Some(c.gc())));
+                    (None, win, gc, s.target_size, s.shutdown)
+                })
+            });
 
         if shutdown {
             break;
         }
+        let frame = retry.take(frame);
         let (Some(window), Some(gc)) = (content_window, content_gc) else {
-            // No window yet: nothing can be presented.
+            // The geometry thread has not created the window yet; the frame
+            // stays owed until it has.
+            if let Some((frame, source)) = frame {
+                retry.defer(frame, source, jfn_gpu_paint::Deferred::new().retry_at());
+            }
             continue;
         };
-        let Some(frame) = frame else {
+        let Some((frame, source)) = frame else {
             continue;
         };
-        if !visible {
-            continue;
-        }
 
-        present_frame(
+        match present_frame(
             &mut backend,
             content_conn.as_deref(),
             window,
             gc,
             target_size,
             frame,
-        );
+        ) {
+            Outcome::Committed => {}
+            Outcome::Deferred(frame, at) => retry.defer(frame, source, at),
+            // The degraded backend is SHM now, so the frame it kept goes out
+            // through it in the same iteration.
+            Outcome::Degraded(frame) => {
+                if let (Backend::Shm(state), Some(conn)) = (&mut backend, content_conn.as_deref()) {
+                    present_shm(state, conn, window, gc, frame);
+                }
+            }
+        }
     }
 
     teardown(backend, content_conn.as_deref(), &mailbox);
@@ -238,51 +262,68 @@ fn run_worker(mailbox: Mailbox<OverlayState>) {
 fn present_frame(
     backend: &mut Backend,
     content_conn: Option<&RustConnection>,
-    window: u32,
-    gc: u32,
+    window: xproto::Window,
+    gc: xproto::Gcontext,
     target_size: (u32, u32),
     frame: PendingFrame,
-) {
+) -> Outcome {
     match backend {
         Backend::Gpu(painter) => {
-            if present_gpu(painter, window, target_size, frame) {
-                return;
+            let outcome = present_gpu(painter, window, target_size, &frame);
+            match outcome {
+                Gpu::Committed => Outcome::Committed,
+                Gpu::Deferred(at) => Outcome::Deferred(frame, at),
+                Gpu::Degrade => {
+                    // Take the painter out and shut it down BEFORE switching —
+                    // wgpu's swapchain and hand-rolled SHM must never both be
+                    // writing this window.
+                    if let Backend::Gpu(p) = backend
+                        && let Some(p) = p.take()
+                    {
+                        drop(p);
+                    }
+                    *backend = Backend::Shm(ShmState::default());
+                    Outcome::Degraded(frame)
+                }
             }
-            // A fatal GPU failure: degrade to SHM. Take the painter out and
-            // shut it down BEFORE switching — wgpu's swapchain and hand-rolled
-            // SHM must never both be writing this window.
-            if let Backend::Gpu(p) = backend
-                && let Some(p) = p.take()
-            {
-                drop(p);
-            }
-            *backend = Backend::Shm(ShmState::default());
         }
         Backend::Shm(state) => {
             if let Some(conn) = content_conn {
                 present_shm(state, conn, window, gc, frame);
             }
+            Outcome::Committed
         }
     }
 }
 
-/// Present through the GPU surface. Returns `false` only when the failure was
-/// fatal and the caller should degrade to SHM. A failed shared frame is never
-/// fatal — dmabuf has no CPU fallback, so degrading would strand the surface
-/// with no output at all; the frame is logged and dropped instead.
+/// What the GPU path did with the frame it was shown.
+enum Gpu {
+    Committed,
+    Deferred(Option<Instant>),
+    Degrade,
+}
+
+/// The frame is owed again one refresh from now.
+fn owed_again() -> Gpu {
+    Gpu::Deferred(jfn_gpu_paint::Deferred::new().retry_at())
+}
+
+/// Present through the GPU surface. Only a lost surface asks the caller to
+/// degrade to SHM. A shared frame never does — dmabuf has no CPU fallback, so
+/// degrading would strand the surface with no output at all.
 fn present_gpu(
     painter: &mut Option<Box<jfn_gpu_paint::Surface<'static>>>,
-    window: u32,
+    window: xproto::Window,
     target_size: (u32, u32),
-    frame: PendingFrame,
-) -> bool {
+    frame: &PendingFrame,
+) -> Gpu {
     if painter.is_none() {
         let (Some(conn_ptr), Some(paint), Some(gpu)) = (
             crate::x11_state::raw_xcb_connection(),
             crate::x11_state::paint(),
             crate::paint::gpu(),
         ) else {
-            return true;
+            return owed_again();
         };
         let target = WindowTarget::Xcb {
             connection: conn_ptr,
@@ -303,32 +344,31 @@ fn present_gpu(
                 // present it, so it would be dropped here and so would every
                 // frame after it. Stay on GPU and retry creation next frame.
                 if matches!(frame, PendingFrame::Shared(_)) {
-                    tracing::warn!("[x11] overlay actor gpu init failed: {e}; dropping frame");
-                    return true;
+                    tracing::warn!("[x11] overlay actor gpu init failed: {e}; frame stays owed");
+                    return owed_again();
                 }
                 eprintln!("[x11] overlay actor gpu init failed: {e}; using SHM");
-                return false;
+                return Gpu::Degrade;
             }
         }
     }
     let Some(painter) = painter.as_mut() else {
-        return true;
+        return owed_again();
     };
-    painter.set_visible(true);
     painter.resize(PhysicalSize {
         w: target_size.0 as i32,
         h: target_size.1 as i32,
     });
 
-    let outcome = match &frame {
+    let outcome = match frame {
         PendingFrame::Pixels {
             pixels,
             dirty,
             width,
             height,
             stride,
-        } => painter.present(
-            Frame::Copied(Pixels {
+        } => painter.present_pixels(
+            Pixels {
                 size: PhysicalSize {
                     w: *width,
                     h: *height,
@@ -336,23 +376,24 @@ fn present_gpu(
                 stride: *stride as u32,
                 bgra: pixels,
                 dirty,
-            }),
+            },
             || {},
         ),
-        PendingFrame::Shared(tex) => painter.present(Frame::Shared(tex), || {}),
+        PendingFrame::Shared(tex) => painter.present_shared(tex, || {}),
     };
 
     match outcome {
-        Ok(Presented::Yes) => true,
-        Ok(Presented::Skipped) => {
-            tracing::debug!("[x11] overlay actor frame skipped (surface unavailable)");
-            true
+        Ok(_presented) => Gpu::Committed,
+        Err(PresentFailed::Deferred(deferred)) => Gpu::Deferred(deferred.retry_at()),
+        // The surface is fine and the producer owes the successor; nothing here
+        // can conjure one, so this frame goes nowhere.
+        Err(e @ (PresentFailed::Import | PresentFailed::Kind)) => {
+            tracing::debug!("[x11] overlay actor frame not presented: {e}");
+            owed_again()
         }
-        // An `Err` is the surface saying it is done; anything recoverable came
-        // back as `Skipped`.
-        Err(e) => {
+        Err(e @ PresentFailed::Lost(_)) => {
             eprintln!("[x11] overlay actor present failed: {e}; using SHM");
-            false
+            Gpu::Degrade
         }
     }
 }
@@ -386,7 +427,13 @@ fn present_shm(
     let dst_stride = (width as usize) * 4;
     let dst = buf.pixels_mut();
     for rect in &dirty {
-        let Some((rx, ry, rw, rh)) = clip_rect(rect, width, height) else {
+        let Some(JfnRect {
+            x: rx,
+            y: ry,
+            w: rw,
+            h: rh,
+        }) = rect.clamped(width, height)
+        else {
             continue;
         };
         for row in 0..rh {
@@ -423,31 +470,6 @@ fn present_shm(
     let _ = conn.flush();
 }
 
-fn clip_rect(rect: &JfnRect, width: i32, height: i32) -> Option<(i32, i32, i32, i32)> {
-    let mut rx = rect.x;
-    let mut ry = rect.y;
-    let mut rw = rect.w;
-    let mut rh = rect.h;
-    if rx < 0 {
-        rw += rx;
-        rx = 0;
-    }
-    if ry < 0 {
-        rh += ry;
-        ry = 0;
-    }
-    if rx + rw > width {
-        rw = width - rx;
-    }
-    if ry + rh > height {
-        rh = height - ry;
-    }
-    if rw <= 0 || rh <= 0 {
-        return None;
-    }
-    Some((rx, ry, rw, rh))
-}
-
 fn teardown(
     backend: Backend,
     content_conn: Option<&RustConnection>,
@@ -470,35 +492,5 @@ fn teardown(
             }
         });
         let _ = conn.flush();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn rect(x: i32, y: i32, w: i32, h: i32) -> JfnRect {
-        JfnRect { x, y, w, h }
-    }
-
-    #[test]
-    fn clip_rect_clamps_negative_origin() {
-        assert_eq!(clip_rect(&rect(-2, -2, 4, 4), 10, 10), Some((0, 0, 2, 2)));
-    }
-
-    #[test]
-    fn clip_rect_clamps_overflow() {
-        assert_eq!(clip_rect(&rect(8, 8, 10, 10), 10, 10), Some((8, 8, 2, 2)));
-    }
-
-    #[test]
-    fn clip_rect_rejects_zero_and_off_screen() {
-        assert_eq!(clip_rect(&rect(0, 0, 0, 5), 10, 10), None);
-        assert_eq!(clip_rect(&rect(10, 0, 4, 4), 10, 10), None);
-    }
-
-    #[test]
-    fn clip_rect_passes_through_in_bounds() {
-        assert_eq!(clip_rect(&rect(1, 2, 3, 4), 10, 10), Some((1, 2, 3, 4)));
     }
 }

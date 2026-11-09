@@ -1,9 +1,7 @@
 //! Native [`WindowSource`]: the Wayland backend owns the toplevel, so live
 //! geometry comes from compositor state, not mpv ingest.
 
-use jfn_platform_abi::{
-    LogicalSize, PhysicalSize, Scale, WindowExtent, WindowSnapshot, WindowSource,
-};
+use jfn_platform_abi::{AppCreatedWindow, BootGeometry, WindowSnapshot, WindowSource};
 
 use crate::runtime::WlRuntime;
 
@@ -22,23 +20,23 @@ impl WindowSource for WaylandWindowSource {
         // One snapshot so extent and mode can't span two generations.
         let snap = self.rt.window().window_extent();
         WindowSnapshot {
-            extent: snap.map(|e| {
-                WindowExtent::with_logical(
-                    PhysicalSize {
-                        w: e.physical().w(),
-                        h: e.physical().h(),
-                    },
-                    Scale(e.scale()),
-                    LogicalSize {
-                        w: e.logical().w(),
-                        h: e.logical().h(),
-                    },
-                )
-            }),
+            extent: snap
+                .as_ref()
+                .and_then(|s| crate::scale::extent(s.logical(), s.physical(), s.scale())),
             position: None,
             maximized: snap.is_some_and(|e| e.mode() == crate::window_state::WindowMode::Maximized),
             fullscreen: snap
                 .is_some_and(|e| e.mode() == crate::window_state::WindowMode::Fullscreen),
         }
+    }
+}
+
+impl AppCreatedWindow for WaylandWindowSource {
+    /// Only the app window's own geometry uses the boot size; mpv mirrors the
+    /// committed window geometry and never the boot guess.
+    fn seed_boot_geometry(&self, g: &BootGeometry) {
+        self.rt
+            .root()
+            .set_boot_geometry(g.logical().w, g.logical().h, g.maximized());
     }
 }

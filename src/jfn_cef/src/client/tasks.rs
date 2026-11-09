@@ -4,7 +4,8 @@ use crossbeam_channel::Sender;
 use std::sync::Arc;
 
 use super::Inner;
-use jfn_playback::shutdown::jfn_shutting_down;
+use crate::frame_rate::FrameRate;
+use crate::web_overlay::CloseDeliveryError;
 
 wrap_task! {
     struct ApplyResizeTask {
@@ -12,52 +13,37 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.inner.apply_pending_resize();
+            self.inner.session.dispatch(|| self.inner.apply_pending_resize());
         }
     }
 }
 
 pub(super) fn post_apply_resize(inner: Arc<Inner>, delay_ms: i64) {
-    let mut task = ApplyResizeTask::new(inner);
-    let _ = post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
+    let session = Arc::clone(&inner.session);
+    session.dispatch(|| {
+        let mut task = ApplyResizeTask::new(inner);
+        let _ = post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
+    });
 }
 
 wrap_task! {
     struct SetRefreshTask {
         inner: Arc<Inner>,
-        target: i32,
+        target: FrameRate,
     }
     impl Task {
         fn execute(&self) {
-            self.inner.apply_set_refresh(self.target);
+            self.inner.session.dispatch(|| self.inner.apply_set_refresh(self.target));
         }
     }
 }
 
-pub(super) fn post_set_refresh(inner: Arc<Inner>, target: i32) {
-    let mut task = SetRefreshTask::new(inner, target);
-    let _ = post_task(ThreadId::UI, Some(&mut task));
-}
-
-wrap_task! {
-    struct ResetCreateTask {
-        inner: Arc<Inner>,
-    }
-    impl Task {
-        fn execute(&self) {
-            // Creating a browser during shutdown races CefShutdown teardown
-            // and hangs.
-            if jfn_shutting_down() {
-                return;
-            }
-            self.inner.create("");
-        }
-    }
-}
-
-pub(super) fn post_reset_create(inner: Arc<Inner>) {
-    let mut task = ResetCreateTask::new(inner);
-    let _ = post_task(ThreadId::UI, Some(&mut task));
+pub(super) fn post_set_refresh(inner: Arc<Inner>, target: FrameRate) {
+    let session = Arc::clone(&inner.session);
+    session.dispatch(|| {
+        let mut task = SetRefreshTask::new(inner, target);
+        let _ = post_task(ThreadId::UI, Some(&mut task));
+    });
 }
 
 wrap_task! {
@@ -69,61 +55,146 @@ wrap_task! {
         fn execute(&self) {
             let text = jfn_js_json::to_js_json(&self.text).unwrap_or_else(|| "\"\"".to_string());
             let js = format!("document.execCommand('insertText',false,{text});");
-            self.inner.exec_js_focused(&js);
+            self.inner.session.dispatch(|| self.inner.exec_js_focused(&js));
         }
     }
 }
 
 pub(super) fn post_paste_js(inner: Arc<Inner>, text: String) {
-    let mut task = PasteJsTask::new(inner, text);
-    let _ = post_task(ThreadId::UI, Some(&mut task));
+    let session = Arc::clone(&inner.session);
+    session.dispatch(|| {
+        let mut task = PasteJsTask::new(inner, text);
+        let _ = post_task(ThreadId::UI, Some(&mut task));
+    });
 }
 
 wrap_task! {
-    struct CloseAndCollectTask {
-        tx: Sender<Vec<Arc<Inner>>>,
+    struct CloseTask {
+        inner: Arc<Inner>,
+        delivered: Sender<()>,
     }
     impl Task {
         fn execute(&self) {
-            let _ = self.tx.send(crate::browsers::jfn_browsers_close_and_snapshot());
+            let _ = self.inner.surface().set_visibility(jfn_platform_abi::Visibility::Hidden);
+            self.inner.menu_reset();
+            self.inner.close_browser_force();
+            let _ = self.delivered.send(());
         }
     }
 }
 
-pub(crate) fn jfn_cef_post_close_and_collect(tx: Sender<Vec<Arc<Inner>>>) {
-    let mut task = CloseAndCollectTask::new(tx);
-    assert!(
-        post_task(ThreadId::UI, Some(&mut task)) != 0,
-        "TID_UI post during shutdown — CEF UI thread invariant broken"
-    );
+/// Posts the one browser-close task onto TID_UI. A rejected post returns before
+/// ownership transfer, a canceled accepted task is reported by channel
+/// disconnection, and a delivered task waits for the client's RAII owner
+/// channel to disconnect after `OnBeforeClose`.
+pub(crate) fn post_close_and_wait(
+    inner: Arc<Inner>,
+    deadline: std::time::Instant,
+) -> Result<(), CloseDeliveryError> {
+    let owner_disconnected = inner.owner_disconnection();
+    let (delivered, delivery) = crossbeam_channel::bounded(1);
+    let mut task = CloseTask::new(inner, delivered);
+    let accepted = post_task(ThreadId::UI, Some(&mut task)) != 0;
+    drop(task);
+    if !accepted {
+        return Err(CloseDeliveryError::PostRejected);
+    }
+    wait_for_close(delivery, owner_disconnected, deadline)
+}
+
+fn wait_for_close(
+    delivery: crossbeam_channel::Receiver<()>,
+    owner_disconnected: crossbeam_channel::Receiver<std::convert::Infallible>,
+    deadline: std::time::Instant,
+) -> Result<(), CloseDeliveryError> {
+    delivery
+        .recv_deadline(deadline)
+        .map_err(|error| match error {
+            crossbeam_channel::RecvTimeoutError::Timeout => {
+                CloseDeliveryError::Timeout("close delivery")
+            }
+            crossbeam_channel::RecvTimeoutError::Disconnected => CloseDeliveryError::TaskCanceled,
+        })?;
+    match owner_disconnected.recv_deadline(deadline) {
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {}
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            return Err(CloseDeliveryError::Timeout("browser owner release"));
+        }
+        Ok(never) => match never {},
+    }
+    Ok(())
 }
 
 wrap_task! {
-    struct SetHiddenAllTask {
+    struct SetHiddenTask {
+        inner: Arc<Inner>,
         hidden: bool,
     }
     impl Task {
         fn execute(&self) {
-            crate::browsers::jfn_browsers_apply_hidden_all(self.hidden);
+            self.inner.session.dispatch(|| self.inner.cef_was_hidden(self.hidden));
         }
     }
 }
 
-pub(crate) fn jfn_cef_post_set_hidden_all(hidden: bool) {
-    let mut task = SetHiddenAllTask::new(hidden);
-    let _ = post_task(ThreadId::UI, Some(&mut task));
+pub(crate) fn post_set_hidden(inner: Arc<Inner>, hidden: bool) {
+    let session = Arc::clone(&inner.session);
+    session.dispatch(|| {
+        let mut task = SetHiddenTask::new(inner, hidden);
+        let _ = post_task(ThreadId::UI, Some(&mut task));
+    });
 }
 
-wrap_task! {
-    struct PushCsdStateAllTask {}
-    impl Task {
-        fn execute(&self) {
-            crate::browsers::jfn_browsers_apply_csd_state_all();
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn accepted_close_reports_delivery_timeout() {
+        let (_sender, delivery) = crossbeam_channel::bounded(1);
+        let (_owner, disconnected) = crossbeam_channel::unbounded();
+        assert_eq!(
+            wait_for_close(delivery, disconnected, Instant::now()),
+            Err(CloseDeliveryError::Timeout("close delivery"))
+        );
     }
-}
 
-pub(crate) fn jfn_cef_post_csd_state_all() {
-    let mut task = PushCsdStateAllTask::new();
-    let _ = post_task(ThreadId::UI, Some(&mut task));
+    #[test]
+    fn canceled_close_does_not_confirm_drain() {
+        let (sender, delivery) = crossbeam_channel::bounded(1);
+        drop(sender);
+        let (_owner, disconnected) = crossbeam_channel::unbounded();
+        assert_eq!(
+            wait_for_close(delivery, disconnected, Instant::now()),
+            Err(CloseDeliveryError::TaskCanceled)
+        );
+    }
+
+    #[test]
+    fn delivered_close_reports_owner_timeout() {
+        let (sender, delivery) = crossbeam_channel::bounded(1);
+        assert!(sender.send(()).is_ok());
+        let (_owner, disconnected) = crossbeam_channel::unbounded();
+        assert_eq!(
+            wait_for_close(delivery, disconnected, Instant::now()),
+            Err(CloseDeliveryError::Timeout("browser owner release"))
+        );
+    }
+
+    #[test]
+    fn delivered_close_requires_owner_release() {
+        let (sender, delivery) = crossbeam_channel::bounded(1);
+        assert!(sender.send(()).is_ok());
+        let (owner, disconnected) = crossbeam_channel::unbounded();
+        drop(owner);
+        assert_eq!(
+            wait_for_close(
+                delivery,
+                disconnected,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Ok(())
+        );
+    }
 }

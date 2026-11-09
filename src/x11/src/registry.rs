@@ -17,17 +17,18 @@
 //! (slotmap generation check). CEF-facing ops update desired/content state and
 //! enqueue a [`GeometryCommand`]; the geometry thread is the sole consumer.
 
+use std::ffi::c_int;
 use std::sync::OnceLock;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use slotmap::{Key, KeyData, SlotMap, new_key_type};
 use x11rb::protocol::xproto::{
     ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, Gcontext, StackMode, Window,
 };
 use x11rb::rust_connection::RustConnection;
 
-use jfn_platform_abi::SurfaceHandle;
+use jfn_platform_abi::{SurfaceHandle, Visibility};
 
 use crate::overlay_actor::OverlayActor;
 
@@ -141,11 +142,17 @@ pub(crate) fn split_capabilities(
     (StructureSurface { window }, ContentSurface { window, gc })
 }
 
-/// Per-surface shared record. Holds the content actor and the desired
-/// visibility flag; structure state lives on the geometry thread.
+/// Per-surface shared record. Holds the content actor; structure state —
+/// including the surface's one visibility value — lives on the geometry thread.
 pub(crate) struct SurfaceRecord {
     pub(crate) actor: OverlayActor,
-    pub(crate) visible: bool,
+    /// Set by `Platform::surface_window_target`. The geometry thread gives an
+    /// external window an empty XShape input region and issues no `GrabButton`
+    /// on it, and its actor drops every present.
+    pub(crate) external: bool,
+    pub(crate) window: Option<Window>,
+    pub(crate) target_ready: Vec<Box<dyn FnOnce() + Send>>,
+    pub(crate) top_physical: i32,
 }
 
 pub(crate) struct SurfaceRegistry {
@@ -192,18 +199,48 @@ pub(crate) fn registry() -> &'static Mutex<SurfaceRegistry> {
 /// no timer.
 pub(crate) enum GeometryCommand {
     /// Create the window for a reserved id and hand its [`ContentSurface`] to
-    /// the actor.
-    Create { id: SurfaceId },
+    /// the actor. The surface is born at `initial`.
+    Create { id: SurfaceId, initial: Visibility },
     /// Destroy the window for a freed id (its actor is already stopped).
     Destroy { id: SurfaceId },
-    /// Update the desired visibility of a surface (FSM folds it into map/unmap).
-    SetVisible { id: SurfaceId, visible: bool },
+    /// Set the surface's visibility (the FSM folds it into map/unmap).
+    SetVisibility {
+        id: SurfaceId,
+        visibility: Visibility,
+    },
     /// Replace the bottom-to-top overlay z-order.
     SetOrder { ids: Vec<SurfaceId> },
+    /// Reserve `top_physical` pixels at the top of the window for the shell
+    /// overlay; the surface is placed and sized below them.
+    SetTopInset { id: SurfaceId, top_physical: c_int },
+    /// Mark a surface externally presented: empty input region, no grab.
+    SetExternal { id: SurfaceId },
 }
 
 static QUEUE: OnceLock<Sender<GeometryCommand>> = OnceLock::new();
 static QUEUE_RX: OnceLock<Receiver<GeometryCommand>> = OnceLock::new();
+
+/// Serializes ticket minting against the geometry thread's drain so that every
+/// command counted by a drain's mark was already sent when the drain ran.
+struct Fence {
+    seq: Mutex<Seq>,
+    applied: Condvar,
+}
+
+struct Seq {
+    /// Tickets minted so far.
+    next: u64,
+    /// Highest ticket the geometry thread has applied and round-tripped.
+    applied: u64,
+}
+
+static FENCE: Fence = Fence {
+    seq: Mutex::new(Seq {
+        next: 0,
+        applied: 0,
+    }),
+    applied: Condvar::new(),
+};
 
 /// Install the command channel. Called once as the geometry thread starts.
 pub(crate) fn install_command_channel() {
@@ -212,21 +249,52 @@ pub(crate) fn install_command_channel() {
     let _ = QUEUE_RX.set(rx);
 }
 
-/// Enqueue a command and wake the geometry thread. Dropped silently before the
-/// channel exists (pre-boot) or after teardown.
-pub(crate) fn enqueue(cmd: GeometryCommand) {
-    if let Some(tx) = QUEUE.get() {
-        let _ = tx.send(cmd);
-    }
+/// Enqueue a command and wake the geometry thread, returning the ticket
+/// [`wait_applied`] waits on. `None` before the channel exists (pre-boot) or
+/// after teardown, where nothing will ever apply the command.
+pub(crate) fn enqueue(cmd: GeometryCommand) -> Option<u64> {
+    let tx = QUEUE.get()?;
+    let ticket = {
+        let mut seq = FENCE.seq.lock();
+        seq.next += 1;
+        if tx.send(cmd).is_err() {
+            return None;
+        }
+        seq.next
+    };
     crate::geometry::request_resync();
+    Some(ticket)
 }
 
-/// Drain all pending commands. Called only by the geometry thread on wake.
-pub(crate) fn drain_commands() -> Vec<GeometryCommand> {
+/// Drain all pending commands, with the mark covering every ticket minted so
+/// far. Called only by the geometry thread on wake.
+pub(crate) fn drain_commands() -> (Vec<GeometryCommand>, u64) {
     let Some(rx) = QUEUE_RX.get() else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    rx.try_iter().collect()
+    let seq = FENCE.seq.lock();
+    let mark = seq.next;
+    let cmds: Vec<GeometryCommand> = rx.try_iter().collect();
+    drop(seq);
+    (cmds, mark)
+}
+
+/// Announce that every ticket up to `mark` has been applied and round-tripped.
+/// Called only by the geometry thread.
+pub(crate) fn publish_applied(mark: u64) {
+    let mut seq = FENCE.seq.lock();
+    if mark > seq.applied {
+        seq.applied = mark;
+        FENCE.applied.notify_all();
+    }
+}
+
+/// Block until the geometry thread has applied `ticket`.
+pub(crate) fn wait_applied(ticket: u64) {
+    let mut seq = FENCE.seq.lock();
+    while seq.applied < ticket {
+        FENCE.applied.wait(&mut seq);
+    }
 }
 
 #[cfg(test)]

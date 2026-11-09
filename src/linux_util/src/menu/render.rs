@@ -1,15 +1,20 @@
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
+use iced_graphics::text::cosmic_text::{
+    Attrs, Buffer, Color, Family, Metrics, Shaping, SwashCache,
+};
 use tiny_skia::{Color as SkColor, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
 
-use jfn_platform_abi::MenuItem;
+use jfn_platform_abi::{MenuItem, Scale};
 
 // Logical (unscaled) metrics; multiplied by the display scale at layout time.
 const FONT_PX: f32 = 13.0;
-const ROW_H: f32 = 28.0;
-const SEP_H: f32 = 9.0;
+/// Row, separator and vertical-padding heights in logical pixels, whole
+/// counts: their physical values are [`Scale::to_physical`] of these, with no
+/// float round-trip.
+const ROW_H: i32 = 28;
+const SEP_H: i32 = 9;
+const PAD_Y: i32 = 4;
 const PAD_X: f32 = 12.0;
 const PAD_RIGHT: f32 = 24.0;
-const PAD_Y: f32 = 4.0;
 const MIN_W: f32 = 160.0;
 const RADIUS: f32 = 4.0;
 
@@ -44,7 +49,7 @@ pub struct Layout {
     pub height: i32,
     pub rows: Vec<Row>,
     pub selectable: Vec<usize>,
-    scale: f32,
+    scale: Scale,
 }
 
 impl Layout {
@@ -55,7 +60,7 @@ impl Layout {
             height,
             rows,
             selectable,
-            scale: 1.0,
+            scale: Scale::ONE,
         }
     }
 
@@ -88,30 +93,42 @@ impl Layout {
     }
 }
 
+fn with_font_system<R>(
+    f: impl FnOnce(&mut iced_graphics::text::cosmic_text::FontSystem) -> R,
+) -> R {
+    let mut guard = match iced_graphics::text::font_system().write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(guard.raw())
+}
+
+/// The menu's glyph cache. The font system it shapes through is the process's
+/// one, so the menu thread never runs a font scan of its own.
 pub struct Fonts {
-    system: FontSystem,
     cache: SwashCache,
 }
 
 impl Fonts {
     pub fn new() -> Self {
         Self {
-            system: FontSystem::new(),
             cache: SwashCache::new(),
         }
     }
 
     fn shape(&mut self, text: &str, font_px: f32) -> Buffer {
-        let mut buf = Buffer::new(&mut self.system, Metrics::new(font_px, font_px * 1.3));
-        buf.set_size(None, None);
-        buf.set_text(
-            text,
-            &Attrs::new().family(Family::SansSerif),
-            Shaping::Advanced,
-            None,
-        );
-        buf.shape_until_scroll(&mut self.system, false);
-        buf
+        with_font_system(|system| {
+            let mut buf = Buffer::new(system, Metrics::new(font_px, font_px * 1.3));
+            buf.set_size(None, None);
+            buf.set_text(
+                text,
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(system, false);
+            buf
+        })
     }
 
     fn text_width(&mut self, text: &str, font_px: f32) -> f32 {
@@ -128,12 +145,14 @@ impl Default for Fonts {
     }
 }
 
-pub fn layout(fonts: &mut Fonts, items: &[MenuItem], scale: f32) -> Layout {
-    let s = if scale > 0.0 { scale } else { 1.0 };
+/// `None` when the reported scale does not map one of the menu's logical
+/// metrics to a physical one.
+pub fn layout(fonts: &mut Fonts, items: &[MenuItem], scale: Scale) -> Option<Layout> {
+    let s = scale.as_f32();
     let font_px = FONT_PX * s;
-    let row_h = (ROW_H * s).round() as i32;
-    let sep_h = (SEP_H * s).round() as i32;
-    let pad_y = (PAD_Y * s).round() as i32;
+    let row_h = scale.to_physical(ROW_H)?;
+    let sep_h = scale.to_physical(SEP_H)?;
+    let pad_y = scale.to_physical(PAD_Y)?;
     let text_w_budget = (PAD_X + PAD_RIGHT) * s;
 
     let mut max_text = MIN_W * s - text_w_budget;
@@ -163,13 +182,13 @@ pub fn layout(fonts: &mut Fonts, items: &[MenuItem], scale: f32) -> Layout {
     }
     let height = y + pad_y;
 
-    Layout {
+    Some(Layout {
         width,
         height,
         rows,
         selectable,
-        scale: s,
-    }
+        scale,
+    })
 }
 
 pub fn paint(
@@ -178,7 +197,7 @@ pub fn paint(
     items: &[MenuItem],
     active: i32,
 ) -> Option<Pixmap> {
-    let s = layout.scale;
+    let s = layout.scale.as_f32();
     let mut pm = Pixmap::new(layout.width as u32, layout.height as u32)?;
 
     let w = layout.width as f32;
@@ -253,11 +272,9 @@ fn draw_text(
         let glyphs: Vec<_> = run.glyphs.to_vec();
         for glyph in &glyphs {
             let phys = glyph.physical((ox, oy + run.line_y), 1.0);
-            let Some(img) = fonts
-                .cache
-                .get_image(&mut fonts.system, phys.cache_key)
-                .as_ref()
-            else {
+            let img =
+                with_font_system(|system| fonts.cache.get_image(system, phys.cache_key).clone());
+            let Some(img) = img.as_ref() else {
                 continue;
             };
             if img.data.is_empty() {
@@ -342,10 +359,9 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Pat
 /// Writes premultiplied BGRA (wl_shm ARGB8888 little-endian, X11 ARGB32), and
 /// copies `min(dst.len(), pm.width() * pm.height() * 4)` bytes.
 pub fn blit_bgra(pm: &Pixmap, dst: &mut [u8]) {
-    for (out, src) in dst.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
-        out[0] = src[2];
-        out[1] = src[1];
-        out[2] = src[0];
-        out[3] = src[3];
+    let (out, _) = dst.as_chunks_mut::<4>();
+    let (src, _) = pm.data().as_chunks::<4>();
+    for (out, src) in out.iter_mut().zip(src) {
+        *out = [src[2], src[1], src[0], src[3]];
     }
 }

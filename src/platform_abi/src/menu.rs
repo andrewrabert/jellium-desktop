@@ -85,21 +85,27 @@ pub enum MenuScript {
 }
 
 pub fn menu_scripts(kind: MenuKind) -> &'static [MenuScript] {
-    match (menu_delivery(kind), kind) {
+    let Some(lease) = crate::try_lease() else {
+        return &[];
+    };
+    match (lease.menu_delivery(kind), kind) {
         (MenuDelivery::Page, MenuKind::Dropdown) => &[MenuScript::SelectMenu],
         _ => &[],
     }
 }
 
+/// Native menu access is borrowed from the platform lease.
+///
+/// ```compile_fail
+/// fn escape(lease: &jfn_platform_abi::PlatformLease) -> jfn_platform_abi::MenuDelivery<'static> {
+///     lease.menu_delivery(jfn_platform_abi::MenuKind::ContextMenu)
+/// }
+/// ```
 #[derive(Copy, Clone)]
-pub enum MenuDelivery {
-    Host(&'static dyn MenuHost),
+pub enum MenuDelivery<'a> {
+    Host(&'a dyn MenuHost),
     Composited,
     Page,
-}
-
-pub fn menu_delivery(kind: MenuKind) -> MenuDelivery {
-    crate::get().menu_delivery(kind)
 }
 
 pub trait MenuHost: Send + Sync {
@@ -117,38 +123,30 @@ pub trait MenuHost: Send + Sync {
     fn shutdown(&self) {}
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub struct MenuPlacement {
     /// Anchor in logical (view) coordinates.
-    pub x: c_int,
-    pub y: c_int,
-    /// Logical (compositor) size of the visible menu.
-    pub lw: c_int,
-    pub lh: c_int,
-    /// Physical (buffer) size of the visible menu.
-    pub pw: c_int,
-    pub ph: c_int,
+    pub anchor: crate::geometry::LogicalPoint,
+    /// The visible menu's own size in both spaces.
+    pub view: crate::geometry::WindowExtent,
 }
 
 pub struct MenuPaint {
     pub generation: Generation,
-    /// Premultiplied BGRA, `pw` x `ph`.
+    /// Premultiplied BGRA, `buffer.w` x `buffer.h`.
     pub pixels: Vec<u8>,
-    pub pw: c_int,
-    pub ph: c_int,
+    /// Physical (buffer) size of the whole menu.
+    pub buffer: crate::geometry::PhysicalSize,
     /// Scroll offset into the buffer, physical px.
     pub scroll: c_int,
-    /// Visible height of the crop, physical px.
-    pub view_ph: c_int,
-    /// Logical size the crop is scaled to.
-    pub lw: c_int,
-    pub lh: c_int,
+    /// The visible crop's own size in both spaces.
+    pub view: crate::geometry::WindowExtent,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct MenuMetrics {
     /// Physical pixels per logical pixel.
-    pub scale: f32,
+    pub scale: crate::geometry::Scale,
     /// Window height, physical px, that a width-constrained menu is clamped to;
     /// `None` leaves every menu full height.
     pub clamp_ph: Option<c_int>,
@@ -166,9 +164,21 @@ pub enum MenuClose {
 pub trait PopupSurface: Send + Sync {
     fn metrics(&self) -> MenuMetrics;
 
-    /// `serial` is the input serial a grab must cite; backends that do not grab
-    /// on a serial ignore it.
-    fn create(&self, generation: Generation, place: MenuPlacement, serial: u32);
+    /// Puts up the surface that holds the grab, anchored at `anchor`, with
+    /// no menu on it.
+    ///
+    /// That surface has no menu, so it has no logical size, no physical size
+    /// and no scale: each backend maps it at the smallest size its own
+    /// protocol admits, and no caller supplies one.
+    ///
+    /// `serial` is the input serial a grab must cite; backends that do not
+    /// grab on a serial ignore it.
+    fn arm(&self, generation: Generation, anchor: crate::geometry::LogicalPoint, serial: u32);
+
+    /// Maps the armed surface, so the grab takes effect before the menu has
+    /// pixels. A backend whose armed surface maps at [`PopupSurface::arm`]
+    /// states that here and does nothing else.
+    fn map_armed(&self, generation: Generation);
 
     fn reposition(&self, generation: Generation, place: MenuPlacement);
 

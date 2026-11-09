@@ -6,16 +6,162 @@
 //! platform-side and hands the resolved [`Bounds`] in, so the shared logic
 //! is testable on any host.
 
+use std::cmp::Ordering;
 use std::ffi::c_int;
+use std::num::NonZeroU64;
 
-/// HiDPI scale factor (physical pixels per logical pixel).
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Scale(pub f32);
+/// Physical pixels per logical pixel, exact.
+///
+/// Held as a reduced rational so a backend's own unit — 120ths, half-steps,
+/// DPI/96, a backing factor — survives with no error, and so the conversions
+/// below are integer arithmetic.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Scale {
+    numerator: NonZeroU64,
+    denominator: NonZeroU64,
+}
+
+/// `floor(num / den)` for a strictly positive `den`.
+fn floor_div(num: i128, den: i128) -> i128 {
+    let q = num / den;
+    if num % den != 0 && num < 0 { q - 1 } else { q }
+}
+
+/// `floor(num / den + 1/2)` for a strictly positive `den`: round-half-up,
+/// monotone over the whole input range.
+fn div_round_half_up(num: i128, den: i128) -> i128 {
+    floor_div(num * 2 + den, den * 2)
+}
+
+const fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// `value / divisor`, where `divisor` divides `value`.
+const fn reduce(value: NonZeroU64, divisor: u64) -> NonZeroU64 {
+    match NonZeroU64::new(value.get() / divisor) {
+        Some(reduced) => reduced,
+        None => unreachable!(),
+    }
+}
 
 impl Scale {
-    /// Replace a non-positive (unknown) scale with 1.0.
-    pub fn or_one(self) -> Self {
-        if self.0 > 0.0 { self } else { Scale(1.0) }
+    pub const ONE: Scale = Scale {
+        numerator: NonZeroU64::MIN,
+        denominator: NonZeroU64::MIN,
+    };
+
+    /// `numerator / denominator`, reduced by their greatest common divisor.
+    pub const fn from_nonzero_ratio(numerator: NonZeroU64, denominator: NonZeroU64) -> Scale {
+        let g = gcd(numerator.get(), denominator.get());
+        Scale {
+            numerator: reduce(numerator, g),
+            denominator: reduce(denominator, g),
+        }
+    }
+
+    /// `numerator / denominator`, reduced by their greatest common divisor.
+    /// `None` for a zero numerator.
+    pub fn from_ratio(numerator: u64, denominator: NonZeroU64) -> Option<Scale> {
+        Some(Scale::from_nonzero_ratio(
+            NonZeroU64::new(numerator)?,
+            denominator,
+        ))
+    }
+
+    /// The exact value of `value`, which is a dyadic rational. `None` when
+    /// `value` is not finite and greater than zero, or when its exact
+    /// numerator or denominator exceeds `u64`.
+    pub fn from_f64(value: f64) -> Option<Scale> {
+        if !value.is_finite() || value <= 0.0 {
+            return None;
+        }
+        let bits = value.to_bits();
+        let biased = ((bits >> 52) & 0x7ff) as i32;
+        let fraction = bits & ((1u64 << 52) - 1);
+        let (mut mantissa, mut exponent) = if biased == 0 {
+            (fraction, -1074i32)
+        } else {
+            (fraction | (1u64 << 52), biased - 1075)
+        };
+        let shift = mantissa.trailing_zeros();
+        mantissa >>= shift;
+        exponent += shift as i32;
+        if exponent >= 0 {
+            let factor = 1u64.checked_shl(u32::try_from(exponent).ok()?)?;
+            Scale::from_ratio(mantissa.checked_mul(factor)?, NonZeroU64::MIN)
+        } else {
+            let spread = u32::try_from(-exponent).ok()?;
+            let denominator = NonZeroU64::new(1u64.checked_shl(spread)?)?;
+            Scale::from_ratio(mantissa, denominator)
+        }
+    }
+
+    pub fn as_f32(self) -> f32 {
+        self.as_f64() as f32
+    }
+
+    pub fn as_f64(self) -> f64 {
+        self.numerator.get() as f64 / self.denominator.get() as f64
+    }
+
+    /// `logical * scale`, integer round-half-up. `None` when the result does
+    /// not fit `c_int`.
+    pub fn to_physical(self, logical: c_int) -> Option<c_int> {
+        let num = i128::from(logical) * i128::from(self.numerator.get());
+        c_int::try_from(div_round_half_up(num, i128::from(self.denominator.get()))).ok()
+    }
+
+    /// `physical / scale`, integer round-half-up. `None` when the result does
+    /// not fit `c_int`.
+    pub fn to_logical(self, physical: c_int) -> Option<c_int> {
+        let num = i128::from(physical) * i128::from(self.denominator.get());
+        c_int::try_from(div_round_half_up(num, i128::from(self.numerator.get()))).ok()
+    }
+}
+
+/// `value`, which is not zero.
+const fn nz(value: u64) -> NonZeroU64 {
+    match NonZeroU64::new(value) {
+        Some(v) => v,
+        None => unreachable!(),
+    }
+}
+
+/// The display scales this project covers end to end, as
+/// `dev/requirements/the-display-scale-every-consumer-overrules.md` records
+/// them: 0.5, 0.75, 1.0, 1.25, 1.5, 2.0.
+pub const COVERED_SCALES: [Scale; 6] = [
+    Scale::from_nonzero_ratio(nz(1), nz(2)),
+    Scale::from_nonzero_ratio(nz(3), nz(4)),
+    Scale::from_nonzero_ratio(nz(1), nz(1)),
+    Scale::from_nonzero_ratio(nz(5), nz(4)),
+    Scale::from_nonzero_ratio(nz(3), nz(2)),
+    Scale::from_nonzero_ratio(nz(2), nz(1)),
+];
+
+impl PartialOrd for Scale {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Scale {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let lhs = u128::from(self.numerator.get()) * u128::from(other.denominator.get());
+        let rhs = u128::from(other.numerator.get()) * u128::from(self.denominator.get());
+        lhs.cmp(&rhs)
+    }
+}
+
+impl std::fmt::Display for Scale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_f64())
     }
 }
 
@@ -36,22 +182,22 @@ pub struct PhysicalSize {
 }
 
 impl LogicalSize {
-    pub fn to_physical(self, s: Scale) -> PhysicalSize {
-        let s = s.or_one().0;
-        PhysicalSize {
-            w: (self.w as f32 * s).round() as c_int,
-            h: (self.h as f32 * s).round() as c_int,
-        }
+    /// `None` when either axis of the result does not fit `c_int`.
+    pub fn to_physical(self, scale: Scale) -> Option<PhysicalSize> {
+        Some(PhysicalSize {
+            w: scale.to_physical(self.w)?,
+            h: scale.to_physical(self.h)?,
+        })
     }
 }
 
 impl PhysicalSize {
-    pub fn to_logical(self, s: Scale) -> LogicalSize {
-        let s = s.or_one().0;
-        LogicalSize {
-            w: (self.w as f32 / s).round() as c_int,
-            h: (self.h as f32 / s).round() as c_int,
-        }
+    /// `None` when either axis of the result does not fit `c_int`.
+    pub fn to_logical(self, scale: Scale) -> Option<LogicalSize> {
+        Some(LogicalSize {
+            w: scale.to_logical(self.w)?,
+            h: scale.to_logical(self.h)?,
+        })
     }
 }
 
@@ -71,10 +217,36 @@ pub struct LogicalPoint {
     pub y: c_int,
 }
 
-/// A coherent (logical, physical, scale) triple. [`WindowExtent::new`]
-/// derives the logical size by division; [`WindowExtent::with_logical`]
-/// preserves a producer's exact logical size, which division at fractional
-/// scales cannot reproduce.
+impl LogicalPoint {
+    /// The point a view reports in its own logical coordinate space.
+    ///
+    /// Each axis is truncated toward zero and saturates at the [`c_int`]
+    /// bounds; a non-finite axis names zero.
+    pub fn from_view(x: f64, y: f64) -> LogicalPoint {
+        LogicalPoint {
+            x: view_axis(x),
+            y: view_axis(y),
+        }
+    }
+}
+
+/// `v` truncated toward zero, saturating at the [`c_int`] bounds. A
+/// non-finite `v` names zero.
+fn view_axis(v: f64) -> c_int {
+    if !v.is_finite() {
+        return 0;
+    }
+    let truncated = v.trunc();
+    if truncated <= f64::from(c_int::MIN) {
+        return c_int::MIN;
+    }
+    if truncated >= f64::from(c_int::MAX) {
+        return c_int::MAX;
+    }
+    truncated as c_int
+}
+
+/// A coherent (logical, physical, scale) triple.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct WindowExtent {
     logical: LogicalSize,
@@ -83,20 +255,23 @@ pub struct WindowExtent {
 }
 
 impl WindowExtent {
-    pub fn new(physical: PhysicalSize, scale: Scale) -> Self {
-        Self {
-            logical: physical.to_logical(scale),
-            physical,
-            scale,
+    /// The extent `physical`, `scale` and `logical` name.
+    ///
+    /// `logical` is the size its producer supplied; nothing here re-derives
+    /// it.
+    ///
+    /// `None` when either axis of either size is below two pixels: a
+    /// one-pixel axis has no second endpoint for
+    /// [`WindowExtent::to_logical_point`] to map onto.
+    pub fn new(physical: PhysicalSize, scale: Scale, logical: LogicalSize) -> Option<Self> {
+        if physical.w < 2 || physical.h < 2 || logical.w < 2 || logical.h < 2 {
+            return None;
         }
-    }
-
-    pub fn with_logical(physical: PhysicalSize, scale: Scale, logical: LogicalSize) -> Self {
-        Self {
+        Some(Self {
             logical,
             physical,
             scale,
-        }
+        })
     }
 
     pub fn logical(&self) -> LogicalSize {
@@ -113,12 +288,10 @@ impl WindowExtent {
 
     /// Map a pointer position into the space this extent's logical size names.
     ///
-    /// Maps through this extent's own logical:physical ratio per axis, so it
-    /// is the exact inverse of the size handed to CEF — including the exact
-    /// logical size of [`WindowExtent::with_logical`], which division by
-    /// [`WindowExtent::scale`] cannot reproduce. Floors toward negative
-    /// infinity, so a point dragged past the client origin stays monotone. A
-    /// degenerate physical extent maps to the identity.
+    /// Maps each axis endpoint-to-endpoint through this extent's own
+    /// logical:physical pair, so the last physical row or column is the last
+    /// logical one at every scale — including a producer's exact logical
+    /// size, which division by [`WindowExtent::scale`] cannot reproduce.
     pub fn to_logical_point(&self, p: PhysicalPoint) -> LogicalPoint {
         LogicalPoint {
             x: map_axis(p.x, self.logical.w, self.physical.w),
@@ -127,24 +300,21 @@ impl WindowExtent {
     }
 }
 
-/// `v * logical / physical`, floored toward negative infinity; the identity
-/// when `physical` is not positive.
+/// `v * (logical - 1) / (physical - 1)`, integer round-half-up, saturating
+/// at the `c_int` bounds.
+///
+/// Total: [`WindowExtent`] admits no axis below two pixels, so neither
+/// difference is zero. Monotone over the whole `c_int` range, so a point
+/// dragged past the client origin stays monotone.
 fn map_axis(v: c_int, logical: c_int, physical: c_int) -> c_int {
-    if physical <= 0 {
-        return v;
-    }
-    let num = i64::from(v) * i64::from(logical);
-    let den = i64::from(physical);
-    let mut q = num / den;
-    if num % den != 0 && (num < 0) {
-        q -= 1;
-    }
-    q as c_int
+    let num = i128::from(v) * i128::from(logical - 1);
+    let mapped = div_round_half_up(num, i128::from(physical - 1));
+    mapped.clamp(i128::from(c_int::MIN), i128::from(c_int::MAX)) as c_int
 }
 
 /// Fully-resolved boot geometry: one typed value computed once from saved
-/// config, consumed by `Platform::apply_boot_geometry` (logical) and mpv's
-/// `--geometry` (physical).
+/// config, consumed by `WindowOwner::apply_boot_geometry`: it seeds an
+/// app-created window (logical) or hands mpv its `--geometry` (physical).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BootGeometry {
     logical: LogicalSize,
@@ -256,16 +426,43 @@ pub struct WindowPos {
     pub y: c_int,
 }
 
-/// A surface resize request: logical (DIP) and physical (pixel) dimensions.
-/// Carried as one struct through `Platform::surface_resize` so adding a
-/// field later doesn't change the method's arity (and so doesn't churn
-/// every backend + call site).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// A surface's own coherent size, the scale it is presented at, and the strip
+/// of the window above it.
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SurfaceSize {
-    pub logical_w: c_int,
-    pub logical_h: c_int,
-    pub physical_w: c_int,
-    pub physical_h: c_int,
+    pub extent: WindowExtent,
+    /// Offset of the surface's top edge from the window's top edge.
+    pub logical_top: c_int,
+    pub physical_top: c_int,
+}
+
+/// The physical size mpv's window is resized to at boot.
+///
+/// `None` when `locked`, when the saved logical size does not map to a
+/// representable physical one, and when the size it maps to is the one the
+/// saved geometry already records.
+pub(crate) fn mpv_reconcile_size(
+    reported: Scale,
+    saved_logical: LogicalSize,
+    saved_physical: PhysicalSize,
+    locked: bool,
+) -> Option<PhysicalSize> {
+    if locked {
+        return None;
+    }
+    let physical = saved_logical.to_physical(reported)?;
+    (physical != saved_physical).then_some(physical)
+}
+
+/// `g`'s size shrunk to fit `bounds`; its position is untouched.
+///
+/// An axis whose bound is not positive is left alone.
+pub fn clamp_size_to_bounds(g: WindowGeometry, bounds: Bounds) -> WindowGeometry {
+    WindowGeometry {
+        w: if bounds.w > 0 { g.w.min(bounds.w) } else { g.w },
+        h: if bounds.h > 0 { g.h.min(bounds.h) } else { g.h },
+        position: g.position,
+    }
 }
 
 /// Clamp `g` so the window stays fully within `bounds`: shrink oversized
@@ -305,66 +502,239 @@ pub fn clamp_to_bounds(g: &mut WindowGeometry, bounds: Bounds) {
 mod tests {
     use super::*;
 
+    fn covered() -> Vec<Scale> {
+        COVERED_SCALES.to_vec()
+    }
+
+    fn ratio(numerator: u64, denominator: u64) -> Option<Scale> {
+        Scale::from_ratio(numerator, NonZeroU64::new(denominator)?)
+    }
+
     #[test]
-    fn logical_physical_round_trip() {
-        for (logical, scale, physical) in [
-            (
-                LogicalSize { w: 1280, h: 720 },
-                1.0,
-                PhysicalSize { w: 1280, h: 720 },
-            ),
-            (
-                LogicalSize { w: 1280, h: 720 },
-                1.25,
-                PhysicalSize { w: 1600, h: 900 },
-            ),
-            (
-                LogicalSize { w: 1600, h: 900 },
-                1.5,
-                PhysicalSize { w: 2400, h: 1350 },
-            ),
-            (
-                LogicalSize { w: 1280, h: 720 },
-                2.0,
-                PhysicalSize { w: 2560, h: 1440 },
-            ),
-        ] {
-            assert_eq!(logical.to_physical(Scale(scale)), physical);
-            assert_eq!(physical.to_logical(Scale(scale)), logical);
+    fn covered_scales_are_exact_reduced_rationals() {
+        let ratios: Vec<Option<Scale>> = covered().into_iter().map(Some).collect();
+        assert_eq!(
+            ratios,
+            vec![
+                ratio(1, 2),
+                ratio(3, 4),
+                ratio(1, 1),
+                ratio(5, 4),
+                ratio(3, 2),
+                ratio(2, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn logical_physical_round_trips_at_every_covered_scale() {
+        let logical = LogicalSize { w: 1280, h: 720 };
+        for scale in covered() {
+            let physical = logical.to_physical(scale);
+            assert_eq!(
+                physical.and_then(|p| p.to_logical(scale)),
+                Some(logical),
+                "at {scale}"
+            );
         }
     }
 
     #[test]
-    fn scale_or_one_guards_nonpositive() {
-        assert_eq!(Scale(0.0).or_one(), Scale(1.0));
-        assert_eq!(Scale(-2.0).or_one(), Scale(1.0));
-        assert_eq!(Scale(1.5).or_one(), Scale(1.5));
+    fn covered_scales_map_to_their_known_physical_sizes() {
+        let logical = LogicalSize { w: 1280, h: 720 };
+        let sizes: Vec<Option<PhysicalSize>> = covered()
+            .into_iter()
+            .map(|s| logical.to_physical(s))
+            .collect();
         assert_eq!(
-            LogicalSize { w: 800, h: 600 }.to_physical(Scale(0.0)),
-            PhysicalSize { w: 800, h: 600 }
+            sizes,
+            vec![
+                Some(PhysicalSize { w: 640, h: 360 }),
+                Some(PhysicalSize { w: 960, h: 540 }),
+                Some(PhysicalSize { w: 1280, h: 720 }),
+                Some(PhysicalSize { w: 1600, h: 900 }),
+                Some(PhysicalSize { w: 1920, h: 1080 }),
+                Some(PhysicalSize { w: 2560, h: 1440 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn scale_rejects_non_positive_and_non_finite_values() {
+        assert_eq!(Scale::from_f64(0.0), None);
+        assert_eq!(Scale::from_f64(-2.0), None);
+        assert_eq!(Scale::from_f64(f64::NAN), None);
+        assert_eq!(Scale::from_f64(f64::INFINITY), None);
+        assert_eq!(Scale::from_ratio(0, NonZeroU64::MIN), None);
+    }
+
+    #[test]
+    fn equal_ratios_reduce_to_one_value_and_order_by_magnitude() {
+        assert_eq!(ratio(6, 4), Scale::from_f64(1.5));
+        assert_eq!(ratio(7, 7), Some(Scale::ONE));
+        let mut sorted = covered();
+        sorted.sort();
+        assert_eq!(sorted, covered());
+        assert!(ratio(1, 2) < ratio(2, 1));
+    }
+
+    #[test]
+    fn an_axis_below_two_pixels_names_no_extent() {
+        let one = PhysicalSize { w: 1, h: 720 };
+        let ok = LogicalSize { w: 1280, h: 720 };
+        assert_eq!(WindowExtent::new(one, Scale::ONE, ok), None);
+        assert_eq!(
+            WindowExtent::new(
+                PhysicalSize { w: 1280, h: 720 },
+                Scale::ONE,
+                LogicalSize { w: 1280, h: 1 },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_last_physical_pixel_maps_to_the_last_logical_pixel_at_every_covered_scale() {
+        let logical = LogicalSize { w: 1280, h: 720 };
+        let corners: Vec<Option<(LogicalPoint, LogicalPoint)>> = covered()
+            .into_iter()
+            .map(|scale| {
+                let extent = WindowExtent::new(logical.to_physical(scale)?, scale, logical)?;
+                let physical = extent.physical();
+                Some((
+                    extent.to_logical_point(PhysicalPoint { x: 0, y: 0 }),
+                    extent.to_logical_point(PhysicalPoint {
+                        x: physical.w - 1,
+                        y: physical.h - 1,
+                    }),
+                ))
+            })
+            .collect();
+        let expected = Some((
+            LogicalPoint { x: 0, y: 0 },
+            LogicalPoint {
+                x: logical.w - 1,
+                y: logical.h - 1,
+            },
+        ));
+        assert_eq!(corners, vec![expected; COVERED_SCALES.len()]);
+    }
+
+    #[test]
+    fn pointer_map_stays_monotone_past_the_client_origin() {
+        let logical = LogicalSize { w: 1280, h: 720 };
+        let monotone: Vec<Option<bool>> = covered()
+            .into_iter()
+            .map(|scale| {
+                let extent = WindowExtent::new(logical.to_physical(scale)?, scale, logical)?;
+                let mut previous = c_int::MIN;
+                let mut ok = true;
+                for x in -16..(extent.physical().w + 16) {
+                    let mapped = extent.to_logical_point(PhysicalPoint { x, y: 0 }).x;
+                    ok &= mapped >= previous;
+                    previous = mapped;
+                }
+                Some(ok)
+            })
+            .collect();
+        assert_eq!(monotone, vec![Some(true); COVERED_SCALES.len()]);
+    }
+
+    #[test]
+    fn mpv_reconcile_declines_a_scale_that_maps_to_the_stored_size() {
+        let logical = LogicalSize { w: 1280, h: 720 };
+        let physical = PhysicalSize { w: 1280, h: 720 };
+        assert_eq!(
+            mpv_reconcile_size(Scale::ONE, logical, physical, false),
+            None
+        );
+        assert_eq!(
+            ratio(5, 4).and_then(|s| mpv_reconcile_size(s, logical, physical, true)),
+            None
+        );
+    }
+
+    #[test]
+    fn mpv_reconcile_resizes_when_the_reported_scale_maps_elsewhere() {
+        let logical = LogicalSize { w: 1280, h: 720 };
+        let physical = PhysicalSize { w: 1280, h: 720 };
+        assert_eq!(
+            ratio(5, 4).and_then(|s| mpv_reconcile_size(s, logical, physical, false)),
+            Some(PhysicalSize { w: 1600, h: 900 })
         );
     }
 
     #[test]
     fn mpv_geometry_string_with_and_without_position() {
         let logical = LogicalSize { w: 1280, h: 720 };
-        let base = BootGeometry::from_clamped(
-            logical,
-            Scale(1.25),
-            WindowGeometry::from_raw(1600, 900, -1, -1),
-            false,
+        let scale = Scale::from_f64(1.25);
+        assert_eq!(scale, ratio(5, 4));
+        let describe = |x: c_int, y: c_int| {
+            scale.map(|s| {
+                let g = BootGeometry::from_clamped(
+                    logical,
+                    s,
+                    WindowGeometry::from_raw(1600, 900, x, y),
+                    false,
+                );
+                (g.mpv_geometry_string(), g.force_position())
+            })
+        };
+        assert_eq!(describe(-1, -1), Some(("1600x900".to_owned(), false)));
+        assert_eq!(
+            describe(100, 50),
+            Some(("1600x900+100+50".to_owned(), true))
         );
-        assert_eq!(base.mpv_geometry_string(), "1600x900");
-        assert!(!base.force_position());
+    }
 
-        let positioned = BootGeometry::from_clamped(
-            logical,
-            Scale(1.25),
-            WindowGeometry::from_raw(1600, 900, 100, 50),
-            false,
+    #[test]
+    fn a_view_position_truncates_toward_zero_and_saturates() {
+        assert_eq!(
+            LogicalPoint::from_view(3.9, -3.9),
+            LogicalPoint { x: 3, y: -3 }
         );
-        assert_eq!(positioned.mpv_geometry_string(), "1600x900+100+50");
-        assert!(positioned.force_position());
+        assert_eq!(
+            LogicalPoint::from_view(0.0, -0.5),
+            LogicalPoint { x: 0, y: 0 }
+        );
+        assert_eq!(
+            LogicalPoint::from_view(f64::MAX, f64::MIN),
+            LogicalPoint {
+                x: c_int::MAX,
+                y: c_int::MIN
+            }
+        );
+    }
+
+    #[test]
+    fn a_non_finite_view_axis_names_zero() {
+        assert_eq!(
+            LogicalPoint::from_view(f64::NAN, f64::INFINITY),
+            LogicalPoint { x: 0, y: 0 }
+        );
+        assert_eq!(
+            LogicalPoint::from_view(f64::NEG_INFINITY, 7.5),
+            LogicalPoint { x: 0, y: 7 }
+        );
+    }
+
+    #[test]
+    fn the_size_clamp_shrinks_without_moving_the_window() {
+        let g = WindowGeometry::from_raw(3000, 2000, 1500, 900);
+        assert_eq!(
+            clamp_size_to_bounds(g, Bounds { w: 1920, h: 1080 }),
+            WindowGeometry::from_raw(1920, 1080, 1500, 900)
+        );
+    }
+
+    #[test]
+    fn a_non_positive_bound_leaves_its_axis_alone() {
+        let g = WindowGeometry::from_raw(3000, 2000, -1, -1);
+        assert_eq!(clamp_size_to_bounds(g, Bounds { w: 0, h: -5 }), g);
+        assert_eq!(
+            clamp_size_to_bounds(g, Bounds { w: 1920, h: 0 }),
+            WindowGeometry::from_raw(1920, 2000, -1, -1)
+        );
     }
 
     const SCREEN: Bounds = Bounds { w: 1920, h: 1080 };
@@ -404,8 +774,6 @@ mod tests {
 
     #[test]
     fn oversized_then_floored_at_origin() {
-        // Oversized window: shrink to bounds, center (negative → 0 after
-        // edge-adjust + floor).
         let mut g = WindowGeometry::from_raw(3000, 2000, -1, -1);
         clamp_to_bounds(&mut g, SCREEN);
         assert_eq!(g, WindowGeometry::from_raw(1920, 1080, 0, 0));

@@ -14,9 +14,10 @@ parking_lot.workspace = true
 # The whole crate is `#![cfg(target_os = "linux")]`, so it's an empty rlib
 # elsewhere and the workspace builds uniformly on every platform.
 [target.'cfg(target_os = "linux")'.dependencies]
+cursor-icon = "1"
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
-cosmic-text = "0.19"
 drm-fourcc = "2"
+iced_graphics.workspace = true
 jfn-input = { path = "../input" }
 jfn-mailbox = { path = "../mailbox" }
 jfn-platform-abi = { path = "../platform_abi" }

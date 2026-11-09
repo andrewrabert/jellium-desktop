@@ -80,12 +80,12 @@ wrap_context_menu_handler! {
                 return 1;
             }
             let MenuDelivery::Host(host) =
-                jfn_platform_abi::menu_delivery(MenuKind::ContextMenu)
+                self.inner.surface().platform().menu_delivery(MenuKind::ContextMenu)
             else {
                 callback.cancel();
                 return 1;
             };
-            let Some(session) = crate::browsers::jfn_browsers_menu_open() else {
+            let Some(session) = self.inner.menu_open() else {
                 callback.cancel();
                 return 1;
             };
@@ -115,7 +115,10 @@ wrap_context_menu_handler! {
             host.open(MenuRequest {
                 items,
                 x: params.xcoord(),
-                y: params.ycoord(),
+                // The anchor is in the web overlay's own view space; the app menu
+                // is placed in window space, so the strip the overlay was sized
+                // below is added back.
+                y: params.ycoord() + self.inner.view_top(),
                 width: 0,
                 initial: MENU_DISMISSED,
                 on_selected: self.inner.menu_selection_callback(session),

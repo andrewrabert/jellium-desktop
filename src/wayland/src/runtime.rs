@@ -6,8 +6,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::app_conn::AppConn;
-use crate::clipboard::Clipboard;
 use crate::decoration_probe::DecorationGlobals;
+use crate::selection::Selections;
 use jfn_linux_util::menu::SoftwareMenu;
 
 use crate::input::{InputThread, SeatShared};
@@ -15,7 +15,7 @@ use crate::mpv_proxy::ProxyShared;
 use crate::paint_override::WlPaintOverride;
 use crate::root_window::RootShared;
 use crate::window_state::WindowState;
-use crate::wl_state::{DmabufRegistry, WlState};
+use crate::wl_state::{Callbacks, DmabufRegistry, WlState};
 
 const DECORATION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -25,12 +25,14 @@ pub(crate) struct WlRuntime {
     window: WindowState,
     core: OnceLock<Mutex<WlState>>,
     buffers: DmabufRegistry,
+    callbacks: Callbacks,
     root: RootShared,
     proxy: ProxyShared,
     seat: SeatShared,
     input: OnceLock<InputThread>,
     menu: OnceLock<SoftwareMenu>,
-    clipboard: Clipboard,
+    menu_host: OnceLock<crate::popup::WlMenuHost>,
+    selections: Selections,
     app_conn: AppConn,
     #[cfg(feature = "kde-palette")]
     palette: crate::kde_palette::Palette,
@@ -44,12 +46,14 @@ impl WlRuntime {
             window: WindowState::new(),
             core: OnceLock::new(),
             buffers: DmabufRegistry::new(),
+            callbacks: Callbacks::new(),
             root: RootShared::new(),
             proxy: ProxyShared::new(),
             seat: SeatShared::new(),
             input: OnceLock::new(),
             menu: OnceLock::new(),
-            clipboard: Clipboard::new(),
+            menu_host: OnceLock::new(),
+            selections: Selections::new(),
             app_conn: AppConn::new(),
             #[cfg(feature = "kde-palette")]
             palette: crate::kde_palette::Palette::new(),
@@ -70,6 +74,10 @@ impl WlRuntime {
 
     pub(crate) fn buffers(&self) -> &DmabufRegistry {
         &self.buffers
+    }
+
+    pub(crate) fn callbacks(&'static self) -> &'static Callbacks {
+        &self.callbacks
     }
 
     pub(crate) fn root(&self) -> &RootShared {
@@ -100,12 +108,17 @@ impl WlRuntime {
         })
     }
 
+    pub(crate) fn menu_host(&'static self) -> &'static crate::popup::WlMenuHost {
+        self.menu_host
+            .get_or_init(|| crate::popup::WlMenuHost { rt: self })
+    }
+
     pub(crate) fn try_menu(&self) -> Option<&SoftwareMenu> {
         self.menu.get()
     }
 
-    pub(crate) fn clipboard(&self) -> &Clipboard {
-        &self.clipboard
+    pub(crate) fn selections(&self) -> &Selections {
+        &self.selections
     }
 
     pub(crate) fn app_conn(&self) -> &AppConn {

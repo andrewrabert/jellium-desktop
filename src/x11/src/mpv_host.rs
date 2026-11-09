@@ -24,6 +24,12 @@ impl MpvHost for X11MpvHost {
         crate::x11_state::host().map(|h| i64::from(h.video_host))
     }
 
+    // mpv is embedded and passive here; its `osd-dimensions` is the authority
+    // for the size ingest reads
+    fn logical_content_size(&self) -> Option<jfn_platform_abi::LogicalSize> {
+        None
+    }
+
     fn host_ready(&self) -> bool {
         crate::x11_state::host().is_some()
     }

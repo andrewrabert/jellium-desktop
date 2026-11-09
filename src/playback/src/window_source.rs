@@ -1,8 +1,8 @@
-//! The mpv-backed [`WindowSource`]: on backends where mpv owns the OS
-//! window (macOS / Windows / X11), live geometry comes from the ingest
-//! extent cell that mpv's property observations feed.
+//! The mpv-backed [`WindowSource`] macOS uses: live geometry comes from the
+//! ingest extent cell that mpv's property observations feed. Windows and X11
+//! have their own sources.
 
-use jfn_platform_abi::{WindowSnapshot, WindowSource};
+use jfn_platform_abi::{MpvCreatedWindow, WindowSnapshot, WindowSource};
 
 pub struct MpvWindowSource;
 
@@ -12,9 +12,12 @@ impl WindowSource for MpvWindowSource {
     fn snapshot(&self) -> WindowSnapshot {
         WindowSnapshot {
             extent: crate::ingest_driver::jfn_playback_window_extent(),
-            position: jfn_platform_abi::get().query_window_position(),
+            position: jfn_platform_abi::try_lease()
+                .and_then(|lease| lease.platform().query_window_position()),
             maximized: crate::ingest_driver::jfn_playback_window_maximized(),
             fullscreen: crate::ingest_driver::jfn_playback_fullscreen(),
         }
     }
 }
+
+impl MpvCreatedWindow for MpvWindowSource {}

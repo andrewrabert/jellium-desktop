@@ -6,7 +6,6 @@
 #![cfg(target_os = "linux")]
 
 pub(crate) mod app_conn;
-pub(crate) mod clipboard;
 pub(crate) mod decoration_probe;
 pub(crate) mod input;
 pub(crate) mod input_lifecycle;
@@ -20,11 +19,14 @@ pub(crate) mod mpv_host;
 pub(crate) mod mpv_proxy;
 pub mod paint_override;
 pub(crate) mod popup;
+pub(crate) mod popup_protocol;
+pub(crate) mod protocol;
 pub(crate) mod root_window;
 pub(crate) mod runtime;
 pub(crate) mod scale;
 pub(crate) mod scale_probe;
 pub(crate) mod scene;
+pub(crate) mod selection;
 pub(crate) mod window_source;
 pub(crate) mod window_state;
 pub(crate) mod wl_ops;

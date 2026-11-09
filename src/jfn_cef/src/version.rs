@@ -3,7 +3,6 @@
 use std::ffi::CStr;
 use std::fmt;
 use std::os::raw::c_int;
-use std::sync::LazyLock;
 
 use serde::{Serialize, Serializer};
 
@@ -13,10 +12,12 @@ unsafe extern "C" {
     fn cef_version_info(entry: c_int) -> c_int;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShortHash([u8; 7]);
 
 impl ShortHash {
-    fn new(full: &str) -> Option<Self> {
+    /// Extract seven hexadecimal ASCII characters; any suffix is intentionally ignored.
+    pub fn from_prefix(full: &str) -> Option<Self> {
         let bytes = full.as_bytes().get(..7)?;
         if !bytes.iter().all(u8::is_ascii_hexdigit) {
             return None;
@@ -29,11 +30,16 @@ impl ShortHash {
 
 impl fmt::Display for ShortHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(str::from_utf8(&self.0).unwrap_or_default())
+        use std::fmt::Write;
+        for byte in self.0 {
+            f.write_char(char::from(byte))?;
+        }
+        Ok(())
     }
 }
 
-pub struct CefVersionInfo {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CefVersion {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
@@ -41,68 +47,99 @@ pub struct CefVersionInfo {
     pub chromium: [u32; 4],
 }
 
-pub enum CefVersion {
-    Known(CefVersionInfo),
-    Unknown,
-}
-
 impl fmt::Display for CefVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Known(v) => write!(
-                f,
-                "{}.{}.{}+g{}+chromium-{}.{}.{}.{}",
-                v.major,
-                v.minor,
-                v.patch,
-                v.commit,
-                v.chromium[0],
-                v.chromium[1],
-                v.chromium[2],
-                v.chromium[3],
-            ),
-            Self::Unknown => f.write_str("unknown"),
-        }
+        let v = self;
+        write!(
+            f,
+            "{}.{}.{}+g{}+chromium-{}.{}.{}.{}",
+            v.major,
+            v.minor,
+            v.patch,
+            v.commit,
+            v.chromium[0],
+            v.chromium[1],
+            v.chromium[2],
+            v.chromium[3],
+        )
     }
 }
 
-/// `Known` serializes as the [`Display`](fmt::Display) form; `Unknown` as null.
+/// Serializes as the [`Display`](fmt::Display) form.
 impl Serialize for CefVersion {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Known(_) => serializer.collect_str(self),
-            Self::Unknown => serializer.serialize_none(),
-        }
+        serializer.collect_str(self)
     }
 }
 
-fn commit_hash() -> Option<ShortHash> {
+fn commit_hash(_runtime: &crate::runtime::LibraryLoaded) -> Result<ShortHash, VersionError> {
     // cef_api_hash's first call also configures the libcef API version;
     // it must get the same value the cef crate passes.
     let ptr = unsafe { cef::sys::cef_api_hash(cef::sys::CEF_API_VERSION_LAST, 2) };
     if ptr.is_null() {
-        return None;
+        return Err(VersionError::MissingCommitHash);
     }
-    let full = unsafe { CStr::from_ptr(ptr) }.to_str().ok()?;
-    ShortHash::new(full)
+    let full = unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|_| VersionError::InvalidCommitHash)?;
+    ShortHash::from_prefix(full).ok_or(VersionError::InvalidCommitHash)
 }
 
-fn probe() -> CefVersion {
-    let Some(commit) = commit_hash() else {
-        return CefVersion::Unknown;
+pub(crate) fn probe(runtime: &crate::runtime::LibraryLoaded) -> Result<CefVersion, VersionError> {
+    let commit = commit_hash(runtime)?;
+    let v = |entry| {
+        // SAFETY: runtime proves the process library has been loaded and pinned.
+        let value = unsafe { cef_version_info(entry) };
+        u32::try_from(value).map_err(|_| VersionError::InvalidComponent { entry, value })
     };
-    let v = |entry| unsafe { cef_version_info(entry) }.unsigned_abs();
-    CefVersion::Known(CefVersionInfo {
-        major: v(0),
-        minor: v(1),
-        patch: v(2),
+    Ok(CefVersion {
+        major: v(0)?,
+        minor: v(1)?,
+        patch: v(2)?,
         commit,
-        chromium: [v(4), v(5), v(6), v(7)],
+        chromium: [v(4)?, v(5)?, v(6)?, v(7)?],
     })
 }
 
-static CEF_VERSION: LazyLock<CefVersion> = LazyLock::new(probe);
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum VersionError {
+    #[error("CEF version component {entry} is invalid: {value}")]
+    InvalidComponent { entry: c_int, value: c_int },
+    #[error("CEF returned no commit hash")]
+    MissingCommitHash,
+    #[error("CEF returned an invalid commit hash")]
+    InvalidCommitHash,
+}
 
-pub fn cef_version() -> &'static CefVersion {
-    &CEF_VERSION
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    #[test]
+    fn prefix_contract_and_exact_version_format() {
+        for invalid in ["", "123456", "abcdefz", "ébcdef0"] {
+            assert!(ShortHash::from_prefix(invalid).is_none());
+        }
+        assert_eq!(
+            ShortHash::from_prefix("ABCDEF0ignored")
+                .unwrap()
+                .to_string(),
+            "ABCDEF0"
+        );
+        let version = CefVersion {
+            major: 151,
+            minor: 3,
+            patch: 16,
+            commit: ShortHash::from_prefix("abcdef0").unwrap(),
+            chromium: [151, 0, 7871, 2],
+        };
+        assert_eq!(
+            version.to_string(),
+            "151.3.16+gabcdef0+chromium-151.0.7871.2"
+        );
+        assert_eq!(
+            serde_json::to_string(&version).unwrap(),
+            "\"151.3.16+gabcdef0+chromium-151.0.7871.2\""
+        );
+    }
 }

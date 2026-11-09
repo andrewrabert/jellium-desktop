@@ -1,19 +1,10 @@
 //! `app://` scheme handler.
 //!
-//! Embedded resources are included at compile time from `src/web/*`. Two
-//! URLs need dynamic generation:
-//! - `app://resources/theme.css` — `:root{--bg-color:#RRGGBB}` from the
-//!   compile-time background color constant.
-//! - `app://resources/about.js` — a `var _aboutData = {...};` prefix
-//!   prepended to the static about.js body.
+//! Embedded resources are included at compile time from `src/web/*`.
 
 use cef::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-use serde::Serialize;
-
-use crate::version::CefVersion;
 
 // ---- embedded resources ----------------------------------------------------
 
@@ -36,79 +27,18 @@ macro_rules! embedded {
 
 // URL key is the path after the `app://` scheme (no leading slash).
 static RESOURCES: &[(&str, Embedded)] = &[
-    embedded!("about.html", "text/html"),
-    embedded!("about.js", "application/javascript"),
-    embedded!("client-settings.js", "application/javascript"),
-    embedded!("connectivityHelper.js", "application/javascript"),
     embedded!("input-plugin.js", "application/javascript"),
-    embedded!("logo.png", "image/png"),
     embedded!("mpv-audio-player.js", "application/javascript"),
     embedded!("mpv-player-base.js", "application/javascript"),
     embedded!("mpv-video-player.js", "application/javascript"),
     embedded!("native-shim.js", "application/javascript"),
-    embedded!("overlay.css", "text/css"),
-    embedded!("overlay.html", "text/html"),
-    embedded!("overlay.js", "application/javascript"),
-    embedded!("overlay.lang.js", "application/javascript"),
+    embedded!("select-menu.js", "application/javascript"),
 ];
 
 fn lookup(url_path: &str) -> Option<&'static Embedded> {
     // URL key has the "resources/" prefix; strip it to match RESOURCES.
     let name = url_path.strip_prefix("resources/")?;
     RESOURCES.iter().find(|(n, _)| *n == name).map(|(_, r)| r)
-}
-
-// Background color from src/color.h:40 — kBgColor{0x101010}.
-const BG_COLOR_HEX: &str = "#101010";
-
-fn theme_css() -> Vec<u8> {
-    format!(":root{{--bg-color:{BG_COLOR_HEX}}}").into_bytes()
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AboutData<'a> {
-    app: &'a str,
-    cef: &'a CefVersion,
-    config_dir: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    log_file: Option<String>,
-}
-
-fn about_js_payload() -> Vec<u8> {
-    let log_path = jfn_logging::active_path();
-    let data = AboutData {
-        app: crate::APP_VERSION_FULL,
-        cef: crate::cef_version(),
-        config_dir: abs_path(&jfn_paths::config_dir().to_string_lossy()),
-        log_file: (!log_path.is_empty()).then(|| abs_path(&log_path)),
-    };
-    let json = jfn_js_json::to_js_json(&data).unwrap_or_else(|| "{}".to_string());
-    let prefix = format!("var _aboutData = {json};\n");
-
-    let static_body = RESOURCES
-        .iter()
-        .find(|(n, _)| *n == "about.js")
-        .map(|(_, r)| r.bytes)
-        .unwrap_or(&[]);
-
-    let mut out = Vec::with_capacity(prefix.len() + static_body.len());
-    out.extend_from_slice(prefix.as_bytes());
-    out.extend_from_slice(static_body);
-    out
-}
-
-// Absolute-but-not-resolved: prepend CWD if relative, leave symlinks/../.
-// alone. Fall back to input on error.
-fn abs_path(p: &str) -> String {
-    let pb = std::path::Path::new(p);
-    if pb.is_absolute() {
-        return p.to_string();
-    }
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(pb).to_string_lossy().into_owned(),
-        Err(_) => p.to_string(),
-    }
 }
 
 // ---- SchemeHandlerFactory --------------------------------------------------
@@ -142,16 +72,12 @@ wrap_scheme_handler_factory! {
                 .unwrap_or("")
                 .to_string();
 
-            let (bytes, mime): (Vec<u8>, &'static str) = if url_path == "resources/theme.css" {
-                (theme_css(), "text/css")
-            } else if url_path == "resources/about.js" {
-                (about_js_payload(), "application/javascript")
-            } else if let Some(r) = lookup(&url_path) {
+            let (bytes, mime): (Vec<u8>, &'static str) = if let Some(r) = lookup(&url_path) {
                 (r.bytes.to_vec(), r.mime)
             } else {
                 jfn_logging::log(
-                    jfn_logging::CATEGORY_RESOURCE,
-                    jfn_logging::LEVEL_WARN,
+                    jfn_logging::Category::Resource,
+                    jfn_logging::Level::Warn,
                     &format!("EmbeddedScheme not found: {url_path}"),
                 );
                 return None;

@@ -16,6 +16,8 @@ use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+pub mod blocking;
+pub use blocking::BlockingError;
 pub mod cef_host;
 pub mod geometry;
 pub mod instance;
@@ -23,31 +25,44 @@ pub mod media_sink;
 pub mod menu;
 pub mod mpv_host;
 pub mod osr_popup;
+pub mod paint;
 #[cfg_attr(unix, path = "process_unix.rs")]
 #[cfg_attr(not(unix), path = "process_other.rs")]
 mod process;
+pub mod selection;
 #[cfg_attr(unix, path = "signal_unix.rs")]
 #[cfg_attr(not(unix), path = "signal_other.rs")]
 mod signal;
+pub mod stack;
+mod subscriptions;
+pub mod visibility;
+pub mod window_owner;
 pub mod window_source;
 
 pub use cef_host::CefHost;
 pub use geometry::{
-    BootGeometry, LogicalPoint, LogicalSize, PhysicalPoint, PhysicalSize, Scale, SurfaceSize,
-    WindowExtent, WindowGeometry, WindowPos,
+    BootGeometry, COVERED_SCALES, LogicalPoint, LogicalSize, PhysicalPoint, PhysicalSize, Scale,
+    SurfaceSize, WindowExtent, WindowGeometry, WindowPos,
 };
 pub use instance::{Instance, InstanceId};
 pub use jfn_gpu_paint::DamageRect as JfnRect;
+pub use jfn_gpu_paint::WindowTarget;
 pub use media_sink::MediaSink;
 pub use menu::{
     Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem, MenuKind, MenuMetrics,
-    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface, menu_delivery,
+    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface,
     menu_has_selectable, menu_initial_row, menu_scripts,
 };
-pub use mpv_host::{DefaultMpvHost, MpvHost, VO_WAIT_TICK};
+pub use mpv_host::{DefaultMpvHost, MpvHost, VoWait};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};
+pub use paint::{Content, FrameRetry, FrameSource, PaintFrame, Presented, Superseded};
+pub use selection::{OnText, PrimarySelection};
+pub use stack::Plane;
+pub use visibility::{Ack, Visibility, VisibilityCommit};
+pub use window_owner::{AppCreatedWindow, MpvBootWindow, MpvCreatedWindow, WindowOwner};
 pub use window_source::{
-    WindowSnapshot, WindowSource, notify_window_changed, subscribe_window_changed,
+    WindowSnapshot, WindowSource, WindowSubscription, notify_window_changed,
+    subscribe_window_changed,
 };
 
 /// Preserves the process's SIGINT/SIGTERM dispositions across a scope.
@@ -328,22 +343,6 @@ impl DecorationOptions {
     }
 }
 
-/// One CEF paint callback's payload, decoded.
-///
-/// CEF has exactly two output paths — `OnAcceleratedPaint` and `OnPaint` —
-/// selected once per browser by `shared_texture_enabled`.
-pub enum PaintFrame<'a> {
-    /// A texture the app owns. By value, because a backend that presents off
-    /// the callback thread (X11 and Wayland both do) has to keep it.
-    Accelerated(jfn_gpu_paint::SharedTexture),
-    /// CPU pixels in BGRA, tightly packed, with the regions that changed.
-    Software {
-        size: PhysicalSize,
-        pixels: &'a [u8],
-        dirty: &'a [JfnRect],
-    },
-}
-
 /// Idle-inhibit level.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum IdleInhibitLevel {
@@ -405,8 +404,40 @@ impl SurfaceHandle {
     }
 }
 
-/// Process-wide platform handle. Optional methods have no-op defaults so
-/// backends only override what they care about.
+/// The gate a backend arms at the physical size a resize transition settles
+/// at. Reachable only through [`Platform::resize_gate`].
+pub trait ResizeGate: Send + Sync {
+    fn begin(&self);
+
+    fn end(&self);
+
+    fn in_transition(&self) -> bool;
+
+    fn set_expected(&self, size: PhysicalSize);
+}
+
+/// The window controls an app-drawn titlebar drives. Reachable only through
+/// [`Platform::titlebar_controls`].
+pub trait TitlebarControls: Send + Sync {
+    fn minimize(&self);
+
+    fn toggle_maximize(&self);
+
+    /// Begin an interactive, compositor-driven window move. Must be called in
+    /// response to a pointer button press on the titlebar drag region.
+    fn start_move(&self);
+
+    /// Begin an interactive, compositor-driven resize from the given edge.
+    /// `edge` is the xdg_toplevel resize-edge mask: top=1, bottom=2, left=4,
+    /// right=8, corners are the ORs.
+    fn start_resize(&self, edge: c_int);
+}
+
+/// Process-wide platform handle.
+///
+/// A default body here expresses shared mechanism or an absence the type
+/// makes total, and nothing else: every method carrying a platform answer is
+/// required, so adding one fails to compile all four backends.
 ///
 /// All methods take `&self` — backends keep their own interior mutability
 /// (`Mutex`, `AtomicBool`, etc) where they need it.
@@ -415,13 +446,12 @@ pub trait Platform: Send + Sync {
 
     fn default_window_decorations(&self) -> WindowDecorations;
 
-    /// Decoration modes this backend can honor. The default keeps every mode
-    /// valid; backends with an authoritative availability source (Wayland
-    /// derives it from the compositor's advertised protocols) narrow the set.
-    fn window_decoration_options(&self) -> DecorationOptions {
-        DecorationOptions::all()
-    }
+    /// Decoration modes this backend can honor.
+    fn window_decoration_options(&self) -> DecorationOptions;
 
+    /// Data-only policy, valid before native initialization and after cleanup.
+    /// Implementations may inspect owned configuration/capability snapshots,
+    /// but must not access native resources.
     fn resolve_window_decorations(
         &self,
         configured: Option<WindowDecorations>,
@@ -434,40 +464,59 @@ pub trait Platform: Send + Sync {
         }
     }
 
-    fn early_init(&self) {}
+    fn early_init(&self);
     /// `mpv` is the opaque libmpv `mpv_handle` — a raw C handle, stays raw.
-    fn init(&self, mpv: *mut c_void) -> bool {
-        let _ = mpv;
-        true
-    }
-    fn cleanup(&self) {}
-    fn post_window_cleanup(&self) {}
+    fn init(&self, access: &LifecycleAccess, mpv: *mut c_void) -> Result<(), PlatformInitError>;
+    fn cleanup(&self, access: &LifecycleAccess);
+    fn post_window_cleanup(&self, access: &LifecycleAccess);
 
     // Per-surface
-    fn alloc_surface(&self) -> SurfaceHandle {
-        SurfaceHandle::NONE
+    /// The surface starts in `initial`; no surface is born at a default.
+    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle;
+    fn free_surface(&self, s: SurfaceHandle);
+    /// Presents `frame`, or hands it back undischarged when this surface has no
+    /// commit stream for it.
+    fn surface_present<'a>(
+        &self,
+        s: SurfaceHandle,
+        frame: PaintFrame<'a>,
+    ) -> Result<Presented, PaintFrame<'a>>;
+    /// Applies `size` to `s` before returning.
+    fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize);
+    /// The swapchain target for `s`, or `None` until the backend has created
+    /// the surface's window.
+    ///
+    /// Calling it declares that the caller presents to `s` itself: from the
+    /// first call the backend attaches no buffer to `s`, never calls
+    /// [`Platform::surface_present`] on it, grabs no input on it, and gives it
+    /// an empty input region.
+    fn surface_window_target(&self, s: SurfaceHandle) -> Option<WindowTarget>;
+
+    /// Notify once the native target can be queried. Synchronous backends
+    /// already have their target when allocation returns. Register before
+    /// querying to avoid losing a concurrent creation notification.
+    fn on_surface_target_ready(&self, _s: SurfaceHandle, ready: Box<dyn FnOnce() + Send>) {
+        ready();
     }
-    fn free_surface(&self, _s: SurfaceHandle) {}
-    fn surface_present(&self, _s: SurfaceHandle, _frame: PaintFrame<'_>) -> bool {
-        false
-    }
-    fn surface_resize(&self, _s: SurfaceHandle, _size: SurfaceSize) {}
-    fn surface_set_visible(&self, _s: SurfaceHandle, _visible: bool) {}
-    fn restack(&self, _ordered: &[SurfaceHandle]) {}
+
+    /// Issues the commit carrying `visibility` before returning.
+    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit;
+
+    /// Applies the whole order, bottom first, in one transaction, and pins the
+    /// video plane below every named surface.
+    fn apply_stack(&self, ordered: &[SurfaceHandle]);
 
     /// How this backend delivers `kind`; `Host` names the backend's own menu
     /// host.
-    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery;
+    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery<'_>;
 
     fn osr_popup_surface(&self) -> &dyn OsrPopupSurface {
         &NoOsrPopup
     }
 
     /// How this platform hosts mpv's lifecycle (env prep, VO wait,
-    /// teardown detach). Default: mpv needs nothing from the platform.
-    fn mpv_host(&self) -> &dyn MpvHost {
-        &DefaultMpvHost
-    }
+    /// teardown detach).
+    fn mpv_host(&self) -> &dyn MpvHost;
 
     /// `Some` when the platform drives CEF's message loop itself
     /// (external pump); `None` runs CEF's multi-threaded message loop.
@@ -482,98 +531,34 @@ pub trait Platform: Send + Sync {
     fn cef_paths(&self) -> CefPaths;
 
     // Fullscreen
-    fn set_fullscreen(&self, _v: bool) {}
-    fn toggle_fullscreen(&self) {}
+    fn set_fullscreen(&self, v: bool);
+    fn toggle_fullscreen(&self);
 
-    // Window controls for client-side decorations. Default no-ops cover
-    // backends without CSD (X11 WMs / macOS / Windows draw their own).
-    fn window_minimize(&self) {}
-    fn window_toggle_maximize(&self) {}
-    /// Begin an interactive, compositor-driven window move. Must be called in
-    /// response to a pointer button press on the titlebar drag region.
-    fn window_start_move(&self) {}
-    /// Begin an interactive, compositor-driven resize from the given edge.
-    /// `edge` uses xdg_toplevel resize-edge values (1=top, 2=bottom, 4=left,
-    /// 8=right, corners are the ORs, e.g. 5=top-left).
-    fn window_start_resize(&self, _edge: c_int) {}
+    /// The controls an app-drawn titlebar drives, or `None` where the OS or
+    /// the window manager draws the app window's titlebar.
+    fn titlebar_controls(&self) -> Option<&dyn TitlebarControls>;
 
-    // Transition
-    fn begin_transition(&self) {}
-    fn end_transition(&self) {}
-    fn in_transition(&self) -> bool {
-        false
-    }
-    fn set_expected_size(&self, _w: c_int, _h: c_int) {}
+    /// The resize-transition gate, or `None` where this backend gates none.
+    fn resize_gate(&self) -> Option<&dyn ResizeGate>;
 
-    fn get_scale(&self) -> f32 {
-        1.0
-    }
-    fn get_display_scale(&self, _x: c_int, _y: c_int) -> f32 {
-        1.0
-    }
+    /// The display scale this backend reports for the app window.
+    fn scale(&self) -> Scale;
 
-    /// Scale used to convert physical window pixels to CEF logical size.
-    /// Default trusts mpv's `display-hidpi-scale` when known; Wayland
-    /// overrides to always use the compositor scale (mpv doesn't own the
-    /// surface there, so its value isn't authoritative).
-    fn effective_scale(&self, mpv_display_hidpi_scale: f64) -> f32 {
-        if mpv_display_hidpi_scale > 0.0 {
-            mpv_display_hidpi_scale as f32
-        } else {
-            self.get_scale()
-        }
-    }
+    /// The display scale this backend reports for the display holding `at`,
+    /// or for its own default display when `at` is `None`.
+    fn display_scale(&self, at: Option<WindowPos>) -> Scale;
 
-    /// Seed the window owner with the restored boot geometry. Backends that
-    /// own their toplevel (Wayland) size it here; mpv-backed backends rely on
-    /// mpv's `--geometry` instead and keep the no-op default.
-    fn apply_boot_geometry(&self, _g: &BootGeometry) {}
+    /// The window's current position in backing pixels, or `None` when this
+    /// backend has no window position to report.
+    fn query_window_position(&self) -> Option<WindowPos>;
 
-    /// Current window position, or `None` if it can't be determined.
-    fn query_window_position(&self) -> Option<WindowPos> {
-        None
-    }
+    /// Who creates the app window, and the live geometry authority for it.
+    fn window_owner(&self) -> WindowOwner<'_>;
 
-    /// Live window-geometry authority for this backend: the compositor-backed
-    /// source where the backend owns its toplevel (Wayland), the mpv-backed
-    /// source everywhere else.
-    fn window_source(&self) -> &dyn WindowSource;
+    /// Clamp saved geometry to stay on-screen.
+    fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry;
 
-    /// The mpv `--geometry` string for boot, or `None` when the backend owns
-    /// its toplevel and sizes it itself. The default sizes via mpv; toplevel-
-    /// owning backends (Wayland) override to `None`.
-    fn boot_mpv_geometry(&self, g: &BootGeometry) -> Option<String> {
-        Some(g.mpv_geometry_string())
-    }
-
-    /// Physical size mpv should be resized to when the boot display scale
-    /// differs from the saved scale, or `None` to leave sizing untouched. The
-    /// default performs the mpv reconcile; `locked` (booting fullscreen or
-    /// maximized) and toplevel-owning backends yield `None`.
-    fn reconcile_mpv_size(
-        &self,
-        display_hidpi_scale: f64,
-        saved_scale: f32,
-        saved_logical: LogicalSize,
-        locked: bool,
-    ) -> Option<PhysicalSize> {
-        if locked
-            || display_hidpi_scale <= 0.0
-            || saved_scale <= 0.0
-            || (display_hidpi_scale - f64::from(saved_scale)).abs() < 0.01
-        {
-            return None;
-        }
-        Some(saved_logical.to_physical(Scale(display_hidpi_scale as f32)))
-    }
-
-    /// Clamp saved geometry to stay on-screen. Backends that don't constrain
-    /// geometry return `g` unchanged (the default).
-    fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry {
-        g
-    }
-
-    fn pump(&self) {}
+    fn pump(&self);
     /// Block the process main thread until [`wake_main_loop`] is called.
     /// Default parks on the process-wide [`main_park_wait`]; macOS overrides
     /// with `[NSApp run]`.
@@ -587,65 +572,58 @@ pub trait Platform: Send + Sync {
         main_park_signal();
     }
 
-    fn set_cursor(&self, _shape: cursor::CursorShape) {}
-    fn set_idle_inhibit(&self, _level: IdleInhibitLevel) {}
-    fn set_theme_color(&self, _rgb: u32) {}
+    fn set_cursor(&self, shape: cursor::CursorShape);
+    fn set_idle_inhibit(&self, level: IdleInhibitLevel);
+    fn set_theme_color(&self, rgb: u32);
 
     /// Whether the window-decorations setting (client-side vs server-side
     /// titlebar) applies on this platform. Gates the settings UI entry; the
     /// entry's option list comes from [`Platform::window_decoration_options`].
-    fn window_decorations_supported(&self) -> bool {
-        false
-    }
-    /// The decoration mode currently in effect. Defaults to ServerSide — on
-    /// macOS/Windows/X11 the OS/WM draws the titlebar, so the app never
-    /// does. Changes are announced via [`notify_decorations_changed`].
-    fn effective_decorations(&self) -> EffectiveDecorations {
-        EffectiveDecorations::ServerSide
-    }
+    fn window_decorations_supported(&self) -> bool;
+    /// The decoration mode currently in effect. Changes are announced via
+    /// [`notify_decorations_changed`].
+    fn effective_decorations(&self) -> EffectiveDecorations;
 
-    fn shared_texture_supported(&self) -> bool {
-        true
-    }
+    fn shared_texture_supported(&self) -> bool;
 
     /// True where `CefInitialize` depends on neither platform init nor a run
     /// loop the boot wait owns, so CEF's process bring-up may run while mpv's
-    /// core thread creates the VO. False on Wayland and X11 (platform init
-    /// resolves shared-texture support) and on macOS (external pump).
-    fn cef_init_precedes_mpv_window(&self) -> bool {
-        false
-    }
-    /// Set during init by Wayland backend (dmabuf probe) when GPU lacks the
-    /// shared-texture path.
-    fn set_shared_texture_unsupported(&self) {}
+    /// core thread creates the VO.
+    fn cef_init_precedes_mpv_window(&self) -> bool;
+    /// Revises [`Platform::shared_texture_supported`] to `false` where the
+    /// backend resolves the shared-texture path after init.
+    fn set_shared_texture_unsupported(&self);
 
-    /// Whether [`clipboard_read_text_async`] will actually invoke the
-    /// backend clipboard. Wayland clears this in `wl_init` when no data
-    /// device manager is present; the menu Paste path uses it to decide
-    /// between native OS read vs CEF `frame.Paste()`.
-    fn clipboard_text_supported(&self) -> bool {
-        true
+    /// The OS clipboard's text.
+    /// `None` when it holds no text, or the read failed.
+    fn clipboard_read_text_async(&self, on_done: OnText);
+
+    /// Places `text` on the OS clipboard.
+    /// A backend that cannot take the selection leaves the previous contents.
+    fn clipboard_write_text(&self, text: &str);
+
+    /// The primary selection, on the backends that serve one.
+    fn primary_selection(&self) -> Option<&dyn PrimarySelection> {
+        None
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
-        // No backend support — invoke with empty text synchronously.
-        on_done("");
-    }
-    /// Disable subsequent clipboard reads (set by Wayland when no data
-    /// device manager is available).
-    fn clear_clipboard_handler(&self) {}
+    /// Whether the web overlay pastes by reading the OS clipboard and
+    /// injecting the text, rather than by calling `frame.Paste()`.
+    /// Pinned per backend, and unrelated to the shell overlay's clipboard.
+    fn web_paste_reads_clipboard(&self) -> bool;
 
-    fn open_external_url(&self, _url: &str) {}
+    fn open_external_url(&self, url: &str);
 
     /// Open a filesystem path in the OS file manager.
-    fn open_path(&self, _path: &Path) {}
+    fn open_path(&self, path: &Path);
 
     /// Run `f` to completion without deadlocking work that needs the
     /// main thread (e.g. mpv's VO uninit doing `DispatchQueue.main.sync`).
     /// Default runs `f` inline; macOS runs it on a side thread while main
     /// pumps its run loop.
-    fn run_blocking(&self, f: Box<dyn FnOnce() + Send>) {
+    fn run_blocking(&self, f: Box<dyn FnOnce() + Send>) -> Result<(), BlockingError> {
         f();
+        Ok(())
     }
 
     /// `on_shutdown` must be async-signal-safe.
@@ -676,9 +654,15 @@ pub fn install(p: Box<dyn Platform>) {
 }
 
 /// Returns the installed platform backend. Panics if [`install`] hasn't
-/// been called yet — every call site is post-boot.
+/// been called yet.
+///
+/// # Safety
+/// The caller must own the platform lifecycle phase or a live dependent lease
+/// for every native operation through this reference. It must not let the
+/// reference escape that authority. Native backends and boot wiring only;
+/// ordinary consumers acquire [`try_lease`] or use an injected lease.
 #[allow(clippy::expect_used)] // every call site is post-boot
-pub fn get() -> &'static dyn Platform {
+pub unsafe fn get() -> &'static dyn Platform {
     *PLATFORM
         .get()
         .expect("jfn_platform_abi::get() called before install()")
@@ -687,80 +671,417 @@ pub fn get() -> &'static dyn Platform {
 /// Like [`get`] but returns `None` before install. Used by jfn_cef's
 /// `OnConsoleMessage` and similar paths that may fire during early CEF
 /// helper-process boot when no platform is installed.
-pub fn try_get() -> Option<&'static dyn Platform> {
+///
+/// # Safety
+/// The caller must uphold the same phase/lease lifetime contract as [`get`].
+pub unsafe fn try_get() -> Option<&'static dyn Platform> {
     PLATFORM.get().copied()
 }
 
-// =====================================================================
-// Browser bridge
-// =====================================================================
-//
-// Lets crates that can't depend on jfn_cef (input, macos) forward events
-// to whichever CEF layer is currently active. jfn_cef installs the impl
-// at boot; the trait methods resolve the active layer internally so
-// callers never see a JfnCefLayer pointer.
-
-pub trait BrowserBridge: Send + Sync {
-    #[allow(clippy::too_many_arguments)] // mirrors CEF's KeyEvent layout 1:1
-    fn send_key_event(
-        &self,
-        type_: c_int,
-        modifiers: u32,
-        windows_key_code: c_int,
-        native_key_code: c_int,
-        is_system_key: bool,
-        character: u16,
-        unmodified_character: u16,
-    );
-    fn send_mouse_click(
-        &self,
-        x: c_int,
-        y: c_int,
-        modifiers: u32,
-        button: c_int,
-        mouse_up: bool,
-        click_count: c_int,
-    );
-    fn send_mouse_move(&self, x: i32, y: i32, modifiers: u32, leave: bool);
-    fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int);
-    fn set_focus(&self, focus: bool);
-    fn navigate_history(&self, forward: bool);
-    fn undo(&self);
-    fn redo(&self);
-    fn cut(&self);
-    fn copy(&self);
-    fn paste(&self);
-    fn select_all(&self);
-    /// True if a layer is currently active. Cheap check used by callers
-    /// that want to early-out before building an event payload.
-    fn has_active(&self) -> bool;
+// Publication and revocation share a lock: a callback cannot acquire a new
+// dependent after cleanup has checked that the runtime is the sole owner.
+static LIVE_PLATFORM: Mutex<Option<PlatformLeaseWeak>> = Mutex::new(None);
+struct PlatformLeaseWeak {
+    platform: &'static dyn Platform,
+    live: std::sync::Weak<LeaseState>,
 }
 
-static BROWSER_BRIDGE: OnceLock<&'static dyn BrowserBridge> = OnceLock::new();
-
-#[allow(clippy::expect_used)] // boot invariant: install exactly once
-pub fn install_browser_bridge(b: Box<dyn BrowserBridge>) {
-    let leaked: &'static dyn BrowserBridge = Box::leak(b);
-    BROWSER_BRIDGE
-        .set(leaked)
-        .map_err(|_| ())
-        .expect("install_browser_bridge called twice");
+/// Acquire native authority only while the initialized runtime remains live.
+/// A successful lease delays cleanup until its work finishes.
+pub fn try_lease() -> Option<PlatformLease> {
+    let published = LIVE_PLATFORM.lock();
+    let published = published.as_ref()?;
+    let live = published.live.upgrade()?;
+    *live.count.lock() += 1;
+    Some(PlatformLease {
+        platform: published.platform,
+        live,
+    })
 }
 
-pub fn browser_bridge() -> Option<&'static dyn BrowserBridge> {
-    BROWSER_BRIDGE.get().copied()
+/// Resolve configuration through the backend's data-only policy. This exposes
+/// no native handle and is valid during preparation, before runtime publication.
+#[allow(clippy::expect_used)]
+pub fn resolve_window_decorations(configured: Option<WindowDecorations>) -> WindowDecorations {
+    PLATFORM
+        .get()
+        .expect("platform policy requested before install")
+        .resolve_window_decorations(configured)
 }
 
-static DECORATIONS_LISTENER: OnceLock<fn()> = OnceLock::new();
+/// Titlebar height, logical pixels.
+pub const TITLEBAR_LOGICAL_HEIGHT: c_int = 32;
 
-/// Register the callback fired when [`Platform::effective_decorations`]
-/// changes. Single listener, installed once alongside the browser bridge.
-pub fn set_decorations_listener(f: fn()) {
-    let _ = DECORATIONS_LISTENER.set(f);
+static ABOUT_HANDLER: OnceLock<fn()> = OnceLock::new();
+
+/// Register the callback that raises the about panel. Single listener,
+/// installed once at boot.
+pub fn set_about_handler(f: fn()) {
+    let _ = ABOUT_HANDLER.set(f);
 }
 
-pub fn notify_decorations_changed() {
-    if let Some(f) = DECORATIONS_LISTENER.get() {
+pub fn request_about() {
+    if let Some(f) = ABOUT_HANDLER.get() {
         f();
     }
 }
+
+static CLIENT_SETTINGS_HANDLER: OnceLock<fn()> = OnceLock::new();
+
+/// Register the callback that raises client settings. Single listener,
+/// installed once at boot.
+pub fn set_client_settings_handler(f: fn()) {
+    let _ = CLIENT_SETTINGS_HANDLER.set(f);
+}
+
+pub fn request_client_settings() {
+    if let Some(f) = CLIENT_SETTINGS_HANDLER.get() {
+        f();
+    }
+}
+
+static DECORATIONS_LISTENERS: std::sync::LazyLock<subscriptions::Subscribers> =
+    std::sync::LazyLock::new(subscriptions::Subscribers::new);
+pub use subscriptions::Subscription as DecorationsSubscription;
+
+/// Listen while the returned subscription is alive.
+pub fn set_decorations_listener(f: fn()) -> DecorationsSubscription {
+    DECORATIONS_LISTENERS.subscribe(f)
+}
+
+pub fn notify_decorations_changed() {
+    DECORATIONS_LISTENERS.notify();
+}
+
+/// Backend lifecycle authority. Only PlatformRuntime can construct this token.
+/// Ordinary platform references cannot initialize or destroy the backend.
+///
+/// ```compile_fail
+/// let access = jfn_platform_abi::LifecycleAccess { _private: () };
+/// ```
+pub struct LifecycleAccess {
+    _private: (),
+}
+
+#[derive(Debug)]
+pub enum PlatformInitError {
+    AlreadyClaimed,
+    WrongThread,
+    Panicked,
+    Backend {
+        operation: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl PlatformInitError {
+    pub fn backend(
+        operation: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self::Backend {
+            operation,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PlatformInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Panicked => f.write_str("platform initialization panicked; rollback required"),
+            Self::AlreadyClaimed => f.write_str("platform startup has already been claimed"),
+            Self::WrongThread => {
+                f.write_str("platform initialization requires the macOS main thread")
+            }
+            Self::Backend { operation, source } => write!(f, "{operation}: {source}"),
+        }
+    }
+}
+impl std::error::Error for PlatformInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend { source, .. } => Some(&**source),
+            _ => None,
+        }
+    }
+}
+
+struct LeaseState {
+    // Includes the runtime's own lease. Unlike Arc::strong_count, this count
+    // can be decremented before notifying waiters in PlatformLease::drop.
+    count: Mutex<usize>,
+    changed: Condvar,
+}
+impl LeaseState {
+    fn wait_for_dependents(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut count = self.count.lock();
+        while *count != 1 {
+            if self.changed.wait_until(&mut count, deadline).timed_out() {
+                return *count == 1;
+            }
+        }
+        true
+    }
+}
+
+/// A dependent keeps the backend alive until its native resources are released.
+pub struct PlatformLease {
+    platform: &'static dyn Platform,
+    live: std::sync::Arc<LeaseState>,
+}
+impl Clone for PlatformLease {
+    fn clone(&self) -> Self {
+        *self.live.count.lock() += 1;
+        Self {
+            platform: self.platform,
+            live: std::sync::Arc::clone(&self.live),
+        }
+    }
+}
+impl Drop for PlatformLease {
+    fn drop(&mut self) {
+        *self.live.count.lock() -= 1;
+        self.live.changed.notify_all();
+    }
+}
+impl PlatformLease {
+    /// Native access cannot outlive the lease that keeps its backend alive.
+    ///
+    /// ```compile_fail
+    /// fn escape(lease: &jfn_platform_abi::PlatformLease) -> &'static dyn jfn_platform_abi::Platform {
+    ///     lease.platform()
+    /// }
+    /// ```
+    pub fn platform(&self) -> &dyn Platform {
+        self.platform
+    }
+}
+
+impl std::ops::Deref for PlatformLease {
+    type Target = dyn Platform;
+    fn deref(&self) -> &Self::Target {
+        self.platform
+    }
+}
+
+#[derive(Debug)]
+pub struct PlatformBusy;
+impl std::fmt::Display for PlatformBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("platform dependents remain alive; cleanup deferred")
+    }
+}
+impl std::error::Error for PlatformBusy {}
+
+/// Thread-confined process owner. Call cleanup after releasing dependent leases.
+/// macOS construction checks the main thread; elsewhere the application chooses
+/// its initialization thread and the non-Send owner keeps teardown on that thread.
+/// Dropping without cleanup deliberately retains native state; the application
+/// startup owner is responsible for ordered rollback, including during unwinding.
+#[must_use = "the initialized platform requires ordered cleanup"]
+pub struct PlatformRuntime {
+    lease: PlatformLease,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+/// Owns early backend setup, including a host window created before mpv.
+/// Initialization failure returns this owner so the caller can terminate mpv
+/// between backend cleanup and post-window cleanup. No dependency lease exists
+/// until initialization succeeds.
+#[must_use = "early platform resources require ordered cleanup"]
+pub struct PreparedPlatform {
+    platform: &'static dyn Platform,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl PreparedPlatform {
+    pub fn claim(platform: &'static dyn Platform) -> Result<Self, PlatformInitError> {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn pthread_main_np() -> std::ffi::c_int;
+            }
+            // SAFETY: this query has no initialization requirements.
+            if unsafe { pthread_main_np() } == 0 {
+                return Err(PlatformInitError::WrongThread);
+            }
+        }
+        static CLAIMED: OnceLock<()> = OnceLock::new();
+        CLAIMED
+            .set(())
+            .map_err(|()| PlatformInitError::AlreadyClaimed)?;
+        Ok(Self {
+            platform,
+            _thread: std::marker::PhantomData,
+        })
+    }
+    pub fn initialize(
+        self,
+        mpv: *mut c_void,
+    ) -> Result<PlatformRuntime, (PlatformInitError, Self)> {
+        let access = LifecycleAccess { _private: () };
+        // Keep rollback authority even when a backend unwinds after acquiring
+        // resources. The application still owns mpv and must terminate it
+        // between backend detachment and post-window cleanup.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.platform.init(&access, mpv)
+        }));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err((error, self)),
+            Err(_) => return Err((PlatformInitError::Panicked, self)),
+        }
+        let lease = PlatformLease {
+            platform: self.platform,
+            live: std::sync::Arc::new(LeaseState {
+                count: Mutex::new(1),
+                changed: Condvar::new(),
+            }),
+        };
+        *LIVE_PLATFORM.lock() = Some(PlatformLeaseWeak {
+            platform: self.platform,
+            live: std::sync::Arc::downgrade(&lease.live),
+        });
+        Ok(PlatformRuntime {
+            lease,
+            _thread: std::marker::PhantomData,
+        })
+    }
+    pub fn cleanup<F, E>(self, terminate_window: F) -> Result<(), (E, PostWindowCleanup)>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let access = LifecycleAccess { _private: () };
+        self.platform.cleanup(&access);
+        PostWindowCleanup {
+            platform: self.platform,
+            _thread: std::marker::PhantomData,
+        }
+        .retry(terminate_window)
+    }
+}
+impl PlatformRuntime {
+    pub fn platform(&self) -> &dyn Platform {
+        self.lease.platform
+    }
+    pub fn lease(&self) -> PlatformLease {
+        self.lease.clone()
+    }
+    /// ```compile_fail
+    /// fn twice(runtime: jfn_platform_abi::PlatformRuntime) {
+    ///     let _ = runtime.cleanup(|| Ok::<(), std::convert::Infallible>(()));
+    ///     let _ = runtime.cleanup(|| Ok::<(), std::convert::Infallible>(()));
+    /// }
+    /// ```
+    ///
+    /// The callback terminates mpv after backend detachment/cleanup and before
+    /// post-window cleanup. It is never called while dependents remain alive.
+    /// A busy result returns both owners, including captures of the termination
+    /// callback, so callers can release dependencies and retry without destroying
+    /// the window prematurely. New global lease admission stops before a bounded
+    /// wait for existing callbacks; a busy result keeps admission retired.
+    pub fn cleanup<F, E>(self, terminate_window: F) -> Result<(), PlatformCleanupError<F, E>>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        self.cleanup_with_timeout(terminate_window, std::time::Duration::from_secs(2))
+    }
+
+    fn cleanup_with_timeout<F, E>(
+        self,
+        terminate_window: F,
+        timeout: std::time::Duration,
+    ) -> Result<(), PlatformCleanupError<F, E>>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        // Retire admission before waiting: native input threads may still be
+        // running until backend cleanup, but may no longer start new work.
+        *LIVE_PLATFORM.lock() = None;
+        if *self.lease.live.count.lock() != 1 {
+            let live = std::sync::Arc::clone(&self.lease.live);
+            let (done, result) = std::sync::mpsc::sync_channel(1);
+            if let Err(error) = self.platform().run_blocking(Box::new(move || {
+                let _ = done.send(live.wait_for_dependents(timeout));
+            })) {
+                tracing::error!("platform quiescence: {error}");
+                // This pending job owns only the wait state/channel, never a
+                // native resource. Dropping it leaves both native owners here.
+                drop(error);
+                return Err(PlatformCleanupError::Busy {
+                    runtime: self,
+                    terminate: terminate_window,
+                });
+            }
+            if !matches!(result.try_recv(), Ok(true)) {
+                return Err(PlatformCleanupError::Busy {
+                    runtime: self,
+                    terminate: terminate_window,
+                });
+            }
+        }
+        let access = LifecycleAccess { _private: () };
+        self.platform().cleanup(&access);
+        let remaining = PostWindowCleanup {
+            platform: self.lease.platform,
+            _thread: std::marker::PhantomData,
+        };
+        remaining
+            .retry(terminate_window)
+            .map_err(|(error, post_window)| PlatformCleanupError::Termination {
+                error,
+                post_window,
+            })
+    }
+}
+
+/// Failure retains exactly the phase that can still be retried. A termination
+/// failure must never repeat backend detachment or release the host window.
+pub enum PlatformCleanupError<F, E> {
+    Busy {
+        runtime: PlatformRuntime,
+        terminate: F,
+    },
+    Termination {
+        error: E,
+        post_window: PostWindowCleanup,
+    },
+}
+
+/// Backend detachment completed; the host must remain until window termination
+/// is confirmed. Dropping this token deliberately retains native host state.
+#[must_use = "post-window resources require confirmed window termination"]
+pub struct PostWindowCleanup {
+    platform: &'static dyn Platform,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl PostWindowCleanup {
+    /// Retry only the remaining termination, without detaching the backend a
+    /// second time. Host cleanup runs only on successful termination.
+    pub fn retry<E>(
+        self,
+        terminate_window: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), (E, Self)> {
+        match terminate_window() {
+            Ok(()) => {
+                self.finish();
+                Ok(())
+            }
+            Err(error) => Err((error, self)),
+        }
+    }
+    /// The owner calls this only after successfully running retained window
+    /// termination work. No other backend cleanup operation is repeated.
+    pub fn finish(self) {
+        self.platform
+            .post_window_cleanup(&LifecycleAccess { _private: () });
+    }
+    /// Retain the native host until process exit when termination is uncertain.
+    pub fn abandon(self) {}
+}
+
+#[cfg(test)]
+static TEST_PLATFORM: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod lifecycle_tests;

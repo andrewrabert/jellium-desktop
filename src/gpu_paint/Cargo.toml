@@ -12,7 +12,7 @@ crate-type = ["rlib"]
 parking_lot.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-wgpu = "30"
+wgpu.workspace = true
 pollster = "1.0"
 
 # wgpu-hal is pinned to wgpu's exact build so the hal types are identical to
@@ -22,11 +22,11 @@ pollster = "1.0"
 [target.'cfg(target_os = "linux")'.dependencies]
 nix.workspace = true
 raw-window-handle = "0.6"
-wgpu-hal = { version = "=30.0.0", features = ["vulkan"] }
+wgpu-hal = { version = "=29.0.4", features = ["vulkan"] }
 ash = "0.38"
 
 [target.'cfg(windows)'.dependencies]
-wgpu-hal = { version = "=30.0.0", features = ["dx12"] }
+wgpu-hal = { version = "=29.0.4", features = ["dx12"] }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D12",
@@ -35,10 +35,13 @@ windows = { workspace = true, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-wgpu-hal = { version = "=30.0.0", features = ["metal"] }
+wgpu-hal = { version = "=29.0.4", features = ["metal"] }
 objc2.workspace = true
 objc2-io-surface.workspace = true
 objc2-metal.workspace = true
+
+[dev-dependencies]
+trybuild = "1"
 
 [lints]
 workspace = true

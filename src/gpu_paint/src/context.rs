@@ -3,10 +3,12 @@
 use crate::error::{Kind, SurfaceLost};
 use crate::painter::{AlphaSource, Surface};
 use crate::shared;
+use crate::swapchain::Swapchain;
 use crate::types::WindowTarget;
-use crate::{FrameSize, ProducerId, SharedTexture};
+use crate::{FrameSize, ProducerId};
 
-pub(crate) const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+/// The one swapchain format the process presents in, on every window system.
+pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 /// The only handle to wgpu in the process. Held once; [`crate::Surface`]s
 /// borrow it.
@@ -35,6 +37,14 @@ pub struct Surfaces {
     can_import_shared: bool,
 }
 
+static INSTANCE: std::sync::OnceLock<Option<Surfaces>> = std::sync::OnceLock::new();
+
+/// The process's one wgpu device, or `None` before the first
+/// [`Surfaces::init`] and on a machine with no usable adapter.
+pub fn surfaces() -> Option<&'static Surfaces> {
+    INSTANCE.get()?.as_ref()
+}
+
 impl Surfaces {
     pub(crate) fn configure_surface(
         &self,
@@ -52,15 +62,11 @@ impl Surfaces {
         }
     }
 
-    /// Open the device, selecting the adapter CEF produces its shared buffers
-    /// on where that is knowable. `None` when this system has no usable GPU
-    /// path at all.
+    /// Open the process's one wgpu device, or hand back the one already open.
     ///
-    /// `sample` is one frame from the producer, for platforms that can only
-    /// name the producer's device from its output — on Windows a shared handle
-    /// carries the LUID of the adapter that created it, and nothing else names
-    /// that adapter. Pass `None` where a frame is unavailable or the platform
-    /// names the producer some other way.
+    /// The first call fixes the adapter for the process lifetime; `producer`
+    /// on any later call is ignored. `None` when this system has no usable GPU
+    /// path at all.
     ///
     /// On the platforms that call it first, this creates the process's GPU
     /// instance — which on X11 must happen before the mpv proxy repoints
@@ -70,14 +76,16 @@ impl Surfaces {
     /// connection on the real server and completes before mpv's VO thread is
     /// spawned, winning the loader-scan race that otherwise crashes NVIDIA
     /// proprietary (two threads reading a half-populated ICD dispatch table).
-    pub fn init(sample: Option<&SharedTexture>, producer: Option<ProducerId>) -> Option<Self> {
-        match Self::open(producer.or_else(|| shared::producer_id(sample))) {
-            Ok(surfaces) => Some(surfaces),
-            Err(e) => {
-                tracing::info!("gpu_paint: device init failed: {e}");
-                None
-            }
-        }
+    pub fn init(producer: Option<ProducerId>) -> Option<&'static Surfaces> {
+        INSTANCE
+            .get_or_init(|| match Self::open(producer) {
+                Ok(surfaces) => Some(surfaces),
+                Err(e) => {
+                    tracing::info!("gpu_paint: device init failed: {e}");
+                    None
+                }
+            })
+            .as_ref()
     }
 
     /// Whether *this device* can import CEF's shared buffers.
@@ -151,6 +159,36 @@ impl Surfaces {
         size: FrameSize,
     ) -> Result<Surface<'_>, SurfaceLost> {
         Surface::new(self, target, size)
+    }
+
+    /// Bind a swapchain to one window that the caller draws into itself.
+    ///
+    /// Format, present mode and composite-alpha mode come from the same
+    /// per-target policy [`Surface`] uses.
+    pub fn new_swapchain(
+        &self,
+        target: WindowTarget,
+        size: FrameSize,
+    ) -> Result<Swapchain<'_>, SurfaceLost> {
+        Swapchain::new(self, target, size)
+    }
+
+    pub fn adapter(&self) -> &wgpu::Adapter {
+        &self.adapter
+    }
+
+    /// The LUID of the adapter this device was opened on, packed high:low.
+    #[cfg(windows)]
+    pub fn adapter_luid(&self) -> Option<ProducerId> {
+        shared::adapter_luid(&self.adapter)
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
     }
 }
 
@@ -250,7 +288,7 @@ fn build_pipeline(
             entry_point: Some(fragment_entry),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: SURFACE_FORMAT,
+                format: FORMAT,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],

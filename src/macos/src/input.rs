@@ -32,6 +32,7 @@ extern_class!(
 
 use jfn_input::buttons::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use jfn_input::scroll::ScrollAccum;
+use jfn_platform_abi::LogicalPoint;
 use jfn_platform_abi::cursor::CursorShape;
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_ALT_DOWN, EVENTFLAG_COMMAND_DOWN, EVENTFLAG_CONTROL_DOWN,
@@ -64,10 +65,10 @@ const NS_TRACKING_IN_VISIBLE_RECT: u64 = 0x200;
 // Cross-crate entry points
 // =====================================================================
 
+use jfn_input::key::{KeyReport, PhysicalKey};
 use jfn_input::{
-    jfn_input_dispatch_char_sys, jfn_input_dispatch_history_nav, jfn_input_dispatch_key_full,
-    jfn_input_dispatch_keyboard_focus, jfn_input_dispatch_mouse_button,
-    jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll_precise,
+    jfn_input_dispatch_history_nav, jfn_input_dispatch_key, jfn_input_dispatch_mouse_button,
+    jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll_precise, jfn_input_dispatch_utf16,
 };
 
 use crate::dispatch::post_to_main;
@@ -429,24 +430,35 @@ define_class!(
         // ---- Keyboard ----
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &AnyObject) {
-            let (vkey, mods, kc, ch, ch_nomod) = key_event_fields(event);
-            jfn_input_dispatch_key_full(1, vkey, kc as i32, mods, ch, ch_nomod, 0);
-            // Forward typed characters for text input — paired CHAR event only
-            // for printable chars + Return.
-            if ch != 0 {
-                let c = ch;
-                let forward = c == 0x0d
-                    || (c >= 0x20 && c != 0x7f && !((0xF700..=0xF7FF).contains(&c)));
-                if forward {
-                    jfn_input_dispatch_char_sys(c as u32, mods, kc as u32, 0);
-                }
-            }
+            let (vkey, mods, kc, ch, ch_nomod, logical) = key_event_fields(event);
+            jfn_input_dispatch_key(KeyReport {
+                pressed: true,
+                modifiers: mods,
+                windows_key_code: vkey,
+                native_key_code: kc as i32,
+                is_system_key: false,
+                character: ch,
+                unmodified_character: ch_nomod,
+                logical,
+                physical: PhysicalKey::MacOS(kc),
+            });
+            dispatch_characters(event, mods, kc);
         }
 
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &AnyObject) {
-            let (vkey, mods, kc, ch, ch_nomod) = key_event_fields(event);
-            jfn_input_dispatch_key_full(0, vkey, kc as i32, mods, ch, ch_nomod, 0);
+            let (vkey, mods, kc, ch, ch_nomod, logical) = key_event_fields(event);
+            jfn_input_dispatch_key(KeyReport {
+                pressed: false,
+                modifiers: mods,
+                windows_key_code: vkey,
+                native_key_code: kc as i32,
+                is_system_key: false,
+                character: ch,
+                unmodified_character: ch_nomod,
+                logical,
+                physical: PhysicalKey::MacOS(kc),
+            });
         }
 
         #[unsafe(method(flagsChanged:))]
@@ -467,59 +479,74 @@ define_class!(
             let pressed = if flag != 0 { (raw_flags & flag) != 0 } else { false };
             let vkey = ns_keycode_to_vkey(kc);
             let mods = ns_to_cef_modifiers(raw_flags);
-            jfn_input_dispatch_key_full(if pressed { 1 } else { 0 }, vkey, kc as i32, mods, 0, 0, 0);
-        }
-
-        // ---- Focus ----
-        #[unsafe(method(becomeFirstResponder))]
-        fn become_first_responder(&self) -> Bool {
-            jfn_input_dispatch_keyboard_focus(1);
-            unsafe { msg_send![super(self), becomeFirstResponder] }
-        }
-        #[unsafe(method(resignFirstResponder))]
-        fn resign_first_responder(&self) -> Bool {
-            jfn_input_dispatch_keyboard_focus(0);
-            unsafe { msg_send![super(self), resignFirstResponder] }
+            jfn_input_dispatch_key(KeyReport {
+                pressed,
+                modifiers: mods,
+                windows_key_code: vkey,
+                native_key_code: kc as i32,
+                is_system_key: false,
+                character: 0,
+                unmodified_character: 0,
+                logical: None,
+                physical: PhysicalKey::MacOS(kc),
+            });
         }
 
         // ---- Edit menu actions ----
         // Without an Edit menu in the responder chain, AppKit never sends
-        // these. Forward each to the active CEF browser's focused frame.
+        // these. Forward each through the input router.
         #[unsafe(method(undo:))]
         fn undo_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.undo();
-            }
+            jfn_input::jfn_input_undo();
         }
         #[unsafe(method(redo:))]
         fn redo_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.redo();
-            }
+            jfn_input::jfn_input_redo();
         }
         #[unsafe(method(cut:))]
         fn cut_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.cut();
-            }
+            jfn_input::jfn_input_cut();
         }
         #[unsafe(method(copy:))]
         fn copy_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.copy();
-            }
+            jfn_input::jfn_input_copy();
         }
         #[unsafe(method(paste:))]
         fn paste_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.paste();
-            }
+            jfn_input::jfn_input_paste();
         }
         #[unsafe(method(selectAll:))]
         fn select_all_action(&self, _sender: *mut AnyObject) {
-            if let Some(b) = jfn_platform_abi::browser_bridge() {
-                b.select_all();
+            jfn_input::jfn_input_select_all();
+        }
+
+        /// Enabled by [`jfn_input::field_edit`] while a shell field is
+        /// focused, and enabled unconditionally while it reports none —
+        /// jellyfin-web owns input then, and only the page knows what its
+        /// focused element can do.
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: *mut AnyObject) -> Bool {
+            let Some(field) = jfn_input::field_edit() else {
+                return Bool::YES;
+            };
+            if item.is_null() {
+                return Bool::YES;
             }
+            let action: objc2::runtime::Sel = unsafe { msg_send![item, action] };
+            let enabled = if action == objc2::sel!(undo:) {
+                field.undo
+            } else if action == objc2::sel!(redo:) {
+                field.redo
+            } else if action == objc2::sel!(cut:) {
+                field.cut
+            } else if action == objc2::sel!(copy:) {
+                field.copy
+            } else if action == objc2::sel!(selectAll:) {
+                field.select_all
+            } else {
+                true
+            };
+            Bool::from(enabled)
         }
     }
 );
@@ -553,11 +580,12 @@ fn dispatch_mouse_button(view: &InputView, event: &AnyObject, button_code: u32, 
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let _click: isize = unsafe { msg_send![event, clickCount] };
     let mods = ns_to_cef_modifiers(raw_flags) | next;
+    let position = LogicalPoint::from_view(loc.x, loc.y);
     jfn_input_dispatch_mouse_button(
         button_code,
         if pressed { 1 } else { 0 },
-        loc.x as i32,
-        loc.y as i32,
+        position.x,
+        position.y,
         mods,
     );
 }
@@ -566,11 +594,54 @@ fn dispatch_mouse_move(view: &InputView, event: &AnyObject, leave: bool) {
     let loc = mouse_loc_in_view(view, event);
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let mods = ns_to_cef_modifiers(raw_flags) | G_MOUSE_BUTTON_MODIFIERS.load(Ordering::SeqCst);
-    jfn_input_dispatch_mouse_move(loc.x as i32, loc.y as i32, mods, if leave { 1 } else { 0 });
+    let position = LogicalPoint::from_view(loc.x, loc.y);
+    jfn_input_dispatch_mouse_move(position.x, position.y, mods, if leave { 1 } else { 0 });
 }
 
-/// Returns (windows_key_code, modifiers, native_keycode, character, unmodified_character).
-fn key_event_fields(event: &AnyObject) -> (i32, u32, u16, u16, u16) {
+/// AppKit names a function key with a code unit from the private-use block
+/// `NSEvent.h` reserves for them, `NSUpArrowFunctionKey` through the last
+/// defined constant: the arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`,
+/// forward delete and F1 through F35.
+const NS_FUNCTION_KEY_FIRST: u16 = 0xF700;
+const NS_FUNCTION_KEY_LAST: u16 = 0xF7FF;
+/// `NSDeleteCharacter`, the unit the Delete key types. Forward delete names
+/// itself with `NSDeleteFunctionKey`, inside the private-use range above.
+const NS_DELETE_CHARACTER: u16 = 0x7F;
+/// `CR`, the unit Return types.
+const NS_CARRIAGE_RETURN: u16 = 0x0D;
+/// The first unit that is not an ASCII control.
+const NS_FIRST_NON_CONTROL: u16 = 0x20;
+
+/// Whether a code unit is one a key typed rather than one AppKit uses to name
+/// a key the key event already carried.
+fn is_typed(unit: u16) -> bool {
+    if (NS_FUNCTION_KEY_FIRST..=NS_FUNCTION_KEY_LAST).contains(&unit) || unit == NS_DELETE_CHARACTER
+    {
+        return false;
+    }
+    unit == NS_CARRIAGE_RETURN || unit >= NS_FIRST_NON_CONTROL
+}
+
+/// Every UTF-16 unit of `-characters` a key typed, in order.
+fn dispatch_characters(event: &AnyObject, mods: u32, kc: u16) {
+    unsafe {
+        let chars: *mut AnyObject = msg_send![event, characters];
+        if chars.is_null() {
+            return;
+        }
+        let len: usize = msg_send![chars, length];
+        for index in 0..len {
+            let unit: u16 = msg_send![chars, characterAtIndex: index];
+            if is_typed(unit) {
+                jfn_input_dispatch_utf16(unit, mods, u32::from(kc), false);
+            }
+        }
+    }
+}
+
+/// Returns (windows_key_code, modifiers, native_keycode, character,
+/// unmodified_character, logical).
+fn key_event_fields(event: &AnyObject) -> (i32, u32, u16, u16, u16, Option<char>) {
     let kc: u16 = unsafe { msg_send![event, keyCode] };
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let etype: u64 = unsafe { msg_send![event, type] };
@@ -601,6 +672,7 @@ fn key_event_fields(event: &AnyObject) -> (i32, u32, u16, u16, u16) {
         kc,
         ch,
         ch_nomod,
+        jfn_input::key::logical_char(u32::from(ch_nomod)),
     )
 }
 

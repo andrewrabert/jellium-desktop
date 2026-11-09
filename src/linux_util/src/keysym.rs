@@ -32,6 +32,18 @@ pub fn keysym_to_vkey(sym: u32) -> i32 {
         ks::KEY_Page_Down => 0x22,
         ks::KEY_Delete => 0x2E,
         ks::KEY_Insert => 0x2D,
+        ks::KEY_Menu => 0x5D,
+        ks::KEY_KP_Enter => 0x0D,
+        ks::KEY_KP_Home => 0x24,
+        ks::KEY_KP_Left => 0x25,
+        ks::KEY_KP_Up => 0x26,
+        ks::KEY_KP_Right => 0x27,
+        ks::KEY_KP_Down => 0x28,
+        ks::KEY_KP_Page_Up => 0x21,
+        ks::KEY_KP_Page_Down => 0x22,
+        ks::KEY_KP_End => 0x23,
+        ks::KEY_KP_Insert => 0x2D,
+        ks::KEY_KP_Delete => 0x2E,
         // OEM punctuation. Required so Chromium can derive event.key (e.g.
         // '>' from Shift+Period) for DOM keydown handlers; without a VK
         // here, jellyfin-web shortcuts like '<' / '>' never match.

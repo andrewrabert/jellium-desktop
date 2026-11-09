@@ -3,6 +3,7 @@
 
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Shared, cloneable handle to one actor's state: a `parking_lot` mutex plus
 /// the condvar its consumer blocks on. Coalescing is the state's own business
@@ -59,6 +60,27 @@ impl<S> Mailbox<S> {
         }
         take(&mut state)
     }
+
+    /// Block until `ready` holds of the state or `deadline` passes, then run
+    /// `take` under the same lock. `None` when the deadline passed with `ready`
+    /// still false.
+    pub fn wait_until<R>(
+        &self,
+        deadline: Instant,
+        ready: impl Fn(&S) -> bool,
+        take: impl FnOnce(&mut S) -> R,
+    ) -> Option<R> {
+        let mut state = self.inner.state.lock();
+        while !ready(&state) {
+            // The timeout is only decisive once the predicate has been asked
+            // again under the reacquired lock: a wake and the deadline can land
+            // together.
+            if self.inner.cv.wait_until(&mut state, deadline).timed_out() && !ready(&state) {
+                return None;
+            }
+        }
+        Some(take(&mut state))
+    }
 }
 
 #[cfg(test)]
@@ -87,6 +109,27 @@ mod tests {
             producer.update(|s| *s = Some(9));
         });
         assert_eq!(mb.wait(|s| s.is_some(), Option::take), Some(9));
+        t.join().expect("producer thread");
+    }
+
+    #[test]
+    fn wait_until_returns_none_when_the_deadline_passes() {
+        let mb = Mailbox::new(None::<u32>);
+        let deadline = Instant::now() + std::time::Duration::from_millis(10);
+        assert_eq!(mb.wait_until(deadline, |s| s.is_some(), Option::take), None);
+        assert!(Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn wait_until_takes_a_state_that_became_ready() {
+        let mb = Mailbox::new(None::<u32>);
+        let producer = mb.clone();
+        let t = std::thread::spawn(move || producer.update(|s| *s = Some(4)));
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(
+            mb.wait_until(deadline, |s| s.is_some(), Option::take),
+            Some(Some(4))
+        );
         t.join().expect("producer thread");
     }
 

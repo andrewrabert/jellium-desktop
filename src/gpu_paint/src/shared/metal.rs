@@ -15,10 +15,6 @@ use crate::shared::{ImportFailed, Imported, Opened};
 /// nothing to mismatch.
 pub type ProducerId = ();
 
-pub(crate) fn producer_id(_sample: Option<&SharedTexture>) -> Option<ProducerId> {
-    Some(())
-}
-
 pub(crate) fn adapter_matches(_adapter: &wgpu::Adapter, _want: ProducerId) -> bool {
     true
 }
@@ -126,7 +122,6 @@ impl Importer {
                     height,
                     depth: 1,
                 },
-                None,
             )
         };
         let texture = unsafe {
@@ -146,7 +141,6 @@ impl Importer {
                     usage: wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 },
-                wgpu::TextureUses::UNINITIALIZED,
             )
         };
         self.cached = Some(Cached {

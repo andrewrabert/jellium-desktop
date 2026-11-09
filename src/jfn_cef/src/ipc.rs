@@ -1,21 +1,13 @@
-use cef::{
-    Browser, CefString, Frame, ImplBrowser, ImplFrame, ImplListValue, ImplProcessMessage,
-    ListValue, ProcessId, process_message_create, sys,
-};
+use cef::{ImplListValue, ListValue, sys};
 
 pub(crate) struct BrowserMessage {
     name: String,
     args: Option<ListValue>,
-    browser: Option<Browser>,
 }
 
 impl BrowserMessage {
-    pub(crate) fn new(name: String, args: Option<ListValue>, browser: Option<Browser>) -> Self {
-        Self {
-            name,
-            args,
-            browser,
-        }
+    pub(crate) fn new(name: String, args: Option<ListValue>) -> Self {
+        Self { name, args }
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -24,14 +16,6 @@ impl BrowserMessage {
 
     pub(crate) fn args(&self) -> Option<&ListValue> {
         self.args.as_ref()
-    }
-
-    pub(crate) fn browser(&self) -> Option<&Browser> {
-        self.browser.as_ref()
-    }
-
-    pub(crate) fn main_frame(&self) -> Option<Frame> {
-        self.browser.as_ref().and_then(|b| b.main_frame())
     }
 }
 
@@ -55,17 +39,4 @@ pub(crate) fn list_int(args: &ListValue, idx: usize) -> i32 {
     } else {
         args.int(idx)
     }
-}
-
-pub(crate) fn send_to_renderer<F: FnOnce(&ListValue)>(frame: &Frame, name: &str, fill: F) {
-    let Some(mut msg) = process_message_create(Some(&CefString::from(name))) else {
-        return;
-    };
-    if let Some(args) = msg.argument_list() {
-        fill(&args);
-    }
-    frame.send_process_message(
-        ProcessId::from(sys::cef_process_id_t::PID_RENDERER),
-        Some(&mut msg),
-    );
 }

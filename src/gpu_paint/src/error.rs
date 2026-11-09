@@ -4,10 +4,10 @@ use thiserror::Error;
 /// This surface can no longer present; the caller should abandon it.
 ///
 /// Its *existence* is the whole signal — there is no severity to interrogate,
-/// which is why it is opaque. Anything recoverable is handled internally and
-/// comes back as [`crate::Presented::Skipped`]: a stale, occluded or timed-out
-/// swapchain, and a shared-texture import that failed (a shared frame has no
-/// CPU pixels, so there is nothing to fall back to and the frame is dropped).
+/// which is why it is opaque. Anything recoverable comes back as another
+/// [`crate::PresentFailed`] arm, each naming what its producer still owes: a
+/// stale, occluded or timed-out swapchain, and a shared-texture import that
+/// failed.
 ///
 /// The detail below exists for the log line, and reaches callers only through
 /// `Display`.

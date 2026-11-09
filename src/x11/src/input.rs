@@ -22,13 +22,12 @@ use jfn_input::{
     jfn_input_dispatch_char, jfn_input_dispatch_history_nav, jfn_input_dispatch_mouse_button,
     jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll,
 };
-use jfn_linux_util::input::jfn_input_dispatch_key_raw;
+use jfn_linux_util::input::{compose_feed, compose_pending, jfn_input_dispatch_key_raw};
 use jfn_playback::shutdown::jfn_shutdown_register_waker;
 use jfn_wake_event::{Drain, WakeEvent, WakeSource};
 
 use crate::conn_source::XcbSource;
 
-use cursor_icon::CursorIcon;
 use jfn_input::buttons;
 use jfn_linux_util::xkb::to_cef_mods;
 use jfn_platform_abi::cursor::CursorShape;
@@ -120,8 +119,15 @@ enum QueuedInputEvent {
         modifiers: u32,
         native: u32,
     },
+    Text {
+        text: String,
+        modifiers: u32,
+    },
     HistoryNav {
         forward: c_int,
+    },
+    KeyboardFocus {
+        gained: bool,
     },
     MouseButton {
         code: u32,
@@ -150,6 +156,7 @@ struct State {
     window: u32,
     root: u32,
     net_active_window: u32,
+    screen_num: i32,
     xkb_ctx: xkb::Context,
     xkb_kmap: Option<xkb::Keymap>,
     xkb_st: Option<xkb::State>,
@@ -166,46 +173,6 @@ struct State {
 }
 
 unsafe impl Send for State {}
-
-fn cef_cursor_to_icon(shape: CursorShape) -> CursorIcon {
-    use CursorShape::*;
-    match shape {
-        Cross => CursorIcon::Crosshair,
-        Hand => CursorIcon::Pointer,
-        IBeam => CursorIcon::Text,
-        Wait => CursorIcon::Wait,
-        Help => CursorIcon::Help,
-        EastResize => CursorIcon::EResize,
-        NorthResize => CursorIcon::NResize,
-        NorthEastResize => CursorIcon::NeResize,
-        NorthWestResize => CursorIcon::NwResize,
-        SouthResize => CursorIcon::SResize,
-        SouthEastResize => CursorIcon::SeResize,
-        SouthWestResize => CursorIcon::SwResize,
-        WestResize => CursorIcon::WResize,
-        NorthSouthResize => CursorIcon::NsResize,
-        EastWestResize => CursorIcon::EwResize,
-        NorthEastSouthWestResize => CursorIcon::NeswResize,
-        NorthWestSouthEastResize => CursorIcon::NwseResize,
-        ColumnResize => CursorIcon::ColResize,
-        RowResize => CursorIcon::RowResize,
-        MiddlePanning | MiddlePanningVertical | MiddlePanningHorizontal => CursorIcon::AllScroll,
-        Move => CursorIcon::Move,
-        VerticalText => CursorIcon::VerticalText,
-        Cell => CursorIcon::Cell,
-        ContextMenu => CursorIcon::ContextMenu,
-        Alias => CursorIcon::Alias,
-        Progress => CursorIcon::Progress,
-        NoDrop => CursorIcon::NoDrop,
-        Copy => CursorIcon::Copy,
-        NotAllowed => CursorIcon::NotAllowed,
-        ZoomIn => CursorIcon::ZoomIn,
-        ZoomOut => CursorIcon::ZoomOut,
-        Grab => CursorIcon::Grab,
-        Grabbing => CursorIcon::Grabbing,
-        _ => CursorIcon::Default,
-    }
-}
 
 fn setup_xkb(conn: &xcb::Connection, st: &mut State) -> bool {
     let mut major = 0u16;
@@ -289,10 +256,19 @@ fn cef_modifiers(st: &State) -> u32 {
     st.modifiers | st.mouse_button_modifiers
 }
 
-fn to_logical(physical: i32) -> i32 {
-    let scale = crate::x11_state::parent_snapshot().scale;
-    let s = if scale > 0.0 { f64::from(scale) } else { 1.0 };
-    (physical as f64 / s) as i32
+/// The pointer position in the space the window's logical size names; the
+/// identity before the geometry thread has published an extent.
+fn view_point(x: i32, y: i32) -> jfn_platform_abi::LogicalPoint {
+    let extent = crate::x11_state::parent_snapshot().and_then(|s| {
+        crate::scale::extent(
+            jfn_platform_abi::PhysicalSize {
+                w: s.width,
+                h: s.height,
+            },
+            s.scale,
+        )
+    });
+    crate::scale::view_point(extent, jfn_platform_abi::PhysicalPoint { x, y })
 }
 
 fn handle_key(st: &mut State, detail: u8, pressed: bool) {
@@ -329,13 +305,20 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
     });
 
     if pressed {
-        let cp = xst.key_get_utf32(kc);
-        if cp > 0 {
-            let _ = st.dispatch.send(QueuedInputEvent::Char {
-                cp,
+        if let Some(text) = compose_feed(sym) {
+            let _ = st.dispatch.send(QueuedInputEvent::Text {
+                text,
                 modifiers: st.modifiers,
-                native: native as u32,
             });
+        } else if !compose_pending() {
+            let cp = xst.key_get_utf32(kc);
+            if cp > 0 {
+                let _ = st.dispatch.send(QueuedInputEvent::Char {
+                    cp,
+                    modifiers: st.modifiers,
+                    native: native as u32,
+                });
+            }
         }
     }
 
@@ -352,8 +335,8 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
 
 fn handle_button(st: &mut State, detail: u8, event_x: i16, event_y: i16, pressed: bool) {
     let button = detail as u32;
-    let x = to_logical(event_x as i32);
-    let y = to_logical(event_y as i32);
+    let point = view_point(event_x as i32, event_y as i32);
+    let (x, y) = (point.x, point.y);
 
     if (4..=7).contains(&button) {
         if !pressed {
@@ -435,8 +418,9 @@ fn activate_parent(st: &State) {
 }
 
 fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) {
-    st.ptr_x = to_logical(ev.event_x() as i32);
-    st.ptr_y = to_logical(ev.event_y() as i32);
+    let point = view_point(ev.event_x() as i32, ev.event_y() as i32);
+    st.ptr_x = point.x;
+    st.ptr_y = point.y;
     let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
         x: st.ptr_x,
         y: st.ptr_y,
@@ -446,8 +430,9 @@ fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) {
 }
 
 fn handle_enter(st: &mut State, ev: &xcb::x::EnterNotifyEvent) {
-    st.ptr_x = to_logical(ev.event_x() as i32);
-    st.ptr_y = to_logical(ev.event_y() as i32);
+    let point = view_point(ev.event_x() as i32, ev.event_y() as i32);
+    st.ptr_x = point.x;
+    st.ptr_y = point.y;
     st.cursor.resend_latest();
     let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
         x: st.ptr_x,
@@ -523,7 +508,7 @@ fn apply_cursor(st: &mut CursorState, shape: CursorShape) {
                 let Some(cursor_handle) = st.cursor_handle.as_ref() else {
                     return;
                 };
-                let name = cef_cursor_to_icon(shape).name();
+                let name = jfn_linux_util::cursor::icon_for(shape).name();
                 let Ok(id) = cursor_handle.load_cursor(&**conn, name) else {
                     return;
                 };
@@ -571,12 +556,14 @@ fn input_thread_body(mut st: State) {
         | x::EventMask::BUTTON_RELEASE
         | x::EventMask::POINTER_MOTION
         | x::EventMask::ENTER_WINDOW
-        | x::EventMask::LEAVE_WINDOW;
+        | x::EventMask::LEAVE_WINDOW
+        | x::EventMask::FOCUS_CHANGE;
     st.conn.send_request(&x::ChangeWindowAttributes {
         window: x::Window::new(st.window),
         value_list: &[x::Cw::EventMask(mask)],
     });
     let _ = st.conn.flush();
+    crate::selection::install(&st.conn, st.screen_num);
 
     let mut event_loop: EventLoop<'_, State> = match EventLoop::try_new() {
         Ok(el) => el,
@@ -671,7 +658,13 @@ fn dispatch_input_event(ev: QueuedInputEvent) {
             modifiers,
             native,
         } => jfn_input_dispatch_char(cp, modifiers, native),
+        QueuedInputEvent::Text { text, modifiers } => {
+            jfn_input::jfn_input_dispatch_text(&text, modifiers)
+        }
         QueuedInputEvent::HistoryNav { forward } => jfn_input_dispatch_history_nav(forward),
+        QueuedInputEvent::KeyboardFocus { gained } => {
+            jfn_input::jfn_input_dispatch_keyboard_focus(c_int::from(gained));
+        }
         QueuedInputEvent::MouseButton {
             code,
             pressed,
@@ -720,6 +713,22 @@ fn input_dispatch_thread_body(events: Channel<QueuedInputEvent>) {
     }
 }
 
+/// A focus change the window itself took or lost. A `NotifyGrab` or
+/// `NotifyUngrab` mode is the menu's keyboard grab and changes nothing, and so
+/// is a `NotifyPointer`, `NotifyPointerRoot` or `NotifyInferior` detail.
+fn handle_focus(st: &State, mode: x::NotifyMode, detail: x::NotifyDetail, gained: bool) {
+    if matches!(mode, x::NotifyMode::Grab | x::NotifyMode::Ungrab) {
+        return;
+    }
+    if matches!(
+        detail,
+        x::NotifyDetail::Pointer | x::NotifyDetail::PointerRoot | x::NotifyDetail::Inferior
+    ) {
+        return;
+    }
+    let _ = st.dispatch.send(QueuedInputEvent::KeyboardFocus { gained });
+}
+
 fn handle_event(st: &mut State, ev: xcb::Event) {
     use xcb::Event;
     match ev {
@@ -732,6 +741,23 @@ fn handle_event(st: &mut State, ev: xcb::Event) {
             handle_button(st, e.detail(), e.event_x(), e.event_y(), false)
         }
         Event::X(x::Event::MotionNotify(e)) => handle_motion(st, &e),
+        Event::X(x::Event::FocusIn(e)) => handle_focus(st, e.mode(), e.detail(), true),
+        Event::X(x::Event::FocusOut(e)) => handle_focus(st, e.mode(), e.detail(), false),
+        Event::X(x::Event::SelectionRequest(e)) => {
+            if let Some(selections) = crate::selection::selections() {
+                selections.on_selection_request(&e);
+            }
+        }
+        Event::X(x::Event::SelectionNotify(e)) => {
+            if let Some(selections) = crate::selection::selections() {
+                selections.on_selection_notify(&e);
+            }
+        }
+        Event::X(x::Event::SelectionClear(e)) => {
+            if let Some(selections) = crate::selection::selections() {
+                selections.on_selection_clear(&e);
+            }
+        }
         Event::X(x::Event::EnterNotify(e)) => handle_enter(st, &e),
         Event::X(x::Event::LeaveNotify(e)) => handle_leave(st, &e),
         Event::Xkb(xkb_ev) => {
@@ -764,6 +790,7 @@ pub fn start(screen_num: i32, parent: u32) -> Option<Handle> {
         window: parent,
         root,
         net_active_window,
+        screen_num,
         xkb_ctx: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
         xkb_kmap: None,
         xkb_st: None,

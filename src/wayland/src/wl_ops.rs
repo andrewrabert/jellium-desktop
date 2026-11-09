@@ -6,11 +6,11 @@
 //! C++ original.
 
 use jfn_gpu_paint::SharedTexture;
-use jfn_platform_abi::JfnRect;
+use jfn_platform_abi::{Ack, Content, PaintFrame, Presented, Visibility, VisibilityCommit};
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
-use crate::layer::{LayerSurface, Present, PresentError, SurfaceRef, ViewportState};
+use crate::layer::{LayerSurface, SurfaceRef, ViewportState};
 use crate::layer_actor::{LayerActor, LayerBackend};
 use crate::runtime::WlRuntime;
 use crate::wl_state::{PlatformSurface, WlState, size_in_tolerance};
@@ -25,8 +25,8 @@ fn core(rt: &WlRuntime) -> Option<parking_lot::MutexGuard<'_, WlState>> {
 
 /// The returned pointer is stable for the surface's lifetime; the caller owns
 /// it until `free_surface`.
-fn new_boxed() -> *mut PlatformSurface {
-    Box::into_raw(Box::new(PlatformSurface::new()))
+fn new_boxed(visibility: Visibility) -> *mut PlatformSurface {
+    Box::into_raw(Box::new(PlatformSurface::new(visibility)))
 }
 
 unsafe fn drop_boxed(p: *mut PlatformSurface) {
@@ -43,12 +43,12 @@ unsafe fn surface_mut<'a>(p: *mut PlatformSurface) -> &'a mut PlatformSurface {
 // alloc / free / restack
 // =====================================================================
 
-pub(crate) fn alloc_surface(rt: &'static WlRuntime) -> *mut PlatformSurface {
+pub(crate) fn alloc_surface(rt: &'static WlRuntime, initial: Visibility) -> *mut PlatformSurface {
     // Take the lock before allocating: bailing out afterwards would leak the box.
     let Some(mut st) = core(rt) else {
         return std::ptr::null_mut();
     };
-    let ptr = new_boxed();
+    let ptr = new_boxed(initial);
     // SAFETY: ptr is freshly heap-allocated; no aliases yet.
     let s = unsafe { surface_mut(ptr) };
 
@@ -59,15 +59,12 @@ pub(crate) fn alloc_surface(rt: &'static WlRuntime) -> *mut PlatformSurface {
         surface.set_input_region(Some(empty.wl_region()));
     }
 
-    let viewport = st
-        .viewporter
-        .as_ref()
-        .map(|vp| vp.get_viewport(&surface, &st.qh, ()));
+    let viewport = st.viewporter.get_viewport(&surface, &st.qh, ());
 
     surface.commit();
     st.flush();
 
-    s.layer_actor = Some(build_actor(rt, &st, &surface, &viewport, s.visible));
+    s.layer_actor = Some(build_actor(rt, &st, &surface, &viewport, s.visibility));
     s.surface = Some(SurfaceRef::new(surface, viewport));
     crate::wl_state::parent_layer(&mut st, ptr);
 
@@ -122,6 +119,7 @@ pub(crate) fn free_surface(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
     unsafe { drop_boxed(ptr) };
 }
 
+/// Applies the whole order, bottom first, replacing whatever was applied before.
 pub(crate) fn restack(rt: &'static WlRuntime, ordered: &[*mut PlatformSurface]) {
     let Some(mut st) = core(rt) else { return };
     st.stack.clear();
@@ -131,45 +129,97 @@ pub(crate) fn restack(rt: &'static WlRuntime, ordered: &[*mut PlatformSurface]) 
         .filter(|p| !p.is_null())
         .map(|p| crate::scene::LayerId(*p as usize))
         .collect();
-    crate::scene::dispatch(rt, &mut st, crate::scene::SceneEvent::Restack(order));
+    crate::scene::dispatch(rt, &mut st, crate::scene::SceneEvent::Order(order));
 }
 
 // =====================================================================
-// set_visible
+// visibility
 // =====================================================================
 
-pub(crate) fn surface_set_visible(
+/// Writes the surface's one visibility value and hands back the commit carrying
+/// it.
+///
+/// The root read loop takes this lock to dispatch the acknowledgement, so the
+/// commit is returned with the lock released and awaited by the caller.
+pub(crate) fn set_visibility(
     rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
-    visible: bool,
-    bg_r: u8,
-    bg_g: u8,
-    bg_b: u8,
+    visibility: Visibility,
+) -> VisibilityCommit {
+    if ptr.is_null() {
+        return VisibilityCommit::issued(visibility, Ack::immediate());
+    }
+    let Some(st) = core(rt) else {
+        return VisibilityCommit::issued(visibility, Ack::immediate());
+    };
+    let s = unsafe { surface_mut(ptr) };
+    s.visibility = visibility;
+    let Some(actor) = s.layer_actor.as_ref() else {
+        return VisibilityCommit::issued(visibility, Ack::immediate());
+    };
+    let commit = actor.apply_visibility(visibility);
+    // Release the lock before the caller can block on the ack: the actor thread
+    // takes it to reach the runtime while it services the request.
+    drop(st);
+    rt.root().request_present();
+    commit
+}
+
+// =====================================================================
+// resize / window target
+// =====================================================================
+
+/// Positions the subsurface at its reserved top inset and shrinks the
+/// viewport destination by the same amount.
+pub(crate) fn surface_resize(
+    rt: &'static WlRuntime,
+    ptr: *mut PlatformSurface,
+    size: jfn_platform_abi::SurfaceSize,
 ) {
     if ptr.is_null() {
         return;
     }
     let Some(st) = core(rt) else { return };
     let s = unsafe { surface_mut(ptr) };
-    if s.visible == visible {
-        return;
+    let logical = size.extent.logical();
+    let physical = size.extent.physical();
+    s.top_logical = size.logical_top.max(0);
+    s.top_physical = size.physical_top.max(0);
+    if let Some(sub) = s.subsurface.as_ref() {
+        sub.set_position(0, s.top_logical);
     }
-    s.visible = visible;
-    if s.surface.is_none() {
-        return;
+    if let Some(surface) = s.surface.as_ref() {
+        surface.set_destination(logical.w, logical.h);
     }
-
-    // Skip the placeholder in GPU mode: Vulkan-WSI owns this surface's buffers,
-    // so an shm placeholder would fight the swapchain.
-    let use_gpu_paint = st.use_gpu_paint;
     if let Some(actor) = s.layer_actor.as_ref() {
-        actor.set_visible(visible);
-        if visible && !use_gpu_paint {
-            actor.request_placeholder(bg_r, bg_g, bg_b);
-        }
+        actor.resize(logical.w, logical.h, physical.w, physical.h);
     }
-    s.null_attached = !visible;
-    rt.root().request_present();
+    st.flush();
+}
+
+/// Marks the surface external, desynchronizes it, and hands back its swapchain
+/// target.
+///
+/// Takes the `WlState` lock: every other reader of `PlatformSurface` holds the
+/// same lock. Desync is what makes the surface's own commits reach the
+/// compositor without a parent commit, which is what makes the frame callbacks
+/// a FIFO swapchain throttles on arrive.
+pub(crate) fn window_target(
+    rt: &'static WlRuntime,
+    ptr: *mut PlatformSurface,
+) -> Option<jfn_gpu_paint::WindowTarget> {
+    if ptr.is_null() {
+        return None;
+    }
+    let st = core(rt)?;
+    let s = unsafe { surface_mut(ptr) };
+    s.external = true;
+    if let Some(sub) = s.subsurface.as_ref() {
+        sub.set_desync();
+    }
+    let target = s.surface.as_ref()?.window_target();
+    st.flush();
+    target
 }
 
 // =====================================================================
@@ -190,14 +240,13 @@ fn build_actor(
     rt: &'static WlRuntime,
     st: &WlState,
     surface: &WlSurface,
-    viewport: &Option<WpViewport>,
-    visible: bool,
+    viewport: &WpViewport,
+    visibility: Visibility,
 ) -> LayerActor {
     let backend = match (st.use_gpu_paint, st.gpu) {
         (true, Some(ctx)) => LayerBackend::Gpu(ctx),
         _ => LayerBackend::Shm,
     };
-    let (lw, lh, pw, ph) = extent_or(rt, 0, 0);
     let layer = LayerSurface::new(st.conn.clone(), surface.clone(), viewport.clone());
     LayerActor::new(
         backend,
@@ -208,84 +257,112 @@ fn build_actor(
             dmabuf: st.dmabuf.clone(),
         },
         layer,
-        ViewportState { lw, lh, pw, ph },
-        visible,
+        window_viewport(rt),
+        visibility,
     )
 }
 
-fn extent_or(rt: &WlRuntime, w: i32, h: i32) -> (i32, i32, i32, i32) {
-    rt.window().window_extent().map_or((w, h, w, h), |ext| {
-        (
-            ext.logical().w(),
-            ext.logical().h(),
-            ext.physical().w(),
-            ext.physical().h(),
-        )
-    })
+/// The published window extent minus `s`'s reserved top inset — the size the
+/// subsurface actually covers.
+fn inset_extent(
+    s: &PlatformSurface,
+    extent: crate::window_state::WindowExtentSnapshot,
+) -> (i32, i32, i32, i32) {
+    (
+        extent.logical().w(),
+        (extent.logical().h() - s.top_logical).max(1),
+        extent.physical().w(),
+        (extent.physical().h() - s.top_physical).max(1),
+    )
 }
 
-pub(crate) fn surface_present(
+/// The viewport the published window extent names, or
+/// [`ViewportState::UNPUBLISHED`] before the first publish.
+fn window_viewport(rt: &WlRuntime) -> ViewportState {
+    rt.window()
+        .window_extent()
+        .map_or(ViewportState::UNPUBLISHED, |ext| ViewportState {
+            lw: ext.logical().w(),
+            lh: ext.logical().h(),
+            pw: ext.physical().w(),
+            ph: ext.physical().h(),
+        })
+}
+
+/// The window extent `content` may be presented against, or `None` when this
+/// surface has no commit stream for it right now.
+///
+/// Everything that can reject a frame is asked here, before the frame is
+/// consumed, so no producer is handed a commit proof for a frame that goes
+/// nowhere. A window that has published no extent rejects every frame: the
+/// frame's own texel size names no scale, and nothing here may name one. A
+/// dmabuf frame additionally needs the protocol and a size the window still
+/// expects; mid-transition frames of the old size would flash the wrong
+/// geometry.
+fn accepts(
+    rt: &'static WlRuntime,
+    st: &WlState,
+    s: &PlatformSurface,
+    content: &Content<'_>,
+) -> Option<crate::window_state::WindowExtentSnapshot> {
+    if s.surface.is_none() || !s.visibility.is_shown() || s.external || s.layer_actor.is_none() {
+        return None;
+    }
+    let extent = rt.window().window_extent()?;
+    match content {
+        Content::Accelerated(tex) => {
+            st.dmabuf.is_some()
+                && tex.coded().w > 0
+                && tex.coded().h > 0
+                && size_in_tolerance(rt, tex.visible_rect().w, tex.visible_rect().h)
+        }
+        Content::Software { size, pixels, .. } => {
+            size.w > 0
+                && size.h > 0
+                && (size.h as usize)
+                    .checked_mul((size.w as usize).saturating_mul(4))
+                    .is_some_and(|need| pixels.len() >= need)
+        }
+    }
+    .then_some(extent)
+}
+
+/// Hands `frame` to the surface's actor, or back to its producer when this
+/// surface has no commit stream for it.
+pub(crate) fn present<'a>(
     rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
-    frame: SharedTexture,
-) -> Result<Present, PresentError> {
+    frame: PaintFrame<'a>,
+) -> Result<Presented, PaintFrame<'a>> {
     if ptr.is_null() {
-        return Ok(Present::Skipped);
+        return Err(frame);
     }
-    let (w, h) = (frame.coded().w, frame.coded().h);
-    let (vw, vh) = (frame.visible_rect().w, frame.visible_rect().h);
-
     let Some(st) = core(rt) else {
-        return Ok(Present::Skipped);
+        return Err(frame);
     };
     let s = unsafe { surface_mut(ptr) };
-    if s.surface.is_none() || !s.visible || st.dmabuf.is_none() {
-        return Ok(Present::Skipped);
-    }
-    if !size_in_tolerance(rt, vw, vh) && !s.null_attached {
-        return Ok(Present::Skipped);
-    }
-
-    s.null_attached = false;
-    let (lw, lh, pw, ph) = extent_or(rt, w, h);
-
+    let Some(extent) = accepts(rt, &st, s, frame.content()) else {
+        return Err(frame);
+    };
+    let (lw, lh, pw, ph) = inset_extent(s, extent);
     let Some(actor) = s.layer_actor.as_ref() else {
-        return Ok(Present::Skipped);
+        return Err(frame);
     };
-    actor.set_visible(s.visible);
     actor.resize(lw, lh, pw, ph);
-    actor.present_dmabuf(frame)
-}
-
-pub(crate) fn surface_present_software(
-    rt: &'static WlRuntime,
-    ptr: *mut PlatformSurface,
-    dirty: &[JfnRect],
-    pixels: &[u8],
-    w: i32,
-    h: i32,
-) -> Result<Present, PresentError> {
-    if ptr.is_null() || w <= 0 || h <= 0 {
-        return Err(PresentError::BadDimensions(w, h));
-    }
-
-    let Some(_st) = core(rt) else {
-        return Ok(Present::Skipped);
-    };
-    let s = unsafe { surface_mut(ptr) };
-    if s.surface.is_none() || !s.visible {
-        return Ok(Present::Skipped);
-    }
-
-    s.null_attached = false;
-    let (lw, lh, pw, ph) = extent_or(rt, w, h);
-
-    let Some(actor) = s.layer_actor.as_ref() else {
-        return Ok(Present::Skipped);
-    };
-    actor.set_visible(s.visible);
-    actor.resize(lw, lh, pw, ph);
-    actor.present_software(pixels, w, h, dirty)
+    // Taken before the frame is consumed: the actor holds a frame the swapchain
+    // could not take, and only the producer named here is owed its successor.
+    let source = frame.source();
+    Ok(frame.present(|content| {
+        match content {
+            Content::Accelerated(tex) => actor.present_dmabuf(tex, source),
+            Content::Software {
+                size,
+                pixels,
+                dirty,
+            } => actor.present_software(pixels, size.w, size.h, dirty, source),
+        }
+        Presented::issued()
+    }))
 }
 
 pub(crate) fn on_configure(rt: &'static WlRuntime, fullscreen: bool) {
@@ -306,8 +383,14 @@ pub(crate) fn on_configure(rt: &'static WlRuntime, fullscreen: bool) {
             continue;
         }
         let s = unsafe { surface_mut(p) };
+        let (slw, slh, spw, sph) = (
+            lw,
+            (lh - s.top_logical).max(1),
+            pw,
+            (ph - s.top_physical).max(1),
+        );
         if let Some(actor) = s.layer_actor.as_ref() {
-            actor.resize(lw, lh, pw, ph);
+            actor.resize(slw, slh, spw, sph);
         }
     }
 

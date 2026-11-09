@@ -18,7 +18,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use jfn_compositor_core::transition::TransitionGate;
 use memmap2::MmapMut;
 use x11rb::protocol::shm;
@@ -99,6 +99,16 @@ pub struct Atoms {
     pub cardinal: u32,
     pub motif_wm_hints: u32,
     pub net_active_window: u32,
+    pub clipboard: u32,
+    pub primary: u32,
+    pub targets: u32,
+    pub timestamp: u32,
+    pub utf8_string: u32,
+    pub text: u32,
+    pub text_plain_utf8: u32,
+    pub incr: u32,
+    /// The property a conversion is delivered into.
+    pub jfn_selection: u32,
 }
 
 /// Immutable host-window facts, set once by [`crate::lifecycle::ensure_host_window`].
@@ -129,7 +139,7 @@ pub struct PaintServices {
 /// The app top-level's live geometry, published by the geometry thread. An
 /// immutable snapshot swapped wholesale so every other reader is lock-free and
 /// never tears placement mid-update.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug)]
 pub struct ParentSnapshot {
     pub origin_x: i32,
     pub origin_y: i32,
@@ -137,12 +147,12 @@ pub struct ParentSnapshot {
     pub height: i32,
     pub fullscreen: bool,
     pub maximized: bool,
-    pub scale: f32,
+    pub scale: jfn_platform_abi::Scale,
 }
 
 static HOST: OnceLock<HostServices> = OnceLock::new();
 static PAINT: OnceLock<PaintServices> = OnceLock::new();
-static PARENT: OnceLock<ArcSwap<ParentSnapshot>> = OnceLock::new();
+static PARENT: OnceLock<ArcSwapOption<ParentSnapshot>> = OnceLock::new();
 /// Bottom-to-top live overlay window ids, republished by the geometry thread on
 /// every create/destroy so the cursor thread can target them lock-free.
 static OVERLAY_WINDOWS: OnceLock<ArcSwap<Vec<u32>>> = OnceLock::new();
@@ -151,6 +161,37 @@ static OVERLAY_WINDOWS: OnceLock<ArcSwap<Vec<u32>>> = OnceLock::new();
 /// good frame holds. Small dedicated lock (the [`TransitionGate`] is a pure
 /// value type).
 pub static GATE: Mutex<TransitionGate> = Mutex::new(TransitionGate::new());
+
+/// X11's resize-transition gate: it captures the published parent size when a
+/// transition begins, so a stale-size frame is dropped until the window
+/// settles.
+pub(crate) struct X11ResizeGate;
+
+pub(crate) static X11_RESIZE_GATE: X11ResizeGate = X11ResizeGate;
+
+impl jfn_platform_abi::ResizeGate for X11ResizeGate {
+    fn begin(&self) {
+        let Some(snap) = parent_snapshot() else {
+            tracing::warn!(target: "Platform", "no published geometry; nothing to gate");
+            return;
+        };
+        GATE.lock().begin_capturing((snap.width, snap.height));
+    }
+
+    /// Ends the gate only; the geometry thread is the sole owner of overlay
+    /// structure, so nothing is re-applied here.
+    fn end(&self) {
+        GATE.lock().end();
+    }
+
+    fn in_transition(&self) -> bool {
+        GATE.lock().in_transition()
+    }
+
+    fn set_expected(&self, size: jfn_platform_abi::PhysicalSize) {
+        GATE.lock().set_expected((size.w, size.h));
+    }
+}
 
 static CONN: OnceLock<Arc<xcb::Connection>> = OnceLock::new();
 pub static X11RB_CONN: OnceLock<Arc<RustConnection>> = OnceLock::new();
@@ -171,17 +212,18 @@ pub(crate) fn paint() -> Option<&'static PaintServices> {
     PAINT.get()
 }
 
-fn parent_cell() -> &'static ArcSwap<ParentSnapshot> {
-    PARENT.get_or_init(|| ArcSwap::from_pointee(ParentSnapshot::default()))
+fn parent_cell() -> &'static ArcSwapOption<ParentSnapshot> {
+    PARENT.get_or_init(ArcSwapOption::empty)
 }
 
 /// Publish a fresh parent snapshot. Called only by the geometry thread.
 pub(crate) fn publish_parent(snap: ParentSnapshot) {
-    parent_cell().store(Arc::new(snap));
+    parent_cell().store(Some(Arc::new(snap)));
 }
 
-/// Lock-free read of the latest published parent geometry.
-pub fn parent_snapshot() -> Arc<ParentSnapshot> {
+/// Lock-free read of the latest published parent geometry. `None` until the
+/// geometry thread has published one.
+pub fn parent_snapshot() -> Option<Arc<ParentSnapshot>> {
     parent_cell().load_full()
 }
 

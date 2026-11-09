@@ -16,7 +16,7 @@ use std::ffi::{CStr, CString};
 use std::os::fd::IntoRawFd;
 use std::rc::Rc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::thread;
 
 use error_reporter::Report;
@@ -66,6 +66,10 @@ pub(crate) struct ProxyShared {
     // S_mpv records this from `server_id()`; S_app matches it against
     // `client_id()` on client M. Same wire object => the two ids are equal.
     mpv_video_surface_id: AtomicU32,
+    /// Set until the proxy thread has placed the video subsurface at the bottom
+    /// of the host root's stack. Sticky, so a request raised before the splice
+    /// is honored by the splice itself.
+    pin_video_pending: AtomicBool,
     app_client_fd: AtomicI32,
     mpv_wake: Mutex<Option<calloop::ping::Ping>>,
     proxy: OnceLock<Proxy>,
@@ -76,6 +80,7 @@ impl ProxyShared {
         Self {
             window: Mutex::new(None),
             mpv_video_surface_id: AtomicU32::new(0),
+            pin_video_pending: AtomicBool::new(false),
             app_client_fd: AtomicI32::new(-1),
             mpv_wake: Mutex::new(None),
             proxy: OnceLock::new(),
@@ -89,6 +94,21 @@ impl ProxyShared {
         // SAFETY: the swap hands this fd to exactly one caller, and nothing
         // else in the process holds it after publication.
         (fd >= 0).then(|| unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+    }
+
+    /// Asks the proxy thread to place mpv's video subsurface directly above the
+    /// host root; the placement applies on the parent's next commit.
+    ///
+    /// Order-independent: raised before the splice, the splice's own placement
+    /// discharges it; raised after, the proxy thread's next turn does.
+    pub(crate) fn pin_video_bottom(&self) {
+        self.pin_video_pending.store(true, Ordering::Release);
+    }
+
+    /// Claims a pending pin, leaving the flag clear only for the caller that
+    /// takes it.
+    fn take_pin_video_bottom(&self) -> bool {
+        self.pin_video_pending.swap(false, Ordering::AcqRel)
     }
 
     fn window_size(&self) -> Option<WindowSize> {

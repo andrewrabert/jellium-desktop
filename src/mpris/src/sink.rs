@@ -1,6 +1,7 @@
-//! MPRIS direct sink. Owns its own thread that runs a zbus blocking
-//! Connection. Receives PlaybackEvents through a channel, updates the
-//! content/snapshot state, and emits PropertiesChanged + Seeked signals.
+//! MPRIS direct sink. A [`QueuedSink`] run by the playback sink harness on
+//! its consumer thread, holding a zbus blocking Connection. Each delivered
+//! PlaybackEvent updates the content/snapshot state and emits
+//! PropertiesChanged + Seeked signals.
 //!
 //! Method/property handlers run inline on zbus's reactor thread; outbound
 //! transport (Play/Pause/Stop/etc.) calls jfn_mpv_* directly. Next/
@@ -8,12 +9,10 @@
 //! callback.
 
 use async_io::block_on;
-use crossbeam_channel::{Receiver, Sender, unbounded};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 
 use zbus::blocking::Connection;
 use zbus::blocking::object_server::InterfaceRef;
@@ -23,6 +22,7 @@ use zbus::object_server::{Interface, SignalEmitter};
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
 use crate::projection;
+use jfn_playback::sink_core::{self, QueuedSink};
 use jfn_playback::{MediaMetadata, PlaybackEvent, PlaybackEventKind, PlaybackSnapshot};
 
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
@@ -145,8 +145,6 @@ impl State {
         }
     }
 }
-
-use jfn_playback::sink_core;
 
 // ============================================================================
 // D-Bus interface impls
@@ -289,40 +287,63 @@ impl Player {
 }
 
 // ============================================================================
-// Worker thread + global sink registry
+// Queued sink
 // ============================================================================
 
-struct Sink {
-    tx: Sender<PlaybackEvent>,
-    join: JoinHandle<()>,
+/// The MPRIS transport the harness drives: connects on `init`, releases the
+/// bus name on `teardown`.
+struct Transport {
+    service_name: String,
+    bus: Option<Bus>,
 }
 
-/// Producer end plus worker handle, live only while the sink runs. `stop`
-/// clears it, which disconnects the worker once the queue drains.
-static SINK: RwLock<Option<Sink>> = RwLock::new(None);
+/// A live session-bus registration.
+struct Bus {
+    conn: Connection,
+    state: Arc<Mutex<State>>,
+    iface: InterfaceRef<Player>,
+    last_props: HashMap<String, OwnedValue>,
+}
 
-/// Push a PlaybackEvent into the running MPRIS sink. No-op if not started.
-/// Called by the event-sink closure registered in [`start`].
-pub(crate) fn deliver(ev: PlaybackEvent) {
-    if let Some(sink) = SINK.read().as_ref() {
-        let _ = sink.tx.send(ev);
+impl Transport {
+    fn new(service_suffix: &str) -> Self {
+        Transport {
+            service_name: format!("{BASE_SERVICE_NAME}{service_suffix}"),
+            bus: None,
+        }
     }
 }
 
-fn worker(rx: Receiver<PlaybackEvent>, service_suffix: String) {
-    let service_name = format!("{}{}", BASE_SERVICE_NAME, service_suffix);
+impl QueuedSink for Transport {
+    fn init(&mut self) {
+        self.bus = connect(&self.service_name);
+    }
 
+    fn deliver(&mut self, ev: &PlaybackEvent) {
+        if let Some(bus) = &mut self.bus {
+            handle_event(ev, &bus.state, &bus.iface, &mut bus.last_props);
+        }
+    }
+
+    fn teardown(&mut self) {
+        if let Some(bus) = self.bus.take() {
+            let _ = bus.conn.release_name(self.service_name.as_str());
+        }
+    }
+}
+
+fn connect(service_name: &str) -> Option<Bus> {
     let conn = match Connection::session() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("mpris: session bus connect failed: {}", e);
-            return;
+            return None;
         }
     };
 
     if let Err(e) = conn.object_server().at(MPRIS_PATH, Root) {
         eprintln!("mpris: register root iface: {}", e);
-        return;
+        return None;
     }
 
     let state = Arc::new(Mutex::new(State::fresh()));
@@ -331,39 +352,40 @@ fn worker(rx: Receiver<PlaybackEvent>, service_suffix: String) {
     };
     if let Err(e) = conn.object_server().at(MPRIS_PATH, player) {
         eprintln!("mpris: register player iface: {}", e);
-        return;
+        return None;
     }
 
     let iface = match conn.object_server().interface::<_, Player>(MPRIS_PATH) {
         Ok(iface) => iface,
         Err(e) => {
             eprintln!("mpris: resolve player iface: {e}");
-            return;
+            return None;
         }
     };
-    let mut last_props = match player_properties(&iface) {
+    let last_props = match player_properties(&iface) {
         Ok(props) => props,
         Err(e) => {
             eprintln!("mpris: initial property snapshot: {e}");
-            return;
+            return None;
         }
     };
 
-    if let Err(e) = conn.request_name(service_name.as_str()) {
+    if let Err(e) = conn.request_name(service_name) {
         eprintln!("mpris: request name {}: {}", service_name, e);
-        return;
+        return None;
     }
     eprintln!("mpris: registered as {}", service_name);
 
-    while let Ok(ev) = rx.recv() {
-        handle_event(ev, &state, &iface, &mut last_props);
-    }
-
-    let _ = conn.release_name(service_name.as_str());
+    Some(Bus {
+        conn,
+        state,
+        iface,
+        last_props,
+    })
 }
 
 fn handle_event(
-    ev: PlaybackEvent,
+    ev: &PlaybackEvent,
     state: &Arc<Mutex<State>>,
     iface: &InterfaceRef<Player>,
     last: &mut HashMap<String, OwnedValue>,
@@ -490,44 +512,16 @@ fn emit_properties_changed(
 // start / stop
 // ============================================================================
 
-/// Spawn the MPRIS sink thread. `service_suffix` is appended to the base
-/// service name (`org.mpris.MediaPlayer2.JelliumDesktop<suffix>`).
+/// Run the MPRIS sink on the harness thread. `service_suffix` is appended to
+/// the base service name (`org.mpris.MediaPlayer2.JelliumDesktop<suffix>`).
 /// No-op if already running.
 pub(crate) fn start(service_suffix: &str) {
-    let mut slot = SINK.write();
-    if slot.is_some() {
-        return;
-    }
     let suffix = service_suffix.to_owned();
-    let (tx, rx) = unbounded::<PlaybackEvent>();
-    let join = match thread::Builder::new()
-        .name("mpris-sink".into())
-        .spawn(move || worker(rx, suffix))
-    {
-        Ok(join) => join,
-        Err(e) => {
-            eprintln!("mpris: spawn mpris-sink thread: {e}");
-            return;
-        }
-    };
-    *slot = Some(Sink { tx, join });
-    drop(slot);
-
-    // Once, not a resettable flag: a second start() must not double-register.
-    static REGISTER: std::sync::Once = std::sync::Once::new();
-    REGISTER.call_once(|| {
-        jfn_playback::register_event_sink(Box::new(|ev: &PlaybackEvent| {
-            deliver(ev.clone());
-        }));
-    });
+    sink_core::run_sink("mpris-sink", move || Transport::new(&suffix));
 }
 
 pub(crate) fn stop() {
-    let Some(sink) = SINK.write().take() else {
-        return;
-    };
-    drop(sink.tx);
-    let _ = sink.join.join();
+    sink_core::stop();
 }
 
 #[cfg(test)]

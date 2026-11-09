@@ -142,10 +142,12 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) {
     }
 
     let scale = win_get_scale();
-    let mut pt = POINT {
-        x: (pending.x as f32 * scale).round() as i32,
-        y: (pending.y as f32 * scale).round() as i32,
+    let (Some(x), Some(y)) = (scale.to_physical(pending.x), scale.to_physical(pending.y)) else {
+        tracing::error!(target: "platform", "menu anchor {},{} is unrepresentable at scale {scale}", pending.x, pending.y);
+        pending.on_selected.resolve(MENU_DISMISSED);
+        return;
     };
+    let mut pt = POINT { x, y };
     unsafe {
         let _ = ClientToScreen(hwnd, &mut pt);
     }

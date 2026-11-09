@@ -16,11 +16,14 @@
 //! path holds the lock during commit/flush, and finer-grained locking
 //! would risk null-attach vs. commit ordering races.
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::ffi::c_void;
 use std::os::fd::BorrowedFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use jfn_gpu_paint::Surfaces;
+use jfn_platform_abi::Visibility;
 
 use crate::layer::SurfaceRef;
 use crate::layer_actor::LayerActor;
@@ -36,6 +39,7 @@ use wayland_client::backend::ObjectId;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
+    wl_callback::WlCallback,
     wl_compositor::WlCompositor,
     wl_registry::WlRegistry,
     wl_shm::{Format, WlShm},
@@ -77,14 +81,14 @@ impl RootParent {
         subcompositor: &WlSubcompositor,
         surface: &WlSurface,
         qh: &QueueHandle<DispatchState>,
-    ) -> SyncSubsurface {
-        SyncSubsurface::create(subcompositor, surface, &self.0, qh)
+    ) -> Subsurface {
+        Subsurface::create(subcompositor, surface, &self.0, qh)
     }
 }
 
-pub(crate) struct SyncSubsurface(WlSubsurface);
+pub(crate) struct Subsurface(WlSubsurface);
 
-impl SyncSubsurface {
+impl Subsurface {
     pub(crate) fn create(
         subcompositor: &WlSubcompositor,
         surface: &WlSurface,
@@ -101,6 +105,15 @@ impl SyncSubsurface {
 
     pub(crate) fn place_above(&self, sibling: &WlSurface) {
         self.0.place_above(sibling);
+    }
+
+    /// Commits apply on this surface's own commit rather than the parent's.
+    ///
+    /// A synchronized subsurface only reaches the compositor when its parent
+    /// commits, so the frame callbacks a FIFO swapchain throttles on never
+    /// arrive and the second present blocks forever.
+    pub(crate) fn set_desync(&self) {
+        self.0.set_desync();
     }
 
     pub(crate) fn destroy(self) {
@@ -251,20 +264,28 @@ pub(crate) fn draw_from_pixels(
 
 pub(crate) struct PlatformSurface {
     pub surface: Option<SurfaceRef>,
-    pub subsurface: Option<SyncSubsurface>,
-    pub visible: bool,
-    pub null_attached: bool,
+    pub subsurface: Option<Subsurface>,
+    /// The process's single statement of whether this surface is on screen; the
+    /// actor mirrors it only as the request it has yet to commit.
+    pub visibility: Visibility,
     pub layer_actor: Option<LayerActor>,
+    /// Set by `Platform::surface_window_target`. The actor attaches no buffer
+    /// and drops every present for a surface with this set.
+    pub external: bool,
+    pub top_logical: i32,
+    pub top_physical: i32,
 }
 
 impl PlatformSurface {
-    pub(crate) fn new() -> Self {
-        Self {
+    pub(crate) fn new(visibility: Visibility) -> PlatformSurface {
+        PlatformSurface {
             surface: None,
             subsurface: None,
-            visible: true,
-            null_attached: false,
+            visibility,
             layer_actor: None,
+            external: false,
+            top_logical: 0,
+            top_physical: 0,
         }
     }
 }
@@ -285,7 +306,7 @@ pub(crate) struct WlState {
     pub subcompositor: WlSubcompositor,
     pub shm: ShmGlobal,
     pub dmabuf: Option<ZwpLinuxDmabufV1>,
-    pub viewporter: Option<WpViewporter>,
+    pub viewporter: WpViewporter,
 
     pub root_surface: Option<RootParent>,
 
@@ -297,11 +318,8 @@ pub(crate) struct WlState {
     pub was_fullscreen: bool,
 
     pub gpu: Option<&'static Surfaces>,
-    /// When true, `surface_present_software` routes through each
-    /// surface's GPU paint worker (Vulkan WSI) instead of `wl_shm`.
-    /// `set_visible` and `resize` also skip their
-    /// `wl_surface.attach`/`viewport.set_destination` work for the
-    /// gpu_paint surface.
+    /// When true, a software present routes through each surface's GPU paint
+    /// worker (Vulkan WSI) instead of `wl_shm`.
     pub use_gpu_paint: bool,
 
     pub scene: crate::scene::Scene,
@@ -313,11 +331,106 @@ unsafe impl Send for WlState {}
 
 pub(crate) struct DispatchState {
     buffers: &'static DmabufRegistry,
+    callbacks: &'static Callbacks,
 }
 
 impl DispatchState {
-    pub(crate) fn new(buffers: &'static DmabufRegistry) -> Self {
-        Self { buffers }
+    pub(crate) fn new(buffers: &'static DmabufRegistry, callbacks: &'static Callbacks) -> Self {
+        Self { buffers, callbacks }
+    }
+}
+
+/// The `wl_callback`s the app waits on: the `wl_surface.frame` of a commit
+/// that carries a buffer, the `wl_display.sync` of one that empties the
+/// surface.
+pub(crate) struct Callbacks {
+    armed: Mutex<Vec<(ObjectId, Arc<Signal>)>>,
+    closed: AtomicBool,
+}
+
+/// One acknowledgement's resolved flag and the parking spot for its waiter.
+struct Signal {
+    done: Mutex<bool>,
+    woken: Condvar,
+}
+
+impl Signal {
+    fn resolve(&self) {
+        *self.done.lock() = true;
+        self.woken.notify_all();
+    }
+}
+
+impl Callbacks {
+    pub(crate) fn new() -> Callbacks {
+        Callbacks {
+            armed: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Arms `callback` and hands back the token its `done` event resolves.
+    pub(crate) fn arm(&'static self, callback: &WlCallback) -> Acked {
+        let signal = Arc::new(Signal {
+            done: Mutex::new(false),
+            woken: Condvar::new(),
+        });
+        if self.closed.load(Ordering::Acquire) {
+            signal.resolve();
+            return Acked { signal };
+        }
+        self.armed.lock().push((callback.id(), Arc::clone(&signal)));
+        Acked { signal }
+    }
+
+    pub(crate) fn note_done(&self, callback: &WlCallback) {
+        let id = callback.id();
+        let mut armed = self.armed.lock();
+        let Some(pos) = armed.iter().position(|(armed_id, _)| *armed_id == id) else {
+            return;
+        };
+        let (_, signal) = armed.swap_remove(pos);
+        drop(armed);
+        signal.resolve();
+    }
+
+    /// Releases every waiter, so no acknowledgement outlives the connection.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let armed = std::mem::take(&mut *self.armed.lock());
+        for (_, signal) in armed {
+            signal.resolve();
+        }
+    }
+}
+
+/// One compositor acknowledgement in flight.
+pub(crate) struct Acked {
+    signal: Arc<Signal>,
+}
+
+impl Acked {
+    /// Blocks until the compositor fired the callback, or the connection closed.
+    pub(crate) fn wait(self) {
+        let mut done = self.signal.done.lock();
+        while !*done {
+            self.signal.woken.wait(&mut done);
+        }
+    }
+}
+
+impl Dispatch<WlCallback, ()> for DispatchState {
+    fn event(
+        state: &mut Self,
+        callback: &WlCallback,
+        event: <WlCallback as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_callback::Event::Done { .. } = event {
+            state.callbacks.note_done(callback);
+        }
     }
 }
 
@@ -488,7 +601,7 @@ pub(crate) fn pump_events(rt: &'static crate::runtime::WlRuntime) {
         let st = &mut *st;
         let _ = st
             .queue
-            .dispatch_pending(&mut DispatchState::new(rt.buffers()));
+            .dispatch_pending(&mut DispatchState::new(rt.buffers(), rt.callbacks()));
     }
 }
 
@@ -537,7 +650,9 @@ pub(crate) unsafe fn init(
         .map_err(bind_error("wl_subcompositor"))?;
     let shm = ShmGlobal::new(globals.bind(&qh, 1..=1, ()).map_err(bind_error("wl_shm"))?);
     let dmabuf: Option<ZwpLinuxDmabufV1> = globals.bind(&qh, 1..=4, ()).ok();
-    let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+    let viewporter: WpViewporter = globals
+        .bind(&qh, 1..=1, ())
+        .map_err(bind_error("wp_viewporter"))?;
 
     let mut state = WlState {
         conn,
@@ -605,6 +720,11 @@ fn parent_layer_locked(st: &mut WlState, ptr: *mut PlatformSurface) {
     };
     let sub = root.attach_child(&st.subcompositor, surface.as_arg(), &st.qh);
     sub.set_position(0, 0);
+    // A surface already claimed for external presentation must not wait on a
+    // parent commit to reach the compositor.
+    if s.external {
+        sub.set_desync();
+    }
     s.subsurface = Some(sub);
 }
 

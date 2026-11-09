@@ -12,10 +12,10 @@ use raw_window_handle::{
     XcbWindowHandle,
 };
 
-use crate::context::{SURFACE_FORMAT, Surfaces};
+use crate::context::{FORMAT, Surfaces};
 use crate::error::{Kind, SurfaceLost};
 use crate::shared::Importer;
-use crate::types::{Frame, PaintMode, Pixels, Presented, WindowTarget};
+use crate::types::{Deferred, PaintMode, Pixels, Presented, WindowTarget};
 use crate::{FrameSize, SharedTexture};
 
 /// How a surface chooses its swapchain extent.
@@ -78,14 +78,14 @@ impl AlphaSource {
 
 /// The present mode this target's backend actually advertises.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PresentPolicy {
+pub(crate) enum PresentPolicy {
     Fifo,
     /// dx12 only: `Mailbox` maps to `Present(0, 0)`.
     Mailbox,
 }
 
 impl PresentPolicy {
-    const fn for_target(target: &WindowTarget) -> Self {
+    pub(crate) const fn for_target(target: &WindowTarget) -> Self {
         match target {
             WindowTarget::Xcb { .. }
             | WindowTarget::Wayland { .. }
@@ -94,7 +94,7 @@ impl PresentPolicy {
         }
     }
 
-    const fn mode(self) -> wgpu::PresentMode {
+    pub(crate) const fn mode(self) -> wgpu::PresentMode {
         match self {
             Self::Fifo => wgpu::PresentMode::Fifo,
             Self::Mailbox => wgpu::PresentMode::Mailbox,
@@ -110,7 +110,7 @@ impl PresentPolicy {
 /// present that reconfigured inline would move that write to whatever thread
 /// CEF painted on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ConfigureSite {
+pub(crate) enum ConfigureSite {
     /// The painter reconfigures from the present path when the extent moves or
     /// the swapchain reports itself stale.
     Painter,
@@ -120,7 +120,7 @@ enum ConfigureSite {
 }
 
 impl ConfigureSite {
-    const fn for_target(target: &WindowTarget) -> Self {
+    pub(crate) const fn for_target(target: &WindowTarget) -> Self {
         match target {
             WindowTarget::Xcb { .. }
             | WindowTarget::Wayland { .. }
@@ -149,7 +149,6 @@ pub struct Surface<'a> {
     // between the swapchain and what is on screen, so the next configure must
     // happen even though the extent did not move.
     needs_configure: bool,
-    visible: bool,
     policy: SizePolicy,
     alpha: AlphaSource,
     configure_site: ConfigureSite,
@@ -245,14 +244,13 @@ impl<'a> Surface<'a> {
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: SURFACE_FORMAT,
+            format: FORMAT,
             width: extent.0,
             height: extent.1,
             present_mode: present.mode(),
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
-            color_space: wgpu::SurfaceColorSpace::Auto,
         };
 
         let painter = Self {
@@ -263,7 +261,6 @@ impl<'a> Surface<'a> {
             upload: None,
             pending_size: extent,
             needs_configure: false,
-            visible: true,
             policy,
             alpha,
             configure_site,
@@ -350,38 +347,23 @@ impl<'a> Surface<'a> {
         self.needs_configure = true;
     }
 
-    pub fn set_visible(&mut self, v: bool) {
-        self.visible = v;
-    }
-
-    /// Present one frame.
+    /// Latch this surface's frame kind, or reject a frame of the other one.
     ///
-    /// `on_present` runs between submit and present, so a caller can latch
-    /// state against the frame actually being shown (Wayland sets its viewport
-    /// source there) without that state applying to a frame that was skipped.
-    pub fn present(
-        &mut self,
-        frame: Frame<'_>,
-        on_present: impl FnOnce(),
-    ) -> Result<Presented, SurfaceLost> {
-        // A surface latches its frame kind from the first frame it presents and
-        // will not take the other kind afterwards: `Copied` maintains a
-        // persistent upload texture that a `Shared` frame would leave stale,
-        // and the next dirty-only frame would then patch onto a base two frames
-        // old. CEF fixes the kind per browser via `shared_texture_enabled`, so
-        // a mismatch means something upstream is wrong, not that this surface
-        // is lost — drop the frame and say so.
+    /// A surface latches its kind from the first frame it presents and will not
+    /// take the other kind afterwards: `Copied` maintains a persistent upload
+    /// texture that a `Shared` frame would leave stale, and the next dirty-only
+    /// frame would then patch onto a base two frames old. CEF fixes the kind
+    /// per browser via `shared_texture_enabled`, so a mismatch means something
+    /// upstream is wrong, not that this surface is lost — the producer owes the
+    /// successor.
+    fn latch(&mut self, mode: PaintMode) -> Result<(), PresentFailed> {
         match self.mode {
-            Some(mode) if mode != frame.mode() => {
-                tracing::warn!("gpu_paint: frame kind changed on a live surface; dropping frame");
-                return Ok(Presented::Skipped);
+            Some(latched) if latched != mode => Err(PresentFailed::Kind),
+            Some(_) => Ok(()),
+            None => {
+                self.mode = Some(mode);
+                Ok(())
             }
-            Some(_) => {}
-            None => self.mode = Some(frame.mode()),
-        }
-        match frame {
-            Frame::Copied(px) => self.present_pixels(px, on_present),
-            Frame::Shared(tex) => self.present_shared(tex, on_present),
         }
     }
 
@@ -435,16 +417,21 @@ impl<'a> Surface<'a> {
         Ok((w, h))
     }
 
-    fn present_pixels(
+    /// Present CPU pixels, latching the copied kind on this surface's first
+    /// frame.
+    ///
+    /// `on_present` runs between submit and present, so a caller can latch
+    /// state against the frame actually being shown (Wayland sets its viewport
+    /// source there) without that state applying to a frame that never
+    /// commits.
+    pub fn present_pixels(
         &mut self,
         frame: Pixels<'_>,
         on_present: impl FnOnce(),
-    ) -> Result<Presented, SurfaceLost> {
+    ) -> Result<Presented, PresentFailed> {
+        self.latch(PaintMode::Copied)?;
         let (fw, fh) = self.frame_extent(frame.size)?;
         check_buffer(&frame, fw, fh)?;
-        if !self.visible {
-            return Ok(Presented::Skipped);
-        }
 
         let (cw, ch) = self.extent_for((fw, fh));
 
@@ -456,15 +443,15 @@ impl<'a> Surface<'a> {
         self.draw_and_present(&bind_group, None, None, on_present)
     }
 
-    fn present_shared(
+    /// Present a shared texture, latching the shared kind on this surface's
+    /// first frame. `on_present` runs as for [`Surface::present_pixels`].
+    pub fn present_shared(
         &mut self,
         frame: &SharedTexture,
         on_present: impl FnOnce(),
-    ) -> Result<Presented, SurfaceLost> {
+    ) -> Result<Presented, PresentFailed> {
+        self.latch(PaintMode::Shared)?;
         let (fw, fh) = self.frame_extent(frame.coded())?;
-        if !self.visible {
-            return Ok(Presented::Skipped);
-        }
 
         let (cw, ch) = self.extent_for((fw, fh));
 
@@ -478,13 +465,13 @@ impl<'a> Surface<'a> {
         };
 
         // A failed import is not a lost surface: a shared frame has no CPU
-        // pixels, so there is nowhere to degrade to. Drop it and keep the last
-        // good frame on screen.
+        // pixels, so there is nowhere to degrade to. The last good frame stays
+        // on screen and the producer owes the successor.
         let imported = match self.importer.import(&self.ctx.device, frame) {
             Ok(imported) => imported,
             Err(e) => {
                 tracing::warn!("gpu_paint: {e}");
-                return Ok(Presented::Skipped);
+                return Err(PresentFailed::Import);
             }
         };
         // A reused import is the importer's cached texture, so the bind group
@@ -521,7 +508,7 @@ impl<'a> Surface<'a> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: SURFACE_FORMAT,
+            format: FORMAT,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -535,20 +522,19 @@ impl<'a> Surface<'a> {
         }
     }
 
-    /// Acquire the next swapchain frame, reconfiguring once if the swapchain
-    /// is stale. `None` is a skipped frame, never a fault.
-    fn acquire_frame(&self) -> Result<Option<AcquiredFrame<'_>>, SurfaceLost> {
+    /// Acquire the next swapchain frame with no gate held, reconfiguring once
+    /// if the swapchain is stale. A swapchain with no texture this cycle is a
+    /// [`PresentFailed::Deferred`], never a fault.
+    fn acquire_frame(&self) -> Result<AcquiredFrame, PresentFailed> {
         use wgpu::CurrentSurfaceTexture::*;
-        let mut gate = self.ctx.submit_gate.read();
         let mut reconfigured = false;
         loop {
             match self.surface.get_current_texture() {
                 Success(frame) => {
-                    return Ok(Some(AcquiredFrame {
+                    return Ok(AcquiredFrame {
                         frame,
                         suboptimal: false,
-                        gate,
-                    }));
+                    });
                 }
                 // The owner configures, and it is not this thread. Skip; the
                 // owner's next resize rebuilds the swapchain. On metal these
@@ -557,32 +543,30 @@ impl<'a> Surface<'a> {
                 // a later edit reintroducing an off-main configure, not a live
                 // path.
                 Suboptimal(_) | Lost | Outdated if self.configure_site == ConfigureSite::Owner => {
-                    return Ok(None);
+                    return Err(PresentFailed::Deferred(Deferred::new()));
                 }
                 // The frame is usable, but the swapchain no longer matches the
                 // surface; the caller rebuilds it after presenting.
                 Suboptimal(frame) => {
-                    return Ok(Some(AcquiredFrame {
+                    return Ok(AcquiredFrame {
                         frame,
                         suboptimal: true,
-                        gate,
-                    }));
+                    });
                 }
                 // Stale swapchain (typically a resize). Reconfigure and retry
                 // ONCE, presenting THIS frame — overlay content is event-driven
                 // and may not repaint for a long time, so a drop leaves it stale.
-                // The gate is non-reentrant and configure takes the write side,
-                // so it is dropped for the configure and re-taken after.
                 Lost | Outdated if !reconfigured => {
                     reconfigured = true;
-                    drop(gate);
                     self.configure_now();
-                    gate = self.ctx.submit_gate.read();
                 }
                 // Transient (occluded, timed out, or still stale after reconfigure):
-                // skip without faulting — an Err would degrade the backend to SHM.
-                Lost | Outdated | Timeout | Occluded => return Ok(None),
-                Validation => return Err(Kind::Acquire("validation").into()),
+                // the surface is fine and the frame is still owed, so the caller
+                // presents it again rather than degrading the backend to SHM.
+                Lost | Outdated | Timeout | Occluded => {
+                    return Err(PresentFailed::Deferred(Deferred::new()));
+                }
+                Validation => return Err(SurfaceLost::from(Kind::Acquire("validation")).into()),
             }
         }
     }
@@ -593,21 +577,15 @@ impl<'a> Surface<'a> {
         external_image: Option<u64>,
         viewport: Option<(f32, f32, f32, f32)>,
         on_present: impl FnOnce(),
-    ) -> Result<Presented, SurfaceLost> {
-        let Some(AcquiredFrame {
-            frame,
-            suboptimal,
-            gate,
-        }) = self.acquire_frame()?
-        else {
-            return Ok(Presented::Skipped);
-        };
+    ) -> Result<Presented, PresentFailed> {
+        let AcquiredFrame { frame, suboptimal } = self.acquire_frame()?;
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         // The acquire barrier must precede the render pass, in its own
         // command buffer: wgpu 29 forbids mixing raw HAL encoding
         // (`as_hal_mut`) and normal wgpu encoding on one CommandEncoder.
+        let gate = self.ctx.submit_gate.read();
         if let Some(image) = external_image {
             let mut acquire_encoder =
                 self.ctx
@@ -657,31 +635,50 @@ impl<'a> Surface<'a> {
             pass.draw(0..3, 0..1);
         }
         self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        // The gate covers the submits alone: a FIFO present blocks until the
+        // compositor releases the previous frame, and nothing may be forced to
+        // wait behind it.
+        drop(gate);
         // Run after the early-return present failures above, so the closure's
         // surface-state updates only latch on a frame that actually presents.
         on_present();
-        self.ctx.queue.present(frame);
+        frame.present();
         // SUBOPTIMAL: the presented frame was fine, but rebuild the swapchain so
-        // the next acquire is fresh rather than repeatedly suboptimal. Drop the
-        // gate first — configure takes the write side, which is exclusive.
-        drop(gate);
+        // the next acquire is fresh rather than repeatedly suboptimal.
         if suboptimal {
             self.configure_now();
         }
-        Ok(Presented::Yes)
+        Ok(Presented::issued())
     }
 }
 
-/// One acquired swapchain frame, carrying the read side of the submit gate:
-/// acquiring hands the gate over, and everything encoded and presented
-/// against the frame happens under it — so a submit can never overlap a
-/// configure (the write side) — until the holder explicitly drops it.
-struct AcquiredFrame<'g> {
+/// Why a frame did not reach the compositor.
+#[derive(Debug, thiserror::Error)]
+pub enum PresentFailed {
+    /// The surface is done; abandon it.
+    #[error(transparent)]
+    Lost(#[from] SurfaceLost),
+    /// The swapchain had no texture this cycle. The surface is fine, the frame
+    /// is still owed, and the caller presents it again at the named instant.
+    #[error("swapchain deferred the frame")]
+    Deferred(Deferred),
+    /// The shared frame could not be imported. The surface is fine, the last
+    /// frame stays on screen, and the producer owes the successor.
+    #[error("shared frame import failed")]
+    Import,
+    /// A frame of the other kind reached a surface already latched to one. The
+    /// producer owes the successor.
+    #[error("frame kind changed on a live surface")]
+    Kind,
+}
+
+/// One acquired swapchain frame. No gate is held across the acquire or the
+/// present; the caller takes the read side around its submits alone.
+struct AcquiredFrame {
     frame: wgpu::SurfaceTexture,
     /// The frame is usable but the swapchain no longer matches the surface;
     /// reconfigure after presenting.
     suboptimal: bool,
-    gate: parking_lot::RwLockReadGuard<'g, ()>,
 }
 
 /// Whether the swapchain has to be configured.
@@ -697,7 +694,7 @@ const fn configure_needed(resized: bool, detached: bool) -> bool {
 /// A physical size as texels, or `None` when it is not a positive extent.
 /// Sizes cross the ABI as `c_int` because that is what the window systems and
 /// CEF use; wgpu wants unsigned, and a non-positive one is never presentable.
-fn texels(size: FrameSize) -> Option<(u32, u32)> {
+pub(crate) fn texels(size: FrameSize) -> Option<(u32, u32)> {
     match (u32::try_from(size.w).ok()?, u32::try_from(size.h).ok()?) {
         (0, _) | (_, 0) => None,
         wh => Some(wh),
@@ -811,7 +808,7 @@ fn write_rect(
     );
 }
 
-fn pick_alpha_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode {
+pub(crate) fn pick_alpha_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode {
     use wgpu::CompositeAlphaMode::*;
     [PreMultiplied, PostMultiplied, Inherit, Opaque, Auto]
         .into_iter()
@@ -824,7 +821,7 @@ fn pick_alpha_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode
 /// The window-system objects inside `target` must be live, and must outlive
 /// the returned surface: the `'static` lifetime is a promise the caller
 /// makes, not one wgpu can check.
-unsafe fn create_surface(
+pub(crate) unsafe fn create_surface(
     instance: &wgpu::Instance,
     target: WindowTarget,
 ) -> Result<wgpu::Surface<'static>, SurfaceLost> {

@@ -1,98 +1,230 @@
-//! CefLayer state.
+//! Browser state.
 //!
-//! Holds the small bits of CefLayer state plus the resize-debounce and the
-//! per-layer CEF browser ops dispatch that schedules `WasResized`,
-//! `NotifyScreenInfoChanged`, `Invalidate`, `SetWindowlessFrameRate`,
-//! `SendExternalBeginFrame`, and `ExecuteJavaScript` calls on TID_UI.
+//! Holds the browser handle the web overlay drives, the size it last applied
+//! to it, its menu-session slot, the resize-debounce and the CEF browser ops
+//! dispatch that schedules `WasResized`, `NotifyScreenInfoChanged`,
+//! `Invalidate`, `SetWindowlessFrameRate`, `SendExternalBeginFrame`, and
+//! `ExecuteJavaScript` calls on TID_UI.
 //!
-//! Lifetime model: the FFI handle is `Box<JfnCefLayer>` (raw pointer owned
-//! by the caller). Internal state lives in an `Arc<Inner>` so posted CEF
-//! tasks can keep a clone alive past `jfn_cef_layer_free`. CefLayer
-//! destructor clears `cef_ops` first, so any in-flight task that does
-//! eventually run sees `None` and exits.
+//! Lifetime model: `Arc<Inner>`, so posted CEF tasks keep a clone alive past
+//! the overlay's own drop.
 
 use cef::{Browser, RunContextMenuCallback};
+use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::atomic::AtomicCell;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
+use std::convert::Infallible;
 use std::os::raw::{c_int, c_void};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::ipc::BrowserMessage;
-use crate::platform_ops;
-use crate::sink_routing::Handle;
+use crate::menu_ownership::{MenuOwnership, Session};
+use crate::web_overlay::WebOverlaySurface;
 
+use crate::frame_rate::FrameRate;
 use crate::paint_scheduler::{PaintMode, PaintScheduler};
 
 mod accel;
 mod browser_ops;
 mod callbacks;
 mod events;
-mod ffi;
 mod lifecycle;
+mod ops;
 mod paint;
 mod popup;
 mod resize;
 mod tasks;
-pub(crate) use ffi::*;
-pub use ffi::{jfn_cef_layer_create, jfn_cef_layer_wait_for_load};
-pub(crate) use tasks::{
-    jfn_cef_post_close_and_collect, jfn_cef_post_csd_state_all, jfn_cef_post_set_hidden_all,
-};
+pub(crate) use tasks::{post_close_and_wait, post_set_hidden};
 
-// A word-sized handle must never fall back to AtomicCell's global-lock
-// path: it is read on every paint.
-const _: () = assert!(AtomicCell::<platform_ops::SurfaceHandle>::is_lock_free());
+/// The document a browser is left showing once its navigation is abandoned.
+const BLANK: &str = "about:blank";
 
-const STATE_NORMAL: i32 = 0;
-const STATE_PENDING_RESET: i32 = 1;
-const STATE_RECREATING: i32 = 2;
-
-#[repr(C)]
-pub struct JfnCefLayer {
-    pub(crate) inner: Arc<Inner>,
+enum PendingNavigation {
+    Page {
+        navigation: crate::Navigation,
+        url: String,
+    },
+    Blank,
 }
 
-// Process-wide defaults set once at startup by Browsers ctor; consumed by
-// Inner::do_create_browser when building WindowInfo + BrowserSettings.
-static DEFAULT_FRAME_RATE: AtomicI32 = AtomicI32::new(60);
-static PAINT_MODE: OnceLock<PaintMode> = OnceLock::new();
+pub(crate) struct DeferredNavigation {
+    /// The newest effective navigation not yet submitted to a real main frame;
+    /// an empty vector is absence and the vector contains at most one typed load.
+    pending: Mutex<Vec<PendingNavigation>>,
+    pub(crate) on_event: std::sync::OnceLock<crate::WebEventHandler>,
+}
+
+impl DeferredNavigation {
+    pub(crate) fn new() -> Arc<DeferredNavigation> {
+        Arc::new(Self {
+            pending: Mutex::new(Vec::new()),
+            on_event: std::sync::OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn navigate(&self, navigation: crate::Navigation, url: &str) {
+        let mut pending = self.pending.lock();
+        pending.clear();
+        pending.push(PendingNavigation::Page {
+            navigation,
+            url: url.to_owned(),
+        });
+    }
+
+    pub(crate) fn abandon(&self, navigation: crate::Navigation) {
+        let mut pending = self.pending.lock();
+        if matches!(
+            pending.as_slice(),
+            [PendingNavigation::Page {
+                navigation: pending_navigation,
+                ..
+            }] if *pending_navigation == navigation
+        ) {
+            pending.clear();
+            pending.push(PendingNavigation::Blank);
+        }
+    }
+
+    fn blank_if_absent(&self) {
+        let mut pending = self.pending.lock();
+        if pending.is_empty() {
+            pending.push(PendingNavigation::Blank);
+        }
+    }
+}
+
+/// Which navigation this browser's pixels belong to.
+enum Painting {
+    /// No navigation has been issued.
+    None,
+    /// `navigation` was issued for `base`, and no main-frame load under `base`
+    /// has finished; the pixels this browser produces are another document's.
+    Awaiting {
+        navigation: crate::Navigation,
+        base: String,
+    },
+    /// A main-frame load under `base` finished; every frame produced from here
+    /// on is that navigation's document.
+    Loaded {
+        navigation: crate::Navigation,
+        base: String,
+        presented: bool,
+    },
+}
+
+impl Painting {
+    /// The state after a main-frame load of `url` finished: a load that is a
+    /// page of the awaited base promotes it, and every other load leaves the
+    /// state alone.
+    fn loaded(self, url: &str) -> Painting {
+        match self {
+            Painting::Awaiting { navigation, base } if jfn_jellyfin::is_page_of(&base, url) => {
+                Painting::Loaded {
+                    navigation,
+                    base,
+                    presented: false,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// The navigation a main-frame load of `url` belongs to.
+    fn navigation_of(&self, url: &str) -> Option<crate::Navigation> {
+        match self {
+            Painting::Awaiting { navigation, base }
+            | Painting::Loaded {
+                navigation, base, ..
+            } if jfn_jellyfin::is_page_of(base, url) => Some(*navigation),
+            _ => None,
+        }
+    }
+
+    /// Whether this browser is painting `navigation`.
+    fn names(&self, navigation: crate::Navigation) -> bool {
+        match self {
+            Painting::Awaiting {
+                navigation: live, ..
+            }
+            | Painting::Loaded {
+                navigation: live, ..
+            } => *live == navigation,
+            Painting::None => false,
+        }
+    }
+
+    fn mark_presented(&mut self, navigation: crate::Navigation) -> bool {
+        match self {
+            Painting::Loaded {
+                navigation: live,
+                presented,
+                ..
+            } if *live == navigation && !*presented => {
+                *presented = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The navigation a frame produced now can witness.
+    fn witness(&self) -> Option<crate::Navigation> {
+        match self {
+            Painting::Loaded {
+                navigation,
+                presented: false,
+                ..
+            } => Some(*navigation),
+            _ => None,
+        }
+    }
+}
+
+/// The browser handle and the size last applied to it, under one lock: a size
+/// derived while no browser exists is never recorded as applied.
+pub(crate) struct BrowserState {
+    pub(crate) browser: Option<Browser>,
+    pub(crate) applied: Option<jfn_platform_abi::SurfaceSize>,
+}
 
 pub(crate) struct Inner {
+    pub(crate) session: Arc<crate::runtime::Session>,
     // identity / state queries (slice 1)
     name: Mutex<String>,
-    closed: AtomicBool,
-    loaded: AtomicBool,
-    close_mtx: Mutex<()>,
-    close_cv: Condvar,
-    load_mtx: Mutex<()>,
-    load_cv: Condvar,
+    _owner_connected: Sender<Infallible>,
+    owner_disconnected: Receiver<Infallible>,
+    /// Which navigation this browser's pixels belong to, written on TID_UI
+    /// alone — by the requests bring-up produces and by the main-frame load
+    /// callback — and read on every paint.
+    painting: Mutex<Painting>,
 
     // Stored cef::Browser captured at LifeSpanHandler::on_after_created.
     // All CEF host/frame ops on TID_UI route through this; dropped on
     // OnBeforeClose.
-    browser: Mutex<Option<Browser>>,
+    browser: Mutex<BrowserState>,
     // Pending RunContextMenuCallback — held while a context menu is open.
     pending_menu_callback: Mutex<Option<RunContextMenuCallback>>,
-    // Injection-profile kind ("web" / "overlay" / "about") — looked up at
-    // browser-create time to build the extra_info DictionaryValue.
-    injection_kind: Mutex<String>,
-    // Opaque per-layer surface handle (PlatformSurface*); passed back to the
-    // C++ platform vtable for surface_resize / present / popup.
-    surface: AtomicCell<platform_ops::SurfaceHandle>,
+    // The one context-menu session slot for this browser.
+    menu: Mutex<MenuOwnership>,
+    // The surface owner is shared through CEF's client ownership; its opaque
+    // handle is never copied into this client.
+    surface: Arc<WebOverlaySurface>,
 
-    // logical/physical dims (slice 3)
+    // logical dims + the scale CEF is told about (slice 3)
     width: AtomicI32,
     height: AtomicI32,
-    physical_w: AtomicI32,
-    physical_h: AtomicI32,
+    /// The scale the platform reported for the last applied size; `None`
+    /// before any size has been applied.
+    scale: AtomicCell<Option<jfn_platform_abi::Scale>>,
 
+    /// How the browser's pixels reach the surface; fixed for the process.
+    pub(super) paint_mode: PaintMode,
     paint_scheduler: PaintScheduler,
 
-    // frame rate (slice 3): configured and last applied
-    pub(crate) frame_rate: AtomicI32,
-    current_frame_rate: AtomicI32,
+    /// The rate the browser is asked to paint at; `None` leaves CEF's default.
+    pub(crate) frame_rate: AtomicCell<Option<FrameRate>>,
 
     // resize-debounce (slice 3)
     resize_scheduled: AtomicBool,
@@ -103,39 +235,23 @@ pub(crate) struct Inner {
     // arrives via OnPopupSize, options via the "popupOptions" renderer IPC;
     // try_show_popup fires when popup_visible + size_received + options_received.
     popup: Mutex<PopupState>,
-    dropdown: jfn_platform_abi::MenuDelivery,
 
-    // lifecycle / reset state machine (slice 5)
-    state: AtomicI32,
-    pending_url: Mutex<String>,
-    has_browser: AtomicBool,
-    pending_internal_reset: AtomicBool,
+    /// The newest effective navigation not yet submitted to a real main frame;
+    /// an empty vector is absence and the vector contains at most one typed load.
+    deferred_navigation: Arc<DeferredNavigation>,
 
     // app-level callback slots, stored as boxed closures.
     message_handler: Mutex<Option<Box<MessageFn>>>,
-    created_callback: Mutex<Option<Box<CreatedFn>>>,
-    before_close_callback: Mutex<Option<Box<BeforeCloseFn>>>,
+    created_callback: Mutex<Option<Arc<CreatedFn>>>,
     context_menu_builder: Mutex<Option<Box<ContextBuilderFn>>>,
     context_menu_dispatcher: Mutex<Option<Box<ContextDispatcherFn>>>,
-
-    // Back-pointer to the owning `Box<JfnCefLayer>` raw handle. Set once
-    // after `Box::into_raw` in `jfn_cef_layer_new`; in
-    // `handle_on_before_close` we `swap` to null and act on the prior value.
-    // `AtomicPtr` (not `OnceLock`) because the null sentinel after swap is
-    // load-bearing — it guarantees the auto-remove + log fires exactly
-    // once even if `OnBeforeClose` were ever re-entered, and prevents a
-    // double-free of the registry entry.
-    layer_ptr: AtomicPtr<JfnCefLayer>,
-
-    cursor_handle: OnceLock<Handle>,
 }
 
 // Typed closure signatures stored in each callback slot. `*mut c_void` args
 // stay raw because callers may want to receive cef-rs handles or C++
 // CefRefPtr objects depending on which side installed the handler.
 pub(crate) type MessageFn = dyn Fn(BrowserMessage) -> bool + Send + Sync;
-pub type CreatedFn = dyn Fn(*mut c_void) + Send + Sync;
-pub type BeforeCloseFn = dyn Fn() + Send + Sync;
+pub type CreatedFn = dyn Fn() + Send + Sync;
 pub type ContextBuilderFn = dyn Fn(*mut c_void) + Send + Sync;
 pub type ContextDispatcherFn = dyn Fn(c_int) -> bool + Send + Sync;
 
@@ -164,76 +280,213 @@ unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
 impl Inner {
-    fn new() -> Arc<Self> {
-        let paint_scheduler = PAINT_MODE
-            .get_or_init(|| PaintMode::new(false))
-            .make_scheduler();
+    pub(crate) fn report_presented(
+        &self,
+        navigation: crate::Navigation,
+        presented: jfn_gpu_paint::Presented,
+    ) {
+        let first = self.painting.lock().mark_presented(navigation);
+        if first {
+            self.report_web_event(crate::WebEvent::FramePresented(
+                crate::NavigationPresented::witnessed(navigation, presented),
+            ));
+        }
+    }
+
+    pub(crate) fn report_web_event(&self, event: crate::WebEvent) {
+        self.session.dispatch(|| {
+            if let Some(handler) = self.deferred_navigation.on_event.get() {
+                handler(event);
+            }
+        });
+    }
+
+    pub(crate) fn new(
+        session: Arc<crate::runtime::Session>,
+        surface: Arc<WebOverlaySurface>,
+        deferred_navigation: Arc<DeferredNavigation>,
+        paint_mode: PaintMode,
+        frame_rate: Option<FrameRate>,
+    ) -> Arc<Self> {
+        let paint_scheduler = paint_mode.make_scheduler();
+        let (owner_connected, owner_disconnected) = crossbeam_channel::unbounded();
         Arc::new(Self {
+            session,
             name: Mutex::new(String::new()),
-            closed: AtomicBool::new(false),
-            loaded: AtomicBool::new(false),
-            close_mtx: Mutex::new(()),
-            close_cv: Condvar::new(),
-            load_mtx: Mutex::new(()),
-            load_cv: Condvar::new(),
-            browser: Mutex::new(None),
+            _owner_connected: owner_connected,
+            owner_disconnected,
+            painting: Mutex::new(Painting::None),
+            browser: Mutex::new(BrowserState {
+                browser: None,
+                applied: None,
+            }),
             pending_menu_callback: Mutex::new(None),
-            injection_kind: Mutex::new(String::new()),
-            surface: AtomicCell::new(platform_ops::SurfaceHandle::NONE),
+            menu: Mutex::new(MenuOwnership::default()),
+            surface,
             width: AtomicI32::new(0),
             height: AtomicI32::new(0),
-            physical_w: AtomicI32::new(0),
-            physical_h: AtomicI32::new(0),
+            scale: AtomicCell::new(None),
+            paint_mode,
             paint_scheduler,
-            frame_rate: AtomicI32::new(0),
-            current_frame_rate: AtomicI32::new(0),
+            frame_rate: AtomicCell::new(frame_rate),
             resize_scheduled: AtomicBool::new(false),
             last_was_resized_ns: AtomicI64::new(0),
             popup: Mutex::new(PopupState {
                 selected_idx: -1,
                 ..PopupState::default()
             }),
-            dropdown: jfn_platform_abi::menu_delivery(jfn_platform_abi::MenuKind::Dropdown),
-            state: AtomicI32::new(STATE_NORMAL),
-            pending_url: Mutex::new(String::new()),
-            has_browser: AtomicBool::new(false),
-            pending_internal_reset: AtomicBool::new(false),
+            deferred_navigation,
             message_handler: Mutex::new(None),
             created_callback: Mutex::new(None),
-            before_close_callback: Mutex::new(None),
             context_menu_builder: Mutex::new(None),
             context_menu_dispatcher: Mutex::new(None),
-            layer_ptr: AtomicPtr::new(std::ptr::null_mut()),
-            cursor_handle: OnceLock::new(),
         })
+    }
+
+    pub(crate) fn set_name(&self, name: &str) {
+        *self.name.lock() = name.to_owned();
     }
 
     fn name_str(&self) -> String {
         self.name.lock().clone()
     }
 
-    pub(crate) fn set_layer_ptr(&self, p: *mut JfnCefLayer) {
-        self.layer_ptr.store(p, Ordering::Release);
+    pub(crate) fn owner_disconnection(&self) -> Receiver<Infallible> {
+        self.owner_disconnected.clone()
     }
 
-    /// Current raw layer ptr, or null after `handle_on_before_close` swap.
-    /// Callbacks fired by `Inner` (created/before-close/etc.) read this to
-    /// route to ptr-keyed APIs (e.g. `jfn_browsers_set_active`) without
-    /// capturing the raw ptr into the closure.
-    pub(crate) fn layer_ptr(&self) -> *mut JfnCefLayer {
-        self.layer_ptr.load(Ordering::Acquire)
+    pub(crate) fn surface(&self) -> &WebOverlaySurface {
+        &self.surface
     }
 
-    pub(crate) fn set_cursor_handle(&self, handle: Handle) {
-        let _ = self.cursor_handle.set(handle);
+    /// The strip this browser's view was sized below, logical pixels. Zero
+    /// until a size has been applied to a live browser.
+    pub(crate) fn view_top(&self) -> c_int {
+        self.browser
+            .lock()
+            .applied
+            .map_or(0, |size| size.logical_top)
     }
 
-    pub(crate) fn cursor_handle(&self) -> Option<Handle> {
-        self.cursor_handle.get().copied()
+    /// Hand `size` to the platform surface and, when a browser exists, to CEF.
+    /// A size derived before the browser exists is applied but never recorded,
+    /// so the next reconcile applies it again once the browser is there.
+    pub(crate) fn apply_view_size(self: &Arc<Self>, size: jfn_platform_abi::SurfaceSize) {
+        {
+            let mut state = self.browser.lock();
+            if state.browser.is_none() {
+                state.applied = None;
+            } else if state.applied == Some(size) {
+                return;
+            } else {
+                state.applied = Some(size);
+            }
+        }
+        self.resize(size);
     }
 
-    fn surface_handle(&self) -> platform_ops::SurfaceHandle {
-        self.surface.load()
+    pub(crate) fn menu_open(&self) -> Option<Session> {
+        self.menu.lock().open()
+    }
+
+    pub(crate) fn menu_resolve(&self, session: Session) -> bool {
+        self.menu.lock().resolve(session)
+    }
+
+    pub(crate) fn menu_reset(&self) {
+        self.menu.lock().reset();
+    }
+
+    pub(crate) fn set_message_handler(&self, f: Option<Box<MessageFn>>) {
+        *self.message_handler.lock() = f;
+    }
+    pub(crate) fn set_created_callback(&self, f: Option<Arc<CreatedFn>>) {
+        *self.created_callback.lock() = f;
+    }
+    pub(crate) fn set_context_menu_builder(&self, f: Option<Box<ContextBuilderFn>>) {
+        *self.context_menu_builder.lock() = f;
+    }
+    pub(crate) fn set_context_menu_dispatcher(&self, f: Option<Box<ContextDispatcherFn>>) {
+        *self.context_menu_dispatcher.lock() = f;
+    }
+}
+
+/// A frame this browser produced that did not reach the screen is replaced by
+/// one this asks for: the view is invalidated, and where the host drives
+/// frames, the next one is requested.
+impl Inner {
+    /// Records the newest effective page, removes the previous navigation's
+    /// witness immediately, and attempts delivery to the current main frame.
+    pub(crate) fn navigate(&self, navigation: crate::Navigation, url: &str) {
+        self.deferred_navigation.navigate(navigation, url);
+        *self.painting.lock() = Painting::Awaiting {
+            navigation,
+            base: url.to_owned(),
+        };
+        self.deliver_deferred_navigation();
+    }
+
+    /// A main-frame load of `url` finished. It names the navigation only when
+    /// `url` is a page of that navigation's base, so the blank document a
+    /// browser is created with, an `about:` URL, and the page the previous
+    /// navigation left behind each name nothing.
+    pub(crate) fn note_main_frame_loaded(&self, url: &str) {
+        let mut painting = self.painting.lock();
+        let previous = std::mem::replace(&mut *painting, Painting::None);
+        *painting = previous.loaded(url);
+    }
+
+    /// Immediately removes a matching navigation from frames and failures and
+    /// records an intentional blank load until a main frame accepts it.
+    pub(crate) fn abandon_navigation(&self, navigation: crate::Navigation) {
+        self.deferred_navigation.abandon(navigation);
+        let matched_live_navigation = {
+            let mut painting = self.painting.lock();
+            if painting.names(navigation) {
+                *painting = Painting::None;
+                true
+            } else {
+                false
+            }
+        };
+        if matched_live_navigation {
+            self.deferred_navigation.blank_if_absent();
+        }
+        self.deliver_deferred_navigation();
+    }
+
+    /// The navigation a frame produced now can witness, and `None` until a
+    /// requested document has finished loading.
+    pub(crate) fn witness_navigation(&self) -> Option<crate::Navigation> {
+        self.painting.lock().witness()
+    }
+
+    /// The navigation a main-frame load of `url` belongs to, for charging that
+    /// load's failure; `None` when `url` is a page of no navigation this
+    /// browser was asked for.
+    pub(crate) fn load_navigation(&self, url: &str) -> Option<crate::Navigation> {
+        self.painting.lock().navigation_of(url)
+    }
+}
+
+impl Inner {
+    /// This browser as the producer a frame it made names.
+    pub(crate) fn frame_source(self: &Arc<Self>) -> Arc<dyn jfn_platform_abi::FrameSource> {
+        Arc::clone(self) as Arc<dyn jfn_platform_abi::FrameSource>
+    }
+}
+
+impl jfn_platform_abi::FrameSource for Inner {
+    fn request_frame(&self) {
+        if !self.browser_alive() {
+            return;
+        }
+        self.invalidate_view();
+        let external_bf = jfn_platform_abi::try_lease()
+            .is_some_and(|p| p.cef_host().is_some_and(|h| h.external_begin_frame()));
+        if external_bf {
+            self.send_external_begin_frame();
+        }
     }
 }
 
@@ -244,24 +497,50 @@ pub(crate) fn now_ns() -> i64 {
         .as_nanos() as i64
 }
 
-// ---------------------------------------------------------------------------
-// Pub Rust API: in-process callers install closures directly. Pass `None`
-// to clear; the previously installed closure is dropped.
-// ---------------------------------------------------------------------------
-impl JfnCefLayer {
-    pub(crate) fn set_message_handler_rust(&self, f: Option<Box<MessageFn>>) {
-        *self.inner.message_handler.lock() = f;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SUBPATH_BASE: &str = "https://host/jellyfin";
+
+    fn awaiting(base: &str) -> Painting {
+        Painting::Awaiting {
+            navigation: crate::Navigation::new(1),
+            base: base.to_owned(),
+        }
     }
-    pub fn set_created_callback_rust(&self, f: Option<Box<CreatedFn>>) {
-        *self.inner.created_callback.lock() = f;
+
+    #[test]
+    fn presentation_is_reported_once_and_only_for_the_loaded_navigation() {
+        let navigation = crate::Navigation::new(1);
+        let mut painting = awaiting(SUBPATH_BASE);
+        assert!(!painting.mark_presented(navigation));
+        let mut painting = painting.loaded("https://host/jellyfin/web/index.html");
+        assert!(!painting.mark_presented(crate::Navigation::new(2)));
+        assert_eq!(painting.witness(), Some(navigation));
+        assert!(painting.mark_presented(navigation));
+        assert_eq!(painting.witness(), None);
+        assert!(!painting.mark_presented(navigation));
+        assert_eq!(painting.navigation_of(SUBPATH_BASE), Some(navigation));
     }
-    pub fn set_before_close_callback_rust(&self, f: Option<Box<BeforeCloseFn>>) {
-        *self.inner.before_close_callback.lock() = f;
+
+    #[test]
+    fn a_subpath_hosted_navigation_is_promoted_by_its_own_page() {
+        let painting = awaiting(SUBPATH_BASE).loaded("https://host/jellyfin/web/index.html");
+        assert_eq!(painting.witness(), Some(crate::Navigation::new(1)));
     }
-    pub fn set_context_menu_builder_rust(&self, f: Option<Box<ContextBuilderFn>>) {
-        *self.inner.context_menu_builder.lock() = f;
+
+    #[test]
+    fn a_page_of_another_base_promotes_nothing() {
+        let painting = awaiting(SUBPATH_BASE).loaded("https://host/web/index.html");
+        assert_eq!(painting.witness(), None);
     }
-    pub fn set_context_menu_dispatcher_rust(&self, f: Option<Box<ContextDispatcherFn>>) {
-        *self.inner.context_menu_dispatcher.lock() = f;
+
+    #[test]
+    fn a_failed_load_of_a_subpath_hosted_page_charges_its_navigation() {
+        assert_eq!(
+            awaiting(SUBPATH_BASE).navigation_of("https://host/jellyfin/web/index.html"),
+            Some(crate::Navigation::new(1))
+        );
     }
 }

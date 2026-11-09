@@ -1,194 +1,308 @@
 //! Headless app control-plane thread.
-//!
-//! A long-lived worker that routes app-level control work off the platform
-//! main loop and off CEF's UI thread. Mirrors the playback coordinator's
-//! queue + drain idiom (`jfn_playback::coordinator`), but lives in
-//! the binary crate because it drives `jfn_cef` + `platform_abi` — layers
-//! *above* `playback`, so it can't fold into the coordinator without a
-//! dependency cycle.
-//!
-//! Owns the process-wide lifecycle FSM. Subsystems (X11/Wayland/macOS/Windows
-//! platform layers) translate native window/power events into `ManagerMsg`
-//! and post them via `jfn_manager_send`; the manager loop folds each message
-//! into a single `LifecycleState` and drives the side effects (CEF visibility
-//! fan-out, shutdown drain).
-//!
-//! The `SHUTTING_DOWN` flag (set async-signal-safely by `jfn_shutdown_initiate`)
-//! carries shutdown *state* — read synchronously by the TID_UI recreate guards;
-//! the queue carries the orchestration *command*. The SIGINT handler can't lock
-//! the queue (interrupt context), so it wakes the manager via the signal-safe
-//! bridge, and the manager — a normal-context thread — translates that wake into
-//! a queued `Shutdown`.
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
 use jfn_playback::shutdown::jfn_shutting_down;
 use jfn_wake_event::WakeEvent;
 
-/// Work routed to the manager thread. Producers post via `jfn_manager_send`
-/// (platform threads) or the signal-handler bridge `jfn_manager_notify_shutdown`
-/// (signal context).
 pub enum ManagerMsg {
-    /// Window/app became visible (true) or hidden (false). Posted by platform
-    /// layers on OS-level visibility changes — Wayland xdg_toplevel
-    /// suspended, X11 Map/Unmap/WM_STATE, macOS hide/unhide,
-    /// Windows WM_SHOWWINDOW / SC_MINIMIZE.
     SetVisible(bool),
-    /// System-level suspend / resume — power transitions (laptop lid close,
-    /// macOS sleep, Windows WM_POWERBROADCAST). Treated as a stronger Hidden.
     Suspend,
     Resume,
-    /// Shutdown drain. Synthesized by the manager loop when it observes the
-    /// `SHUTTING_DOWN` flag — the SIGINT path can't enqueue from its handler.
     Shutdown,
 }
 
-/// Process-wide lifecycle phase. Owned by the manager loop; subsystems
-/// observe transitions via the side effects the manager invokes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LifecycleState {
-    /// Foreground + visible. Default after boot.
     Running,
-    /// User-visible hiding (minimize, occlusion, app hide). CEF browsers
-    /// receive `WasHidden(true)`; mpv is left alone (jellyfin-web is the
-    /// playback authority — see project notes).
     Hidden,
-    /// System-level suspend. Same CEF posture as Hidden plus a marker so a
-    /// later `Resume` always transitions back to Running regardless of any
-    /// intervening visibility flap.
     Suspended,
-    /// Shutdown drain in progress. Terminal.
     ShuttingDown,
 }
 
 struct Manager {
     queue: Mutex<VecDeque<ManagerMsg>>,
     wake: WakeEvent,
+    boot_wake: WakeEvent,
 }
 
 #[allow(clippy::expect_used)] // boot invariant: wake eventfd alloc is fatal if it fails
 fn manager() -> &'static Manager {
-    static M: OnceLock<&'static Manager> = OnceLock::new();
-    M.get_or_init(|| {
+    static MANAGER: OnceLock<&'static Manager> = OnceLock::new();
+    MANAGER.get_or_init(|| {
         Box::leak(Box::new(Manager {
             queue: Mutex::new(VecDeque::new()),
             wake: WakeEvent::new().expect("manager WakeEvent allocation failed"),
+            boot_wake: WakeEvent::new().expect("startup WakeEvent allocation failed"),
         }))
     })
 }
 
-/// Spawn the manager thread. Long-lived; returns the join handle so the
-/// teardown tail can join it once shutdown drains. Called once from
-/// `run_with_cef`. Also installs the lifecycle dispatchers so platform
-/// layers can post visibility / suspend / resume events without a direct
-/// dep on this crate.
-#[allow(clippy::expect_used)] // boot invariant: control-plane thread spawn is fatal if it fails
-pub fn jfn_manager_start() -> JoinHandle<()> {
-    // Materialize the singleton so its wake event exists before any producer
-    // (shutdown handler / sender) signals it.
+#[derive(Debug, thiserror::Error)]
+pub enum ManagerError {
+    #[error(transparent)]
+    CloseDelivery(#[from] jfn_cef::CloseDeliveryError),
+    #[error("the shutdown manager thread panicked")]
+    ThreadPanicked,
+}
+
+/// Prepare outside signal context, before producers or OS shutdown hooks exist.
+pub fn prepare_shutdown() {
     let _ = manager();
+    jfn_playback::jfn_shutdown_set_handler(Some(jfn_manager_notify_shutdown));
     jfn_playback::lifecycle::jfn_lifecycle_set_handlers(
-        |v| jfn_manager_send(ManagerMsg::SetVisible(v)),
+        |visible| jfn_manager_send(ManagerMsg::SetVisible(visible)),
         || jfn_manager_send(ManagerMsg::Suspend),
         || jfn_manager_send(ManagerMsg::Resume),
     );
-    thread::Builder::new()
-        .name("jfn-manager".into())
-        .spawn(manager_loop)
-        .expect("spawn jfn-manager thread")
 }
 
-/// Wake the manager to observe the shutdown flag. Async-signal-safe (a single
-/// write to the wake event), so it's valid from the `jfn_shutdown_initiate`
-/// handler in any calling context (signal handler, CEF dispatch, …).
+/// Acquires the worker before any browser exists. A failed thread spawn cannot
+/// leave an overlay needing the main loop to drain.
+pub struct PreparedManager {
+    sender: Option<std::sync::mpsc::SyncSender<jfn_cef::WebOverlay>>,
+    worker: Option<JoinHandle<Result<(), ManagerError>>>,
+}
+impl PreparedManager {
+    #[allow(clippy::expect_used)] // Each field is consumed exactly once here or in Drop.
+    pub fn activate(
+        mut self,
+        overlay: jfn_cef::WebOverlay,
+    ) -> JoinHandle<Result<(), ManagerError>> {
+        // The worker only waits for this value before entering application code.
+        self.sender
+            .take()
+            .expect("unactivated manager")
+            .send(overlay)
+            .unwrap_or_else(|_| {
+                unreachable!("prepared manager receiver cannot exit before activation")
+            });
+        self.worker.take().expect("unactivated manager")
+    }
+}
+impl Drop for PreparedManager {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+pub fn jfn_manager_prepare() -> std::io::Result<PreparedManager> {
+    let _ = manager();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("jfn-manager".into())
+        .spawn(move || {
+            let Ok(overlay) = receiver.recv() else {
+                return Ok(());
+            };
+            run_and_wake(
+                || manager_loop(&overlay),
+                || {
+                    if let Some(lease) = jfn_platform_abi::try_lease() {
+                        lease.platform().wake_main_loop();
+                    }
+                },
+            )
+        })?;
+    Ok(PreparedManager {
+        sender: Some(sender),
+        worker: Some(worker),
+    })
+}
+
 pub fn jfn_manager_notify_shutdown() {
+    manager().boot_wake.signal();
     manager().wake.signal();
 }
 
-/// Route work to the manager thread. Non-blocking, thread-agnostic. (No
-/// callers yet — the hub seam for future control-plane work.)
+/// Forwards the signal-safe wake into mpv while startup owns event ingestion.
+/// The worker is joined before playback ingestion or native teardown can start.
+pub struct BootShutdownWake {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+impl BootShutdownWake {
+    pub fn start() -> std::io::Result<Self> {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::clone(&stop);
+        let manager = manager();
+        let worker = thread::Builder::new()
+            .name("jfn-startup-wake".into())
+            .spawn(move || {
+                loop {
+                    manager.boot_wake.wait();
+                    manager.boot_wake.drain();
+                    if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    if jfn_shutting_down() {
+                        jfn_mpv::api::jfn_mpv_wakeup();
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+impl Drop for BootShutdownWake {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        manager().boot_wake.signal();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 pub fn jfn_manager_send(msg: ManagerMsg) {
     manager().queue.lock().push_back(msg);
     manager().wake.signal();
 }
 
-fn manager_loop() {
-    let m = manager();
+fn manager_loop(overlay: &jfn_cef::WebOverlay) -> Result<(), ManagerError> {
+    let manager = manager();
     let mut state = LifecycleState::Running;
     loop {
-        m.wake.wait();
-        m.wake.drain();
+        manager.wake.drain();
 
-        // The signal-safe bridge wakes us with SHUTTING_DOWN set (from any
-        // trigger, including the SIGINT handler that can't lock the queue).
-        // Translate it into a queued message so every manager action is a
-        // ManagerMsg handled in one place. Loop returns as soon as `handle`
-        // observes the ShuttingDown terminal state.
         let work: VecDeque<ManagerMsg> = {
-            let mut q = m.queue.lock();
+            let mut queue = manager.queue.lock();
             if jfn_shutting_down() && state != LifecycleState::ShuttingDown {
-                q.push_back(ManagerMsg::Shutdown);
+                queue.push_back(ManagerMsg::Shutdown);
             }
-            std::mem::take(&mut *q)
+            std::mem::take(&mut *queue)
         };
-        for msg in work {
-            state = transition(state, msg);
+        for message in work {
+            state = transition(overlay, state, message)?;
             if state == LifecycleState::ShuttingDown {
-                return;
+                return Ok(());
             }
         }
+        manager.wake.wait();
     }
 }
 
-/// Apply one message to the lifecycle FSM. Returns the new state; the
-/// caller observes terminal `ShuttingDown` to exit the loop. Side effects
-/// happen inline (CEF visibility fan-out, shutdown drain).
-fn transition(state: LifecycleState, msg: ManagerMsg) -> LifecycleState {
-    use LifecycleState::*;
-    match (state, msg) {
-        // Shutdown is terminal and idempotent — once seen, ignore everything
-        // else and don't re-enter the drain.
-        (ShuttingDown, _) => ShuttingDown,
+fn transition(
+    overlay: &jfn_cef::WebOverlay,
+    state: LifecycleState,
+    message: ManagerMsg,
+) -> Result<LifecycleState, ManagerError> {
+    use LifecycleState::{Hidden, Running, ShuttingDown, Suspended};
+    match (state, message) {
+        (ShuttingDown, _) => Ok(ShuttingDown),
         (_, ManagerMsg::Shutdown) => {
-            run_shutdown();
-            ShuttingDown
+            run_shutdown(overlay)?;
+            Ok(ShuttingDown)
         }
-        // Visibility flips while running. Suspended is *not* downgraded by a
-        // visibility event — the system must explicitly Resume first.
         (Running, ManagerMsg::SetVisible(false)) => {
-            jfn_cef::browsers::jfn_browsers_set_hidden_all(true);
-            Hidden
+            overlay.set_hidden(true);
+            Ok(Hidden)
         }
         (Hidden, ManagerMsg::SetVisible(true)) => {
-            jfn_cef::browsers::jfn_browsers_set_hidden_all(false);
-            Running
+            overlay.set_hidden(false);
+            Ok(Running)
         }
         (Running | Hidden, ManagerMsg::Suspend) => {
             if state == Running {
-                jfn_cef::browsers::jfn_browsers_set_hidden_all(true);
+                overlay.set_hidden(true);
             }
-            Suspended
+            Ok(Suspended)
         }
         (Suspended, ManagerMsg::Resume) => {
-            jfn_cef::browsers::jfn_browsers_set_hidden_all(false);
-            Running
+            overlay.set_hidden(false);
+            Ok(Running)
         }
-        // No-op: already in the requested posture, or a stray event.
-        _ => state,
+        _ => Ok(state),
     }
 }
 
-/// Orchestrate shutdown off the main thread and off TID_UI: fan out the
-/// shutdown signal to every registered subsystem waker (input threads,
-/// clipboard, …), then a single TID_UI task closes every browser + ships
-/// the wait set back, manager blocks on `OnBeforeClose` for each, then
-/// releases the process main thread to run the teardown tail. One
-/// snapshot, no race between close set and wait set.
-fn run_shutdown() {
+fn run_shutdown(overlay: &jfn_cef::WebOverlay) -> Result<(), ManagerError> {
     jfn_playback::shutdown::jfn_shutdown_fanout();
-    jfn_cef::browsers::jfn_browsers_close_all_blocking();
-    jfn_platform_abi::get().wake_main_loop();
+    overlay.close_blocking()?;
+    Ok(())
+}
+
+fn run_and_wake<R, W>(run: R, wake: W) -> Result<(), ManagerError>
+where
+    R: FnOnce() -> Result<(), ManagerError>,
+    W: FnOnce(),
+{
+    let result = catch_unwind(AssertUnwindSafe(run)).unwrap_or(Err(ManagerError::ThreadPanicked));
+    wake();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn dropping_unactivated_manager_joins_without_entering_runtime() -> std::io::Result<()> {
+        let manager = jfn_manager_prepare()?;
+        // There is no installed platform or CEF session in this unit test.
+        // Entering manager_loop or its wake callback would violate that setup.
+        drop(manager);
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_close_wakes_main_and_returns_success() {
+        let woken = AtomicBool::new(false);
+        let result = run_and_wake(|| Ok(()), || woken.store(true, Ordering::Release));
+        assert!(woken.load(Ordering::Acquire));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn post_rejection_wakes_main_and_returns_its_diagnostic() {
+        let woken = AtomicBool::new(false);
+        let result = run_and_wake(
+            || Err(jfn_cef::CloseDeliveryError::PostRejected.into()),
+            || woken.store(true, Ordering::Release),
+        );
+        assert!(woken.load(Ordering::Acquire));
+        assert!(matches!(
+            result,
+            Err(ManagerError::CloseDelivery(
+                jfn_cef::CloseDeliveryError::PostRejected
+            ))
+        ));
+    }
+
+    #[test]
+    fn task_cancellation_wakes_main_and_returns_its_diagnostic() {
+        let woken = AtomicBool::new(false);
+        let result = run_and_wake(
+            || Err(jfn_cef::CloseDeliveryError::TaskCanceled.into()),
+            || woken.store(true, Ordering::Release),
+        );
+        assert!(woken.load(Ordering::Acquire));
+        assert!(matches!(
+            result,
+            Err(ManagerError::CloseDelivery(
+                jfn_cef::CloseDeliveryError::TaskCanceled
+            ))
+        ));
+    }
+
+    #[test]
+    fn manager_unwind_wakes_main_and_returns_thread_panicked() {
+        let woken = AtomicBool::new(false);
+        let result = run_and_wake(
+            || std::panic::resume_unwind(Box::new("manager unwind")),
+            || woken.store(true, Ordering::Release),
+        );
+        assert!(woken.load(Ordering::Acquire));
+        assert!(matches!(result, Err(ManagerError::ThreadPanicked)));
+    }
 }

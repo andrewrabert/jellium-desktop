@@ -18,7 +18,6 @@ arc-swap.workspace = true
 calloop.workspace = true
 cef.workspace = true
 crossbeam-channel.workspace = true
-cursor-icon = "1"
 slotmap.workspace = true
 jfn-compositor-core = { path = "../compositor_core" }
 jfn-gpu-paint = { path = "../gpu_paint" }
@@ -38,8 +37,11 @@ tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 xcb = { version = "1.7", features = ["xkb", "as-raw-xcb-connection"] }
-x11rb = { version = "0.14", features = ["cursor", "request-parsing", "resource_manager", "shape", "shm", "sync", "xfixes"] }
+x11rb = { version = "0.14", features = ["cursor", "request-parsing", "resource_manager", "shape", "shm", "sync", "xfixes", "xinput"] }
 xkbcommon = { version = "0.9", default-features = false, features = ["x11"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { version = "0.14", features = ["xtest"] }
 
 [lints]
 workspace = true

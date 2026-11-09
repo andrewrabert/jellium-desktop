@@ -16,7 +16,19 @@ path = "src/main.rs"
 default = ["kde-palette"]
 kde-palette = ["jfn-wayland/kde-palette"]
 
+[build-dependencies]
+png = "0.18"
+
 [dependencies]
+iced_core.workspace = true
+iced_graphics.workspace = true
+iced_runtime.workspace = true
+iced_widget.workspace = true
+iced_wgpu.workspace = true
+jfn-input = { path = "../input" }
+jfn-mailbox = { path = "../mailbox" }
+wgpu.workspace = true
+keycode = "1"
 tracing.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
@@ -26,6 +38,7 @@ jfn-platform-abi = { path = "../platform_abi" }
 jfn-cef = { path = "../jfn_cef", default-features = false }
 jfn-color = { path = "../color" }
 jfn-config = { path = "../config" }
+jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-jellyfin = { path = "../jellyfin" }
 jfn-logging = { path = "../logging" }
 jfn-mpv = { path = "../mpv" }
@@ -34,6 +47,7 @@ jfn-playback = { path = "../playback" }
 jfn-instance-ipc = { path = "../instance_ipc" }
 jfn-wake-event = { path = "../wake_event" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+thiserror.workspace = true
 
 
 [target.'cfg(target_os = "macos")'.dependencies]
