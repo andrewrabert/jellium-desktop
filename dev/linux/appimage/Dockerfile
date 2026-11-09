@@ -1,9 +1,9 @@
-# Toolchain image for building jellyfin-desktop AppImages.
+# Toolchain image for building jellium-desktop AppImages.
 # Source build, mpv build, AppDir assembly, and packaging all happen at
 # `podman run` time via container-build.sh (bind-mounted from the repo at
 # /src/dev/linux/appimage/container-build.sh), with host bind mounts for
 # incremental state. See container-build.sh and dev/linux/appimage/appimage.just.
-FROM fedora:latest
+FROM fedora:44
 # RPM Fusion provides the full FFmpeg with the complete decoder set, so mpv
 # can decode the media and the device profile advertises it to the server.
 # ffmpeg-devel below pulls it in; --allowerasing handles the swap for the

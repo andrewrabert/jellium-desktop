@@ -5,15 +5,17 @@
 //! callbacks dispatch via [`sink_core::execute`] / [`sink_core::seek_to_ms`].
 //!
 //! Public entry points:
-//!   * `jfn_windows_sink_start()` / `jfn_windows_sink_start_for(hwnd)` —
-//!     start the sink (SMTC binds to the mpv window via GetForWindow).
+//!   * `jfn_windows_sink_start_for(hwnd)` — start the sink (SMTC binds to the
+//!     mpv window via GetForWindow).
 //!   * `jfn_windows_sink_stop()` — signal the thread to exit at next wake.
 
 #![cfg(target_os = "windows")]
 
 use std::time::Instant;
 
-use jfn_playback::sink_core::{self, MediaCommand, Phase, QueuedSink, map_kind_to_phase};
+use jfn_playback::sink_core::{
+    self, MediaCommand, Phase, PositionThrottle, QueuedSink, map_kind_to_phase,
+};
 use jfn_playback::{MediaMetadata, MediaType as PbMediaType, PlaybackEvent, PlaybackEventKind};
 use windows::Foundation::TimeSpan;
 use windows::Media::{
@@ -29,43 +31,22 @@ use windows::Win32::Security::Cryptography::{CRYPT_STRING_BASE64, CryptStringToB
 use windows::Win32::System::WinRT::{ISystemMediaTransportControlsInterop, RoGetActivationFactory};
 use windows::core::HSTRING;
 
-// =====================================================================
-// Public start/stop entry points.
-// =====================================================================
-
 /// Start the sink. `hwnd_raw` is the HWND of the mpv window — required
 /// to bind SMTC via ISystemMediaTransportControlsInterop::GetForWindow.
 pub fn jfn_windows_sink_start_for(hwnd_raw: isize) {
     sink_core::run_sink("windows-sink", move || WindowsSink::new(hwnd_raw));
 }
 
-/// Convenience entry: queries mpv for the window-id and starts the sink.
-pub fn jfn_windows_sink_start() {
-    let mut wid: i64 = 0;
-    let name = c"window-id";
-    let rc = unsafe { jfn_mpv::api::jfn_mpv_get_property_int(name.as_ptr(), &mut wid) };
-    if rc < 0 || wid == 0 {
-        tracing::error!(target: "Media", "[SMTC] mpv window-id lookup failed");
-        return;
-    }
-    jfn_windows_sink_start_for(wid as isize);
-}
-
 pub fn jfn_windows_sink_stop() {
     sink_core::stop();
 }
-
-// =====================================================================
-// Sink state — lives on the consumer thread for the sink's lifetime.
-// =====================================================================
 
 #[derive(Default)]
 struct WinState {
     metadata: MediaMetadata,
     phase: Option<Phase>,
     position_us: i64,
-    last_position_update: Option<Instant>,
-    pending_update: bool,
+    throttle: PositionThrottle,
 }
 
 struct WindowsSink {
@@ -100,10 +81,6 @@ impl QueuedSink for WindowsSink {
     }
 }
 
-// =====================================================================
-// SMTC bindings.
-// =====================================================================
-
 struct Smtc {
     smtc: SystemMediaTransportControls,
     updater: windows::Media::SystemMediaTransportControlsDisplayUpdater,
@@ -114,8 +91,6 @@ struct Smtc {
 
 fn init_smtc(hwnd_raw: isize) -> Option<Smtc> {
     unsafe {
-        // RPC_E_CHANGED_MODE is fine — another thread may already have
-        // initialised the apartment.
         let _ = windows::Win32::System::Com::CoInitializeEx(
             None,
             windows::Win32::System::Com::COINIT_MULTITHREADED,
@@ -177,7 +152,6 @@ fn init_smtc(hwnd_raw: isize) -> Option<Smtc> {
                     if let Some(args) = args.as_ref()
                         && let Ok(span) = args.RequestedPlaybackPosition()
                     {
-                        // TimeSpan.Duration is 100-ns ticks.
                         let pos_us = span.Duration / 10;
                         sink_core::seek_to_ms(pos_us / 1000);
                     }
@@ -224,8 +198,6 @@ fn deliver(state: &mut WinState, smtc: &mut Option<Smtc>, ev: &PlaybackEvent) {
             if !ev.metadata.id.is_empty() && ev.metadata.id == state.metadata.id {
                 return;
             }
-            // Display refresh happens on the next phase transition
-            // (Started/Paused), which reads this cached metadata.
             state.metadata = ev.metadata.clone();
         }
         PlaybackEventKind::ArtworkChanged => {
@@ -281,30 +253,23 @@ fn deliver(state: &mut WinState, smtc: &mut Option<Smtc>, ev: &PlaybackEvent) {
                     return;
                 }
             }
-            state.pending_update = true;
+            state.throttle.force_next();
         }
         PlaybackEventKind::PositionChanged => {
             state.position_us = ev.snapshot.position_us;
-            let now = Instant::now();
-            let elapsed = state
-                .last_position_update
-                .map(|t| now.duration_since(t).as_millis() as i64)
-                .unwrap_or(i64::MAX);
-            if state.pending_update || elapsed >= 1000 {
-                if let Some(s) = smtc.as_mut() {
-                    update_timeline(state, s);
-                }
-                state.last_position_update = Some(now);
-                state.pending_update = false;
+            if state.throttle.due(Instant::now(), false)
+                && let Some(s) = smtc.as_mut()
+            {
+                update_timeline(state, s);
             }
         }
         PlaybackEventKind::Seeked => {
             state.position_us = ev.snapshot.position_us;
-            if let Some(s) = smtc.as_mut() {
+            if state.throttle.due(Instant::now(), true)
+                && let Some(s) = smtc.as_mut()
+            {
                 update_timeline(state, s);
             }
-            state.last_position_update = Some(Instant::now());
-            state.pending_update = false;
         }
         _ => {}
     }
@@ -386,7 +351,6 @@ fn make_thumbnail_stream(bytes: &[u8]) -> Option<RandomAccessStreamReference> {
     let stream = InMemoryRandomAccessStream::new().ok()?;
     let writer = DataWriter::CreateDataWriter(&stream).ok()?;
     writer.WriteBytes(bytes).ok()?;
-    // Safe to .get() because we're on the MTA sink thread.
     let _ = writer.StoreAsync().ok()?.join().ok()?;
     let _ = writer.DetachStream();
     stream.Seek(0).ok()?;

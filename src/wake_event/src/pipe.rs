@@ -1,64 +1,46 @@
-use libc::{c_int, c_void};
+use std::ffi::c_int;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::unistd::write;
 
 pub struct WakeEvent {
-    read_fd: c_int,
-    write_fd: c_int,
+    read_fd: OwnedFd,
+    write_fd: OwnedFd,
 }
 
 impl WakeEvent {
     pub fn new() -> Option<Self> {
-        let mut fds: [c_int; 2] = [-1, -1];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return None;
+        let (read, write) = std::io::pipe().ok()?;
+        let read_fd = OwnedFd::from(read);
+        let write_fd = OwnedFd::from(write);
+        for fd in [&read_fd, &write_fd] {
+            fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).ok()?;
         }
-        for f in &fds {
-            unsafe {
-                let flags = libc::fcntl(*f, libc::F_GETFL);
-                libc::fcntl(*f, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                libc::fcntl(*f, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-        }
-        Some(WakeEvent {
-            read_fd: fds[0],
-            write_fd: fds[1],
-        })
+        Some(WakeEvent { read_fd, write_fd })
     }
 
     pub fn fd(&self) -> c_int {
-        self.read_fd
+        self.read_fd.as_raw_fd()
     }
 
     pub fn signal(&self) {
-        let byte: u8 = 1;
-        unsafe {
-            libc::write(self.write_fd, &byte as *const u8 as *const c_void, 1);
-        }
+        let _ = write(&self.write_fd, &[1u8]);
     }
 
     pub fn drain(&self) {
-        let mut buf = [0u8; 64];
-        loop {
-            let n = unsafe { libc::read(self.read_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-            if n <= 0 {
-                break;
-            }
-        }
+        crate::drain_raw_fd(self.read_fd.as_raw_fd());
     }
 
     /// Block until signaled. Level-triggered, so a `signal()` that lands
     /// before the call returns immediately.
     pub fn wait(&self) {
-        crate::fd_wait::wait(self.read_fd);
+        crate::fd_wait::wait(self.read_fd.as_raw_fd());
     }
 }
 
-impl Drop for WakeEvent {
-    fn drop(&mut self) {
-        if self.read_fd >= 0 {
-            unsafe { libc::close(self.read_fd) };
-        }
-        if self.write_fd >= 0 {
-            unsafe { libc::close(self.write_fd) };
-        }
+impl AsFd for WakeEvent {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.read_fd.as_fd()
     }
 }

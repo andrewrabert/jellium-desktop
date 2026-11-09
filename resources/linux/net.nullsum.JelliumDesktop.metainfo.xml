@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>net.nullsum.JelliumDesktop</id>
+  <name>Jellium Desktop</name>
+  <summary>Jellyfin media client for desktop</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-2.0-or-later</project_license>
+  <description>
+    <p>
+      Jellium Desktop is a desktop client for Jellyfin media server,
+      built on the Chromium Embedded Framework (CEF) with mpv for video playback.
+    </p>
+  </description>
+  <launchable type="desktop-id">net.nullsum.JelliumDesktop.desktop</launchable>
+  <icon type="stock">net.nullsum.JelliumDesktop</icon>
+  <url type="homepage">https://jellyfin.org</url>
+  <url type="bugtracker">https://github.com/andrewrabert/jellium-desktop/issues</url>
+  <url type="help">https://jellyfin.org/docs/</url>
+  <developer id="net.nullsum">
+    <name>Jellium Contributors</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+  </releases>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+    <category>Player</category>
+    <category>TV</category>
+  </categories>
+</component>

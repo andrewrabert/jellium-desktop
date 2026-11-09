@@ -1,21 +1,26 @@
 //! Settings store. Owns the in-memory state, JSON persistence, and the
 //! singleton accessor that the rest of the workspace calls into.
 //!
-//! On-disk schema is a JSON object with the field names used by
-//! [`SettingsData::to_json`]. Missing keys keep their defaults on load; save
-//! suppresses fields that are at their default (empty strings, sentinel
-//! values, zero geometry) so existing config files round-trip unchanged.
+//! On-disk schema is [`SettingsFile`]. Missing, unknown, and malformed keys
+//! keep their defaults on load; save suppresses fields that are at their
+//! default (empty strings, sentinel values, zero geometry) so existing config
+//! files round-trip unchanged.
 
+use jfn_mailbox::Mailbox;
 use jfn_platform_abi::WindowDecorations;
-use parking_lot::{Condvar, Mutex};
-use serde_json::{Map, Value, json};
+use parking_lot::Mutex;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
+mod hardware_decode;
+pub use hardware_decode::{HWDEC_DEFAULT, Hwdec, UnknownHwdec, hwdec_options};
+
 const DEVICE_NAME_MAX: usize = 64;
-const HWDEC_DEFAULT: &str = "no";
 
 #[derive(Clone, Copy, Debug)]
 pub struct JfnWindowGeometry {
@@ -25,7 +30,6 @@ pub struct JfnWindowGeometry {
     pub height: i32,
     pub logical_width: i32,
     pub logical_height: i32,
-    pub scale: f32,
     pub maximized: bool,
 }
 
@@ -38,13 +42,13 @@ impl Default for JfnWindowGeometry {
             height: 0,
             logical_width: 0,
             logical_height: 0,
-            scale: 0.0,
             maximized: false,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum StartupWindowMode {
     #[default]
     Windowed,
@@ -74,7 +78,7 @@ impl StartupWindowMode {
 #[derive(Clone, Debug)]
 struct SettingsData {
     server_url: String,
-    hwdec: String,
+    hwdec: Hwdec,
     startup_window_mode: StartupWindowMode,
     audio_passthrough: String,
     audio_channels: String,
@@ -93,7 +97,7 @@ impl Default for SettingsData {
     fn default() -> Self {
         Self {
             server_url: String::new(),
-            hwdec: String::new(),
+            hwdec: Hwdec::default(),
             startup_window_mode: StartupWindowMode::default(),
             audio_passthrough: String::new(),
             audio_channels: String::new(),
@@ -110,221 +114,264 @@ impl Default for SettingsData {
     }
 }
 
+/// The settings.json document. Every key is optional on load; a key at its
+/// default is absent on save. Field order is the on-disk key order.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SettingsFile {
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    server_url: Option<String>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    window_width: Option<i32>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    window_height: Option<i32>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    window_logical_width: Option<i32>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    window_logical_height: Option<i32>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    window_x: Option<i32>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    window_y: Option<i32>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    window_maximized: Option<bool>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    hwdec: Option<Hwdec>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    startup_window_mode: Option<StartupWindowMode>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    audio_passthrough: Option<String>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    audio_exclusive: Option<bool>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    audio_channels: Option<String>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    disable_gpu_compositing: Option<bool>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    transparent_titlebar: Option<bool>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    log_level: Option<String>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    force_transcoding: Option<bool>,
+
+    #[serde(
+        deserialize_with = "lenient_decorations",
+        serialize_with = "serialize_decorations",
+        skip_serializing_if = "Option::is_none"
+    )]
+    window_decorations: Option<WindowDecorations>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    hide_scrollbar: Option<bool>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
+}
+
+/// Reads any JSON value and yields `None` unless it deserializes as `T`, so a
+/// key of the wrong type is ignored instead of failing the whole load.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(T::deserialize(value).ok())
+}
+
+/// Decoration names outside the wire contract are ignored like any other
+/// malformed key.
+fn lenient_decorations<'de, D>(deserializer: D) -> Result<Option<WindowDecorations>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let name: Option<String> = lenient(deserializer)?;
+    Ok(name.as_deref().and_then(WindowDecorations::parse))
+}
+
+/// Emits the wire literal from `WindowDecorations::as_str`.
+fn serialize_decorations<S>(
+    value: &Option<WindowDecorations>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(d) => serializer.serialize_str(d.as_str()),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// The settings blob the web UI parses. `windowDecorations` is absent:
+/// resolving its effective value needs the Platform default, unavailable in
+/// the CEF renderer where this is built.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CliSettings<'a> {
+    hwdec: Hwdec,
+    startup_window_mode: StartupWindowMode,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_passthrough: Option<&'a str>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_exclusive: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_channels: Option<&'a str>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disable_gpu_compositing: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transparent_titlebar: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_level: Option<&'a str>,
+
+    force_transcoding: bool,
+
+    hide_scrollbar: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_name: Option<&'a str>,
+
+    device_name_default: String,
+
+    hwdec_options: &'static [&'static str],
+}
+
 impl SettingsData {
-    fn overlay_json(&mut self, v: &Value) {
-        let Some(_) = v.as_object() else {
-            return;
+    fn overlay(&mut self, file: SettingsFile) {
+        if let Some(v) = file.server_url {
+            self.server_url = v;
+        }
+        if let Some(v) = file.startup_window_mode {
+            self.startup_window_mode = v;
+        }
+        if let Some(v) = file.hwdec {
+            self.hwdec = v;
+        }
+        if let Some(v) = file.audio_passthrough {
+            self.audio_passthrough = v;
+        }
+        if let Some(v) = file.audio_channels {
+            self.audio_channels = v;
+        }
+        if let Some(v) = file.log_level {
+            self.log_level = v;
+        }
+        if let Some(mut v) = file.device_name {
+            truncate_device_name(&mut v);
+            self.device_name = v;
+        }
+        if let Some(v) = file.window_width {
+            self.window.width = v;
+        }
+        if let Some(v) = file.window_height {
+            self.window.height = v;
+        }
+        if let Some(v) = file.window_logical_width {
+            self.window.logical_width = v;
+        }
+        if let Some(v) = file.window_logical_height {
+            self.window.logical_height = v;
+        }
+        if let Some(v) = file.window_x {
+            self.window.x = v;
+        }
+        if let Some(v) = file.window_y {
+            self.window.y = v;
+        }
+        if let Some(v) = file.window_maximized {
+            self.window.maximized = v;
+        }
+        if let Some(v) = file.audio_exclusive {
+            self.audio_exclusive = v;
+        }
+        if let Some(v) = file.disable_gpu_compositing {
+            self.disable_gpu_compositing = v;
+        }
+        if let Some(v) = file.transparent_titlebar {
+            self.transparent_titlebar = v;
+        }
+        if let Some(v) = file.force_transcoding {
+            self.force_transcoding = v;
+        }
+        if let Some(v) = file.window_decorations {
+            self.window_decorations = Some(v);
+        }
+        if let Some(v) = file.hide_scrollbar {
+            self.hide_scrollbar = v;
+        }
+    }
+
+    fn to_file(&self) -> SettingsFile {
+        let size = self.window.width > 0 && self.window.height > 0;
+        let logical = self.window.logical_width > 0 && self.window.logical_height > 0;
+        let position = self.window.x >= 0 && self.window.y >= 0;
+        SettingsFile {
+            server_url: Some(self.server_url.clone()),
+            window_width: size.then_some(self.window.width),
+            window_height: size.then_some(self.window.height),
+            window_logical_width: logical.then_some(self.window.logical_width),
+            window_logical_height: logical.then_some(self.window.logical_height),
+            window_x: position.then_some(self.window.x),
+            window_y: position.then_some(self.window.y),
+            window_maximized: Some(self.window.maximized),
+            startup_window_mode: (self.startup_window_mode != StartupWindowMode::default())
+                .then_some(self.startup_window_mode),
+            hwdec: (self.hwdec != Hwdec::default()).then_some(self.hwdec),
+            audio_passthrough: (!self.audio_passthrough.is_empty())
+                .then(|| self.audio_passthrough.clone()),
+            audio_exclusive: self.audio_exclusive.then_some(true),
+            audio_channels: (!self.audio_channels.is_empty()).then(|| self.audio_channels.clone()),
+            disable_gpu_compositing: self.disable_gpu_compositing.then_some(true),
+            transparent_titlebar: (!self.transparent_titlebar).then_some(false),
+            log_level: (!self.log_level.is_empty()).then(|| self.log_level.clone()),
+            force_transcoding: self.force_transcoding.then_some(true),
+            window_decorations: self.window_decorations,
+            hide_scrollbar: (!self.hide_scrollbar).then_some(false),
+            device_name: (!self.device_name.is_empty()).then(|| self.device_name.clone()),
+        }
+    }
+
+    fn cli_json(&self) -> String {
+        let view = CliSettings {
+            hwdec: self.hwdec,
+            startup_window_mode: self.startup_window_mode,
+            audio_passthrough: (!self.audio_passthrough.is_empty())
+                .then_some(self.audio_passthrough.as_str()),
+            audio_exclusive: self.audio_exclusive.then_some(true),
+            audio_channels: (!self.audio_channels.is_empty())
+                .then_some(self.audio_channels.as_str()),
+            disable_gpu_compositing: self.disable_gpu_compositing.then_some(true),
+            transparent_titlebar: (!self.transparent_titlebar).then_some(false),
+            log_level: (!self.log_level.is_empty()).then_some(self.log_level.as_str()),
+            force_transcoding: self.force_transcoding,
+            hide_scrollbar: self.hide_scrollbar,
+            device_name: (!self.device_name.is_empty()).then_some(self.device_name.as_str()),
+            device_name_default: default_device_name(),
+            hwdec_options: hwdec_options(),
         };
-        if let Some(s) = v.get("serverUrl").and_then(Value::as_str) {
-            self.server_url = s.into();
-        }
-        if let Some(s) = v.get("hwdec").and_then(Value::as_str) {
-            self.hwdec = s.into();
-        }
-        if let Some(mode) = v
-            .get("startupWindowMode")
-            .and_then(Value::as_str)
-            .and_then(StartupWindowMode::parse)
-        {
-            self.startup_window_mode = mode;
-        }
-        if let Some(s) = v.get("audioPassthrough").and_then(Value::as_str) {
-            self.audio_passthrough = s.into();
-        }
-        if let Some(s) = v.get("audioChannels").and_then(Value::as_str) {
-            self.audio_channels = s.into();
-        }
-        if let Some(s) = v.get("logLevel").and_then(Value::as_str) {
-            self.log_level = s.into();
-        }
-        if let Some(s) = v.get("deviceName").and_then(Value::as_str) {
-            let mut s = s.to_string();
-            if s.len() > DEVICE_NAME_MAX {
-                s.truncate(DEVICE_NAME_MAX);
-            }
-            self.device_name = s;
-        }
-        if let Some(n) = v.get("windowWidth").and_then(Value::as_i64) {
-            self.window.width = n as i32;
-        }
-        if let Some(n) = v.get("windowHeight").and_then(Value::as_i64) {
-            self.window.height = n as i32;
-        }
-        if let Some(n) = v.get("windowLogicalWidth").and_then(Value::as_i64) {
-            self.window.logical_width = n as i32;
-        }
-        if let Some(n) = v.get("windowLogicalHeight").and_then(Value::as_i64) {
-            self.window.logical_height = n as i32;
-        }
-        if let Some(n) = v.get("windowScale").and_then(Value::as_f64) {
-            self.window.scale = n as f32;
-        }
-        if let Some(n) = v.get("windowX").and_then(Value::as_i64) {
-            self.window.x = n as i32;
-        }
-        if let Some(n) = v.get("windowY").and_then(Value::as_i64) {
-            self.window.y = n as i32;
-        }
-        if let Some(b) = v.get("windowMaximized").and_then(Value::as_bool) {
-            self.window.maximized = b;
-        }
-        if let Some(b) = v.get("audioExclusive").and_then(Value::as_bool) {
-            self.audio_exclusive = b;
-        }
-        if let Some(b) = v.get("disableGpuCompositing").and_then(Value::as_bool) {
-            self.disable_gpu_compositing = b;
-        }
-        if let Some(b) = v.get("transparentTitlebar").and_then(Value::as_bool) {
-            self.transparent_titlebar = b;
-        }
-        if let Some(b) = v.get("forceTranscoding").and_then(Value::as_bool) {
-            self.force_transcoding = b;
-        }
-        if let Some(d) = v
-            .get("windowDecorations")
-            .and_then(Value::as_str)
-            .and_then(WindowDecorations::parse)
-        {
-            self.window_decorations = Some(d);
-        }
-        if let Some(b) = v.get("hideScrollbar").and_then(Value::as_bool) {
-            self.hide_scrollbar = b;
-        }
-    }
-
-    fn to_json(&self) -> Value {
-        let mut o = Map::new();
-        o.insert("serverUrl".into(), Value::String(self.server_url.clone()));
-        if self.window.width > 0 && self.window.height > 0 {
-            o.insert("windowWidth".into(), json!(self.window.width));
-            o.insert("windowHeight".into(), json!(self.window.height));
-        }
-        if self.window.logical_width > 0 && self.window.logical_height > 0 {
-            o.insert(
-                "windowLogicalWidth".into(),
-                json!(self.window.logical_width),
-            );
-            o.insert(
-                "windowLogicalHeight".into(),
-                json!(self.window.logical_height),
-            );
-        }
-        if self.window.scale > 0.0 {
-            o.insert("windowScale".into(), json!(self.window.scale));
-        }
-        if self.window.x >= 0 && self.window.y >= 0 {
-            o.insert("windowX".into(), json!(self.window.x));
-            o.insert("windowY".into(), json!(self.window.y));
-        }
-        o.insert("windowMaximized".into(), Value::Bool(self.window.maximized));
-        if !self.hwdec.is_empty() && self.hwdec != HWDEC_DEFAULT {
-            o.insert("hwdec".into(), Value::String(self.hwdec.clone()));
-        }
-        if self.startup_window_mode.as_str() != StartupWindowMode::default().as_str() {
-            o.insert(
-                "startupWindowMode".into(),
-                Value::String(self.startup_window_mode.as_str().to_string()),
-            );
-        }
-        if !self.audio_passthrough.is_empty() {
-            o.insert(
-                "audioPassthrough".into(),
-                Value::String(self.audio_passthrough.clone()),
-            );
-        }
-        if self.audio_exclusive {
-            o.insert("audioExclusive".into(), Value::Bool(true));
-        }
-        if !self.audio_channels.is_empty() {
-            o.insert(
-                "audioChannels".into(),
-                Value::String(self.audio_channels.clone()),
-            );
-        }
-        if self.disable_gpu_compositing {
-            o.insert("disableGpuCompositing".into(), Value::Bool(true));
-        }
-        if !self.transparent_titlebar {
-            o.insert("transparentTitlebar".into(), Value::Bool(false));
-        }
-        if !self.log_level.is_empty() {
-            o.insert("logLevel".into(), Value::String(self.log_level.clone()));
-        }
-        if self.force_transcoding {
-            o.insert("forceTranscoding".into(), Value::Bool(true));
-        }
-        if let Some(d) = self.window_decorations {
-            o.insert(
-                "windowDecorations".into(),
-                Value::String(d.as_str().to_string()),
-            );
-        }
-        if !self.hide_scrollbar {
-            o.insert("hideScrollbar".into(), Value::Bool(false));
-        }
-        if !self.device_name.is_empty() {
-            o.insert("deviceName".into(), Value::String(self.device_name.clone()));
-        }
-        Value::Object(o)
-    }
-
-    fn cli_json(&self, hwdec_opts: &[String], display_backend: &str) -> String {
-        let mut o = Map::new();
-        if !self.hwdec.is_empty() {
-            o.insert("hwdec".into(), Value::String(self.hwdec.clone()));
-        }
-        if !self.audio_passthrough.is_empty() {
-            o.insert(
-                "audioPassthrough".into(),
-                Value::String(self.audio_passthrough.clone()),
-            );
-        }
-        if self.audio_exclusive {
-            o.insert("audioExclusive".into(), Value::Bool(true));
-        }
-        if !self.audio_channels.is_empty() {
-            o.insert(
-                "audioChannels".into(),
-                Value::String(self.audio_channels.clone()),
-            );
-        }
-        if self.disable_gpu_compositing {
-            o.insert("disableGpuCompositing".into(), Value::Bool(true));
-        }
-        if !self.transparent_titlebar {
-            o.insert("transparentTitlebar".into(), Value::Bool(false));
-        }
-        if !self.log_level.is_empty() {
-            o.insert("logLevel".into(), Value::String(self.log_level.clone()));
-        }
-        o.insert(
-            "forceTranscoding".into(),
-            Value::Bool(self.force_transcoding),
-        );
-        // windowDecorations is absent: resolving its effective value needs the
-        // Platform default, unavailable in the CEF renderer where cli_json runs.
-        o.insert("hideScrollbar".into(), Value::Bool(self.hide_scrollbar));
-        if !self.device_name.is_empty() {
-            o.insert("deviceName".into(), Value::String(self.device_name.clone()));
-        }
-        o.insert(
-            "deviceNameDefault".into(),
-            Value::String(default_device_name()),
-        );
-        let opts: Vec<Value> = hwdec_opts
-            .iter()
-            .map(|s| Value::String(s.clone()))
-            .collect();
-        o.insert("hwdecOptions".into(), Value::Array(opts));
-        o.insert(
-            "startupWindowMode".into(),
-            Value::String(self.startup_window_mode.as_str().to_string()),
-        );
-        o.insert(
-            "displayBackend".into(),
-            Value::String(display_backend.to_string()),
-        );
-        serde_json::to_string(&Value::Object(o)).unwrap_or_default()
+        serde_json::to_string(&view).unwrap_or_default()
     }
 }
 
@@ -346,19 +393,21 @@ static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 // Single persistent background save worker. save_async() coalesces into
-// Pending::data (only the newest snapshot survives); the worker wakes on the
-// condvar, writes the latest snapshot, then sleeps. Shutdown drains any queued
-// write and joins the thread so nothing is lost at exit.
-struct Pending {
+// SavePending::data (only the newest snapshot survives); the worker wakes,
+// writes the latest snapshot, then sleeps. Shutdown drains any queued write
+// and joins the thread so nothing is lost at exit.
+
+/// Coalescing slot for the background writer: only the newest snapshot
+/// survives, and `stop` both drains the slot and ends the worker.
+struct SavePending {
     data: Option<SettingsData>,
     path: PathBuf,
     stop: bool,
-    started: bool,
 }
 
 struct SaveWorker {
-    pending: Mutex<Pending>,
-    cv: Condvar,
+    mailbox: Mailbox<SavePending>,
+    /// `Some` exactly while the worker thread is running; taken by shutdown.
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -366,36 +415,28 @@ static SAVE_WORKER: OnceLock<SaveWorker> = OnceLock::new();
 
 fn save_worker() -> &'static SaveWorker {
     SAVE_WORKER.get_or_init(|| SaveWorker {
-        pending: Mutex::new(Pending {
+        mailbox: Mailbox::new(SavePending {
             data: None,
             path: PathBuf::new(),
             stop: false,
-            started: false,
         }),
-        cv: Condvar::new(),
         handle: Mutex::new(None),
     })
 }
 
 fn save_worker_loop(w: &'static SaveWorker) {
-    loop {
-        let (data, path) = {
-            let mut p = w.pending.lock();
-            while p.data.is_none() && !p.stop {
-                w.cv.wait(&mut p);
-            }
-            match p.data.take() {
-                Some(d) => (d, p.path.clone()),
-                None => return, // stop with nothing pending — drained
-            }
-        };
+    // A stop with a snapshot still queued writes it, then exits on the next
+    // pass with an empty slot.
+    while let Some((data, path)) = w.mailbox.wait(
+        |p| p.data.is_some() || p.stop,
+        |p| p.data.take().map(|d| (d, p.path.clone())),
+    ) {
         save_data(&path, &data);
     }
 }
 
 fn save_data(path: &Path, data: &SettingsData) -> bool {
-    let v = data.to_json();
-    let Ok(mut text) = serde_json::to_string_pretty(&v) else {
+    let Ok(mut text) = serde_json::to_string_pretty(&data.to_file()) else {
         return false;
     };
     text.push('\n');
@@ -424,13 +465,10 @@ pub fn settings_load() -> bool {
     let Ok(contents) = fs::read_to_string(&path) else {
         return false;
     };
-    let Ok(v) = serde_json::from_str::<Value>(&contents) else {
+    let Ok(file) = serde_json::from_str::<SettingsFile>(&contents) else {
         return false;
     };
-    if !v.is_object() {
-        return false;
-    }
-    st.data.overlay_json(&v);
+    st.data.overlay(file);
     true
 }
 
@@ -453,29 +491,21 @@ pub fn settings_save_async() {
         (st.path.clone(), st.data.clone())
     };
     let w = save_worker();
-    // Hold `handle` across the spawn so a second caller racing in between
-    // `started = true` and the JoinHandle store can't observe a "started"
-    // worker before the thread actually exists.
-    let mut handle_guard = w.handle.lock();
-    let need_spawn = {
-        let mut p = w.pending.lock();
+    // Hold `handle` across the spawn so a second caller racing in between the
+    // enqueue and the JoinHandle store can't observe a started worker before
+    // the thread actually exists.
+    let mut handle = w.handle.lock();
+    let queued = w.mailbox.update(|p| {
         if p.stop {
-            return;
+            return false;
         }
         p.data = Some(snap);
         p.path = path;
-        if p.started {
-            false
-        } else {
-            p.started = true;
-            true
-        }
-    };
-    if need_spawn {
-        *handle_guard = Some(thread::spawn(|| save_worker_loop(save_worker())));
+        true
+    });
+    if queued && handle.is_none() {
+        *handle = Some(thread::spawn(|| save_worker_loop(save_worker())));
     }
-    drop(handle_guard);
-    w.cv.notify_one();
 }
 
 /// Stop the background save worker after draining any pending write. Safe to
@@ -484,14 +514,9 @@ pub fn settings_shutdown_save_worker() {
     let Some(w) = SAVE_WORKER.get() else {
         return;
     };
-    {
-        let mut p = w.pending.lock();
-        if p.stop {
-            return;
-        }
-        p.stop = true;
+    if !w.mailbox.update(|p| !std::mem::replace(&mut p.stop, true)) {
+        return;
     }
-    w.cv.notify_one();
     let handle = w.handle.lock().take();
     if let Some(h) = handle
         && let Err(e) = h.join()
@@ -523,7 +548,6 @@ macro_rules! bool_accessors {
 }
 
 string_accessors!(server_url, set_server_url, server_url);
-string_accessors!(hwdec, set_hwdec, hwdec);
 
 pub fn startup_window_mode() -> StartupWindowMode {
     state().lock().data.startup_window_mode
@@ -533,6 +557,13 @@ pub fn set_startup_window_mode(v: StartupWindowMode) {
     state().lock().data.startup_window_mode = v;
 }
 
+pub fn hwdec() -> Hwdec {
+    state().lock().data.hwdec
+}
+
+pub fn set_hwdec(v: Hwdec) {
+    state().lock().data.hwdec = v;
+}
 string_accessors!(audio_passthrough, set_audio_passthrough, audio_passthrough);
 string_accessors!(audio_channels, set_audio_channels, audio_channels);
 string_accessors!(log_level, set_log_level, log_level);
@@ -541,23 +572,30 @@ pub fn device_name() -> String {
     state().lock().data.device_name.clone()
 }
 
+/// Clamp to the server's 64-byte DeviceName column, never splitting a
+/// character.
+fn truncate_device_name(s: &mut String) {
+    if s.len() <= DEVICE_NAME_MAX {
+        return;
+    }
+    let mut end = DEVICE_NAME_MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 #[cfg(unix)]
 pub fn default_device_name() -> String {
-    let mut buf = [0u8; 256];
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut _, buf.len()) };
-    if rc != 0 {
-        return String::new();
-    }
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let mut s = String::from_utf8_lossy(&buf[..len]).into_owned();
-    s.truncate(DEVICE_NAME_MAX);
+    let mut s = gethostname::gethostname().to_string_lossy().into_owned();
+    truncate_device_name(&mut s);
     s
 }
 
 #[cfg(windows)]
 pub fn default_device_name() -> String {
     let mut s = std::env::var("COMPUTERNAME").unwrap_or_default();
-    s.truncate(DEVICE_NAME_MAX);
+    truncate_device_name(&mut s);
     s
 }
 
@@ -582,20 +620,23 @@ bool_accessors!(
     transparent_titlebar
 );
 bool_accessors!(force_transcoding, set_force_transcoding, force_transcoding);
+/// The user's explicit decoration choice, unresolved; `None` when unset.
+pub fn configured_window_decorations() -> Option<WindowDecorations> {
+    state().lock().data.window_decorations
+}
+
 /// Browser-process only: falls back to the installed `Platform`, which panics
 /// if absent.
 pub fn window_decorations_mode() -> WindowDecorations {
     let configured = state().lock().data.window_decorations;
-    jfn_platform_abi::get().resolve_window_decorations(configured)
+    jfn_platform_abi::resolve_window_decorations(configured)
 }
 
 pub fn window_decorations() -> String {
     window_decorations_mode().as_str().to_string()
 }
-pub fn set_window_decorations(v: &str) {
-    if let Some(d) = WindowDecorations::parse(v) {
-        state().lock().data.window_decorations = Some(d);
-    }
+pub fn set_window_decorations(v: Option<&str>) {
+    state().lock().data.window_decorations = v.and_then(WindowDecorations::parse);
 }
 
 /// True when the app draws its own (client-side) titlebar.
@@ -615,10 +656,9 @@ pub fn set_window_geometry(g: JfnWindowGeometry) {
     state().lock().data.window = g;
 }
 
-pub fn cli_json(hwdec_opts: &[&str], display_backend: &str) -> String {
+pub fn cli_json() -> String {
     let snap = state().lock().data.clone();
-    let opts: Vec<String> = hwdec_opts.iter().map(|s| (*s).to_string()).collect();
-    snap.cli_json(&opts, display_backend)
+    snap.cli_json()
 }
 
 fn normalize_device_name(raw: &str, platform_default: &str) -> String {
@@ -641,9 +681,7 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
     if trimmed.ends_with(' ') {
         trimmed.pop();
     }
-    if trimmed.len() > DEVICE_NAME_MAX {
-        trimmed.truncate(DEVICE_NAME_MAX);
-    }
+    truncate_device_name(&mut trimmed);
     if trimmed == platform_default {
         trimmed.clear();
     }
@@ -652,9 +690,229 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_device_name;
+    use super::{
+        SettingsData, SettingsFile, WindowDecorations, default_device_name, normalize_device_name,
+    };
+
+    #[test]
+    fn personal_startup_mode_survives_legacy_settings_round_trip() {
+        for (wire, expected) in [
+            ("windowed", super::StartupWindowMode::Windowed),
+            ("maximized", super::StartupWindowMode::Maximized),
+            ("fullscreen", super::StartupWindowMode::Fullscreen),
+        ] {
+            let json =
+                serde_json::json!({"startupWindowMode": wire, "serverUrl": "http://example.test"});
+            let mut data = SettingsData::default();
+            data.overlay(serde_json::from_value(json).unwrap());
+            assert_eq!(data.startup_window_mode, expected);
+            let saved = serde_json::to_value(data.to_file()).unwrap();
+            let mut reloaded = SettingsData::default();
+            reloaded.overlay(serde_json::from_value(saved).unwrap());
+            assert_eq!(reloaded.startup_window_mode, expected);
+            assert_eq!(reloaded.server_url, "http://example.test");
+        }
+    }
+
+    #[test]
+    fn invalid_startup_mode_does_not_discard_other_settings() {
+        for value in [
+            serde_json::json!("unsupported"),
+            serde_json::json!(17),
+            serde_json::Value::Null,
+        ] {
+            let mut data = SettingsData::default();
+            data.overlay(
+                serde_json::from_value(serde_json::json!({
+                    "startupWindowMode": value, "serverUrl": "http://example.test"
+                }))
+                .unwrap(),
+            );
+            assert_eq!(data.startup_window_mode, super::StartupWindowMode::Windowed);
+            assert_eq!(data.server_url, "http://example.test");
+        }
+    }
 
     const PLATFORM: &str = "platform-host";
+
+    /// Top-level keys in the order they appear in the text; `serde_json::Value`
+    /// would reorder them.
+    fn keys(json: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        let mut chars = json.chars().peekable();
+        let mut current = String::new();
+        let mut in_string = false;
+        while let Some(c) = chars.next() {
+            if in_string {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => in_string = false,
+                    _ => current.push(c),
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_string = true;
+                    current.clear();
+                }
+                ':' if depth == 1 => out.push(std::mem::take(&mut current)),
+                '{' | '[' => depth += 1,
+                '}' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn loaded(json: &str) -> SettingsData {
+        let file: SettingsFile = serde_json::from_str(json).expect("valid json");
+        let mut data = SettingsData::default();
+        data.overlay(file);
+        data
+    }
+
+    #[test]
+    fn default_settings_write_only_server_url_and_maximized() {
+        let text = serde_json::to_string(&SettingsData::default().to_file()).expect("serializes");
+        assert_eq!(text, r#"{"serverUrl":"","windowMaximized":false}"#);
+    }
+
+    #[test]
+    fn every_key_writes_in_schema_order() {
+        let data = SettingsData {
+            server_url: "http://host".into(),
+            startup_window_mode: super::StartupWindowMode::default(),
+            hwdec: "auto".parse().expect("auto is offered everywhere"),
+            audio_passthrough: "eac3".into(),
+            audio_channels: "stereo".into(),
+            log_level: "debug".into(),
+            device_name: "box".into(),
+            window: super::JfnWindowGeometry {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+                logical_width: 5,
+                logical_height: 6,
+                maximized: true,
+            },
+            audio_exclusive: true,
+            disable_gpu_compositing: true,
+            transparent_titlebar: false,
+            force_transcoding: true,
+            window_decorations: Some(WindowDecorations::ServerThemed),
+            hide_scrollbar: false,
+        };
+        let text = serde_json::to_string(&data.to_file()).expect("serializes");
+        assert_eq!(
+            keys(&text),
+            [
+                "serverUrl",
+                "windowWidth",
+                "windowHeight",
+                "windowLogicalWidth",
+                "windowLogicalHeight",
+                "windowX",
+                "windowY",
+                "windowMaximized",
+                "hwdec",
+                "audioPassthrough",
+                "audioExclusive",
+                "audioChannels",
+                "disableGpuCompositing",
+                "transparentTitlebar",
+                "logLevel",
+                "forceTranscoding",
+                "windowDecorations",
+                "hideScrollbar",
+                "deviceName",
+            ]
+        );
+        assert!(text.contains(r#""windowDecorations":"serverThemed""#));
+    }
+
+    #[test]
+    fn absent_keys_leave_defaults() {
+        let data = loaded(r#"{"serverUrl":"http://host"}"#);
+        assert_eq!(data.server_url, "http://host");
+        assert!(data.transparent_titlebar);
+        assert!(data.hide_scrollbar);
+        assert_eq!(data.window.x, -1);
+    }
+
+    #[test]
+    fn transparent_titlebar_false_round_trips_and_true_is_omitted() {
+        let false_data = loaded(r#"{"transparentTitlebar":false}"#);
+        assert!(!false_data.transparent_titlebar);
+        let false_json = serde_json::to_string(&false_data.to_file()).expect("serializes");
+        assert!(false_json.contains(r#""transparentTitlebar":false"#));
+        assert!(!loaded(&false_json).transparent_titlebar);
+
+        let true_json =
+            serde_json::to_string(&SettingsData::default().to_file()).expect("serializes");
+        assert!(!true_json.contains("transparentTitlebar"));
+        assert!(loaded(&true_json).transparent_titlebar);
+    }
+
+    #[test]
+    fn wrong_typed_key_is_ignored_and_rest_of_file_loads() {
+        let data = loaded(r#"{"windowWidth":"wide","serverUrl":"http://host","hideScrollbar":7}"#);
+        assert_eq!(data.window.width, 0);
+        assert!(data.hide_scrollbar);
+        assert_eq!(data.server_url, "http://host");
+    }
+
+    #[test]
+    fn unknown_keys_and_unknown_decorations_are_ignored() {
+        let data = loaded(r#"{"nope":1,"windowDecorations":"fancy","serverUrl":"u"}"#);
+        assert_eq!(data.window_decorations, None);
+        assert_eq!(data.server_url, "u");
+    }
+
+    #[test]
+    fn overlong_device_name_loads_truncated_on_char_boundary() {
+        let ascii = "x".repeat(100);
+        let data = loaded(&format!(r#"{{"deviceName":"{ascii}"}}"#));
+        assert_eq!(data.device_name, "x".repeat(64));
+
+        let multibyte = "é".repeat(40);
+        let data = loaded(&format!(r#"{{"deviceName":"{multibyte}"}}"#));
+        assert!(data.device_name.len() <= 64);
+        assert_eq!(data.device_name, "é".repeat(32));
+    }
+
+    #[test]
+    fn cli_json_emits_the_web_ui_contract() {
+        let data = SettingsData {
+            transparent_titlebar: false,
+            device_name: "box".into(),
+            ..SettingsData::default()
+        };
+        let text = data.cli_json();
+        assert_eq!(
+            keys(&text),
+            [
+                "hwdec",
+                "startupWindowMode",
+                "transparentTitlebar",
+                "forceTranscoding",
+                "hideScrollbar",
+                "deviceName",
+                "deviceNameDefault",
+                "hwdecOptions",
+            ]
+        );
+        let options = serde_json::to_string(super::hwdec_options()).expect("serializes");
+        assert!(text.contains(&format!(r#""hwdecOptions":{options}"#)));
+        assert!(text.contains(&format!(
+            r#""deviceNameDefault":"{}""#,
+            default_device_name()
+        )));
+    }
 
     #[test]
     fn trims_leading_and_trailing_whitespace() {

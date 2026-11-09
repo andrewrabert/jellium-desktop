@@ -1,55 +1,39 @@
-//! App-level CEF context-menu items appended to every browser's menu.
-//!
-//! The build/dispatch closures returned here are installed via
-//! `JfnCefLayer::set_context_menu_builder_rust` /
-//! `set_context_menu_dispatcher_rust` by each business wrapper.
+//! Native CEF adapter for application menu data supplied by the composition root.
 
 use cef::rc::ConvertReturnValue;
 use cef::{ImplMenuModel, MenuModel, sys};
-use std::os::raw::{c_int, c_void};
+use std::os::raw::c_void;
+use std::sync::Arc;
 
-// Command IDs numbered from cef_menu_id_t::MENU_ID_USER_FIRST.
-const MENU_ID_USER_FIRST: c_int = sys::cef_menu_id_t::MENU_ID_USER_FIRST as c_int;
-pub const MENU_ID_TOGGLE_FULLSCREEN: c_int = MENU_ID_USER_FIRST;
-pub const MENU_ID_ABOUT: c_int = MENU_ID_USER_FIRST + 1;
-pub const MENU_ID_EXIT: c_int = MENU_ID_USER_FIRST + 2;
+/// Application-owned context menu policy injected into the browser session.
+#[derive(Clone)]
+pub struct ApplicationMenu {
+    pub items: Vec<jfn_platform_abi::MenuItem>,
+    pub on_selected: Arc<dyn Fn(i32) -> bool + Send + Sync>,
+}
 
-use jfn_playback::shutdown::jfn_shutdown_initiate;
-
-/// Build closure for [`JfnCefLayer::set_context_menu_builder_rust`].
-/// The slot invocation adds one ref to the menu model before calling this,
-/// so we adopt it via `wrap_result` (no extra add_ref needed).
-pub fn build_closure() -> Box<crate::client::ContextBuilderFn> {
-    Box::new(|raw: *mut c_void| {
+/// The caller transfers one reference to the native menu model into this adapter.
+pub(crate) fn build_closure(
+    items: Vec<jfn_platform_abi::MenuItem>,
+) -> Box<crate::client::ContextBuilderFn> {
+    Box::new(move |raw: *mut c_void| {
         if raw.is_null() {
             return;
         }
-        let m: MenuModel = (raw as *mut sys::_cef_menu_model_t).wrap_result();
-        m.add_item(
-            MENU_ID_TOGGLE_FULLSCREEN,
-            Some(&cef::CefString::from("Toggle Fullscreen")),
-        );
-        m.add_item(MENU_ID_ABOUT, Some(&cef::CefString::from("About")));
-        m.add_item(MENU_ID_EXIT, Some(&cef::CefString::from("Exit")));
+        let model: MenuModel = (raw as *mut sys::_cef_menu_model_t).wrap_result();
+        for item in &items {
+            if item.separator {
+                model.add_separator();
+            } else {
+                model.add_item(item.id, Some(&cef::CefString::from(item.label.as_str())));
+                model.set_enabled(item.id, i32::from(item.enabled));
+            }
+        }
     })
 }
 
-/// Dispatch closure for [`JfnCefLayer::set_context_menu_dispatcher_rust`].
-pub fn dispatch_closure() -> Box<crate::client::ContextDispatcherFn> {
-    Box::new(|cmd: c_int| -> bool {
-        if cmd == MENU_ID_TOGGLE_FULLSCREEN {
-            if let Some(p) = jfn_platform_abi::try_get() {
-                p.toggle_fullscreen();
-            }
-            true
-        } else if cmd == MENU_ID_ABOUT {
-            crate::business_about::jfn_about_open();
-            true
-        } else if cmd == MENU_ID_EXIT {
-            jfn_shutdown_initiate();
-            true
-        } else {
-            false
-        }
-    })
+pub(crate) fn dispatch_closure(
+    on_selected: Arc<dyn Fn(i32) -> bool + Send + Sync>,
+) -> Box<crate::client::ContextDispatcherFn> {
+    Box::new(move |id| on_selected(id))
 }

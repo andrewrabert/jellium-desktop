@@ -12,9 +12,9 @@
 
 use crate::event::Event;
 use crate::handle::Handle;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 
 pub struct EventLoop {
@@ -28,7 +28,7 @@ impl EventLoop {
     /// for typed events. The wakeup callback on `handle` is left untouched —
     /// `mpv_wait_event(-1)` blocks until libmpv has something to deliver.
     pub fn spawn(handle: Arc<Handle>) -> std::io::Result<(Self, Receiver<Event>)> {
-        let (tx, rx) = channel();
+        let (tx, rx) = unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let handle = Arc::clone(&handle);
@@ -76,6 +76,8 @@ fn drain(handle: Arc<Handle>, stop: Arc<AtomicBool>, tx: Sender<Event>) {
         match event {
             // Timeout sentinel; spurious wakeup (e.g. from `Handle::wakeup`).
             Event::None => continue,
+            // Log messages go straight to tracing; consumers never see them.
+            Event::LogMessage(ref m) => crate::log::forward_to_tracing(m),
             Event::Shutdown => {
                 // Forward shutdown so consumers can react, then exit.
                 let _ = tx.send(Event::Shutdown);

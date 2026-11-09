@@ -36,9 +36,6 @@ pub struct Inputs {
     /// which can lag the WM.
     pub parent_fullscreen: bool,
     pub want_visible: bool,
-    /// False on the dmabuf tier, where the GPU worker sizes the window — the
-    /// geometry thread must not also drive size.
-    pub owns_size: bool,
     pub observed: Option<Geom>,
     /// The window's actual server map state, if known. Lets the FSM recover when
     /// the WM withdraws (unmaps) the window during the override_redirect flip —
@@ -55,18 +52,16 @@ pub enum Effect {
     /// Map + re-establish the passive button grab + raise above the parent.
     MapAndRaise,
     Unmap,
-    Poke {
-        x: i32,
-        y: i32,
-    },
-    SetSize {
-        w: i32,
-        h: i32,
-    },
+    /// Reassert this overlay's position AND size from the parent geometry in one
+    /// configure. The geometry thread is the sole sizer, so placement and size
+    /// move together; emitted only when the observed rect differs (or a just-
+    /// mapped overlay has no trustworthy sample), which keeps our own
+    /// ConfigureNotify from looping.
+    Place,
 }
 
-fn size_differs(observed: Option<Geom>, w: i32, h: i32) -> bool {
-    observed.is_none_or(|o| o.2 != w || o.3 != h)
+fn rect_differs(observed: Option<Geom>, geom: Geom) -> bool {
+    observed.is_none_or(|o| o != geom)
 }
 
 /// Re-derive this overlay's desired placement from `inputs` and emit the minimal
@@ -106,13 +101,8 @@ pub fn step(state: &mut OverlayState, inputs: &Inputs) -> Vec<Effect> {
         force = true;
     }
 
-    let (px, py, pw, ph) = inputs.parent_geom;
-    let pos_ok = inputs.observed.is_some_and(|o| o.0 == px && o.1 == py);
-    if force || !pos_ok {
-        effects.push(Effect::Poke { x: px, y: py });
-    }
-    if inputs.owns_size && size_differs(inputs.observed, pw, ph) {
-        effects.push(Effect::SetSize { w: pw, h: ph });
+    if force || rect_differs(inputs.observed, inputs.parent_geom) {
+        effects.push(Effect::Place);
     }
     effects
 }
@@ -143,32 +133,29 @@ mod tests {
             parent_geom: parent,
             parent_fullscreen: fs,
             want_visible: true,
-            owns_size: true,
             observed,
             observed_mapped: Some(true),
         }
     }
 
-    fn pos(effects: &[Effect]) -> Option<usize> {
-        effects
-            .iter()
-            .position(|e| matches!(e, Effect::Poke { .. }))
+    fn place_pos(effects: &[Effect]) -> Option<usize> {
+        effects.iter().position(|e| matches!(e, Effect::Place))
     }
 
     // Entering fullscreen flips to override_redirect (remap), then places it at
-    // the fullscreen origin — ordering matters: setattr → map → poke.
+    // the fullscreen rect — ordering matters: setattr → map → place.
     #[test]
     fn entering_fullscreen_flips_then_places() {
         let mut s = managed();
         let e = step(&mut s, &inputs(FS, true, Some(WIN)));
         assert_eq!(e[0], Effect::SetOverrideRedirect(true));
         assert_eq!(e[1], Effect::MapAndRaise);
-        assert!(e.contains(&Effect::Poke { x: 0, y: 0 }));
+        assert!(e.contains(&Effect::Place));
         let or = e
             .iter()
             .position(|x| *x == Effect::SetOverrideRedirect(true));
         let map = e.iter().position(|x| *x == Effect::MapAndRaise);
-        assert!(or < map && map < pos(&e));
+        assert!(or < map && map < place_pos(&e));
         assert!(s.unmanaged && s.mapped);
     }
 
@@ -178,7 +165,7 @@ mod tests {
         let e = step(&mut s, &inputs(WIN, false, Some(FS)));
         assert_eq!(e[0], Effect::SetOverrideRedirect(false));
         assert!(e.contains(&Effect::MapAndRaise));
-        assert!(e.contains(&Effect::Poke { x: 100, y: 50 }));
+        assert!(e.contains(&Effect::Place));
         assert!(!s.unmanaged);
     }
 
@@ -207,10 +194,10 @@ mod tests {
         assert_eq!(e, vec![]);
     }
 
-    // No flip while staying fullscreen: a WM clamp shows as an origin mismatch
-    // and is corrected by a plain poke (we own the unmanaged geometry).
+    // No flip while staying fullscreen: a WM clamp shows as a rect mismatch and
+    // is corrected by a plain place (we own the unmanaged geometry).
     #[test]
-    fn fullscreen_drift_repokes_without_flip() {
+    fn fullscreen_drift_replaces_without_flip() {
         let mut s = unmanaged();
         let clamped = (0, 27, 1920, 1053);
         let e = step(&mut s, &inputs(FS, true, Some(clamped)));
@@ -218,15 +205,25 @@ mod tests {
             !e.iter()
                 .any(|x| matches!(x, Effect::SetOverrideRedirect(_)))
         );
-        assert!(e.contains(&Effect::Poke { x: 0, y: 0 }));
+        assert!(e.contains(&Effect::Place));
     }
 
     #[test]
-    fn windowed_move_pokes_new_origin() {
+    fn windowed_move_replaces() {
         let mut s = managed();
         let moved = (300, 200, 800, 600);
         let e = step(&mut s, &inputs(moved, false, Some(WIN)));
-        assert!(e.contains(&Effect::Poke { x: 300, y: 200 }));
+        assert!(e.contains(&Effect::Place));
+    }
+
+    // A pure size mismatch (same origin) still triggers a place — the geometry
+    // thread is the sole sizer.
+    #[test]
+    fn size_mismatch_replaces() {
+        let mut s = managed();
+        let bigger = (100, 50, 1024, 768);
+        let e = step(&mut s, &inputs(bigger, false, Some(WIN)));
+        assert!(e.contains(&Effect::Place));
     }
 
     #[test]
@@ -247,24 +244,6 @@ mod tests {
         };
         let e = step(&mut s, &inputs(WIN, false, Some(WIN)));
         assert!(e.contains(&Effect::MapAndRaise));
-        assert!(pos(&e).is_some());
-    }
-
-    #[test]
-    fn dmabuf_tier_never_sets_size() {
-        let mut s = managed();
-        let mut i = inputs((300, 200, 1024, 768), false, Some(WIN));
-        i.owns_size = false;
-        let e = step(&mut s, &i);
-        assert!(pos(&e).is_some());
-        assert!(!e.iter().any(|x| matches!(x, Effect::SetSize { .. })));
-    }
-
-    #[test]
-    fn owns_size_sets_size_on_mismatch() {
-        let mut s = managed();
-        let bigger = (100, 50, 1024, 768);
-        let e = step(&mut s, &inputs(bigger, false, Some(WIN)));
-        assert!(e.contains(&Effect::SetSize { w: 1024, h: 768 }));
+        assert!(place_pos(&e).is_some());
     }
 }

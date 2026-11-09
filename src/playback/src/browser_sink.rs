@@ -6,32 +6,26 @@ use parking_lot::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde_json::json;
+use serde::Serialize;
 
 use crate::exec_js::call as call_exec_js;
 use crate::types::{PlaybackEvent, PlaybackEventKind};
 
-type SetSizeCb = extern "C" fn(i32, i32, i32, i32);
+#[derive(Serialize)]
+struct BufferedRange {
+    start: i64,
+    end: i64,
+}
+
 type SetHzCb = extern "C" fn(f64);
 
 struct Handlers {
-    set_size: Option<SetSizeCb>,
     set_hz: Option<SetHzCb>,
 }
 
 fn slot() -> &'static Mutex<Handlers> {
     static SLOT: OnceLock<Mutex<Handlers>> = OnceLock::new();
-    SLOT.get_or_init(|| {
-        Mutex::new(Handlers {
-            set_size: None,
-            set_hz: None,
-        })
-    })
-}
-
-/// Install / clear the browsers.setSize handler.
-pub fn jfn_playback_set_browsers_size_handler(cb: Option<SetSizeCb>) {
-    slot().lock().set_size = cb;
+    SLOT.get_or_init(|| Mutex::new(Handlers { set_hz: None }))
 }
 
 /// Install / clear the browsers.setRefreshRate handler.
@@ -61,8 +55,8 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
             } else {
                 ev.error_message.as_str()
             };
-            let json_str = json!(msg).to_string();
-            call_exec_js(&format!("window._nativeEmit('error',{})", json_str));
+            let text = jfn_js_json::to_js_json(msg).unwrap_or_else(|| "\"\"".to_string());
+            call_exec_js(&format!("window._nativeEmit('error',{text})"));
         }
         PlaybackEventKind::SeekingChanged => {
             if ev.flag {
@@ -97,24 +91,22 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
                 if snap.fullscreen { "true" } else { "false" }
             ));
         }
-        PlaybackEventKind::OsdDimsChanged => {
-            if let Some(cb) = slot().lock().set_size {
-                cb(snap.layout_w, snap.layout_h, snap.pixel_w, snap.pixel_h);
-            }
-        }
         PlaybackEventKind::DisplayHzChanged => {
             if let Some(cb) = slot().lock().set_hz {
                 cb(snap.display_hz);
             }
         }
         PlaybackEventKind::BufferedRangesChanged => {
-            let arr: Vec<_> = snap
+            let ranges: Vec<BufferedRange> = snap
                 .buffered
                 .iter()
-                .map(|r| json!({ "start": r.start_ticks, "end": r.end_ticks }))
+                .map(|r| BufferedRange {
+                    start: r.start_ticks,
+                    end: r.end_ticks,
+                })
                 .collect();
-            let json_str = serde_json::Value::Array(arr).to_string();
-            call_exec_js(&format!("window._nativeUpdateBufferedRanges({})", json_str));
+            let json = jfn_js_json::to_js_json(&ranges).unwrap_or_else(|| "[]".to_string());
+            call_exec_js(&format!("window._nativeUpdateBufferedRanges({json})"));
         }
         PlaybackEventKind::BufferingChanged
         | PlaybackEventKind::MediaTypeChanged

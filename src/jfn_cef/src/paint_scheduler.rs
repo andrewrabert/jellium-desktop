@@ -1,4 +1,5 @@
 use cef::rc::Rc;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 
@@ -8,8 +9,13 @@ use cef::{
 };
 
 use crate::client::{Inner, now_ns};
+use crate::frame_rate::FrameRate;
+use crossbeam_utils::atomic::AtomicCell;
 
-const BOOST_MULTIPLIER: i32 = 2;
+const BOOST_MULTIPLIER: NonZeroU32 = match NonZeroU32::new(2) {
+    Some(n) => n,
+    None => unreachable!(),
+};
 const INVALIDATE_TICK_LIMIT: i32 = 1000;
 const SKIP_PAINTS_AFTER_RESIZE: i32 = 1;
 
@@ -40,7 +46,8 @@ const JS_PAINT_NUDGE: &str = r#"
 "#;
 
 struct PaintState {
-    saved_frame_rate: AtomicI32,
+    /// The rate the boost displaced; `None` while no boost is live.
+    saved_frame_rate: AtomicCell<Option<FrameRate>>,
     resize_gen: AtomicU64,
     invalidate_running: AtomicBool,
     invalidate_stop: AtomicBool,
@@ -54,7 +61,7 @@ struct PaintState {
 impl PaintState {
     fn new() -> Self {
         Self {
-            saved_frame_rate: AtomicI32::new(0),
+            saved_frame_rate: AtomicCell::new(None),
             resize_gen: AtomicU64::new(0),
             invalidate_running: AtomicBool::new(false),
             invalidate_stop: AtomicBool::new(false),
@@ -87,16 +94,16 @@ impl PaintState {
         true
     }
 
-    fn update_boost_saved_frame_rate(&self, target: i32) -> bool {
-        if self.saved_frame_rate.load(Ordering::Acquire) == 0 {
+    fn update_boost_saved_frame_rate(&self, target: FrameRate) -> bool {
+        if self.saved_frame_rate.load().is_none() {
             return false;
         }
-        self.saved_frame_rate.store(target, Ordering::Release);
+        self.saved_frame_rate.store(Some(target));
         true
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PaintMode {
     shared_textures: bool,
 }
@@ -124,11 +131,11 @@ trait PaintSchedulerMode: Send + Sync {
     fn before_resize(&self) {}
     fn after_resize(&self, _scheduler: PaintScheduler, _inner: &Arc<Inner>) {}
     fn before_close(&self) {}
-    fn refresh_rate_changed(&self, _target: i32) -> bool {
+    fn refresh_rate_changed(&self, _target: FrameRate) -> bool {
         false
     }
-    fn should_present_paint(&self, _inner: &Inner) -> bool {
-        true
+    fn verdict(&self, _inner: &Inner) -> Verdict {
+        Verdict::Present
     }
     fn kick_task(&self, _scheduler: PaintScheduler, _inner: &Arc<Inner>) {}
     fn tick_task(&self, _scheduler: PaintScheduler, _inner: &Arc<Inner>) {}
@@ -167,12 +174,14 @@ impl PaintScheduler {
         self.mode.before_close();
     }
 
-    pub(crate) fn refresh_rate_changed(&self, target: i32) -> bool {
+    pub(crate) fn refresh_rate_changed(&self, target: FrameRate) -> bool {
         self.mode.refresh_rate_changed(target)
     }
 
-    pub(crate) fn should_present_paint(&self, inner: &Inner) -> bool {
-        self.mode.should_present_paint(inner)
+    /// [`Verdict::Supersede`] is returned only while the invalidate loop that
+    /// produces the successor is running.
+    pub(crate) fn verdict(&self, inner: &Inner) -> Verdict {
+        self.mode.verdict(inner)
     }
 
     fn kick_task(&self, inner: &Arc<Inner>) {
@@ -206,12 +215,12 @@ impl PaintSchedulerMode for ActivePaintScheduler {
         self.state.stop_invalidate_loop();
     }
 
-    fn refresh_rate_changed(&self, target: i32) -> bool {
+    fn refresh_rate_changed(&self, target: FrameRate) -> bool {
         self.state.update_boost_saved_frame_rate(target)
     }
 
-    fn should_present_paint(&self, inner: &Inner) -> bool {
-        active_should_present_paint(&self.state, inner)
+    fn verdict(&self, inner: &Inner) -> Verdict {
+        active_verdict(&self.state, inner)
     }
 
     fn kick_task(&self, scheduler: PaintScheduler, inner: &Arc<Inner>) {
@@ -228,19 +237,35 @@ fn start_invalidate_loop(scheduler: PaintScheduler, state: &PaintState, inner: &
         return;
     }
     let next = Arc::clone(inner);
-    let mut task = KickTask::new(scheduler, next);
-    let _ = post_task(ThreadId::UI, Some(&mut task));
+    inner.session.dispatch(|| {
+        let mut task = KickTask::new(scheduler, next);
+        let _ = post_task(ThreadId::UI, Some(&mut task));
+    });
 }
 
 fn active_kick_apply(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<Inner>) {
     // Boost CEF compositor rate while the loop is live — JS rAF ties to
     // compositor rate, so this speeds up convergence to post-resize dims.
-    let fps = inner.frame_rate.load(Ordering::Acquire);
-    if inner.browser_alive() && fps > 0 && state.saved_frame_rate.load(Ordering::Acquire) == 0 {
-        state.saved_frame_rate.store(fps, Ordering::Release);
-        inner.set_frame_rate(fps * BOOST_MULTIPLIER);
+    if let Some(fps) = inner.frame_rate.load()
+        && inner.browser_alive()
+        && state.saved_frame_rate.load().is_none()
+    {
+        state.saved_frame_rate.store(Some(fps));
+        inner.set_frame_rate(fps.times(BOOST_MULTIPLIER));
     }
     active_invalidate_tick(scheduler, state, inner);
+}
+
+/// Ends the invalidate loop: restores the frame rate it boosted and clears the
+/// running flag. Both exits — the stop flag and a display that reports no
+/// refresh interval — go through here.
+fn stop_invalidate(state: &PaintState, inner: &Arc<Inner>) {
+    if let Some(saved) = state.saved_frame_rate.swap(None)
+        && inner.browser_alive()
+    {
+        inner.set_frame_rate(saved);
+    }
+    state.invalidate_running.store(false, Ordering::Release);
 }
 
 fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<Inner>) {
@@ -248,39 +273,40 @@ fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: 
         state.invalidate_stop.store(true, Ordering::Release);
     }
     if state.invalidate_stop.load(Ordering::Acquire) {
-        let saved = state.saved_frame_rate.swap(0, Ordering::AcqRel);
-        if inner.browser_alive() && saved > 0 {
-            inner.set_frame_rate(saved);
-        }
-        state.invalidate_running.store(false, Ordering::Release);
+        stop_invalidate(state, inner);
         return;
     }
     if inner.browser_alive() {
         inner.invalidate_view();
-        let external_bf = jfn_platform_abi::try_get()
-            .and_then(|p| p.cef_host())
-            .is_some_and(|h| h.external_begin_frame());
+        let external_bf = jfn_platform_abi::try_lease()
+            .is_some_and(|p| p.cef_host().is_some_and(|h| h.external_begin_frame()));
         if external_bf {
             inner.send_external_begin_frame();
         }
     }
-    let fps = inner.frame_rate.load(Ordering::Acquire);
-    if fps <= 0 {
-        state.invalidate_running.store(false, Ordering::Release);
+    // The loop ticks at the display's own refresh; a display that reports none
+    // spaces nothing, so the loop stops rather than run at a rate this process
+    // invented.
+    let Some(period) = jfn_gpu_paint::refresh_interval() else {
+        stop_invalidate(state, inner);
         return;
-    }
-    // Tick at 4x display refresh so the compositor gets nudged more
-    // often than the boosted output rate (2x) — keeps frame production
-    // ahead of the present cadence during a resize.
-    let tick_hz = fps * 4;
-    let delay_ms = ((1000.0 / tick_hz as f64) + 0.5) as i64;
-    let delay_ms = delay_ms.max(1);
+    };
+    let delay_ms = (period.as_millis() as i64).max(1);
     let next = Arc::clone(inner);
-    let mut task = TickTask::new(scheduler, next);
-    let _ = post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
+    inner.session.dispatch(|| {
+        let mut task = TickTask::new(scheduler, next);
+        let _ = post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
+    });
 }
 
-fn active_should_present_paint(state: &PaintState, inner: &Inner) -> bool {
+/// What the scheduler decided about one produced frame.
+pub(crate) enum Verdict {
+    Present,
+    /// The frame is elided; the producer named here owes the successor.
+    Supersede,
+}
+
+fn active_verdict(state: &PaintState, inner: &Inner) -> Verdict {
     let cur_gen = state.resize_gen.load(Ordering::Acquire);
     let last_gen = state.last_paint_gen.load(Ordering::Acquire);
     if cur_gen != last_gen {
@@ -289,26 +315,27 @@ fn active_should_present_paint(state: &PaintState, inner: &Inner) -> bool {
         // many times per second; resetting on every bump would keep
         // wiping the counter before any paint clears the skip threshold.
         let now_ns_val = now_ns();
-        let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
-        let period_ns = if hz > 0.0 {
-            (1e9 / hz) as i64
-        } else {
-            16_666_667
-        };
+        let period_ns = jfn_gpu_paint::refresh_interval().map_or(i64::MAX, |period| {
+            period.as_nanos().min(i64::MAX as u128) as i64
+        });
         if now_ns_val - state.last_skip_reset_ns.load(Ordering::Acquire) >= period_ns {
             state
                 .last_skip_reset_ns
                 .store(now_ns_val, Ordering::Release);
-            let fps = inner.frame_rate.load(Ordering::Acquire);
-            state
-                .pump_paint_count
-                .store(if fps > 0 { 1 + fps } else { 0 }, Ordering::Release);
+            let pump = inner.frame_rate.load().map_or(0, |fps| 1 + fps.get());
+            state.pump_paint_count.store(pump, Ordering::Release);
             state.paints_since_resize.store(0, Ordering::Release);
         }
     }
     let count = state.paints_since_resize.fetch_add(1, Ordering::AcqRel) + 1;
     let pump = state.pump_paint_count.load(Ordering::Acquire);
-    let present = count > SKIP_PAINTS_AFTER_RESIZE;
+    // The skip is only ever taken while the invalidate loop is running, so the
+    // frame it elides has a successor already on the way.
+    let verdict = if count > SKIP_PAINTS_AFTER_RESIZE {
+        Verdict::Present
+    } else {
+        Verdict::Supersede
+    };
     if pump > 0 && count == pump {
         // Pumped enough frames — signal stop to host Invalidate loop and
         // renderer's rAF loop. Counter remains past pump so subsequent
@@ -316,7 +343,7 @@ fn active_should_present_paint(state: &PaintState, inner: &Inner) -> bool {
         state.invalidate_stop.store(true, Ordering::Release);
         inner.exec_js("window.__cefStopRaf && window.__cefStopRaf();");
     }
-    present
+    verdict
 }
 
 wrap_task! {
@@ -326,7 +353,7 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.scheduler.kick_task(&self.inner);
+            self.inner.session.dispatch(|| self.scheduler.kick_task(&self.inner));
         }
     }
 }
@@ -338,7 +365,7 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.scheduler.tick_task(&self.inner);
+            self.inner.session.dispatch(|| self.scheduler.tick_task(&self.inner));
         }
     }
 }

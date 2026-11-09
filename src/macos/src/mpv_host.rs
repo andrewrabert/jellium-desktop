@@ -4,7 +4,8 @@
 
 use std::ffi::c_int;
 
-use jfn_platform_abi::{MpvHost, WindowDecorations};
+use jfn_platform_abi::{MpvHost, VoWait, WindowDecorations};
+use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily};
 
 /// Whether the system's Metal device advertises the Mac2 GPU family.
 ///
@@ -16,28 +17,21 @@ use jfn_platform_abi::{MpvHost, WindowDecorations};
 /// workaround tied to the actual capability. Returns `true` when no Metal
 /// device is present, so a machine we cannot probe keeps the fast path.
 fn metal_has_mac2_family() -> bool {
-    use objc2::runtime::AnyObject;
-    // MTLGPUFamilyMac2, from <Metal/MTLDevice.h>.
-    const MTL_GPU_FAMILY_MAC2: isize = 2002;
-    #[link(name = "Metal", kind = "framework")]
-    unsafe extern "C" {
-        fn MTLCreateSystemDefaultDevice() -> *mut AnyObject;
-    }
-    unsafe {
-        let device = MTLCreateSystemDefaultDevice();
-        if device.is_null() {
-            return true;
-        }
-        let has_mac2: bool = objc2::msg_send![device, supportsFamily: MTL_GPU_FAMILY_MAC2];
-        let _: () = objc2::msg_send![device, release];
-        has_mac2
+    // MTLCreateSystemDefaultDevice resolves through CoreGraphics.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {}
+
+    match MTLCreateSystemDefaultDevice() {
+        Some(device) => device.supportsFamily(MTLGPUFamily::Mac2),
+        // No Metal device to probe: keep the fast path.
+        None => true,
     }
 }
 
 pub struct MacosMpvHost;
 
 impl MpvHost for MacosMpvHost {
-    fn prepare(&self, _decorations: WindowDecorations) {
+    fn prepare(&self, _configured: Option<WindowDecorations>) {
         unsafe {
             // Used by mpv's macOS Cocoa Common to locate the bundle.
             let key = c"MPVBUNDLE";
@@ -69,7 +63,7 @@ impl MpvHost for MacosMpvHost {
         }
     }
 
-    fn run_vo_wait(&self, pump: &mut dyn FnMut(bool) -> bool) {
+    fn run_vo_wait(&self, pump: &mut dyn FnMut(VoWait) -> std::ops::ControlFlow<()>) {
         unsafe {
             jfn_mpv::api::jfn_mpv_set_wakeup_callback(
                 crate::macos_mpv_wakeup_cb,
@@ -79,17 +73,23 @@ impl MpvHost for MacosMpvHost {
         // Block until the main run loop services a source — e.g. the
         // dispatch block posted by the wakeup callback — never inside
         // mpv's own blocking wait, which would starve the run loop.
-        while pump(false) {
-            crate::macos_pump_block(60.0);
+        loop {
+            // Drain AppKit before testing readiness: draining it after the
+            // check could consume the last queued wake and then park forever.
+            crate::macos_pump();
+            if let std::ops::ControlFlow::Break(()) = pump(VoWait::Drain) {
+                break;
+            }
+            crate::backend::macos_wait_for_source();
         }
         jfn_mpv::api::jfn_mpv_clear_wakeup_callback();
     }
 
-    fn logical_content_size(&self) -> Option<(i32, i32)> {
+    fn logical_content_size(&self) -> Option<jfn_platform_abi::LogicalSize> {
         let mut w: c_int = 0;
         let mut h: c_int = 0;
         if crate::init::jfn_macos_query_logical_content_size(&mut w, &mut h) {
-            Some((w, h))
+            Some(jfn_platform_abi::LogicalSize { w, h })
         } else {
             None
         }

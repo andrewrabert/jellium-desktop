@@ -31,7 +31,7 @@ wrap_v8_handler! {
                         } else if v.is_double() == 1 {
                             args_list.set_double(i, v.double_value());
                         } else if v.is_string() == 1 {
-                            let s = crate::app::userfree_to_string(&v.string_value());
+                            let s = crate::cef_string::userfree_to_string(&v.string_value());
                             let cs = CefString::from(s.as_str());
                             args_list.set_string(i, Some(&cs));
                         }

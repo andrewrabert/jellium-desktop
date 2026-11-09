@@ -1,27 +1,27 @@
-//! Argv parser for jellyfin-desktop, built on clap. `--version` is a plain
+//! Argv parser for jellium-desktop, built on clap. `--version` is a plain
 //! `bool` intercepted by `app::jfn_app_main` after parsing, so the libmpv
 //! version probe the version string needs only fires when `--version` is
 //! actually requested.
 
 use clap::{ArgAction, Parser};
 
-const ENV_LOG_LEVEL: &str = "JELLYFIN_DESKTOP_LOG_LEVEL";
-const ENV_LOG_FILE: &str = "JELLYFIN_DESKTOP_LOG_FILE";
-const ENV_CONFIG_DIR: &str = "JELLYFIN_DESKTOP_CONFIG_DIR";
-const ENV_CACHE_DIR: &str = "JELLYFIN_DESKTOP_CACHE_DIR";
+const ENV_LOG_LEVEL: &str = "JELLIUM_DESKTOP_LOG_LEVEL";
+const ENV_LOG_FILE: &str = "JELLIUM_DESKTOP_LOG_FILE";
+const ENV_CONFIG_DIR: &str = "JELLIUM_DESKTOP_CONFIG_DIR";
+const ENV_CACHE_DIR: &str = "JELLIUM_DESKTOP_CACHE_DIR";
 
 #[cfg(test)]
 const ENV_BACKED: &[&str] = &[ENV_LOG_LEVEL, ENV_LOG_FILE, ENV_CONFIG_DIR, ENV_CACHE_DIR];
 
-/// jellyfin-desktop — Jellyfin native desktop client.
+/// jellium-desktop — Jellyfin native desktop client.
 ///
-/// The four path/logging options also read a `JELLYFIN_DESKTOP_*` environment
+/// The four path/logging options also read a `JELLIUM_DESKTOP_*` environment
 /// variable; an explicit flag always wins over the variable. Each option is
 /// `Option<T>` with no clap default, so an absent flag/var falls back to the
 /// settings.json / platform-default layer.
 #[derive(Parser, Debug)]
 #[command(
-    name = "jellyfin-desktop",
+    name = "jellium-desktop",
     disable_version_flag = true,
     args_override_self = true
 )]
@@ -62,9 +62,9 @@ pub struct Cli {
     #[arg(long)]
     pub audio_channels: Option<String>,
 
-    /// Chrome remote debugging port.
+    /// Chrome remote debugging port: 1024..=65535, or 0 to disable.
     #[arg(long)]
-    pub remote_debug_port: Option<i32>,
+    pub remote_debug_port: Option<jfn_cef::DebuggingPort>,
 
     /// Disable CEF GPU compositing.
     #[arg(long, action = ArgAction::SetTrue)]
@@ -180,7 +180,10 @@ mod tests {
     fn equals_form() {
         let a = ok(&["app", "--hwdec=vaapi", "--remote-debug-port=9222"]);
         assert_eq!(a.hwdec.as_deref(), Some("vaapi"));
-        assert_eq!(a.remote_debug_port, Some(9222));
+        assert_eq!(
+            a.remote_debug_port,
+            "9222".parse::<jfn_cef::DebuggingPort>().ok()
+        );
     }
 
     #[test]
@@ -230,6 +233,17 @@ mod tests {
     }
 
     #[test]
+    fn remote_debug_port_range_is_validated() {
+        for value in ["1", "1023", "65536", "-1"] {
+            assert!(try_parse(&["app", &format!("--remote-debug-port={value}")]).is_err());
+        }
+        assert_eq!(
+            ok(&["app", "--remote-debug-port=0"]).remote_debug_port,
+            Some(jfn_cef::DebuggingPort::Disabled)
+        );
+    }
+
+    #[test]
     fn remote_debug_port_non_numeric_error() {
         assert!(try_parse(&["app", "--remote-debug-port=bogus"]).is_err());
     }
@@ -262,7 +276,10 @@ mod tests {
         assert_eq!(a.cache_dir.as_deref(), Some("/tmp/cache"));
         assert_eq!(a.audio_passthrough.as_deref(), Some("ac3,dts-hd"));
         assert_eq!(a.audio_channels.as_deref(), Some("5.1"));
-        assert_eq!(a.remote_debug_port, Some(9222));
+        assert_eq!(
+            a.remote_debug_port,
+            "9222".parse::<jfn_cef::DebuggingPort>().ok()
+        );
     }
 
     #[test]
@@ -331,7 +348,7 @@ mod tests {
     // links them to the consts, so guard the drift here.
     #[test]
     fn const_defaults_match_help_text() {
-        assert_eq!(jfn_mpv::HWDEC_DEFAULT, "no");
+        assert_eq!(jfn_config::HWDEC_DEFAULT, "no");
         assert_eq!(crate::app::DEFAULT_LOG_FILTER, "info");
     }
 }

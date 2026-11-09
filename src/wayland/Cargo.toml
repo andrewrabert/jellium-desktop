@@ -10,7 +10,7 @@ crate-type = ["rlib"]
 
 [features]
 default = ["kde-palette"]
-kde-palette = []
+kde-palette = ["dep:wayland-protocols-plasma"]
 
 [dependencies]
 parking_lot.workspace = true
@@ -21,23 +21,26 @@ parking_lot.workspace = true
 jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-input = { path = "../input" }
 jfn-linux-util = { path = "../linux_util" }
+jfn-mailbox = { path = "../mailbox" }
 jfn-platform-abi = { path = "../platform_abi" }
-jfn-menu = { path = "../menu" }
 jfn-mpris = { path = "../mpris" }
-jfn-mpv = { path = "../mpv" }
 jfn-playback = { path = "../playback" }
-jfn-wlproxy = { path = "../wlproxy" }
+jfn-wake-event = { path = "../wake_event" }
+calloop.workspace = true
+calloop-wayland-source.workspace = true
 cef.workspace = true
-libc.workspace = true
+crossbeam-channel.workspace = true
+error_reporter = "1.0.0"
 libloading = "0.9"
-memmap2 = "0.9"
+nix.workspace = true
+wl-proxy = { version = "0.1.4", features = ["all-protocols"] }
 tracing.workspace = true
-smithay-client-toolkit = { version = "0.20", default-features = false }
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["xkbcommon"] }
+thiserror.workspace = true
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
-wayland-cursor = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
-wayland-scanner = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"], optional = true }
 xkbcommon = "0.9"
 
 [lints]

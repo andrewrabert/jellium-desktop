@@ -26,6 +26,8 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
             if let Some(cb) = *cb_slot().lock() {
                 cb(false);
             }
+            crate::chrome::set_video_active(false);
+            crate::chrome::set_osd_visible(false);
         }
         _ => {}
     }

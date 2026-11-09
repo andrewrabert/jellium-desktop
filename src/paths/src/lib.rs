@@ -8,29 +8,27 @@
 //! Each directory getter creates the directory (and parents) if missing
 //! before returning.
 
-use std::env;
+use parking_lot::{Mutex, MutexGuard};
 use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
-const APP_DIR_NAME: &str = "jellyfin-desktop";
-const LOG_FILE_NAME: &str = "jellyfin-desktop.log";
+const APP_DIR_NAME: &str = "jellium-desktop";
+const LOG_FILE_NAME: &str = "jellium-desktop.log";
 
-#[derive(Default)]
 struct Overrides {
     config_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
 }
 
-static OVERRIDES: OnceLock<Mutex<Overrides>> = OnceLock::new();
+static OVERRIDES: Mutex<Overrides> = Mutex::new(Overrides {
+    config_dir: None,
+    cache_dir: None,
+});
 
 fn overrides() -> MutexGuard<'static, Overrides> {
-    OVERRIDES
-        .get_or_init(|| Mutex::new(Overrides::default()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    OVERRIDES.lock()
 }
 
 pub fn set_config_dir_override(path: PathBuf) {
@@ -49,8 +47,9 @@ fn cache_override() -> Option<PathBuf> {
     overrides().cache_dir.clone()
 }
 
+#[cfg(not(windows))]
 fn env_or(var: &str, fallback: &str) -> String {
-    match env::var(var) {
+    match std::env::var(var) {
         Ok(v) if !v.is_empty() => v,
         _ => fallback.to_string(),
     }
@@ -108,6 +107,53 @@ pub fn log_dir() -> PathBuf {
 
 pub fn mpv_home() -> PathBuf {
     ensure(config_dir().join("mpv"))
+}
+
+#[cfg(unix)]
+pub fn runtime_dir() -> io::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(ensure(PathBuf::from(dir)));
+    }
+    private_dir(PathBuf::from(format!(
+        "/tmp/{APP_DIR_NAME}-{}",
+        nix::unistd::getuid()
+    )))
+}
+
+/// `/tmp` is world-writable and the name is predictable, so a squatter can
+/// pre-create the directory and then own every socket placed inside it.
+/// Accept the path only if we just created it 0700, or it is still a real
+/// directory owned by us that nobody else can reach into.
+#[cfg(unix)]
+fn private_dir(path: PathBuf) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    match fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => return Ok(path),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = fs::symlink_metadata(&path)?;
+    if !meta.is_dir() || meta.uid() != nix::unistd::getuid().as_raw() || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a private directory we own", path.display()),
+        ));
+    }
+    Ok(path)
+}
+
+pub fn instance_listener_path(id: impl std::fmt::Display) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        Ok(runtime_dir()?.join(format!("{APP_DIR_NAME}-{id}")))
+    }
+    #[cfg(windows)]
+    {
+        Ok(PathBuf::from(format!(r"\\.\pipe\{APP_DIR_NAME}-{id}")))
+    }
 }
 
 pub fn log_path() -> PathBuf {

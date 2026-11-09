@@ -30,6 +30,13 @@ pub enum PlaybackPhase {
     Stopped = 3,
 }
 
+impl PlaybackPhase {
+    /// Whether media is loaded: every phase but `Stopped`.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Playing | Self::Paused)
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndReason {
@@ -71,10 +78,6 @@ pub struct PlaybackSnapshot {
     pub duration_us: i64,
     pub fullscreen: bool,
     pub maximized_before_fullscreen: bool,
-    pub layout_w: i32,
-    pub layout_h: i32,
-    pub pixel_w: i32,
-    pub pixel_h: i32,
     pub display_hz: f64,
     pub buffered: Vec<PlaybackBufferedRange>,
 }
@@ -104,7 +107,6 @@ pub enum PlaybackEventKind {
     DurationChanged = 10,
     RateChanged = 11,
     FullscreenChanged = 12,
-    OsdDimsChanged = 13,
     BufferedRangesChanged = 14,
     DisplayHzChanged = 15,
     MetadataChanged = 16,

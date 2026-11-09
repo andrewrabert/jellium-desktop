@@ -1,8 +1,9 @@
 pub mod app;
+mod app_menu;
 mod cli;
-mod instance_id;
 pub mod manager;
 mod platform_install;
+pub mod shell;
 mod window_geometry;
-#[cfg(target_os = "linux")]
-mod wl_interpose;
+
+mod connection;

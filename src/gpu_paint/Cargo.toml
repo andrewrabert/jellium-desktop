@@ -10,20 +10,38 @@ crate-type = ["rlib"]
 
 [dependencies]
 parking_lot.workspace = true
-
-# The crate is `#![cfg(target_os = "linux")]`; empty rlib elsewhere so the
-# workspace builds uniformly on every platform.
-[target.'cfg(target_os = "linux")'.dependencies]
 tracing.workspace = true
-libc.workspace = true
-thiserror = "2"
+thiserror.workspace = true
+wgpu.workspace = true
+pollster = "1.0"
+
+# wgpu-hal is pinned to wgpu's exact build so the hal types are identical to
+# the ones wgpu links; every shared-texture import reaches the backend device
+# through them. One backend per platform — the same single choice the adapter
+# probe makes.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
 raw-window-handle = "0.6"
-wgpu = "29"
-# Pinned to wgpu's exact build so the hal/ash types are identical to the ones
-# wgpu links; the dmabuf-import path reaches the Vulkan device through them.
-wgpu-hal = { version = "=29.0.3", features = ["vulkan"] }
+wgpu-hal = { version = "=29.0.4", features = ["vulkan"] }
 ash = "0.38"
-pollster = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+wgpu-hal = { version = "=29.0.4", features = ["dx12"] }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu-hal = { version = "=29.0.4", features = ["metal"] }
+objc2.workspace = true
+objc2-io-surface.workspace = true
+objc2-metal.workspace = true
+
+[dev-dependencies]
+trybuild = "1"
 
 [lints]
 workspace = true

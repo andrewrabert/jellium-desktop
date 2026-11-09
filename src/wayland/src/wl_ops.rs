@@ -1,32 +1,32 @@
-//! Surface lifecycle + paint + transition ops.
+//! Surface lifecycle + paint ops.
 //!
-//! All entry points run under the [`wl_state::lock()`] mutex. Each
+//! All entry points run under the runtime's `WlState` mutex. Each
 //! protocol-touching op calls `WlState::flush()` (or `conn.flush()`)
 //! before returning so commits land in compositor order matching the
 //! C++ original.
 
-use jfn_gpu_paint::DirtyRect;
-use jfn_platform_abi::JfnRect;
-use std::os::fd::{AsFd, OwnedFd};
-use wayland_client::Proxy;
-use wayland_client::protocol::wl_subsurface::WlSubsurface;
+use jfn_gpu_paint::SharedTexture;
+use jfn_platform_abi::{Ack, Content, PaintFrame, Presented, Visibility, VisibilityCommit};
+use wayland_client::protocol::wl_surface::WlSurface;
+use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
-use crate::gpu_paint_worker::WaylandGpuPaintWorker;
-use crate::shm_paint_worker::{ViewportState, WaylandShmPaintWorker};
-use crate::wl_state::{
-    PlatformSurface, PresentMode, WlState, create_dmabuf_buffer, create_shm_buffer,
-    create_solid_color_buffer, lock, size_in_tolerance,
-};
+use crate::layer::{LayerSurface, SurfaceRef, ViewportState};
+use crate::layer_actor::{LayerActor, LayerBackend};
+use crate::runtime::WlRuntime;
+use crate::wl_state::{PlatformSurface, WlState, size_in_tolerance};
+
+fn core(rt: &WlRuntime) -> Option<parking_lot::MutexGuard<'_, WlState>> {
+    rt.try_core().map(parking_lot::Mutex::lock)
+}
 
 // =====================================================================
 // Lifetime helpers
 // =====================================================================
 
-/// Heap-allocate a fresh PlatformSurface and return its raw pointer.
-/// Caller owns it until `free_surface` is invoked. The pointer is
-/// stable for the surface's lifetime.
-fn new_boxed() -> *mut PlatformSurface {
-    Box::into_raw(Box::new(PlatformSurface::new()))
+/// The returned pointer is stable for the surface's lifetime; the caller owns
+/// it until `free_surface`.
+fn new_boxed(visibility: Visibility) -> *mut PlatformSurface {
+    Box::into_raw(Box::new(PlatformSurface::new(visibility)))
 }
 
 unsafe fn drop_boxed(p: *mut PlatformSurface) {
@@ -43,69 +43,64 @@ unsafe fn surface_mut<'a>(p: *mut PlatformSurface) -> &'a mut PlatformSurface {
 // alloc / free / restack
 // =====================================================================
 
-pub(crate) fn alloc_surface() -> *mut PlatformSurface {
-    let ptr = new_boxed();
-    let mut st = lock();
+pub(crate) fn alloc_surface(rt: &'static WlRuntime, initial: Visibility) -> *mut PlatformSurface {
+    // Take the lock before allocating: bailing out afterwards would leak the box.
+    let Some(mut st) = core(rt) else {
+        return std::ptr::null_mut();
+    };
+    let ptr = new_boxed(initial);
     // SAFETY: ptr is freshly heap-allocated; no aliases yet.
     let s = unsafe { surface_mut(ptr) };
 
     let surface = st.compositor.create_surface(&st.qh, ());
-    let subsurface = st
-        .subcompositor
-        .get_subsurface(&surface, &st.parent, &st.qh, ());
-    subsurface.set_desync();
 
     // No input region on subsurface — keystrokes/clicks go to parent only.
-    let empty = st.compositor.create_region(&st.qh, ());
-    surface.set_input_region(Some(&empty));
-    empty.destroy();
+    if let Some(empty) = st.empty_region() {
+        surface.set_input_region(Some(empty.wl_region()));
+    }
 
-    let viewport = st
-        .viewporter
-        .as_ref()
-        .map(|vp| vp.get_viewport(&surface, &st.qh, ()));
+    let viewport = st.viewporter.get_viewport(&surface, &st.qh, ());
 
     surface.commit();
     st.flush();
 
-    s.surface = Some(surface);
-    s.subsurface = Some(subsurface);
-    s.viewport = viewport;
+    s.layer_actor = Some(build_actor(rt, &st, &surface, &viewport, s.visibility));
+    s.surface = Some(SurfaceRef::new(surface, viewport));
+    crate::wl_state::parent_layer(&mut st, ptr);
 
     crate::scene::dispatch(
+        rt,
         &mut st,
         crate::scene::SceneEvent::LayerAdded(crate::scene::LayerId(ptr as usize)),
     );
+    drop(st);
+    rt.root().request_present();
     ptr
 }
 
-pub(crate) fn free_surface(ptr: *mut PlatformSurface) {
+pub(crate) fn free_surface(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
     if ptr.is_null() {
         return;
     }
 
-    // Tear down the GPU paint worker outside the lock — Vulkan WSI swapchain
-    // destruction can roundtrip/dispatch Wayland events. Caller (CEF UI
-    // thread) owns this ptr exclusively; the worker field can be safely taken
-    // via a raw deref before grabbing the lock.
+    // Shut the actor down before taking the lock: Vulkan WSI swapchain teardown
+    // dispatches Wayland events, which would deadlock against the held lock.
     {
         let s = unsafe { surface_mut(ptr) };
-        if let Some(worker) = s.gpu_paint_worker.take() {
-            worker.shutdown();
-        }
-        if let Some(worker) = s.shm_paint_worker.take() {
-            worker.shutdown();
+        if let Some(actor) = s.layer_actor.take() {
+            actor.shutdown();
         }
     }
 
     {
-        let mut st = lock();
+        let Some(mut st) = core(rt) else { return };
         // Drop from stack if still present.
         st.stack.retain(|p| *p != ptr);
 
         // Update the scene before tearing down wl objects: dismissing a menu
         // anchored here requires this layer's surface to still be alive.
         crate::scene::dispatch(
+            rt,
             &mut st,
             crate::scene::SceneEvent::LayerRemoved(crate::scene::LayerId(ptr as usize)),
         );
@@ -113,26 +108,20 @@ pub(crate) fn free_surface(ptr: *mut PlatformSurface) {
         // SAFETY: stack drop above guarantees no aliases via stack;
         // caller (C++) guarantees no concurrent use of `ptr`.
         let s = unsafe { surface_mut(ptr) };
-        popup_destroy_locked(s);
-        if let Some(v) = s.viewport.take() {
-            v.destroy();
-        }
-        if let Some(b) = s.buffer.take() {
-            b.destroy();
-        }
         if let Some(sub) = s.subsurface.take() {
             sub.destroy();
         }
-        if let Some(surf) = s.surface.take() {
-            surf.destroy();
+        if let Some(surface) = s.surface.take() {
+            surface.destroy();
         }
         st.flush();
     }
     unsafe { drop_boxed(ptr) };
 }
 
-pub(crate) fn restack(ordered: &[*mut PlatformSurface]) {
-    let mut st = lock();
+/// Applies the whole order, bottom first, replacing whatever was applied before.
+pub(crate) fn restack(rt: &'static WlRuntime, ordered: &[*mut PlatformSurface]) {
+    let Some(mut st) = core(rt) else { return };
     st.stack.clear();
     st.stack.extend_from_slice(ordered);
     let order: Vec<crate::scene::LayerId> = ordered
@@ -140,766 +129,270 @@ pub(crate) fn restack(ordered: &[*mut PlatformSurface]) {
         .filter(|p| !p.is_null())
         .map(|p| crate::scene::LayerId(*p as usize))
         .collect();
-    crate::scene::dispatch(&mut st, crate::scene::SceneEvent::Restack(order));
+    crate::scene::dispatch(rt, &mut st, crate::scene::SceneEvent::Order(order));
 }
 
 // =====================================================================
-// resize / set_visible
+// visibility
 // =====================================================================
 
-pub(crate) fn surface_resize(ptr: *mut PlatformSurface, lw: i32, lh: i32, pw: i32, ph: i32) {
-    if ptr.is_null() {
-        return;
-    }
-    let st = lock();
-    let s = unsafe { surface_mut(ptr) };
-    s.lw = lw;
-    s.lh = lh;
-    s.pw = pw;
-    s.ph = ph;
-
-    // Vulkan-WSI path: record desired size/viewport state and notify the
-    // presenter worker. The callback never performs wgpu work.
-    if st.use_gpu_paint {
-        set_viewport_for_buffer_locked(s, s.buffer_w, s.buffer_h);
-        if let Some(worker) = s.gpu_paint_worker.as_ref() {
-            worker.resize((pw.max(1) as u32, ph.max(1) as u32));
-        }
-        st.flush();
-        return;
-    }
-    if let Some(worker) = s.shm_paint_worker.as_ref() {
-        worker.resize(lw, lh, pw, ph);
-        return;
-    }
-
-    let Some(surface) = s.surface.as_ref() else {
-        return;
-    };
-    let Some(viewport) = s.viewport.as_ref() else {
-        return;
-    };
-    let is_main = st.stack.first().map(|p| *p == ptr).unwrap_or(false);
-    if st.transitioning && is_main {
-        viewport.set_destination(lw, lh);
-    } else if s.buffer_w > 0 && s.buffer_h > 0 && pw > 0 && ph > 0 {
-        let src_w = s.buffer_w.min(pw);
-        let src_h = s.buffer_h.min(ph);
-        let dst_w = src_w * lw / pw;
-        let dst_h = src_h * lh / ph;
-        viewport.set_source(0.0, 0.0, src_w as f64, src_h as f64);
-        viewport.set_destination(dst_w, dst_h);
-    } else {
-        viewport.set_destination(lw, lh);
-    }
-    surface.commit();
-    st.flush();
-}
-
-pub(crate) fn surface_set_visible(
+/// Writes the surface's one visibility value and hands back the commit carrying
+/// it.
+///
+/// The root read loop takes this lock to dispatch the acknowledgement, so the
+/// commit is returned with the lock released and awaited by the caller.
+pub(crate) fn set_visibility(
+    rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
-    visible: bool,
-    bg_r: u8,
-    bg_g: u8,
-    bg_b: u8,
+    visibility: Visibility,
+) -> VisibilityCommit {
+    if ptr.is_null() {
+        return VisibilityCommit::issued(visibility, Ack::immediate());
+    }
+    let Some(st) = core(rt) else {
+        return VisibilityCommit::issued(visibility, Ack::immediate());
+    };
+    let s = unsafe { surface_mut(ptr) };
+    s.visibility = visibility;
+    let Some(actor) = s.layer_actor.as_ref() else {
+        return VisibilityCommit::issued(visibility, Ack::immediate());
+    };
+    let commit = actor.apply_visibility(visibility);
+    // Release the lock before the caller can block on the ack: the actor thread
+    // takes it to reach the runtime while it services the request.
+    drop(st);
+    rt.root().request_present();
+    commit
+}
+
+// =====================================================================
+// resize / window target
+// =====================================================================
+
+/// Positions the subsurface at its reserved top inset and shrinks the
+/// viewport destination by the same amount.
+pub(crate) fn surface_resize(
+    rt: &'static WlRuntime,
+    ptr: *mut PlatformSurface,
+    size: jfn_platform_abi::SurfaceSize,
 ) {
     if ptr.is_null() {
         return;
     }
-    let st = lock();
+    let Some(st) = core(rt) else { return };
     let s = unsafe { surface_mut(ptr) };
-    if s.visible == visible {
-        return;
+    let logical = size.extent.logical();
+    let physical = size.extent.physical();
+    s.top_logical = size.logical_top.max(0);
+    s.top_physical = size.physical_top.max(0);
+    if let Some(sub) = s.subsurface.as_ref() {
+        sub.set_position(0, s.top_logical);
     }
-    s.visible = visible;
-    let Some(surface) = s.surface.clone() else {
-        return;
-    };
-
-    // Vulkan-WSI owns attach/commit on this surface — skip the placeholder
-    // and the null-attach. Notify the presenter worker without doing wgpu
-    // work on this callback.
-    if st.use_gpu_paint {
-        if let Some(worker) = s.gpu_paint_worker.as_ref() {
-            worker.set_visible(visible);
-        }
-        return;
+    if let Some(surface) = s.surface.as_ref() {
+        surface.set_destination(logical.w, logical.h);
     }
-    if let Some(worker) = s.shm_paint_worker.as_ref() {
-        worker.set_visible(visible);
-        if !visible {
-            surface.attach(None, 0, 0);
-            surface.commit();
-            st.flush();
-            s.null_attached = true;
-        }
-        return;
-    }
-
-    if visible {
-        // Solid-color placeholder so the user sees the theme background
-        // before CEF's first paint lands.
-        if let Some(buf) = create_solid_color_buffer(&st, bg_r, bg_g, bg_b) {
-            if let Some(old) = s.buffer.take() {
-                old.destroy();
-            }
-            s.placeholder = true;
-            if let Some(viewport) = s.viewport.as_ref() {
-                viewport.set_source(0.0, 0.0, 1.0, 1.0);
-            }
-            surface.attach(Some(&buf), 0, 0);
-            surface.damage_buffer(0, 0, 1, 1);
-            surface.commit();
-            st.flush();
-            s.buffer = Some(buf);
-            s.null_attached = false;
-        }
-    } else {
-        surface.attach(None, 0, 0);
-        surface.commit();
-        st.flush();
-        if let Some(b) = s.buffer.take() {
-            b.destroy();
-        }
-        s.placeholder = false;
-        s.null_attached = true;
-    }
-}
-
-// =====================================================================
-// Popup
-// =====================================================================
-
-pub(crate) fn popup_show(ptr: *mut PlatformSurface, x: i32, y: i32, lw: i32, lh: i32) {
-    if ptr.is_null() {
-        return;
-    }
-    let st = lock();
-    let s = unsafe { surface_mut(ptr) };
-    popup_create_locked(s, &st);
-    s.popup_visible = true;
-    let Some(sub) = s.popup_subsurface.as_ref() else {
-        return;
-    };
-    sub.set_position(x, y);
-    if let Some(vp) = s.popup_viewport.as_ref()
-        && lw > 0
-        && lh > 0
-    {
-        vp.set_destination(lw, lh);
+    if let Some(actor) = s.layer_actor.as_ref() {
+        actor.resize(logical.w, logical.h, physical.w, physical.h);
     }
     st.flush();
 }
 
-pub(crate) fn popup_hide(ptr: *mut PlatformSurface) {
+/// Marks the surface external, desynchronizes it, and hands back its swapchain
+/// target.
+///
+/// Takes the `WlState` lock: every other reader of `PlatformSurface` holds the
+/// same lock. Desync is what makes the surface's own commits reach the
+/// compositor without a parent commit, which is what makes the frame callbacks
+/// a FIFO swapchain throttles on arrive.
+pub(crate) fn window_target(
+    rt: &'static WlRuntime,
+    ptr: *mut PlatformSurface,
+) -> Option<jfn_gpu_paint::WindowTarget> {
     if ptr.is_null() {
-        return;
+        return None;
     }
-    let st = lock();
+    let st = core(rt)?;
     let s = unsafe { surface_mut(ptr) };
-    s.popup_visible = false;
-    popup_destroy_locked(s);
+    s.external = true;
+    if let Some(sub) = s.subsurface.as_ref() {
+        sub.set_desync();
+    }
+    let target = s.surface.as_ref()?.window_target();
     st.flush();
-}
-
-fn popup_create_locked(s: &mut PlatformSurface, st: &WlState) {
-    let Some(parent) = s.surface.as_ref() else {
-        return;
-    };
-    if s.popup_surface.is_some() {
-        return;
-    }
-    let surf = st.compositor.create_surface(&st.qh, ());
-    let sub: WlSubsurface = st.subcompositor.get_subsurface(&surf, parent, &st.qh, ());
-    sub.set_desync();
-    let empty = st.compositor.create_region(&st.qh, ());
-    surf.set_input_region(Some(&empty));
-    empty.destroy();
-    let vp = st
-        .viewporter
-        .as_ref()
-        .map(|v| v.get_viewport(&surf, &st.qh, ()));
-    s.popup_surface = Some(surf);
-    s.popup_subsurface = Some(sub);
-    s.popup_viewport = vp;
-}
-
-fn popup_destroy_locked(s: &mut PlatformSurface) {
-    if let Some(v) = s.popup_viewport.take() {
-        v.destroy();
-    }
-    if let Some(b) = s.popup_buffer.take() {
-        b.destroy();
-    }
-    if let Some(sub) = s.popup_subsurface.take() {
-        sub.destroy();
-    }
-    if let Some(surf) = s.popup_surface.take() {
-        surf.destroy();
-    }
+    target
 }
 
 // =====================================================================
 // Present (dmabuf / software)
 // =====================================================================
 
-/// Frame info the caller unpacks from CefAcceleratedPaintInfo. Owns its
-/// dup'd dmabuf fd so it's closed on drop after the buffer is built —
-/// the compositor dups its own copy over the wire in `create_params.add`.
-pub struct JfnDmabufFrame {
-    pub fd: OwnedFd,
-    pub stride: u32,
-    pub modifier: u64,
-    pub coded_w: i32,
-    pub coded_h: i32,
-    pub visible_w: i32,
-    pub visible_h: i32,
+/// Identity of the dmabuf behind a frame, for the buffer pool: CEF recycles a
+/// small set of buffers, so the same `(dev, ino)` means the same `wl_buffer`
+/// can be reattached instead of rebuilt. `None` disables pooling for the frame.
+pub(crate) fn dmabuf_pool_key(frame: &SharedTexture) -> Option<(u64, u64)> {
+    let plane = frame.planes().first()?;
+    nix::sys::stat::fstat(&plane.fd)
+        .ok()
+        .map(|st| (st.st_dev, st.st_ino))
 }
 
-pub(crate) fn surface_present(ptr: *mut PlatformSurface, frame: &JfnDmabufFrame) -> bool {
-    if ptr.is_null() {
-        return false;
-    }
-    let w = frame.coded_w;
-    let h = frame.coded_h;
-    let vw = frame.visible_w;
-    let vh = frame.visible_h;
-
-    let mut st = lock();
-    let s = unsafe { surface_mut(ptr) };
-    if s.surface.is_none() || !s.visible || st.dmabuf.is_none() {
-        return false;
-    }
-    if st.present_mode == PresentMode::Drop {
-        return false;
-    }
-    if st.transitioning && !size_in_tolerance(s, vw, vh) {
-        unmap_locked(s);
-        st.flush();
-        return false;
-    }
-
-    let Some(buf) = create_dmabuf_buffer(&st, frame.fd.as_fd(), frame.stride, frame.modifier, w, h)
-    else {
-        return false;
-    };
-
-    if st.transitioning && !size_in_tolerance(s, vw, vh) {
-        buf.destroy();
-        unmap_locked(s);
-        st.flush();
-        return false;
-    }
-
-    let was_transitioning = st.transitioning;
-    let was_null_attached = s.null_attached;
-    if !was_transitioning && s.pw > 0 && !size_in_tolerance(s, vw, vh) && !was_null_attached {
-        buf.destroy();
-        return false;
-    }
-
-    attach_and_commit_locked(s, buf, w, h);
-    st.flush();
-
-    if was_transitioning {
-        // First in-tolerance frame ends the FS transition.
-        st.transitioning = false;
-    }
-    true
-}
-
-fn queue_shm_present(
-    s: &mut PlatformSurface,
+fn build_actor(
+    rt: &'static WlRuntime,
     st: &WlState,
-    dirty: &[JfnRect],
-    pixels: &[u8],
-    w: i32,
-    h: i32,
-) -> bool {
-    let Some(surface) = s.surface.as_ref() else {
-        return false;
+    surface: &WlSurface,
+    viewport: &WpViewport,
+    visibility: Visibility,
+) -> LayerActor {
+    let backend = match (st.use_gpu_paint, st.gpu) {
+        (true, Some(ctx)) => LayerBackend::Gpu(ctx),
+        _ => LayerBackend::Shm,
     };
-    s.buffer_w = w;
-    s.buffer_h = h;
-    s.placeholder = false;
-    s.null_attached = false;
-
-    if s.shm_paint_worker.is_none() {
-        s.shm_paint_worker = Some(WaylandShmPaintWorker::new(
-            st.conn.clone(),
-            st.qh.clone(),
-            st.shm.clone(),
-            surface.clone(),
-            s.viewport.clone(),
-            ViewportState {
-                lw: s.lw,
-                lh: s.lh,
-                pw: s.pw,
-                ph: s.ph,
-            },
-            s.visible,
-        ));
-    }
-
-    let Some(worker) = s.shm_paint_worker.as_ref() else {
-        return false;
-    };
-    worker.set_visible(s.visible);
-    worker.resize(s.lw, s.lh, s.pw, s.ph);
-    worker.submit_frame(pixels, w, h, dirty)
+    let layer = LayerSurface::new(st.conn.clone(), surface.clone(), viewport.clone());
+    LayerActor::new(
+        backend,
+        crate::layer_actor::LayerDeps {
+            rt,
+            qh: st.qh.clone(),
+            shm: st.shm.clone(),
+            dmabuf: st.dmabuf.clone(),
+        },
+        layer,
+        window_viewport(rt),
+        visibility,
+    )
 }
 
-pub(crate) fn surface_present_software(
-    ptr: *mut PlatformSurface,
-    dirty: &[JfnRect],
-    pixels: &[u8],
-    w: i32,
-    h: i32,
-) -> bool {
-    if ptr.is_null() || w <= 0 || h <= 0 {
-        return false;
-    }
+/// The published window extent minus `s`'s reserved top inset — the size the
+/// subsurface actually covers.
+fn inset_extent(
+    s: &PlatformSurface,
+    extent: crate::window_state::WindowExtentSnapshot,
+) -> (i32, i32, i32, i32) {
+    (
+        extent.logical().w(),
+        (extent.logical().h() - s.top_logical).max(1),
+        extent.physical().w(),
+        (extent.physical().h() - s.top_physical).max(1),
+    )
+}
 
-    let st = lock();
-    let s = unsafe { surface_mut(ptr) };
-    if s.surface.is_none() || !s.visible {
-        return false;
-    }
-    if !st.use_gpu_paint {
-        if st.present_mode == PresentMode::Drop {
-            return false;
-        }
-        return queue_shm_present(s, &st, dirty, pixels, w, h);
-    }
-    if st.present_mode == PresentMode::Drop {
-        return false;
-    }
-
-    let Some(ctx) = st.gpu_ctx.clone() else {
-        tracing::error!("use_gpu_paint set but gpu_ctx missing");
-        return false;
-    };
-    let Some(surface) = s.surface.as_ref() else {
-        return false;
-    };
-    let raw_surface = surface.id().as_ptr() as *mut std::ffi::c_void;
-    let Some(surface_ptr) = std::ptr::NonNull::new(raw_surface) else {
-        return false;
-    };
-
-    s.buffer_w = w;
-    s.buffer_h = h;
-    set_viewport_for_buffer_locked(s, w, h);
-    let painter_size = if s.pw > 0 && s.ph > 0 {
-        (s.pw as u32, s.ph as u32)
-    } else {
-        (w as u32, h as u32)
-    };
-
-    if s.gpu_paint_worker.is_none() {
-        s.gpu_paint_worker = Some(WaylandGpuPaintWorker::new(
-            ctx,
-            st.display_ptr,
-            surface_ptr,
-            painter_size,
-            s.visible,
-        ));
-    }
-    let Some(worker) = s.gpu_paint_worker.as_ref() else {
-        return false;
-    };
-    worker.set_visible(s.visible);
-    worker.resize(painter_size);
-    let dirty = dirty
-        .iter()
-        .map(|r| DirtyRect {
-            x: r.x,
-            y: r.y,
-            w: r.w,
-            h: r.h,
+/// The viewport the published window extent names, or
+/// [`ViewportState::UNPUBLISHED`] before the first publish.
+fn window_viewport(rt: &WlRuntime) -> ViewportState {
+    rt.window()
+        .window_extent()
+        .map_or(ViewportState::UNPUBLISHED, |ext| ViewportState {
+            lw: ext.logical().w(),
+            lh: ext.logical().h(),
+            pw: ext.physical().w(),
+            ph: ext.physical().h(),
         })
-        .collect();
-    worker.submit_frame(pixels, w as u32, h as u32, dirty);
-    st.flush();
-    true
 }
 
-pub(crate) fn popup_present(ptr: *mut PlatformSurface, frame: &JfnDmabufFrame, lw: i32, lh: i32) {
-    if ptr.is_null() || lw <= 0 || lh <= 0 {
-        return;
+/// The window extent `content` may be presented against, or `None` when this
+/// surface has no commit stream for it right now.
+///
+/// Everything that can reject a frame is asked here, before the frame is
+/// consumed, so no producer is handed a commit proof for a frame that goes
+/// nowhere. A window that has published no extent rejects every frame: the
+/// frame's own texel size names no scale, and nothing here may name one. A
+/// dmabuf frame additionally needs the protocol and a size the window still
+/// expects; mid-transition frames of the old size would flash the wrong
+/// geometry.
+fn accepts(
+    rt: &'static WlRuntime,
+    st: &WlState,
+    s: &PlatformSurface,
+    content: &Content<'_>,
+) -> Option<crate::window_state::WindowExtentSnapshot> {
+    if s.surface.is_none() || !s.visibility.is_shown() || s.external || s.layer_actor.is_none() {
+        return None;
     }
-    let st = lock();
-    let s = unsafe { surface_mut(ptr) };
-    if s.popup_surface.is_none() || !s.popup_visible {
-        return;
+    let extent = rt.window().window_extent()?;
+    match content {
+        Content::Accelerated(tex) => {
+            st.dmabuf.is_some()
+                && tex.coded().w > 0
+                && tex.coded().h > 0
+                && size_in_tolerance(rt, tex.visible_rect().w, tex.visible_rect().h)
+        }
+        Content::Software { size, pixels, .. } => {
+            size.w > 0
+                && size.h > 0
+                && (size.h as usize)
+                    .checked_mul((size.w as usize).saturating_mul(4))
+                    .is_some_and(|need| pixels.len() >= need)
+        }
     }
-    let w = frame.coded_w;
-    let h = frame.coded_h;
-    let vw = if frame.visible_w > 0 {
-        frame.visible_w
-    } else {
-        w
-    };
-    let vh = if frame.visible_h > 0 {
-        frame.visible_h
-    } else {
-        h
-    };
-    let Some(buf) = create_dmabuf_buffer(&st, frame.fd.as_fd(), frame.stride, frame.modifier, w, h)
-    else {
-        return;
-    };
-    if let Some(old) = s.popup_buffer.take() {
-        old.destroy();
-    }
-    if let Some(vp) = s.popup_viewport.as_ref() {
-        vp.set_source(0.0, 0.0, vw as f64, vh as f64);
-        vp.set_destination(lw, lh);
-    }
-    let Some(popup) = s.popup_surface.as_ref() else {
-        return;
-    };
-    popup.attach(Some(&buf), 0, 0);
-    popup.damage_buffer(0, 0, vw, vh);
-    // Commit parent first so subsurface state lands in the same frame.
-    if let Some(parent) = s.surface.as_ref() {
-        parent.commit();
-    }
-    popup.commit();
-    st.flush();
-    s.popup_buffer = Some(buf);
+    .then_some(extent)
 }
 
-pub(crate) fn popup_present_software(
+/// Hands `frame` to the surface's actor, or back to its producer when this
+/// surface has no commit stream for it.
+pub(crate) fn present<'a>(
+    rt: &'static WlRuntime,
     ptr: *mut PlatformSurface,
-    pixels: &[u8],
-    pw: i32,
-    ph: i32,
-    lw: i32,
-    lh: i32,
-) {
-    if ptr.is_null() || lw <= 0 || lh <= 0 {
-        return;
+    frame: PaintFrame<'a>,
+) -> Result<Presented, PaintFrame<'a>> {
+    if ptr.is_null() {
+        return Err(frame);
     }
-    let st = lock();
+    let Some(st) = core(rt) else {
+        return Err(frame);
+    };
     let s = unsafe { surface_mut(ptr) };
-    if s.popup_surface.is_none() || !s.popup_visible {
-        return;
-    }
-    let Some(buf) = create_shm_buffer(&st, pixels, pw, ph) else {
+    let Some(extent) = accepts(rt, &st, s, frame.content()) else {
+        return Err(frame);
+    };
+    let (lw, lh, pw, ph) = inset_extent(s, extent);
+    let Some(actor) = s.layer_actor.as_ref() else {
+        return Err(frame);
+    };
+    actor.resize(lw, lh, pw, ph);
+    // Taken before the frame is consumed: the actor holds a frame the swapchain
+    // could not take, and only the producer named here is owed its successor.
+    let source = frame.source();
+    Ok(frame.present(|content| {
+        match content {
+            Content::Accelerated(tex) => actor.present_dmabuf(tex, source),
+            Content::Software {
+                size,
+                pixels,
+                dirty,
+            } => actor.present_software(pixels, size.w, size.h, dirty, source),
+        }
+        Presented::issued()
+    }))
+}
+
+pub(crate) fn on_configure(rt: &'static WlRuntime, fullscreen: bool) {
+    let Some(ext) = rt.window().window_extent() else {
         return;
     };
-    if let Some(old) = s.popup_buffer.take() {
-        old.destroy();
-    }
-    if let Some(vp) = s.popup_viewport.as_ref() {
-        vp.set_source(0.0, 0.0, pw as f64, ph as f64);
-        vp.set_destination(lw, lh);
-    }
-    let Some(popup) = s.popup_surface.as_ref() else {
-        return;
-    };
-    popup.attach(Some(&buf), 0, 0);
-    popup.damage_buffer(0, 0, pw, ph);
-    if let Some(parent) = s.surface.as_ref() {
-        parent.commit();
-    }
-    popup.commit();
-    st.flush();
-    s.popup_buffer = Some(buf);
-}
+    let (lw, lh) = (ext.logical().w(), ext.logical().h());
+    let (pw, ph) = (ext.physical().w(), ext.physical().h());
 
-// =====================================================================
-// Internal helpers
-// =====================================================================
+    let Some(mut st) = core(rt) else { return };
 
-fn attach_and_commit_locked(
-    s: &mut PlatformSurface,
-    buf: wayland_client::protocol::wl_buffer::WlBuffer,
-    w: i32,
-    h: i32,
-) {
-    if let Some(old) = s.buffer.take() {
-        old.destroy();
-    }
-    s.buffer_w = w;
-    s.buffer_h = h;
-    s.placeholder = false;
-    s.null_attached = false;
-    set_viewport_for_buffer_locked(s, w, h);
-    let Some(surface) = s.surface.as_ref() else {
-        return;
-    };
-    surface.attach(Some(&buf), 0, 0);
-    surface.damage_buffer(0, 0, w, h);
-    surface.commit();
-    s.buffer = Some(buf);
-}
+    st.was_fullscreen = fullscreen;
 
-fn set_viewport_for_buffer_locked(s: &mut PlatformSurface, w: i32, h: i32) {
-    let Some(viewport) = s.viewport.as_ref() else {
-        return;
-    };
-    if s.pw <= 0 || s.ph <= 0 || s.lw <= 0 || s.lh <= 0 {
-        return;
-    }
-    if w > 0 && h > 0 {
-        let src_w = w.min(s.pw);
-        let src_h = h.min(s.ph);
-        let dst_w = src_w * s.lw / s.pw;
-        let dst_h = src_h * s.lh / s.ph;
-        viewport.set_source(0.0, 0.0, src_w as f64, src_h as f64);
-        viewport.set_destination(dst_w, dst_h);
-    } else {
-        viewport.set_destination(s.lw, s.lh);
-    }
-}
-
-fn unmap_locked(s: &mut PlatformSurface) {
-    let Some(surface) = s.surface.as_ref() else {
-        return;
-    };
-    surface.attach(None, 0, 0);
-    if let Some(viewport) = s.viewport.as_ref() {
-        viewport.set_destination(-1, -1);
-    }
-    surface.commit();
-    s.null_attached = true;
-}
-
-// =====================================================================
-// Fullscreen transition
-// =====================================================================
-
-pub(crate) fn begin_transition() {
-    let mut st = lock();
-    begin_transition_locked(&mut st);
-    st.flush();
-}
-
-pub(crate) fn end_transition() {
-    let mut st = lock();
-    end_transition_locked(&mut st);
-    st.flush();
-}
-
-pub(crate) fn in_transition() -> bool {
-    lock().transitioning
-}
-
-pub(crate) fn was_fullscreen() -> bool {
-    lock().was_fullscreen
-}
-
-fn begin_transition_locked(st: &mut WlState) {
-    st.transitioning = true;
-    st.present_mode = PresentMode::Drop;
-    let use_gpu_paint = st.use_gpu_paint;
-    for &p in &st.stack {
-        if p.is_null() {
-            continue;
-        }
-        let s = unsafe { surface_mut(p) };
-        let (Some(surface), Some(_)) = (s.surface.as_ref(), s.subsurface.as_ref()) else {
-            continue;
-        };
-        // Vulkan WSI owns attach/commit on this wl_surface. Do not do wgpu
-        // work here; only gate the presenter worker so queued frames do not
-        // present during the transition.
-        if use_gpu_paint {
-            if let Some(worker) = s.gpu_paint_worker.as_ref() {
-                worker.set_visible(false);
-            }
-            continue;
-        }
-        if let Some(worker) = s.shm_paint_worker.as_ref() {
-            worker.set_visible(false);
-        }
-        surface.attach(None, 0, 0);
-        if let Some(viewport) = s.viewport.as_ref() {
-            viewport.set_destination(-1, -1);
-        }
-        surface.commit();
-        s.null_attached = true;
-    }
-}
-
-fn end_transition_locked(st: &mut WlState) {
-    st.transitioning = false;
-    st.present_mode = PresentMode::Attach;
-    let use_gpu_paint = st.use_gpu_paint;
-    if use_gpu_paint {
-        // Reapply viewport state and re-enable presenter workers without
-        // doing wgpu work on this callback.
-        for &p in &st.stack {
-            if p.is_null() {
-                continue;
-            }
-            let s = unsafe { surface_mut(p) };
-            set_viewport_for_buffer_locked(s, s.buffer_w, s.buffer_h);
-            if let Some(worker) = s.gpu_paint_worker.as_ref() {
-                worker.set_visible(s.visible);
-                if s.pw > 0 && s.ph > 0 {
-                    worker.resize((s.pw as u32, s.ph as u32));
-                }
-            }
-        }
-        return;
-    }
-    for &p in &st.stack {
-        if p.is_null() {
-            continue;
-        }
-        let s = unsafe { surface_mut(p) };
-        if let Some(worker) = s.shm_paint_worker.as_ref() {
-            worker.resize(s.lw, s.lh, s.pw, s.ph);
-            worker.set_visible(s.visible);
-        }
-    }
-    if let Some(&p) = st.stack.first()
-        && !p.is_null()
-    {
-        let s = unsafe { surface_mut(p) };
-        if let Some(viewport) = s.viewport.as_ref()
-            && s.pw > 0
-            && s.lw > 0
-        {
-            viewport.set_source(0.0, 0.0, s.pw as f64, s.ph as f64);
-            viewport.set_destination(s.lw, s.lh);
-        }
-    }
-}
-
-// =====================================================================
-// mpv-configure callback (called from C++ on_proxy_configure → FFI thunk)
-// =====================================================================
-
-pub(crate) fn on_configure(width: i32, height: i32, fullscreen: bool, cached_scale: f32) {
-    if width <= 0 || height <= 0 {
-        return;
-    }
-    let pw = width;
-    let ph = height;
-    let scale = if cached_scale > 0.0 {
-        cached_scale
-    } else {
-        1.0
-    };
-    let lw = (pw as f32 / scale) as i32;
-    let lh = (ph as f32 / scale) as i32;
-
-    let mut st = lock();
-
-    if fullscreen != st.was_fullscreen {
-        if !st.transitioning {
-            begin_transition_locked(&mut st);
-        }
-        st.was_fullscreen = fullscreen;
-    }
+    crate::wl_state::ensure_root_locked(rt, &mut st);
 
     for &p in &st.stack {
         if p.is_null() {
             continue;
         }
         let s = unsafe { surface_mut(p) };
-        s.lw = lw;
-        s.lh = lh;
-        s.pw = pw;
-        s.ph = ph;
-        if let Some(worker) = s.shm_paint_worker.as_ref() {
-            worker.resize(lw, lh, pw, ph);
+        let (slw, slh, spw, sph) = (
+            lw,
+            (lh - s.top_logical).max(1),
+            pw,
+            (ph - s.top_physical).max(1),
+        );
+        if let Some(actor) = s.layer_actor.as_ref() {
+            actor.resize(slw, slh, spw, sph);
         }
     }
 
-    update_surface_size_locked(&st, lw, lh, pw, ph);
-
-    // pw now NEW. Flip paint gate back to Attach (keep transitioning=true).
-    if st.transitioning {
-        st.present_mode = PresentMode::Attach;
-        if let Some(&p) = st.stack.first()
-            && !p.is_null()
-        {
-            let s = unsafe { surface_mut(p) };
-            if let Some(viewport) = s.viewport.as_ref()
-                && s.pw > 0
-                && s.lw > 0
-            {
-                viewport.set_source(0.0, 0.0, s.pw as f64, s.ph as f64);
-                viewport.set_destination(s.lw, s.lh);
-            }
-        }
-    }
     st.flush();
-}
-
-fn update_surface_size_locked(st: &WlState, lw: i32, lh: i32, pw: i32, ph: i32) {
-    if st.use_gpu_paint {
-        let Some(&p) = st.stack.first() else {
-            return;
-        };
-        if p.is_null() {
-            return;
-        }
-        let s = unsafe { surface_mut(p) };
-        set_viewport_for_buffer_locked(s, s.buffer_w, s.buffer_h);
-        if let Some(worker) = s.gpu_paint_worker.as_ref() {
-            worker.resize((pw.max(1) as u32, ph.max(1) as u32));
-        }
-        return;
-    }
-    let Some(&p) = st.stack.first() else {
-        return;
-    };
-    if p.is_null() {
-        return;
-    }
-    let s = unsafe { surface_mut(p) };
-    if let Some(worker) = s.shm_paint_worker.as_ref() {
-        worker.resize(lw, lh, pw, ph);
-        return;
-    }
-    let (Some(surface), Some(viewport)) = (s.surface.as_ref(), s.viewport.as_ref()) else {
-        return;
-    };
-    if st.transitioning {
-        viewport.set_destination(lw, lh);
-        surface.commit();
-        return;
-    }
-    if s.buffer_w > 0 && s.buffer_h > 0 && pw > 0 && ph > 0 {
-        let src_w = s.buffer_w.min(pw);
-        let src_h = s.buffer_h.min(ph);
-        let dst_w = src_w * lw / pw;
-        let dst_h = src_h * lh / ph;
-        viewport.set_source(0.0, 0.0, src_w as f64, src_h as f64);
-        viewport.set_destination(dst_w, dst_h);
-        surface.commit();
-    }
-}
-
-pub(crate) fn set_fullscreen_via(fullscreen: bool, set_wlproxy: unsafe extern "C" fn(i32)) {
-    {
-        let mut st = lock();
-        if st.was_fullscreen == fullscreen {
-            // Compositor may have rejected our previous toggle.
-            if st.transitioning {
-                end_transition_locked(&mut st);
-                st.flush();
-            }
-            return;
-        }
-        begin_transition_locked(&mut st);
-        st.flush();
-    }
-    unsafe { set_wlproxy(if fullscreen { 1 } else { 0 }) };
-}
-
-pub(crate) fn toggle_fullscreen_via(set_wlproxy: unsafe extern "C" fn(i32)) {
-    let target = {
-        let mut st = lock();
-        begin_transition_locked(&mut st);
-        st.flush();
-        if st.was_fullscreen { 0 } else { 1 }
-    };
-    unsafe { set_wlproxy(target) };
 }

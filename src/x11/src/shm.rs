@@ -1,79 +1,68 @@
 //! SHM segment lifecycle.
 //!
-//! Wraps `shmget/shmat/shmctl/shmdt` plus the matching x11rb MIT-SHM
-//! attach/detach so a `ShmBuffer` ends up registered with the X server
+//! Wraps `memfd_create` + `mmap` plus the matching x11rb MIT-SHM
+//! attach-fd/detach so a `ShmBuffer` ends up registered with the X server
 //! and ready for `shm_put_image`.
 
+use memmap2::{MmapMut, MmapOptions};
+use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+use nix::sys::memfd::{MFdFlags, memfd_create};
+use nix::unistd::ftruncate;
 use x11rb::connection::Connection;
-use x11rb::protocol::shm::ConnectionExt as X11rbShmConnection;
+use x11rb::protocol::shm::{self, ConnectionExt as X11rbShmConnection};
 use x11rb::rust_connection::RustConnection;
 
 use crate::x11_state::ShmBuffer;
 
 /// Allocate or reuse a SHM buffer at (w, h). Returns false on failure;
-/// `buf` is left in its previous state when reuse condition matched, or
+/// `buf` is left in its previous state when the reuse condition matched, or
 /// in `empty()` state on failure.
 pub fn shm_alloc(buf: &mut ShmBuffer, conn: &RustConnection, w: i32, h: i32) -> bool {
     let size: usize = (w as usize) * (h as usize) * 4;
-    if !buf.data.is_null() && buf.w == w && buf.h == h {
+    if buf.is_mapped() && buf.dims() == (w, h) {
         return true;
     }
 
-    if !buf.data.is_null() {
-        let _ = conn.shm_detach(buf.seg);
-        unsafe { libc::shmdt(buf.data as *const _) };
-        buf.data = std::ptr::null_mut();
-    }
+    shm_free(buf, Some(conn));
 
-    let shmid = unsafe { libc::shmget(libc::IPC_PRIVATE, size, libc::IPC_CREAT | 0o600) };
-    if shmid < 0 {
-        return false;
-    }
-    buf.shmid = shmid;
-
-    let p = unsafe { libc::shmat(shmid, std::ptr::null(), 0) };
-    if p == (-1isize) as *mut _ {
-        unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
-        buf.data = std::ptr::null_mut();
-        return false;
-    }
-    buf.data = p as *mut u8;
-
-    // Mark for removal — kernel frees once last process detaches.
-    unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
-
-    let Ok(seg) = conn.generate_id() else {
-        unsafe { libc::shmdt(buf.data as *const _) };
-        buf.data = std::ptr::null_mut();
+    let Some((seg, map)) = attach_memfd(conn, size) else {
         return false;
     };
-    if conn.shm_attach(seg, shmid as u32, false).is_err() {
-        unsafe { libc::shmdt(buf.data as *const _) };
-        buf.data = std::ptr::null_mut();
-        return false;
-    }
-
-    buf.seg = seg;
-    buf.w = w;
-    buf.h = h;
-    buf.size = size;
+    buf.set(seg, map, w, h);
     true
 }
 
+/// Detaches the segment before unmapping, so the server never reads a
+/// mapping this process has already dropped.
 pub fn shm_free(buf: &mut ShmBuffer, conn: Option<&RustConnection>) {
-    if buf.data.is_null() {
+    if !buf.is_mapped() {
         return;
     }
-    if let Some(c) = conn {
-        // Skip detach if seg id is 0 (uninitialized).
-        if buf.seg != 0 {
-            let _ = c.shm_detach(buf.seg);
-        }
+    if let Some(c) = conn
+        && buf.seg() != 0
+    {
+        let _ = c.shm_detach(buf.seg());
     }
-    unsafe { libc::shmdt(buf.data as *const _) };
-    buf.data = std::ptr::null_mut();
-    buf.seg = 0;
-    buf.w = 0;
-    buf.h = 0;
-    buf.size = 0;
+    buf.clear();
+}
+
+fn attach_memfd(conn: &RustConnection, size: usize) -> Option<(shm::Seg, MmapMut)> {
+    let fd = memfd_create(
+        c"jellium-shm",
+        MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+    )
+    .ok()?;
+    ftruncate(&fd, size as i64).ok()?;
+    // Sealed against grow/shrink so the server's mapping can never fault.
+    fcntl(
+        &fd,
+        FcntlArg::F_ADD_SEALS(SealFlag::F_SEAL_SHRINK | SealFlag::F_SEAL_GROW),
+    )
+    .ok()?;
+    // SAFETY: the memfd is private to this process until `shm_attach_fd`, and
+    // sealing forbids any later resize, so the mapping stays valid.
+    let map = unsafe { MmapOptions::new().len(size).map_mut(&fd) }.ok()?;
+    let seg = conn.generate_id().ok()?;
+    conn.shm_attach_fd(seg, fd, false).ok()?;
+    Some((seg, map))
 }
