@@ -33,6 +33,16 @@ impl Devices {
         }
     }
 
+    pub(crate) fn rebind(&mut self, hwnd: HWND) -> windows_core::Result<()> {
+        unsafe {
+            let target = self.device.CreateTargetForHwnd(hwnd, false)?;
+            target.SetRoot(&self.root)?;
+            self.device.Commit()?;
+            self._target = target;
+        }
+        Ok(())
+    }
+
     pub(crate) fn root(&self) -> &IDCompositionVisual {
         &self.root
     }

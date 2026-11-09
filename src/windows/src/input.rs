@@ -45,6 +45,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
+const WM_JFN_RECREATE_WINDOW: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 2;
+
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 use jfn_input::buttons::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
@@ -547,6 +549,15 @@ pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void
 
     let mut m = MSG::default();
     while unsafe { GetMessageW(&mut m, None, 0, 0).0 } > 0 {
+        if m.hwnd.is_invalid() && m.message == WM_JFN_RECREATE_WINDOW {
+            let old = STATE.lock().input_hwnd_raw;
+            if old != 0 {
+                let _ = unsafe { DestroyWindow(HWND(old as *mut std::ffi::c_void)) };
+                STATE.lock().input_hwnd_raw = 0;
+            }
+            recreate_input_child_window(HWND(m.lParam.0 as *mut std::ffi::c_void), hinst, tid);
+            continue;
+        }
         unsafe {
             let _ = TranslateMessage(&m);
             DispatchMessageW(&m);
@@ -554,11 +565,79 @@ pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void
     }
 
     if STATE.lock().input_hwnd_raw != 0 {
-        let _ = unsafe { DestroyWindow(input_hwnd) };
+        // The child may have been recreated since startup; destroy the current one.
+        let raw = STATE.lock().input_hwnd_raw;
+        let _ = unsafe { DestroyWindow(HWND(raw as *mut std::ffi::c_void)) };
         STATE.lock().input_hwnd_raw = 0;
     }
     let _ = unsafe { UnregisterClassW(CLASS_NAME, Some(hinst.into())) };
     STATE.lock().thread_id = 0;
+}
+
+/// Build a fresh input child window parented to `new_mpv_hwnd`, from the
+/// input thread itself (`AttachThreadInput`/`SetFocus` require running
+/// on the thread whose input queue attaches to the target). The old
+/// child window need not be explicitly destroyed — Windows already did
+/// so as a side effect of its parent (the old mpv HWND) being
+/// destroyed. The window class is already registered process-wide from
+/// `jfn_input_windows_run_input_thread`'s startup, so it isn't
+/// re-registered here.
+fn recreate_input_child_window(
+    new_mpv_hwnd: HWND,
+    hinst: windows::Win32::Foundation::HMODULE,
+    own_tid: u32,
+) {
+    let mut rc = RECT::default();
+    let _ = unsafe { GetClientRect(new_mpv_hwnd, &mut rc) };
+
+    let input_hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            CLASS_NAME,
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            0,
+            0,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
+            Some(new_mpv_hwnd),
+            Some(HMENU(std::ptr::null_mut())),
+            Some(hinst.into()),
+            None,
+        )
+    };
+    let input_hwnd = match input_hwnd {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("CreateWindowExW(JellyfinCefInput) recreate failed: {e:?}");
+            return;
+        }
+    };
+    STATE.lock().input_hwnd_raw = input_hwnd.0 as usize;
+
+    // Share input queue with the new mpv window so SetFocus across
+    // windows works, same as the initial creation.
+    let mpv_tid = unsafe { GetWindowThreadProcessId(new_mpv_hwnd, None) };
+    let _ = unsafe { AttachThreadInput(own_tid, mpv_tid, true) };
+    let _ = unsafe { SetFocus(Some(input_hwnd)) };
+    tracing::info!(target: "platform", "input child window recreated against new mpv hwnd");
+}
+
+/// Post a request to recreate the input child window against
+/// `new_mpv_hwnd_raw`, run on the input thread. See
+/// `recreate_input_child_window` and `WM_JFN_RECREATE_WINDOW`.
+pub(crate) fn jfn_input_windows_recreate(new_mpv_hwnd_raw: usize) {
+    let tid = STATE.lock().thread_id;
+    if tid != 0 {
+        let _ = unsafe {
+            PostThreadMessageW(
+                tid,
+                WM_JFN_RECREATE_WINDOW,
+                WPARAM(0),
+                LPARAM(new_mpv_hwnd_raw as isize),
+            )
+        };
+    }
 }
 
 pub(crate) fn jfn_input_windows_stop_input_thread() {

@@ -51,6 +51,11 @@ fn dispatch(outs: Vec<IngestOut>) -> u8 {
     for o in outs {
         match o {
             IngestOut::Input(i) => post_input(i),
+            IngestOut::WindowHandleChanged(id) => {
+                if let Some(lease) = jfn_platform_abi::try_lease() {
+                    lease.platform().on_window_handle_changed(id);
+                }
+            }
             IngestOut::WindowExtentChanged => jfn_platform_abi::notify_window_changed(),
             IngestOut::Shutdown => flags |= INGEST_FLAG_SHUTDOWN,
         }

@@ -531,6 +531,10 @@ pub trait Platform: Send + Sync {
     fn cef_paths(&self) -> CefPaths;
 
     // Fullscreen
+    /// Observed mpv native-window replacement. Hosts with an app-owned window
+    /// need no rebind; Windows attaches its overlay/input/media to mpv's HWND.
+    fn on_window_handle_changed(&self, _id: i64) {}
+
     fn set_fullscreen(&self, v: bool);
     fn toggle_fullscreen(&self);
 

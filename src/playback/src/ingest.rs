@@ -58,6 +58,9 @@ pub(crate) enum IngestOut {
     /// The window-extent cell was rewritten; the driver wakes the
     /// platform-abi window subscribers, which pull the new snapshot.
     WindowExtentChanged,
+    /// mpv replaced its native VO window (e.g. a `d3d11-flip` change). The
+    /// driver hands the new handle to the platform to rebind to it.
+    WindowHandleChanged(i64),
     /// Terminal: libmpv has shut down. Caller breaks out of the event
     /// loop and triggers the rest of the app's teardown.
     Shutdown,
@@ -214,7 +217,10 @@ fn digest_property<C: IngestCtx>(
         )))],
         WINDOW_ID => {
             if let Some(id) = as_int(value) {
-                state.window_id.store(id, Ordering::Relaxed);
+                let previous = state.window_id.swap(id, Ordering::Relaxed);
+                if id != previous {
+                    return vec![IngestOut::WindowHandleChanged(id)];
+                }
             }
             Vec::new()
         }
@@ -390,6 +396,28 @@ mod tests {
             panic!("expected Position");
         };
         assert_eq!(*p, 1_500_000);
+    }
+
+    #[test]
+    fn window_replacement_is_observed_without_rebinding_repeated_handles() {
+        let state = IngestState::new();
+        for id in [101, 202] {
+            let out = ingest(
+                &prop(observe_id::WINDOW_ID, PropertyValue::Int(id)),
+                &state,
+                &ctx(Scale::ONE),
+            );
+            assert!(matches!(out.as_slice(), [IngestOut::WindowHandleChanged(got)] if *got == id));
+            assert_eq!(state.window_id(), Some(id));
+            assert!(
+                ingest(
+                    &prop(observe_id::WINDOW_ID, PropertyValue::Int(id)),
+                    &state,
+                    &ctx(Scale::ONE)
+                )
+                .is_empty()
+            );
+        }
     }
 
     #[test]
