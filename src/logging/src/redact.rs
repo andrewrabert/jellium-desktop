@@ -2,6 +2,8 @@
 //! patterns that precede a Jellyfin access token and overwrites the token
 //! value with 'x' characters in place, preserving URL/JSON shape.
 
+use memchr::memmem;
+
 struct PatternRule {
     needle: &'static [u8],
     terminators: &'static [u8],
@@ -37,16 +39,6 @@ const RULES: &[PatternRule] = &[
     },
 ];
 
-fn find_subslice(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || from > haystack.len() {
-        return None;
-    }
-    haystack[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| p + from)
-}
-
 fn find_token_end(buf: &[u8], from: usize, terminators: &[u8]) -> usize {
     buf[from..]
         .iter()
@@ -57,7 +49,8 @@ fn find_token_end(buf: &[u8], from: usize, terminators: &[u8]) -> usize {
 
 fn elide(buf: &mut [u8], rule: &PatternRule) {
     let mut start = 0;
-    while let Some(pos) = find_subslice(buf, rule.needle, start) {
+    while let Some(rel) = memmem::find(&buf[start..], rule.needle) {
+        let pos = start + rel;
         let token_start = pos + rule.needle.len();
         let token_end = find_token_end(buf, token_start, rule.terminators);
         for b in &mut buf[token_start..token_end] {
@@ -73,7 +66,7 @@ fn elide(buf: &mut [u8], rule: &PatternRule) {
 
 pub fn contains_secret(buf: &[u8]) -> bool {
     for rule in RULES {
-        if let Some(pos) = find_subslice(buf, rule.needle, 0) {
+        if let Some(pos) = memmem::find(buf, rule.needle) {
             let token_start = pos + rule.needle.len();
             if token_start < buf.len() && !rule.terminators.contains(&buf[token_start]) {
                 return true;
@@ -128,6 +121,19 @@ mod tests {
             censor_str("X-MediaBrowser-Token%3Dabcdef HTTP"),
             "X-MediaBrowser-Token%3Dxxxxxx HTTP"
         );
+    }
+
+    #[test]
+    fn repeated_tokens_on_one_line() {
+        assert_eq!(
+            censor_str("a?api_key=aa&b?api_key=bb"),
+            "a?api_key=xx&b?api_key=xx"
+        );
+    }
+
+    #[test]
+    fn token_at_end_of_buffer() {
+        assert_eq!(censor_str("?api_key=abc"), "?api_key=xxx");
     }
 
     #[test]

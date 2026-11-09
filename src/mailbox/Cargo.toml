@@ -1,0 +1,15 @@
+[package]
+name = "jfn-mailbox"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "jfn_mailbox"
+crate-type = ["rlib"]
+
+[dependencies]
+parking_lot.workspace = true
+
+[lints]
+workspace = true

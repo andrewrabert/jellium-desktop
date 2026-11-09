@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use std::sync::OnceLock;
 
 pub use crate::coordinator::Input;
-use crate::coordinator::PlaybackCoordinator;
+use crate::coordinator::{CoordinatorHandle, PlaybackCoordinator};
 use crate::types::*;
 
 // =====================================================================
@@ -35,17 +35,30 @@ fn with_coord<F: FnOnce(&PlaybackCoordinator)>(f: F) {
     }
 }
 
+fn coord_handle() -> Option<CoordinatorHandle> {
+    coord_slot()
+        .lock()
+        .as_ref()
+        .map(PlaybackCoordinator::handle)
+}
+
 pub fn jfn_playback_init() {
-    let mut guard = coord_slot().lock();
-    if guard.is_none() {
-        let Some(mut c) = PlaybackCoordinator::new() else {
-            eprintln!("[playback] failed to create coordinator (wake eventfd)");
+    {
+        let mut guard = coord_slot().lock();
+        if guard.is_some() {
             return;
-        };
+        }
+        let mut c = PlaybackCoordinator::new();
         register_builtin_sinks(&c);
         c.start();
+        c.window_subscription = Some(jfn_platform_abi::subscribe_window_changed(
+            crate::ingest_driver::jfn_playback_reconcile_window_mode,
+        ));
         *guard = Some(c);
     }
+    // The immediate reconcile is load-bearing: mode posts made before the
+    // coordinator existed were dropped by `post`, and no wakeup replays them.
+    crate::ingest_driver::jfn_playback_reconcile_window_mode();
 }
 
 fn register_builtin_sinks(c: &PlaybackCoordinator) {
@@ -69,8 +82,10 @@ fn register_builtin_sinks(c: &PlaybackCoordinator) {
 }
 
 pub fn jfn_playback_shutdown() {
-    let mut guard = coord_slot().lock();
-    if let Some(mut c) = guard.take() {
+    // stop() joins the worker, whose sinks call post() → coord_slot;
+    // holding the guard across stop() deadlocks.
+    let coord = coord_slot().lock().take();
+    if let Some(mut c) = coord {
         c.stop();
     }
 }
@@ -84,11 +99,7 @@ pub fn register_action_sink(sink: ActionSink) {
 }
 
 pub fn jfn_playback_snapshot() -> PlaybackSnapshot {
-    let mut guard = coord_slot().lock();
-    match guard.as_mut() {
-        Some(c) => c.snapshot(),
-        None => PlaybackSnapshot::fresh(),
-    }
+    coord_handle().map_or_else(PlaybackSnapshot::fresh, |h| h.snapshot())
 }
 
 // =====================================================================
@@ -96,5 +107,7 @@ pub fn jfn_playback_snapshot() -> PlaybackSnapshot {
 // =====================================================================
 
 pub fn post(input: Input) {
-    with_coord(|c| c.enqueue(input));
+    if let Some(h) = coord_handle() {
+        h.enqueue(input);
+    }
 }

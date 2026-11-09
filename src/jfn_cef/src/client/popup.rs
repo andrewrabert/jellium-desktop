@@ -3,11 +3,23 @@ use cef::{
     ImplBrowserHost, ImplTask, KeyEvent, Task, ThreadId, WrapTask, post_task, sys, wrap_task,
 };
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
-use crate::platform_ops;
+use crate::platform_ops::{MenuDelivery, MenuItem, MenuRequest, MenuSelection};
 
 use super::{Inner, PopupState};
+
+fn options_as_items(options: &[String]) -> Vec<MenuItem> {
+    options
+        .iter()
+        .enumerate()
+        .map(|(i, label)| MenuItem {
+            id: i as i32,
+            label: label.clone(),
+            enabled: true,
+            separator: false,
+        })
+        .collect()
+}
 
 // Windows virtual-key codes CEF expects in KeyEvent::windows_key_code.
 const VK_RETURN: i32 = 0x0D;
@@ -16,6 +28,11 @@ const VK_UP: i32 = 0x26;
 const VK_DOWN: i32 = 0x28;
 
 impl Inner {
+    pub(super) fn dropdown(&self) -> MenuDelivery<'_> {
+        self.surface()
+            .platform()
+            .menu_delivery(jfn_platform_abi::MenuKind::Dropdown)
+    }
     fn reset_popup_state(p: &mut PopupState) {
         p.size_received = false;
         p.options_received = false;
@@ -32,10 +49,7 @@ impl Inner {
             Self::reset_popup_state(&mut p);
         }
         if !show {
-            let surface = self.surface_ptr();
-            if !surface.is_null() {
-                self.dropdown.hide(surface);
-            }
+            self.hide_dropdown();
             return;
         }
         self.send_process_message_named("getPopupOptions");
@@ -91,27 +105,37 @@ impl Inner {
             )
         };
 
-        let surface = self.surface_ptr();
-        if surface.is_null() {
-            return;
-        }
         let inner = Arc::clone(self);
-        let req = platform_ops::JfnPopupRequest {
-            x,
-            y,
-            lw: w,
-            lh: h,
-            options: opts,
-            initial_highlight: selected,
-            on_selected: Some(Box::new(move |idx| {
+        let on_selected = MenuSelection::new(move |idx| {
+            let authority = Arc::clone(&inner.session);
+            authority.dispatch(|| {
                 let mut task = DispatchPopupTask::new(inner, idx, selected, selectable.clone());
                 let _ = post_task(ThreadId::UI, Some(&mut task));
-            })),
-        };
-        self.dropdown.show(surface, req);
+            });
+        });
+        match self.dropdown() {
+            MenuDelivery::Host(host) => host.open(MenuRequest {
+                items: options_as_items(&opts),
+                x,
+                y,
+                width: w,
+                initial: selected,
+                on_selected,
+            }),
+            MenuDelivery::Composited => self.surface().popup_show(x, y, w, h),
+            MenuDelivery::Page => {}
+        }
     }
 
-    pub(super) fn on_deactivated(&self) {
+    fn hide_dropdown(&self) {
+        match self.dropdown() {
+            MenuDelivery::Host(host) => host.hide(),
+            MenuDelivery::Composited => self.surface().popup_hide(),
+            MenuDelivery::Page => {}
+        }
+    }
+
+    pub(crate) fn on_deactivated(&self) {
         let was_visible = {
             let mut p = self.popup.lock();
             let was = p.visible;
@@ -124,11 +148,7 @@ impl Inner {
         if !was_visible {
             return;
         }
-        let surface = self.surface_ptr();
-        if surface.is_null() {
-            return;
-        }
-        self.dropdown.hide(surface);
+        self.hide_dropdown();
     }
 
     pub(super) fn popup_rect(&self) -> (i32, i32) {
@@ -142,7 +162,9 @@ impl Inner {
     // ourselves, then replay the user's pick into CEF's still-open popup —
     // arrow-key to the chosen row + Enter to commit, or Escape to cancel.
     fn dispatch_popup_selection(&self, idx: i32, current: i32, selectable: &[i32]) {
-        if self.closed.load(Ordering::Acquire) {
+        // Blink already closed the popup: a replayed Escape or arrow would land
+        // on the page instead.
+        if !self.popup.lock().visible {
             return;
         }
         let Some(host) = self.host() else {
@@ -199,11 +221,11 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.inner.dispatch_popup_selection(
+            self.inner.session.dispatch(|| self.inner.dispatch_popup_selection(
                 self.index,
                 self.current,
                 &self.selectable,
-            );
+            ));
         }
     }
 }

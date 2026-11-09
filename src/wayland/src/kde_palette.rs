@@ -1,7 +1,7 @@
 //! KDE/KWin per-window titlebar color support.
 
 use parking_lot::Mutex;
-use std::ffi::{CString, c_char};
+use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
@@ -14,7 +14,17 @@ struct PaletteState {
     current_path: Option<CString>,
 }
 
-static STATE: Mutex<Option<PaletteState>> = Mutex::new(None);
+pub(crate) struct Palette {
+    state: Mutex<Option<PaletteState>>,
+}
+
+impl Palette {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+}
 
 fn write_color_scheme(r: u8, g: u8, b: u8, path: &std::path::Path) -> std::io::Result<()> {
     let bg = format!("{},{},{}", r, g, b);
@@ -40,7 +50,7 @@ fn make_colors_dir() -> Option<PathBuf> {
         _ => return None,
     };
     let mut dir = PathBuf::from(runtime);
-    dir.push("jellyfin-desktop");
+    dir.push("jellium-desktop");
     if let Err(e) = fs::create_dir_all(&dir) {
         tracing::warn!("kde_palette: mkdir {} failed: {}", dir.display(), e);
         return None;
@@ -49,39 +59,40 @@ fn make_colors_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-pub fn jfn_wl_kde_palette_init() -> bool {
-    if STATE.lock().is_some() {
+pub(crate) fn init(rt: &crate::runtime::WlRuntime) -> bool {
+    if rt.palette().state.lock().is_some() {
         return true;
     }
     let Some(colors_dir) = make_colors_dir() else {
         return false;
     };
-    *STATE.lock() = Some(PaletteState {
+    *rt.palette().state.lock() = Some(PaletteState {
         colors_dir,
         current_path: None,
     });
     true
 }
 
-/// # Safety
-/// `hex` must be a valid NUL-terminated UTF-8 pointer.
-pub unsafe fn jfn_wl_kde_palette_set_color(r: u8, g: u8, b: u8, hex: *const c_char) {
-    if hex.is_null() {
-        return;
-    }
-    let hex_str = match unsafe { std::ffi::CStr::from_ptr(hex) }.to_str() {
+pub(crate) fn set_color(
+    rt: &'static crate::runtime::WlRuntime,
+    r: u8,
+    g: u8,
+    b: u8,
+    hex: &std::ffi::CStr,
+) {
+    let hex_str = match hex.to_str() {
         Ok(s) if s.len() == 7 && s.starts_with('#') => &s[1..],
         _ => return,
     };
 
-    let mut guard = STATE.lock();
+    let mut guard = rt.palette().state.lock();
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return,
     };
 
     let mut new_path = state.colors_dir.clone();
-    new_path.push(format!("JellyfinDesktop-{}.colors", hex_str));
+    new_path.push(format!("JelliumDesktop-{}.colors", hex_str));
 
     let new_path_c = match CString::new(new_path.as_os_str().as_encoded_bytes()) {
         Ok(c) => c,
@@ -101,12 +112,12 @@ pub unsafe fn jfn_wl_kde_palette_set_color(r: u8, g: u8, b: u8, hex: *const c_ch
         let _ = fs::remove_file(old_path);
     }
 
-    unsafe { jfn_wlproxy::jfn_wlproxy_set_titlebar_palette(new_path_c.as_ptr()) };
+    rt.root().set_titlebar_palette(&new_path);
     state.current_path = Some(new_path_c);
 }
 
-pub fn jfn_wl_kde_palette_post_window_cleanup() {
-    let mut guard = STATE.lock();
+pub(crate) fn post_window_cleanup(rt: &crate::runtime::WlRuntime) {
+    let mut guard = rt.palette().state.lock();
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return,

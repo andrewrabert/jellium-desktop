@@ -1,554 +1,177 @@
-//! Per-surface ops: alloc/free, software present, resize, visibility,
-//! restack.
+//! CEF-facing per-surface ops. Every structure change is expressed as desired
+//! state plus a [`GeometryCommand`] enqueued to the geometry thread (the sole
+//! structure writer); pixel presents route to the surface's [`OverlayActor`].
 //!
-//! # Safety
-//!
-//! `pub unsafe fn jfn_x11_*` entries take a `*mut PlatformSurface`
-//! returned by [`jfn_x11_alloc_surface`]; callers must pass either that
-//! handle or null, plus valid `JfnRect` / pixel-buffer pointers matching
-//! the declared dimensions.
+//! None of these entry points configures, maps, or sizes an overlay window —
+//! that authority lives entirely in [`crate::geometry`].
 
-#![allow(clippy::missing_safety_doc)]
+use std::ffi::c_int;
 
-use std::ffi::{c_int, c_void};
-use std::sync::Arc;
+use jfn_platform_abi::{Ack, Content, PaintFrame, Presented, Visibility, VisibilityCommit};
 
-use jfn_gpu_paint::{DirtyRect, DmabufFrame, WindowTarget};
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    AtomEnum, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
-    PropMode, StackMode, WindowClass,
-};
-use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as X11rbWrapperConnection;
-
-use crate::x11_state::{MUT, Mutable, PlatformSurface, is_none_gc, is_none_window};
+use crate::overlay_actor::OverlayActor;
+use crate::registry::{GeometryCommand, SurfaceId, SurfaceRecord, enqueue, registry, wait_applied};
 
 pub use jfn_platform_abi::JfnRect;
 
 use jfn_playback::shutdown::jfn_shutting_down;
 
-/// Create a WM-managed ARGB transient overlay window at (x, y, w, h).
-/// Caller holds `MUT` and provides the mutable state borrow.
-fn create_overlay_window(
-    x11_conn: &RustConnection,
-    m: &Mutable,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-) -> u32 {
-    let Ok(win_id) = x11_conn.generate_id() else {
-        return 0;
-    };
-    let aux = CreateWindowAux::new()
-        .background_pixel(0)
-        .border_pixel(0)
-        // Managed transient when windowed (the WM stacks/positions it without
-        // flicker); unmanaged only when born into fullscreen, where the WM would
-        // otherwise strut-clamp it below the panel.
-        .override_redirect(u32::from(m.parent_fullscreen))
-        .event_mask(EventMask::EXPOSURE)
-        .colormap(m.colormap);
-    let _ = x11_conn.create_window(
-        m.argb_depth,
-        win_id,
-        m.root,
-        x as i16,
-        y as i16,
-        w as u16,
-        h as u16,
-        0,
-        WindowClass::INPUT_OUTPUT,
-        m.argb_visual,
-        &aux,
-    );
-
-    {
-        // Tie the overlay to mpv's window so the WM raises/lowers/covers it with
-        // the parent.
-        let _ = x11_conn.change_property32(
-            PropMode::REPLACE,
-            win_id,
-            u32::from(AtomEnum::WM_TRANSIENT_FOR),
-            u32::from(AtomEnum::WINDOW),
-            &[m.parent],
-        );
-
-        let _ = x11_conn.change_property32(
-            PropMode::REPLACE,
-            win_id,
-            m.atoms.net_wm_window_type,
-            u32::from(AtomEnum::ATOM),
-            &[m.atoms.net_wm_window_type_normal],
-        );
-        let _ = x11_conn.change_property32(
-            PropMode::REPLACE,
-            win_id,
-            m.atoms.net_wm_state,
-            u32::from(AtomEnum::ATOM),
-            &[
-                m.atoms.net_wm_state_skip_taskbar,
-                m.atoms.net_wm_state_skip_pager,
-            ],
-        );
-
-        // Motif hints: flags=MWM_HINTS_DECORATIONS, decorations=0.
-        let _ = x11_conn.change_property32(
-            PropMode::REPLACE,
-            win_id,
-            m.atoms.motif_wm_hints,
-            m.atoms.motif_wm_hints,
-            &[2_u32, 0, 0, 0, 0],
-        );
-
-        // WM_HINTS: InputHint set, input=false; focus should stay on mpv.
-        let _ = x11_conn.change_property32(
-            PropMode::REPLACE,
-            win_id,
-            u32::from(AtomEnum::WM_HINTS),
-            u32::from(AtomEnum::WM_HINTS),
-            &[1_u32, 0, 0, 0, 0, 0, 0, 0, 0],
-        );
-
-        // No empty input shape — the overlay keeps a real input region so
-        // GrabButton can capture clicks on it directly.
-
-        // WM_DELETE_WINDOW handler.
-        let _ = x11_conn.change_property32(
-            PropMode::REPLACE,
-            win_id,
-            m.atoms.wm_protocols,
-            u32::from(AtomEnum::ATOM),
-            &[m.atoms.wm_delete_window],
-        );
-        let _ = x11_conn.flush();
-    }
-
-    win_id
+/// Reserve a surface id and its content actor, then ask the geometry thread to
+/// create the window at `initial`. Returns synchronously; the window lands
+/// shortly after and the actor drops frames until it does.
+pub fn alloc_surface(initial: Visibility) -> SurfaceId {
+    let actor = OverlayActor::new();
+    let id = registry().lock().insert(SurfaceRecord {
+        actor,
+        external: false,
+        window: None,
+        target_ready: Vec::new(),
+        top_physical: 0,
+    });
+    let _ = enqueue(GeometryCommand::Create { id, initial });
+    id
 }
 
-pub fn jfn_x11_alloc_surface() -> *mut PlatformSurface {
-    let s = Box::into_raw(Box::new(PlatformSurface::new()));
-    let Some(x11_conn) = crate::x11_state::x11rb_conn() else {
-        return s;
-    };
-    let mut g = MUT.lock();
-    let Some(m) = g.as_mut() else {
-        return s;
-    };
-    if is_none_window(m.parent) {
-        return s;
+/// Stop the content actor, invalidate the id, then ask the geometry thread to
+/// destroy the window. Order: (1) remove from the registry (invalidates the
+/// public id), (2) stop+join the actor (frees content resources), (3) enqueue
+/// structure teardown on the geometry owner.
+pub fn free_surface(id: SurfaceId) {
+    let record = registry().lock().remove(id);
+    if let Some(record) = record {
+        record.actor.shutdown();
     }
-
-    let px = m.parent_x;
-    let py = m.parent_y;
-    let pw = if m.pw > 0 { m.pw as u32 } else { 1 };
-    let ph = if m.ph > 0 { m.ph as u32 } else { 1 };
-
-    let win = create_overlay_window(&x11_conn, m, px, py, pw, ph);
-    // grab_overlay_input runs on a separate connection; round-trip first so the
-    // window exists server-side, else its requests hit a silently-dropped
-    // BadWindow and the overlay gets no input.
-    if let Ok(cookie) = x11_conn.get_input_focus() {
-        let _ = cookie.reply();
-    }
-    crate::input::grab_overlay_input(win);
-    let gc = x11_conn.generate_id().unwrap_or(0);
-    let _ = x11_conn.create_gc(gc, win, &CreateGCAux::new());
-
-    unsafe {
-        (*s).window = win;
-        (*s).gc = gc;
-        (*s).pw = pw as i32;
-        (*s).ph = ph as i32;
-        (*s).visible = true;
-        (*s).fsm_state = Some(crate::overlay_fsm::OverlayState::new_mapped(
-            m.parent_fullscreen,
-        ));
-    }
-    let _ = x11_conn.map_window(win);
-    // An override_redirect overlay (born fullscreen) is not stacked by the WM;
-    // raise it above the parent ourselves.
-    if m.parent_fullscreen {
-        let aux = ConfigureWindowAux::new()
-            .sibling(m.parent)
-            .stack_mode(StackMode::ABOVE);
-        let _ = x11_conn.configure_window(win, &aux);
-    }
-    let _ = x11_conn.flush();
-
-    m.live.push(s);
-    drop(g);
-
-    // The parent may already be at its final WM placement with no further
-    // ConfigureNotify coming, leaving this new overlay at stale geometry.
-    crate::geometry::request_resync();
-    s
+    let _ = enqueue(GeometryCommand::Destroy { id });
 }
 
-pub unsafe fn jfn_x11_free_surface(s: *mut PlatformSurface) {
-    if s.is_null() {
-        return;
+/// Hand `frame` to this surface's content actor, or give it back when the
+/// surface has no commit stream for it: it is gone, externally presented, the
+/// process is shutting down, an accelerated frame is at a size the resize gate
+/// rejects, or a software frame's pixels do not cover its size.
+pub fn present<'a>(id: SurfaceId, frame: PaintFrame<'a>) -> Result<Presented, PaintFrame<'a>> {
+    if jfn_shutting_down() {
+        return Err(frame);
     }
-    {
-        let mut g = MUT.lock();
-        if let Some(m) = g.as_mut()
-            && let Some(pos) = m.live.iter().position(|&p| p == s)
-        {
-            // Order-preserving: m.live must stay in z-order for the geometry
-            // watcher's restack. swap_remove would scramble it.
-            m.live.remove(pos);
-        }
+    if !presentable(frame.content()) {
+        return Err(frame);
     }
 
-    let surf = unsafe { &mut *s };
-    if let Some(worker) = surf.gpu_paint_worker.take() {
-        worker.shutdown();
+    let g = registry().lock();
+    let Some(record) = g.get(id) else {
+        return Err(frame);
+    };
+    if record.external {
+        return Err(frame);
     }
-    if let Some(worker) = surf.shm_paint_worker.take() {
-        worker.shutdown();
-    }
-    if let Some(x11_conn) = crate::x11_state::x11rb_conn() {
-        if !is_none_window(surf.window) {
-            let _ = x11_conn.unmap_window(surf.window);
+    // Taken before the frame is consumed: the actor holds a frame the swapchain
+    // could not take, and only the producer named here is owed its successor.
+    let source = frame.source();
+    Ok(frame.present(|content| {
+        match content {
+            Content::Accelerated(texture) => record.actor.present_shared(texture, source),
+            Content::Software {
+                size,
+                pixels,
+                dirty,
+            } => record
+                .actor
+                .present_software(dirty, pixels, size.w, size.h, source),
         }
-        if !is_none_gc(surf.gc) {
-            let _ = x11_conn.free_gc(surf.gc);
-        }
-        if !is_none_window(surf.window) {
-            let _ = x11_conn.destroy_window(surf.window);
-        }
-        let _ = x11_conn.flush();
-    }
-    drop(unsafe { Box::from_raw(s) });
+        Presented::issued()
+    }))
 }
 
-/// Present a CEF `OnAcceleratedPaint` dmabuf frame through the GPU worker. Only
-/// reached when the dmabuf tier resolved at init (`use_dmabuf`). The caller has
-/// already unpacked `CefAcceleratedPaintInfo` into `frame`.
-pub unsafe fn jfn_x11_surface_present_dmabuf(s: *mut PlatformSurface, frame: DmabufFrame) -> bool {
-    if jfn_shutting_down() || s.is_null() {
-        return false;
-    }
-    let Some(conn_ptr) = crate::x11_state::raw_xcb_connection() else {
-        return false;
-    };
-    let mut g = MUT.lock();
-    let Some(m) = g.as_mut() else {
-        return false;
-    };
-
-    let surf = unsafe { &mut *s };
-    if is_none_window(surf.window) || !surf.visible {
-        return false;
-    }
-
-    // Drop stale-size frames while a resize is in flight so the last good frame
-    // holds until CEF relays out at the new size. Gate on the visible size; the
-    // coded size can be padded.
-    let gate_size = if frame.visible_w > 0 && frame.visible_h > 0 {
-        (frame.visible_w as i32, frame.visible_h as i32)
-    } else {
-        (frame.width as i32, frame.height as i32)
-    };
-    if m.gate.main_present_decision(gate_size)
-        == jfn_compositor_core::transition::PresentDecision::Reject
-    {
-        return false;
-    }
-
-    let Some(ctx) = m.gpu_ctx.clone() else {
-        return false;
-    };
-    if surf
-        .gpu_paint_worker
-        .as_ref()
-        .is_some_and(|worker| worker.failed())
-    {
-        return false;
-    }
-
-    if surf.gpu_paint_worker.is_none() {
-        let target = WindowTarget::Xcb {
-            connection: conn_ptr,
-            window: surf.window,
-            screen: m.screen_num,
-            visual: m.argb_visual,
-        };
-        let size = (frame.width.max(1), frame.height.max(1));
-        surf.gpu_paint_worker = Some(crate::gpu_paint_worker::X11GpuPaintWorker::new(
-            ctx,
-            target,
+/// Whether the content can reach the screen at all, checked before the frame is
+/// consumed so a rejection can hand it back.
+fn presentable(content: &Content<'_>) -> bool {
+    match content {
+        // Gate on the visible size; the coded size can be padded.
+        Content::Accelerated(texture) => {
+            let visible = texture.visible();
+            crate::x11_state::GATE
+                .lock()
+                .main_present_decision((visible.w, visible.h))
+                != jfn_compositor_core::transition::PresentDecision::Reject
+        }
+        Content::Software {
             size,
-            surf.visible,
-        ));
-    }
-
-    let Some(worker) = surf.gpu_paint_worker.as_ref() else {
-        return false;
-    };
-    worker.set_visible(surf.visible);
-    worker.submit_dmabuf(frame)
-}
-
-/// Lazily build the per-surface GPU presenter worker and queue `buffer`
-/// through it. Returns false once the worker has failed so caller falls back
-/// to SHM on subsequent frames.
-#[allow(clippy::too_many_arguments)]
-fn queue_gpu_present(
-    surf: &mut PlatformSurface,
-    m: &Mutable,
-    dirty: *const JfnRect,
-    dirty_len: usize,
-    buffer: *const c_void,
-    w: c_int,
-    h: c_int,
-) -> bool {
-    let Some(ctx) = m.gpu_ctx.clone() else {
-        return false;
-    };
-    let size = (w as u32, h as u32);
-
-    if surf
-        .gpu_paint_worker
-        .as_ref()
-        .is_some_and(|worker| worker.failed())
-    {
-        return false;
-    }
-
-    if surf.gpu_paint_worker.is_none() {
-        let Some(conn_ptr) = crate::x11_state::raw_xcb_connection() else {
-            return false;
-        };
-        let target = WindowTarget::Xcb {
-            connection: conn_ptr,
-            window: surf.window,
-            screen: m.screen_num,
-            visual: m.argb_visual,
-        };
-        surf.gpu_paint_worker = Some(crate::gpu_paint_worker::X11GpuPaintWorker::new(
-            ctx,
-            target,
-            size,
-            surf.visible,
-        ));
-    }
-
-    let stride = (w as u32).saturating_mul(4);
-    let Some(len) = (h as usize).checked_mul(stride as usize) else {
-        return false;
-    };
-    let bgra = unsafe { std::slice::from_raw_parts(buffer as *const u8, len) };
-    let dirty_rects = unsafe { std::slice::from_raw_parts(dirty, dirty_len) };
-    let owned: Vec<DirtyRect> = dirty_rects
-        .iter()
-        .map(|r| DirtyRect {
-            x: r.x,
-            y: r.y,
-            w: r.w,
-            h: r.h,
-        })
-        .collect();
-
-    let Some(worker) = surf.gpu_paint_worker.as_ref() else {
-        return false;
-    };
-    worker.set_visible(surf.visible);
-    worker.resize(size);
-    worker.submit_frame(bgra, w as u32, h as u32, owned)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn queue_shm_present(
-    surf: &mut PlatformSurface,
-    m: &Mutable,
-    conn: Arc<RustConnection>,
-    dirty: *const JfnRect,
-    dirty_len: usize,
-    buffer: *const c_void,
-    w: c_int,
-    h: c_int,
-) -> bool {
-    if surf.shm_paint_worker.is_none() {
-        surf.shm_paint_worker = Some(crate::shm_paint_worker::X11ShmPaintWorker::new(
-            conn,
-            surf.window,
-            surf.gc,
-            m.argb_depth,
-            surf.visible,
-        ));
-    }
-
-    let Some(worker) = surf.shm_paint_worker.as_ref() else {
-        return false;
-    };
-    worker.set_visible(surf.visible);
-    worker.submit_frame(buffer, w, h, dirty, dirty_len)
-}
-
-pub unsafe fn jfn_x11_surface_present_software(
-    s: *mut PlatformSurface,
-    dirty: *const JfnRect,
-    dirty_len: usize,
-    buffer: *const c_void,
-    w: c_int,
-    h: c_int,
-) -> bool {
-    if jfn_shutting_down() || s.is_null() || buffer.is_null() || w <= 0 || h <= 0 {
-        return false;
-    }
-    let Some(x11_conn) = crate::x11_state::x11rb_conn() else {
-        return false;
-    };
-    let mut g = MUT.lock();
-    let Some(m) = g.as_mut() else {
-        return false;
-    };
-
-    let surf = unsafe { &mut *s };
-    if is_none_window(surf.window) || !surf.visible {
-        return false;
-    }
-
-    // GPU pixel-upload path. Falls through to SHM on any failure so a
-    // bad first frame doesn't strand the surface.
-    if m.gpu_caps.gpu_available && queue_gpu_present(surf, m, dirty, dirty_len, buffer, w, h) {
-        return true;
-    }
-
-    queue_shm_present(surf, m, x11_conn, dirty, dirty_len, buffer, w, h)
-}
-
-pub unsafe fn jfn_x11_surface_resize(
-    s: *mut PlatformSurface,
-    _lw: c_int,
-    _lh: c_int,
-    pw: c_int,
-    ph: c_int,
-) {
-    if s.is_null() {
-        return;
-    }
-    let Some(x11_conn) = crate::x11_state::x11rb_conn() else {
-        return;
-    };
-    let mut g = MUT.lock();
-    let Some(m) = g.as_mut() else { return };
-
-    let old = (m.pw, m.ph);
-    m.pw = pw;
-    m.ph = ph;
-    let surf = unsafe { &mut *s };
-    surf.pw = pw;
-    surf.ph = ph;
-
-    // On the dmabuf tier the GPU worker sizes the overlay in lockstep with the
-    // frame it presents, so don't drive the window size ahead of content here;
-    // just arm the gate to drop stale-size frames during the resize.
-    let dmabuf_lockstep = m.use_dmabuf && surf.gpu_paint_worker.is_some();
-    if dmabuf_lockstep && pw > 0 && ph > 0 && old != (pw, ph) {
-        m.gate.begin_capturing(old);
-        m.gate.set_expected((pw, ph));
-    }
-
-    if pw > 0
-        && ph > 0
-        && let Some(worker) = surf.gpu_paint_worker.as_ref()
-    {
-        worker.resize((pw as u32, ph as u32));
-    }
-    if is_none_window(surf.window) {
-        return;
-    }
-
-    // Size only: overlay position is owned exclusively by the geometry thread;
-    // writing X/Y here would race it with a stale value during
-    // fullscreen/maximize transitions.
-    if !dmabuf_lockstep {
-        let aux = ConfigureWindowAux::new().width(pw as u32).height(ph as u32);
-        let _ = x11_conn.configure_window(surf.window, &aux);
-        let _ = x11_conn.flush();
-    }
-}
-
-pub unsafe fn jfn_x11_surface_set_visible(s: *mut PlatformSurface, visible: bool) {
-    if s.is_null() {
-        return;
-    }
-    let Some(x11_conn) = crate::x11_state::x11rb_conn() else {
-        return;
-    };
-    let mut g = MUT.lock();
-    let Some(m) = g.as_mut() else { return };
-
-    let surf = unsafe { &mut *s };
-    if surf.visible == visible {
-        return;
-    }
-    surf.visible = visible;
-    if is_none_window(surf.window) {
-        return;
-    }
-
-    if visible {
-        // Place from the geometry thread's cached parent geometry, the single
-        // source of truth for position; re-querying here would race it.
-        let pick = |s: i32, p: i32| -> u32 {
-            if s > 0 {
-                s as u32
-            } else if p > 0 {
-                p as u32
-            } else {
-                1
+            pixels,
+            dirty: _,
+        } => {
+            if size.w <= 0 || size.h <= 0 {
+                return false;
             }
-        };
-        let pw = pick(surf.pw, m.pw);
-        let ph = pick(surf.ph, m.ph);
-        let aux = ConfigureWindowAux::new()
-            .x(m.parent_x)
-            .y(m.parent_y)
-            .width(pw)
-            .height(ph);
-        let _ = x11_conn.configure_window(surf.window, &aux);
-        let _ = x11_conn.map_window(surf.window);
-    } else {
-        let _ = x11_conn.unmap_window(surf.window);
+            let stride = (size.w as usize).saturating_mul(4);
+            (size.h as usize)
+                .checked_mul(stride)
+                .is_some_and(|len| pixels.len() >= len)
+        }
     }
-    if let Some(worker) = surf.gpu_paint_worker.as_ref() {
-        worker.set_visible(visible);
-    }
-    let _ = x11_conn.flush();
 }
 
-/// Stack `ordered[0..n]` above the mpv parent, bottom to top.
-pub unsafe fn jfn_x11_restack(ordered: *const *mut PlatformSurface, n: usize) {
-    if n == 0 || ordered.is_null() {
-        return;
-    }
-    let Some(x11_conn) = crate::x11_state::x11rb_conn() else {
-        return;
-    };
-    let g = MUT.lock();
-    let Some(m) = g.as_ref() else { return };
+/// Reserve `top_physical` pixels at the top of the window for the shell
+/// overlay. The geometry thread applies it on the next reconcile.
+pub fn surface_set_top_inset(id: SurfaceId, top_physical: c_int) {
+    let _ = enqueue(GeometryCommand::SetTopInset { id, top_physical });
+}
 
-    let slice = unsafe { std::slice::from_raw_parts(ordered, n) };
-    let mut prev = m.parent;
-    for &s_ptr in slice {
-        if s_ptr.is_null() {
-            continue;
-        }
-        let s = unsafe { &*s_ptr };
-        let window = s.window;
-        if is_none_window(s.window) || window == prev {
-            continue;
-        }
-        let aux = ConfigureWindowAux::new()
-            .sibling(prev)
-            .stack_mode(StackMode::ABOVE);
-        let _ = x11_conn.configure_window(window, &aux);
-        prev = window;
+/// The swapchain target for `id`, or `None` until the geometry thread has
+/// created its window.
+///
+/// The first call marks the surface external: the geometry thread then gives it
+/// an empty XShape input region, issues no `GrabButton` on it, and its actor
+/// drops every present.
+pub fn window_target(id: SurfaceId) -> Option<jfn_gpu_paint::WindowTarget> {
+    let (first, window) = {
+        let mut g = registry().lock();
+        let record = g.get_mut(id)?;
+        let first = !record.external;
+        record.external = true;
+        (first, record.window)
+    };
+    if first {
+        let _ = enqueue(GeometryCommand::SetExternal { id });
     }
-    let _ = x11_conn.flush();
+    let window = window?;
+    let connection = crate::x11_state::raw_xcb_connection()?;
+    let paint = crate::x11_state::paint()?;
+    Some(jfn_gpu_paint::WindowTarget::Xcb {
+        connection,
+        window,
+        screen: crate::x11_state::host().map_or(0, |h| h.screen_num),
+        visual: paint.argb_visual,
+    })
+}
+
+/// Registers under the same lock used to publish the native window.
+pub fn on_target_ready(id: SurfaceId, ready: Box<dyn FnOnce() + Send>) {
+    {
+        let mut g = registry().lock();
+        if let Some(record) = g.get_mut(id)
+            && record.window.is_none()
+        {
+            record.target_ready.push(ready);
+            return;
+        }
+    }
+    ready();
+}
+
+/// Enqueue the map/unmap; the returned commit blocks until the geometry thread
+/// (the sole owner of map state) has applied it and its server round trip has
+/// returned.
+pub fn set_visibility(id: SurfaceId, visibility: Visibility) -> VisibilityCommit {
+    let ack = match enqueue(GeometryCommand::SetVisibility { id, visibility }) {
+        Some(ticket) => Ack::deferred(Box::new(move || wait_applied(ticket))),
+        // No geometry thread to apply it: nothing will ever acknowledge.
+        None => Ack::immediate(),
+    };
+    VisibilityCommit::issued(visibility, ack)
+}
+
+/// Stack `ordered[0..]` above the app top-level, bottom to top.
+pub fn apply_stack(ordered: &[SurfaceId]) {
+    let _ = enqueue(GeometryCommand::SetOrder {
+        ids: ordered.to_vec(),
+    });
 }

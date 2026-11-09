@@ -14,23 +14,34 @@ parking_lot.workspace = true
 # The whole crate is `#![cfg(target_os = "linux")]`, so it's an empty rlib
 # elsewhere and the workspace builds uniformly on every platform.
 [target.'cfg(target_os = "linux")'.dependencies]
+arc-swap.workspace = true
+calloop.workspace = true
 cef.workspace = true
-cursor-icon = "1"
+crossbeam-channel.workspace = true
+slotmap.workspace = true
 jfn-compositor-core = { path = "../compositor_core" }
 jfn-gpu-paint = { path = "../gpu_paint" }
 jfn-input = { path = "../input" }
 jfn-linux-util = { path = "../linux_util" }
-jfn-menu = { path = "../menu" }
+jfn-mailbox = { path = "../mailbox" }
 jfn-mpris = { path = "../mpris" }
 jfn-mpv = { path = "../mpv" }
+jfn-paths = { path = "../paths" }
 jfn-platform-abi = { path = "../platform_abi" }
 jfn-playback = { path = "../playback" }
 jfn-wake-event = { path = "../wake_event" }
-libc.workspace = true
+gethostname.workspace = true
+memmap2 = "0.9"
+nix.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 xcb = { version = "1.7", features = ["xkb", "as-raw-xcb-connection"] }
-x11rb = { version = "0.13", features = ["cursor", "resource_manager", "shape", "shm", "xfixes"] }
+x11rb = { version = "0.14", features = ["cursor", "request-parsing", "resource_manager", "shape", "shm", "sync", "xfixes", "xinput"] }
 xkbcommon = { version = "0.9", default-features = false, features = ["x11"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { version = "0.14", features = ["xtest"] }
 
 [lints]
 workspace = true

@@ -7,14 +7,17 @@
 //! dependency on them (the X11 case only fires when CEF runs under
 //! `--ozone-platform=x11` over XWayland).
 
-use crate::egl_dyn as egl;
+use crate::egl;
+use drm_fourcc::DrmFourcc;
 use libloading::Library;
+use nix::fcntl::{OFlag, open};
+use nix::sys::stat::Mode;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 
-// ARGB8888 fourcc — pulled from drm_fourcc.h to avoid a libdrm dep.
-const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+// GL is two constants and five entry points reached through
+// `eglGetProcAddress`; `glow` needs a loader context to give anything back.
 const GL_TEXTURE_2D: c_uint = 0x0DE1;
 const GL_NO_ERROR: c_uint = 0;
 const GBM_BO_USE_RENDERING: u32 = 0x0002;
@@ -52,14 +55,14 @@ type FnEglGetPlatformDisplayExt =
     unsafe extern "C" fn(egl::Enum, *mut c_void, *const egl::Int) -> egl::EGLDisplay;
 type FnEglCreateImageKhr = unsafe extern "C" fn(
     egl::EGLDisplay,
-    egl::EGLContext,
+    *mut c_void,
     egl::Enum,
     *mut c_void,
     *const egl::Int,
 ) -> *mut c_void;
-type FnEglDestroyImageKhr = unsafe extern "C" fn(egl::EGLDisplay, *mut c_void) -> egl::Boolean;
+type FnEglDestroyImageKhr = unsafe extern "C" fn(egl::EGLDisplay, *mut c_void) -> c_uint;
 type FnEglQueryDisplayAttribExt =
-    unsafe extern "C" fn(egl::EGLDisplay, egl::Int, *mut isize) -> egl::Boolean;
+    unsafe extern "C" fn(egl::EGLDisplay, egl::Int, *mut isize) -> c_uint;
 type FnEglQueryDeviceStringExt = unsafe extern "C" fn(*mut c_void, egl::Int) -> *const c_char;
 
 /// Returns true if a GBM-allocated ARGB8888 dmabuf can be imported as an EGL
@@ -98,68 +101,66 @@ pub unsafe fn jfn_wl_dmabuf_probe(
 }
 
 fn probe(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<bool, String> {
-    let egl_lib = unsafe { Library::new("libEGL.so.1") }
-        .map_err(|e| format!("libEGL not available: {}", e))?;
-    let egl = egl::Egl::load_from(egl_lib).map_err(|e| format!("EGL load failed: {}", e))?;
+    let egl = egl::load()?;
 
     let (display, owns_display, _x11_state) = acquire_display(&egl, ozone, wayland_egl_dpy)?;
 
     let result = (|| -> Result<bool, String> {
-        if unsafe { (egl.bind_api)(egl::OPENGL_ES_API) } != egl::TRUE {
-            return Err("eglBindAPI failed".into());
-        }
+        egl.bind_api(khronos_egl::OPENGL_ES_API)
+            .map_err(|e| format!("eglBindAPI failed: {e}"))?;
 
-        let cfg_attrs: [egl::Int; 5] = [
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES2_BIT,
-            egl::SURFACE_TYPE,
-            egl::PBUFFER_BIT,
-            egl::NONE,
+        let cfg_attrs = [
+            khronos_egl::RENDERABLE_TYPE,
+            khronos_egl::OPENGL_ES2_BIT,
+            khronos_egl::SURFACE_TYPE,
+            khronos_egl::PBUFFER_BIT,
+            khronos_egl::NONE,
         ];
-        let mut config: egl::EGLConfig = ptr::null_mut();
-        let mut num_config: egl::Int = 0;
-        if unsafe {
-            (egl.choose_config)(display, cfg_attrs.as_ptr(), &mut config, 1, &mut num_config)
-        } != egl::TRUE
-        {
-            return Err("eglChooseConfig failed".into());
-        }
-        if num_config == 0 || config.is_null() {
+        let Some(config) = egl
+            .choose_first_config(display, &cfg_attrs)
+            .map_err(|e| format!("eglChooseConfig failed: {e}"))?
+        else {
             return Err("no suitable EGL config".to_string());
-        }
+        };
 
-        let ctx_attrs: [egl::Int; 3] = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-        let ctx =
-            unsafe { (egl.create_context)(display, config, ptr::null_mut(), ctx_attrs.as_ptr()) };
-        if ctx.is_null() {
-            return Err("can't create GLES context".into());
-        }
+        let ctx_attrs = [khronos_egl::CONTEXT_CLIENT_VERSION, 2, khronos_egl::NONE];
+        let ctx = egl
+            .create_context(display, config, None, &ctx_attrs)
+            .map_err(|e| format!("can't create GLES context: {e}"))?;
 
-        let pb_attrs: [egl::Int; 5] = [egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE];
-        let pbuf = unsafe { (egl.create_pbuffer_surface)(display, config, pb_attrs.as_ptr()) };
-        // pbuf may legitimately be null; make_current will then fail.
+        let pb_attrs = [
+            khronos_egl::WIDTH,
+            1,
+            khronos_egl::HEIGHT,
+            1,
+            khronos_egl::NONE,
+        ];
+        // A pbuffer may legitimately be unavailable; a surfaceless context
+        // still makes current on drivers that advertise
+        // EGL_KHR_surfaceless_context.
+        let pbuf = egl.create_pbuffer_surface(display, config, &pb_attrs).ok();
 
-        if unsafe { (egl.make_current)(display, pbuf, pbuf, ctx) } != egl::TRUE {
-            if !pbuf.is_null() {
-                unsafe { (egl.destroy_surface)(display, pbuf) };
+        if egl.make_current(display, pbuf, pbuf, Some(ctx)).is_err() {
+            if let Some(pbuf) = pbuf {
+                let _ = egl.destroy_surface(display, pbuf);
             }
-            unsafe { (egl.destroy_context)(display, ctx) };
+            let _ = egl.destroy_context(display, ctx);
             return Err("eglMakeCurrent failed".into());
         }
 
         let gl_result = run_gl_test(&egl, display);
 
-        unsafe { (egl.make_current)(display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
-        if !pbuf.is_null() {
-            unsafe { (egl.destroy_surface)(display, pbuf) };
+        let _ = egl.make_current(display, None, None, None);
+        if let Some(pbuf) = pbuf {
+            let _ = egl.destroy_surface(display, pbuf);
         }
-        unsafe { (egl.destroy_context)(display, ctx) };
+        let _ = egl.destroy_context(display, ctx);
 
         gl_result
     })();
 
     if owns_display {
-        unsafe { (egl.terminate)(display) };
+        let _ = egl.terminate(display);
     }
 
     match &result {
@@ -188,10 +189,13 @@ fn acquire_display(
     egl: &egl::Egl,
     ozone: &str,
     wayland_egl_dpy: *mut c_void,
-) -> Result<(egl::EGLDisplay, bool, Option<X11Owned>), String> {
+) -> Result<(egl::Display, bool, Option<X11Owned>), String> {
     if ozone == "wayland" {
         tracing::info!("dmabuf probe: testing on Wayland EGL display");
-        return Ok((wayland_egl_dpy as egl::EGLDisplay, false, None));
+        // SAFETY: the caller guarantees a live EGL display for the Wayland
+        // case.
+        let display = unsafe { egl::Display::from_ptr(wayland_egl_dpy) };
+        return Ok((display, false, None));
     }
 
     let lib = unsafe { Library::new("libX11.so.6") }
@@ -211,21 +215,25 @@ fn acquire_display(
         close: close_fn,
     };
 
-    let display: egl::EGLDisplay = if let Some(fp) = egl.get_proc("eglGetPlatformDisplayEXT") {
+    let display = if let Some(fp) = egl.get_proc_address("eglGetPlatformDisplayEXT") {
         let f: FnEglGetPlatformDisplayExt = unsafe { std::mem::transmute(fp) };
-        unsafe { f(EGL_PLATFORM_X11_KHR, dpy, ptr::null()) }
+        let raw = unsafe { f(EGL_PLATFORM_X11_KHR, dpy, ptr::null()) };
+        if raw.is_null() {
+            return Err("no EGL display for X11".into());
+        }
+        // SAFETY: `raw` is a non-null display just returned by EGL.
+        unsafe { egl::Display::from_ptr(raw) }
     } else {
-        unsafe { (egl.get_display)(dpy) }
+        // SAFETY: `dpy` is a live Xlib display owned by `owned`.
+        let Some(display) = (unsafe { egl.get_display(dpy) }) else {
+            return Err("no EGL display for X11".into());
+        };
+        display
     };
-    if display.is_null() {
-        return Err("no EGL display for X11".into());
-    }
 
-    let mut major: egl::Int = 0;
-    let mut minor: egl::Int = 0;
-    if unsafe { (egl.initialize)(display, &mut major, &mut minor) } != egl::TRUE {
-        return Err("EGL init on X11 failed".into());
-    }
+    let (major, minor) = egl
+        .initialize(display)
+        .map_err(|e| format!("EGL init on X11 failed: {e}"))?;
     tracing::info!(
         "dmabuf probe: testing on X11 EGL display ({}.{})",
         major,
@@ -235,7 +243,7 @@ fn acquire_display(
     Ok((display, true, Some(owned)))
 }
 
-fn run_gl_test(egl: &egl::Egl, display: egl::EGLDisplay) -> Result<bool, String> {
+fn run_gl_test(egl: &egl::Egl, display: egl::Display) -> Result<bool, String> {
     let gen_tex = get_gl::<FnGlGenTextures>(egl, "glGenTextures")?;
     let bind_tex = get_gl::<FnGlBindTexture>(egl, "glBindTexture")?;
     let del_tex = get_gl::<FnGlDeleteTextures>(egl, "glDeleteTextures")?;
@@ -259,56 +267,56 @@ fn run_gl_test(egl: &egl::Egl, display: egl::EGLDisplay) -> Result<bool, String>
         }
     };
 
-    let drm_fd = find_drm_node(egl, display)
-        .ok_or(())
-        .or_else(|_| open_legacy_node().ok_or(()));
-    let drm_fd = match drm_fd {
-        Ok(fd) => fd,
-        Err(_) => {
+    let drm_fd = match find_drm_node(egl, display).or_else(open_legacy_node) {
+        Some(fd) => fd,
+        None => {
             tracing::warn!("dmabuf probe: no DRM render node, assuming supported");
             return Ok(true);
         }
     };
 
-    let device = unsafe { (gbm.create_device)(drm_fd) };
+    let device = unsafe { (gbm.create_device)(drm_fd.as_raw_fd()) };
     if device.is_null() {
-        unsafe { libc::close(drm_fd) };
         return Err("gbm_create_device failed".into());
     }
 
-    let bo = unsafe { (gbm.bo_create)(device, 64, 64, DRM_FORMAT_ARGB8888, GBM_BO_USE_RENDERING) };
+    let bo = unsafe {
+        (gbm.bo_create)(
+            device,
+            64,
+            64,
+            DrmFourcc::Argb8888 as u32,
+            GBM_BO_USE_RENDERING,
+        )
+    };
     if bo.is_null() {
-        unsafe {
-            (gbm.device_destroy)(device);
-            libc::close(drm_fd);
-        }
+        unsafe { (gbm.device_destroy)(device) };
         return Err("gbm_bo_create ARGB8888 failed".into());
     }
 
-    let dmabuf_fd = unsafe { (gbm.bo_get_fd)(bo) };
+    let raw_dmabuf_fd = unsafe { (gbm.bo_get_fd)(bo) };
+    let dmabuf_fd = (raw_dmabuf_fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw_dmabuf_fd) });
     let stride = unsafe { (gbm.bo_get_stride)(bo) };
 
-    let result = if dmabuf_fd < 0 {
-        Err("gbm_bo_get_fd failed".to_string())
-    } else {
+    let result = if let Some(dmabuf_fd) = &dmabuf_fd {
         let img_attrs: [egl::Int; 13] = [
-            egl::WIDTH,
+            khronos_egl::WIDTH,
             64,
-            egl::HEIGHT,
+            khronos_egl::HEIGHT,
             64,
             EGL_LINUX_DRM_FOURCC_EXT,
-            DRM_FORMAT_ARGB8888 as egl::Int,
+            DrmFourcc::Argb8888 as egl::Int,
             EGL_DMA_BUF_PLANE0_FD_EXT,
-            dmabuf_fd as egl::Int,
+            dmabuf_fd.as_raw_fd() as egl::Int,
             EGL_DMA_BUF_PLANE0_OFFSET_EXT,
             0,
             EGL_DMA_BUF_PLANE0_PITCH_EXT,
             stride as egl::Int,
-            egl::NONE,
+            khronos_egl::NONE,
         ];
         let image = unsafe {
             create_image(
-                display,
+                display.as_ptr(),
                 ptr::null_mut(),
                 EGL_LINUX_DMA_BUF_EXT,
                 ptr::null_mut(),
@@ -316,9 +324,10 @@ fn run_gl_test(egl: &egl::Egl, display: egl::EGLDisplay) -> Result<bool, String>
             )
         };
         if image.is_null() {
-            tracing::warn!("dmabuf probe: eglCreateImageKHR failed (0x{:x})", unsafe {
-                (egl.get_error)()
-            });
+            tracing::warn!(
+                "dmabuf probe: eglCreateImageKHR failed ({:?})",
+                egl.get_error()
+            );
             Ok(false)
         } else {
             let mut tex: c_uint = 0;
@@ -335,19 +344,18 @@ fn run_gl_test(egl: &egl::Egl, display: egl::EGLDisplay) -> Result<bool, String>
                     );
                 }
                 del_tex(1, &tex);
-                destroy_image(display, image);
+                destroy_image(display.as_ptr(), image);
                 Ok(ok)
             }
         }
+    } else {
+        Err("gbm_bo_get_fd failed".to_string())
     };
 
-    if dmabuf_fd >= 0 {
-        unsafe { libc::close(dmabuf_fd) };
-    }
+    drop(dmabuf_fd);
     unsafe {
         (gbm.bo_destroy)(bo);
         (gbm.device_destroy)(device);
-        libc::close(drm_fd);
     }
     result
 }
@@ -378,16 +386,16 @@ impl GbmFns {
     }
 }
 
-fn find_drm_node_path(egl: &egl::Egl, display: egl::EGLDisplay) -> Option<CString> {
-    let query_display_ptr = egl.get_proc("eglQueryDisplayAttribEXT")?;
-    let query_device_str_ptr = egl.get_proc("eglQueryDeviceStringEXT")?;
+fn find_drm_node_path(egl: &egl::Egl, display: egl::Display) -> Option<CString> {
+    let query_display_ptr = egl.get_proc_address("eglQueryDisplayAttribEXT")?;
+    let query_device_str_ptr = egl.get_proc_address("eglQueryDeviceStringEXT")?;
     let query_display: FnEglQueryDisplayAttribExt =
         unsafe { std::mem::transmute(query_display_ptr) };
     let query_device_str: FnEglQueryDeviceStringExt =
         unsafe { std::mem::transmute(query_device_str_ptr) };
 
     let mut device_attrib: isize = 0;
-    let ok = unsafe { query_display(display, EGL_DEVICE_EXT, &mut device_attrib) };
+    let ok = unsafe { query_display(display.as_ptr(), EGL_DEVICE_EXT, &mut device_attrib) };
     if ok == 0 || device_attrib == 0 {
         return None;
     }
@@ -399,15 +407,16 @@ fn find_drm_node_path(egl: &egl::Egl, display: egl::EGLDisplay) -> Option<CStrin
     Some(unsafe { CStr::from_ptr(node_ptr) }.to_owned())
 }
 
-fn find_drm_node(egl: &egl::Egl, display: egl::EGLDisplay) -> Option<RawFd> {
+fn find_drm_node(egl: &egl::Egl, display: egl::Display) -> Option<OwnedFd> {
     let node = find_drm_node_path(egl, display)?;
-    let fd = unsafe { libc::open(node.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if fd >= 0 {
-        tracing::info!("dmabuf probe using render node: {}", node.to_string_lossy());
-        Some(fd)
-    } else {
-        None
-    }
+    let fd = open(
+        node.as_c_str(),
+        OFlag::O_RDWR | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    tracing::info!("dmabuf probe using render node: {}", node.to_string_lossy());
+    Some(fd)
 }
 
 /// # Safety
@@ -433,48 +442,37 @@ pub unsafe fn cef_render_node(
 }
 
 fn render_node(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<Option<(i64, i64)>, String> {
-    let egl_lib = unsafe { Library::new("libEGL.so.1") }
-        .map_err(|e| format!("libEGL not available: {}", e))?;
-    let egl = egl::Egl::load_from(egl_lib).map_err(|e| format!("EGL load failed: {}", e))?;
+    let egl = egl::load()?;
 
     let (display, owns_display, _x11_state) = acquire_display(&egl, ozone, wayland_egl_dpy)?;
     let path = find_drm_node_path(&egl, display);
     if owns_display {
-        unsafe { (egl.terminate)(display) };
+        let _ = egl.terminate(display);
     }
     Ok(path.as_deref().and_then(node_major_minor))
 }
 
 fn node_major_minor(path: &CStr) -> Option<(i64, i64)> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::stat(path.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    // glibc dev_t encoding; the plain POSIX major/minor split decodes wrong.
-    let rdev = st.st_rdev as u64;
-    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff_u64);
-    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff_u64);
+    let st = nix::sys::stat::stat(path).ok()?;
+    let major = nix::sys::stat::major(st.st_rdev);
+    let minor = nix::sys::stat::minor(st.st_rdev);
     Some((major as i64, minor as i64))
 }
 
-fn open_legacy_node() -> Option<RawFd> {
-    for i in 128..136 {
-        let path = format!("/dev/dri/renderD{}\0", i);
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr() as *const c_char,
-                libc::O_RDWR | libc::O_CLOEXEC,
-            )
-        };
-        if fd >= 0 {
-            return Some(fd);
-        }
-    }
-    None
+fn open_legacy_node() -> Option<OwnedFd> {
+    (128..136).find_map(|i| {
+        let path = format!("/dev/dri/renderD{}", i);
+        open(
+            path.as_str(),
+            OFlag::O_RDWR | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()
+    })
 }
 
 fn get_gl<T>(egl: &egl::Egl, name: &str) -> Result<T, String> {
-    egl.get_proc(name)
+    egl.get_proc_address(name)
         .map(|p| unsafe { std::mem::transmute_copy::<extern "system" fn(), T>(&p) })
         .ok_or_else(|| format!("missing {}", name))
 }

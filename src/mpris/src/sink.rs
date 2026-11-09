@@ -1,28 +1,35 @@
-//! MPRIS direct sink. Owns its own thread that runs a zbus blocking
-//! Connection. Receives PlaybackEvents through a channel, updates the
-//! content/view state, and emits PropertiesChanged + Seeked signals.
+//! MPRIS direct sink. A [`QueuedSink`] run by the playback sink harness on
+//! its consumer thread, holding a zbus blocking Connection. Each delivered
+//! PlaybackEvent updates the content/snapshot state and emits
+//! PropertiesChanged + Seeked signals.
 //!
 //! Method/property handlers run inline on zbus's reactor thread; outbound
 //! transport (Play/Pause/Stop/etc.) calls jfn_mpv_* directly. Next/
 //! Previous/Seek/SetPosition route to the JS UI via the registered exec_js
 //! callback.
 
+use async_io::block_on;
 use parking_lot::Mutex;
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, OnceLock};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
 
 use zbus::blocking::Connection;
+use zbus::blocking::object_server::InterfaceRef;
+use zbus::fdo;
 use zbus::interface;
-use zbus::names::InterfaceName;
+use zbus::object_server::{Interface, SignalEmitter};
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
 use crate::projection;
+use jfn_playback::sink_core::{self, QueuedSink};
 use jfn_playback::{MediaMetadata, PlaybackEvent, PlaybackEventKind, PlaybackSnapshot};
 
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
-const BASE_SERVICE_NAME: &str = "org.mpris.MediaPlayer2.JellyfinDesktop";
+const BASE_SERVICE_NAME: &str = "org.mpris.MediaPlayer2.JelliumDesktop";
+// MPRIS clients poll Position and every event moves it, so it is never
+// part of a changed set
+const POLLED_PROPERTY: &str = "Position";
 
 // ============================================================================
 // Content + projected view
@@ -49,106 +56,12 @@ impl Content {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct View {
-    playback_status: &'static str,
-    can_play: bool,
-    can_pause: bool,
-    can_seek: bool,
-    can_control: bool,
-    metadata: MediaMetadata,
-    rate: f64,
-    volume: f64,
-    can_go_next: bool,
-    can_go_previous: bool,
-}
-
-impl Default for View {
-    fn default() -> Self {
-        Self {
-            playback_status: "Stopped",
-            can_play: false,
-            can_pause: false,
-            can_seek: false,
-            can_control: false,
-            metadata: MediaMetadata::default(),
-            rate: 1.0,
-            volume: 1.0,
-            can_go_next: false,
-            can_go_previous: false,
-        }
-    }
-}
-
 fn status_name(s: projection::MprisStatus) -> &'static str {
     match s {
         projection::MprisStatus::Playing => "Playing",
         projection::MprisStatus::Paused => "Paused",
         projection::MprisStatus::Stopped => "Stopped",
     }
-}
-
-fn project_view(snap: &PlaybackSnapshot, content: &Content) -> View {
-    let d = projection::project(&projection::ProjectInput {
-        phase: snap.phase,
-        seeking: snap.seeking,
-        buffering: snap.buffering,
-        metadata_duration_us: content.metadata.duration_us,
-        pending_rate: content.pending_rate,
-    });
-    View {
-        playback_status: status_name(d.status),
-        can_play: d.can_play,
-        can_pause: d.can_pause,
-        can_seek: d.can_seek,
-        can_control: d.can_control,
-        // metadata_active=false -> clean transport while nothing is loaded
-        metadata: if d.metadata_active {
-            content.metadata.clone()
-        } else {
-            MediaMetadata::default()
-        },
-        rate: d.rate,
-        volume: content.volume,
-        can_go_next: content.can_go_next,
-        can_go_previous: content.can_go_previous,
-    }
-}
-
-/// Returns the MPRIS property names that differ between two views.
-fn diff_view(prev: &View, next: &View) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if prev.playback_status != next.playback_status {
-        out.push("PlaybackStatus");
-    }
-    if prev.can_play != next.can_play {
-        out.push("CanPlay");
-    }
-    if prev.can_pause != next.can_pause {
-        out.push("CanPause");
-    }
-    if prev.can_seek != next.can_seek {
-        out.push("CanSeek");
-    }
-    if prev.can_control != next.can_control {
-        out.push("CanControl");
-    }
-    if prev.metadata != next.metadata {
-        out.push("Metadata");
-    }
-    if prev.rate != next.rate {
-        out.push("Rate");
-    }
-    if prev.volume != next.volume {
-        out.push("Volume");
-    }
-    if prev.can_go_next != next.can_go_next {
-        out.push("CanGoNext");
-    }
-    if prev.can_go_previous != next.can_go_previous {
-        out.push("CanGoPrevious");
-    }
-    out
 }
 
 fn insert_value(m: &mut HashMap<String, OwnedValue>, key: &str, v: Value<'_>) {
@@ -163,7 +76,7 @@ fn insert_value(m: &mut HashMap<String, OwnedValue>, key: &str, v: Value<'_>) {
 fn metadata_to_dict(meta: &MediaMetadata) -> HashMap<String, OwnedValue> {
     let mut m = HashMap::new();
     // mpris:trackid is required by spec.
-    if let Ok(track_id) = ObjectPath::try_from("/org/jellyfin/track/1") {
+    if let Ok(track_id) = ObjectPath::try_from("/net/nullsum/JelliumDesktop/track/1") {
         insert_value(&mut m, "mpris:trackid", Value::from(track_id));
     }
     if meta.duration_us > 0 {
@@ -202,7 +115,6 @@ fn metadata_to_dict(meta: &MediaMetadata) -> HashMap<String, OwnedValue> {
 
 struct State {
     content: Content,
-    view: View,
     snapshot: PlaybackSnapshot,
 }
 
@@ -210,13 +122,29 @@ impl State {
     fn fresh() -> Self {
         Self {
             content: Content::fresh(),
-            view: View::default(),
             snapshot: PlaybackSnapshot::default(),
         }
     }
-}
 
-use jfn_playback::sink_core;
+    fn derived(&self) -> projection::MprisDerived {
+        projection::project(&projection::ProjectInput {
+            phase: self.snapshot.phase,
+            seeking: self.snapshot.seeking,
+            buffering: self.snapshot.buffering,
+            metadata_duration_us: self.content.metadata.duration_us,
+            pending_rate: self.content.pending_rate,
+        })
+    }
+
+    /// metadata_active=false -> clean transport while nothing is loaded.
+    fn visible_metadata(&self) -> HashMap<String, OwnedValue> {
+        if self.derived().metadata_active {
+            metadata_to_dict(&self.content.metadata)
+        } else {
+            metadata_to_dict(&MediaMetadata::default())
+        }
+    }
+}
 
 // ============================================================================
 // D-Bus interface impls
@@ -231,7 +159,7 @@ impl Root {
 
     #[zbus(property)]
     fn identity(&self) -> &str {
-        "Jellyfin Desktop"
+        "Jellium Desktop"
     }
     #[zbus(property)]
     fn can_quit(&self) -> bool {
@@ -296,13 +224,16 @@ impl Player {
         sink_core::seek_to_ms(position_us / 1000);
     }
 
+    #[zbus(signal)]
+    async fn seeked(emitter: &SignalEmitter<'_>, position: i64) -> zbus::Result<()>;
+
     #[zbus(property)]
     fn playback_status(&self) -> String {
-        self.state.lock().view.playback_status.to_string()
+        status_name(self.state.lock().derived().status).to_string()
     }
     #[zbus(property)]
     fn rate(&self) -> f64 {
-        self.state.lock().view.rate
+        self.state.lock().derived().rate
     }
     #[zbus(property)]
     fn set_rate(&self, value: f64) {
@@ -319,12 +250,11 @@ impl Player {
     }
     #[zbus(property)]
     fn metadata(&self) -> HashMap<String, OwnedValue> {
-        let s = self.state.lock();
-        metadata_to_dict(&s.view.metadata)
+        self.state.lock().visible_metadata()
     }
     #[zbus(property)]
     fn volume(&self) -> f64 {
-        self.state.lock().view.volume
+        self.state.lock().content.volume
     }
     #[zbus(property)]
     fn position(&self) -> i64 {
@@ -332,71 +262,88 @@ impl Player {
     }
     #[zbus(property)]
     fn can_go_next(&self) -> bool {
-        self.state.lock().view.can_go_next
+        self.state.lock().content.can_go_next
     }
     #[zbus(property)]
     fn can_go_previous(&self) -> bool {
-        self.state.lock().view.can_go_previous
+        self.state.lock().content.can_go_previous
     }
     #[zbus(property)]
     fn can_play(&self) -> bool {
-        self.state.lock().view.can_play
+        self.state.lock().derived().can_play
     }
     #[zbus(property)]
     fn can_pause(&self) -> bool {
-        self.state.lock().view.can_pause
+        self.state.lock().derived().can_pause
     }
     #[zbus(property)]
     fn can_seek(&self) -> bool {
-        self.state.lock().view.can_seek
+        self.state.lock().derived().can_seek
     }
     #[zbus(property)]
     fn can_control(&self) -> bool {
-        self.state.lock().view.can_control
+        self.state.lock().derived().can_control
     }
 }
 
 // ============================================================================
-// Worker thread + global sink registry
+// Queued sink
 // ============================================================================
 
-struct Sink {
-    tx: Sender<Msg>,
-    join: Option<JoinHandle<()>>,
+/// The MPRIS transport the harness drives: connects on `init`, releases the
+/// bus name on `teardown`.
+struct Transport {
+    service_name: String,
+    bus: Option<Bus>,
 }
 
-enum Msg {
-    Event(Box<PlaybackEvent>),
-    Stop,
+/// A live session-bus registration.
+struct Bus {
+    conn: Connection,
+    state: Arc<Mutex<State>>,
+    iface: InterfaceRef<Player>,
+    last_props: HashMap<String, OwnedValue>,
 }
 
-fn sink_slot() -> &'static Mutex<Option<Sink>> {
-    static SLOT: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
-
-/// Push a PlaybackEvent into the running MPRIS sink. No-op if not started.
-/// Called by the event-sink closure registered in [`start`].
-pub(crate) fn deliver(ev: PlaybackEvent) {
-    if let Some(s) = sink_slot().lock().as_ref() {
-        let _ = s.tx.send(Msg::Event(Box::new(ev)));
+impl Transport {
+    fn new(service_suffix: &str) -> Self {
+        Transport {
+            service_name: format!("{BASE_SERVICE_NAME}{service_suffix}"),
+            bus: None,
+        }
     }
 }
 
-fn worker(rx: Receiver<Msg>, service_suffix: String) {
-    let service_name = format!("{}{}", BASE_SERVICE_NAME, service_suffix);
+impl QueuedSink for Transport {
+    fn init(&mut self) {
+        self.bus = connect(&self.service_name);
+    }
 
+    fn deliver(&mut self, ev: &PlaybackEvent) {
+        if let Some(bus) = &mut self.bus {
+            handle_event(ev, &bus.state, &bus.iface, &mut bus.last_props);
+        }
+    }
+
+    fn teardown(&mut self) {
+        if let Some(bus) = self.bus.take() {
+            let _ = bus.conn.release_name(self.service_name.as_str());
+        }
+    }
+}
+
+fn connect(service_name: &str) -> Option<Bus> {
     let conn = match Connection::session() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("mpris: session bus connect failed: {}", e);
-            return;
+            return None;
         }
     };
 
     if let Err(e) = conn.object_server().at(MPRIS_PATH, Root) {
         eprintln!("mpris: register root iface: {}", e);
-        return;
+        return None;
     }
 
     let state = Arc::new(Mutex::new(State::fresh()));
@@ -405,26 +352,44 @@ fn worker(rx: Receiver<Msg>, service_suffix: String) {
     };
     if let Err(e) = conn.object_server().at(MPRIS_PATH, player) {
         eprintln!("mpris: register player iface: {}", e);
-        return;
+        return None;
     }
 
-    if let Err(e) = conn.request_name(service_name.as_str()) {
+    let iface = match conn.object_server().interface::<_, Player>(MPRIS_PATH) {
+        Ok(iface) => iface,
+        Err(e) => {
+            eprintln!("mpris: resolve player iface: {e}");
+            return None;
+        }
+    };
+    let last_props = match player_properties(&iface) {
+        Ok(props) => props,
+        Err(e) => {
+            eprintln!("mpris: initial property snapshot: {e}");
+            return None;
+        }
+    };
+
+    if let Err(e) = conn.request_name(service_name) {
         eprintln!("mpris: request name {}: {}", service_name, e);
-        return;
+        return None;
     }
     eprintln!("mpris: registered as {}", service_name);
 
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            Msg::Stop => break,
-            Msg::Event(ev) => handle_event(*ev, &state, &conn),
-        }
-    }
-
-    let _ = conn.release_name(service_name.as_str());
+    Some(Bus {
+        conn,
+        state,
+        iface,
+        last_props,
+    })
 }
 
-fn handle_event(ev: PlaybackEvent, state: &Arc<Mutex<State>>, conn: &Connection) {
+fn handle_event(
+    ev: &PlaybackEvent,
+    state: &Arc<Mutex<State>>,
+    iface: &InterfaceRef<Player>,
+    last: &mut HashMap<String, OwnedValue>,
+) {
     let snap = ev.snapshot.clone();
 
     // last_snap_ tracks every snapshot so getPosition() reads the latest.
@@ -479,133 +444,145 @@ fn handle_event(ev: PlaybackEvent, state: &Arc<Mutex<State>>, conn: &Connection)
             PlaybackEventKind::DurationChanged => {}
             PlaybackEventKind::MediaTypeChanged
             | PlaybackEventKind::FullscreenChanged
-            | PlaybackEventKind::OsdDimsChanged
             | PlaybackEventKind::BufferedRangesChanged
             | PlaybackEventKind::DisplayHzChanged => {}
         }
     }
 
-    if do_recompute {
-        recompute_and_emit(state, conn);
+    if do_recompute && let Err(e) = emit_properties_changed(iface, last) {
+        eprintln!("mpris: emit PropertiesChanged: {e}");
     }
 
     if emit_seeked
-        && let Err(e) = conn.emit_signal(
-            None::<&str>,
-            MPRIS_PATH,
-            "org.mpris.MediaPlayer2.Player",
-            "Seeked",
-            &snap.position_us,
-        )
+        && let Err(e) = block_on(Player::seeked(iface.signal_emitter(), snap.position_us))
     {
-        eprintln!("mpris: emit Seeked: {}", e);
+        eprintln!("mpris: emit Seeked: {e}");
     }
 }
 
-fn recompute_and_emit(state: &Arc<Mutex<State>>, conn: &Connection) {
-    let (changed, new_view) = {
-        let mut s = state.lock();
-        let next = project_view(&s.snapshot, &s.content);
-        let names = diff_view(&s.view, &next);
-        s.view = next.clone();
-        (names, next)
-    };
-    if changed.is_empty() {
-        return;
-    }
-    emit_properties_changed(conn, &changed, &new_view);
+/// Every readable Player property, valued by the same getters that answer
+/// `org.freedesktop.DBus.Properties.Get`.
+fn player_properties(iface: &InterfaceRef<Player>) -> zbus::Result<HashMap<String, OwnedValue>> {
+    let emitter = iface.signal_emitter();
+    let conn = emitter.connection();
+    let props = block_on(
+        iface
+            .get()
+            .get_all(conn.object_server(), conn, None, emitter),
+    )?;
+    Ok(props)
 }
 
-/// Build the PropertiesChanged signal body and emit it directly. Mirrors
-/// the legacy `sd_bus_emit_properties_changed_strv` call but ships values
-/// in the changed dict rather than via the invalidated list, which is
-/// what zbus's auto-generated property-change helpers also do.
-fn emit_properties_changed(conn: &Connection, names: &[&str], view: &View) {
-    let mut changed: HashMap<&str, Value> = HashMap::new();
-    for name in names {
-        let v = match *name {
-            "PlaybackStatus" => Value::from(view.playback_status.to_string()),
-            "Rate" => Value::from(view.rate),
-            "Metadata" => {
-                let dict = metadata_to_dict(&view.metadata);
-                // HashMap<String, OwnedValue> -> a{sv} via Value::from
-                Value::from(dict)
-            }
-            "Volume" => Value::from(view.volume),
-            "CanGoNext" => Value::from(view.can_go_next),
-            "CanGoPrevious" => Value::from(view.can_go_previous),
-            "CanPlay" => Value::from(view.can_play),
-            "CanPause" => Value::from(view.can_pause),
-            "CanSeek" => Value::from(view.can_seek),
-            "CanControl" => Value::from(view.can_control),
-            _ => continue,
-        };
-        changed.insert(*name, v);
+/// Entries of `next` that are absent from `last` or hold a different value.
+fn changed_properties<'a>(
+    last: &HashMap<String, OwnedValue>,
+    next: &'a HashMap<String, OwnedValue>,
+) -> zbus::Result<HashMap<&'a str, Value<'a>>> {
+    let mut changed = HashMap::new();
+    for (name, value) in next {
+        if name == POLLED_PROPERTY || last.get(name) == Some(value) {
+            continue;
+        }
+        changed.insert(name.as_str(), value.try_clone()?.into());
     }
-    if changed.is_empty() {
-        return;
+    Ok(changed)
+}
+
+/// One PropertiesChanged carrying every property whose value moved, after
+/// which `last` becomes the new baseline. Emits nothing when nothing moved.
+fn emit_properties_changed(
+    iface: &InterfaceRef<Player>,
+    last: &mut HashMap<String, OwnedValue>,
+) -> zbus::Result<()> {
+    let next = player_properties(iface)?;
+    let changed = changed_properties(last, &next)?;
+    if !changed.is_empty() {
+        block_on(fdo::Properties::properties_changed(
+            iface.signal_emitter(),
+            Player::name(),
+            changed,
+            Cow::Borrowed(&[]),
+        ))?;
     }
-    let invalidated: Vec<&str> = Vec::new();
-    let Ok(iface_name) = InterfaceName::try_from("org.mpris.MediaPlayer2.Player") else {
-        return;
-    };
-    if let Err(e) = conn.emit_signal(
-        None::<&str>,
-        MPRIS_PATH,
-        "org.freedesktop.DBus.Properties",
-        "PropertiesChanged",
-        &(iface_name.as_str(), changed, invalidated),
-    ) {
-        eprintln!("mpris: emit PropertiesChanged: {}", e);
-    }
+    *last = next;
+    Ok(())
 }
 
 // ============================================================================
 // start / stop
 // ============================================================================
 
-/// Spawn the MPRIS sink thread. `service_suffix` is appended to the base
-/// service name (`org.mpris.MediaPlayer2.JellyfinDesktop<suffix>`).
+/// Run the MPRIS sink on the harness thread. `service_suffix` is appended to
+/// the base service name (`org.mpris.MediaPlayer2.JelliumDesktop<suffix>`).
 /// No-op if already running.
 pub(crate) fn start(service_suffix: &str) {
-    let mut slot = sink_slot().lock();
-    if slot.is_some() {
-        return;
-    }
     let suffix = service_suffix.to_owned();
-    let (tx, rx) = channel::<Msg>();
-    let join = match thread::Builder::new()
-        .name("mpris-sink".into())
-        .spawn(move || worker(rx, suffix))
-    {
-        Ok(join) => join,
-        Err(e) => {
-            eprintln!("mpris: spawn mpris-sink thread: {e}");
-            return;
-        }
-    };
-    *slot = Some(Sink {
-        tx,
-        join: Some(join),
-    });
-    drop(slot);
-
-    // Once, not a resettable flag: a second start() must not double-register.
-    static REGISTER: std::sync::Once = std::sync::Once::new();
-    REGISTER.call_once(|| {
-        jfn_playback::register_event_sink(Box::new(|ev: &PlaybackEvent| {
-            deliver(ev.clone());
-        }));
-    });
+    sink_core::run_sink("mpris-sink", move || Transport::new(&suffix));
 }
 
 pub(crate) fn stop() {
-    let mut slot = sink_slot().lock();
-    let Some(mut s) = slot.take() else {
-        return;
-    };
-    let _ = s.tx.send(Msg::Stop);
-    if let Some(h) = s.join.take() {
-        let _ = h.join();
+    sink_core::stop();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn props<'a>(
+        entries: impl IntoIterator<Item = (&'a str, Value<'a>)>,
+    ) -> zbus::Result<HashMap<String, OwnedValue>> {
+        let mut out = HashMap::new();
+        for (name, value) in entries {
+            out.insert(name.to_string(), OwnedValue::try_from(value)?);
+        }
+        Ok(out)
+    }
+
+    fn dict<'a>(
+        entries: impl IntoIterator<Item = (&'a str, Value<'a>)>,
+    ) -> zbus::Result<Value<'static>> {
+        Ok(Value::from(props(entries)?))
+    }
+
+    #[test]
+    fn position_is_never_reported() -> zbus::Result<()> {
+        let last = props([("Position", Value::from(0i64))])?;
+        let next = props([("Position", Value::from(5i64))])?;
+        assert!(changed_properties(&last, &next)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn equal_values_are_dropped() -> zbus::Result<()> {
+        let last = props([("Rate", Value::from(1.0f64))])?;
+        let next = props([("Rate", Value::from(1.0f64))])?;
+        assert!(changed_properties(&last, &next)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn new_keys_are_reported() -> zbus::Result<()> {
+        let last = HashMap::new();
+        let next = props([("CanPlay", Value::from(true))])?;
+        let changed = changed_properties(&last, &next)?;
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed.get("CanPlay"), Some(&Value::from(true)));
+        Ok(())
+    }
+
+    #[test]
+    fn dict_values_compare_by_content() -> zbus::Result<()> {
+        let a = dict([
+            ("xesam:title", Value::from("t")),
+            ("xesam:album", Value::from("a")),
+        ])?;
+        let b = dict([
+            ("xesam:album", Value::from("a")),
+            ("xesam:title", Value::from("t")),
+        ])?;
+        let last = props([("Metadata", a)])?;
+        let next = props([("Metadata", b)])?;
+        assert!(changed_properties(&last, &next)?.is_empty());
+        Ok(())
     }
 }

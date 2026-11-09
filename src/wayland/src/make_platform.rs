@@ -1,94 +1,81 @@
 //! Wayland backend impl of [`jfn_platform_abi::Platform`].
 //!
-//! Each method forwards to the existing Rust `wl_*` / `jfn_wl_*` helpers
-//! (mostly `crate::wl_ops` + `crate::wl_ffi`). The factory returns the
-//! concrete type; `jfn_app_main` boxes it as `Box<dyn Platform>` before
-//! handing it to `jfn_platform_abi::install`.
+//! This is the crate's ABI adapter: raw pointers, `c_int` dimensions, and
+//! opaque `SurfaceHandle`s from the Platform trait are converted here into
+//! the crate's domain types before reaching any internal module. The factory
+//! returns the concrete type; `jfn_app_main` boxes it as `Box<dyn Platform>`
+//! before handing it to `jfn_platform_abi::install`.
 
 #![allow(non_snake_case)]
-// Platform trait carries raw-pointer args (dmabuf info, accel-paint info)
-// from CEF; trait impls forward them unchanged to unsafe FFI fns.
+// The Platform trait carries raw pointers for non-paint entry points;
+// trait impls forward them unchanged to unsafe FFI fns.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-#[cfg(feature = "kde-palette")]
-use std::ffi::c_char;
 use std::ffi::{c_int, c_void};
-use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::wl_ops::{self, JfnDmabufFrame};
+use crate::paint_override::WlPaintOverride;
+use crate::runtime::WlRuntime;
+use crate::wl_ops;
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    BootGeometry, DisplayBackend, IdleInhibitLevel, JfnContextMenuRequest, JfnPopupRequest,
-    JfnRect, Platform, SurfaceHandle, SurfaceSize, WindowDecorations,
+    DisplayBackend, IdleInhibitLevel, JfnRect, OnText, PaintFrame, Platform, Presented, ResizeGate,
+    SurfaceHandle, SurfaceSize, TitlebarControls, Visibility, VisibilityCommit, WindowDecorations,
+    WindowOwner,
 };
-
-// =====================================================================
-// External symbols
-// =====================================================================
-
-#[cfg(feature = "kde-palette")]
-use crate::kde_palette::{jfn_wl_kde_palette_post_window_cleanup, jfn_wl_kde_palette_set_color};
-use crate::lifecycle::{jfn_wl_lifecycle_cleanup, jfn_wl_lifecycle_init};
-use crate::proxy::jfn_wl_get_cached_scale;
-use crate::scale_probe::jfn_wayland_scale_probe;
-
-// =====================================================================
-// Helpers
-// =====================================================================
-
-// Background color matches kBgColor (0x101010). Hard-coded here so the
-// surface_set_visible path doesn't need to carry the color.
-const BG_R: u8 = 0x10;
-const BG_G: u8 = 0x10;
-const BG_B: u8 = 0x10;
-
-pub(crate) unsafe fn to_dmabuf_frame(info: *const c_void) -> Option<JfnDmabufFrame> {
-    let info = info as *const cef::sys::_cef_accelerated_paint_info_t;
-    if info.is_null() {
-        return None;
-    }
-    let info = unsafe { &*info };
-    let plane0 = &info.planes[0];
-    let dup_fd = unsafe { libc::dup(plane0.fd) };
-    if dup_fd < 0 {
-        return None;
-    }
-    // OwnedFd closes the dup on drop once the frame is presented.
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup_fd) };
-    Some(JfnDmabufFrame {
-        fd,
-        stride: plane0.stride,
-        modifier: info.modifier,
-        coded_w: info.extra.coded_size.width,
-        coded_h: info.extra.coded_size.height,
-        visible_w: info.extra.visible_rect.width,
-        visible_h: info.extra.visible_rect.height,
-    })
-}
 
 // =====================================================================
 // Backend
 // =====================================================================
 
-pub struct WaylandPlatform {
-    shared_texture: AtomicBool,
-    clipboard: AtomicBool,
+/// The compositor-driven window controls the app-drawn titlebar reaches.
+pub struct WaylandTitlebar {
+    rt: &'static WlRuntime,
 }
 
-impl WaylandPlatform {
-    pub fn new() -> Self {
-        Self {
-            shared_texture: AtomicBool::new(true),
-            clipboard: AtomicBool::new(true),
-        }
+impl TitlebarControls for WaylandTitlebar {
+    fn minimize(&self) {
+        self.rt.root().set_minimized();
+    }
+
+    fn toggle_maximize(&self) {
+        self.rt.root().toggle_maximize();
+    }
+
+    fn start_move(&self) {
+        self.rt.root().start_move(self.rt.seat());
+    }
+
+    fn start_resize(&self, edge: c_int) {
+        self.rt.root().start_resize(self.rt.seat(), edge as u32);
     }
 }
 
-impl Default for WaylandPlatform {
-    fn default() -> Self {
-        Self::new()
+pub struct WaylandPlatform {
+    runtime: &'static WlRuntime,
+    mpv_host: crate::mpv_host::WaylandMpvHost,
+    window_source: crate::window_source::WaylandWindowSource,
+    titlebar: WaylandTitlebar,
+    shared_texture: AtomicBool,
+    primary: crate::selection::WlPrimary,
+}
+
+impl WaylandPlatform {
+    pub fn new(paint_request: Option<WlPaintOverride>) -> Self {
+        let runtime = WlRuntime::install(paint_request);
+        Self {
+            runtime,
+            mpv_host: crate::mpv_host::WaylandMpvHost::new(runtime),
+            window_source: crate::window_source::WaylandWindowSource::new(runtime),
+            titlebar: WaylandTitlebar { rt: runtime },
+            shared_texture: AtomicBool::new(true),
+            primary: crate::selection::WlPrimary { rt: runtime },
+        }
+    }
+
+    fn rt(&self) -> &'static WlRuntime {
+        self.runtime
     }
 }
 
@@ -97,85 +84,87 @@ impl Platform for WaylandPlatform {
         DisplayBackend::Wayland
     }
 
+    /// A preference among the available options only — availability itself is
+    /// protocol-derived in [`Self::window_decoration_options`].
     fn default_window_decorations(&self) -> WindowDecorations {
         jfn_linux_util::default_window_decorations()
     }
 
-    fn init(&self, _mpv: *mut c_void) -> bool {
-        jfn_wl_lifecycle_init()
+    fn window_decoration_options(&self) -> jfn_platform_abi::DecorationOptions {
+        jfn_platform_abi::DecorationOptions::with_server(
+            cfg!(feature = "kde-palette") && self.rt().decorations().kde_palette,
+        )
     }
 
-    fn cleanup(&self) {
-        jfn_wl_lifecycle_cleanup();
+    fn early_init(&self) {
+        self.rt().probe_decorations();
     }
 
-    fn post_window_cleanup(&self) {
-        crate::wlproxy_host::stop_wlproxy();
+    fn init(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+        _mpv: *mut c_void,
+    ) -> Result<(), jfn_platform_abi::PlatformInitError> {
+        crate::lifecycle::init(self.rt())
+    }
+
+    fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
+        crate::lifecycle::cleanup(self.rt());
+    }
+
+    fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
+        self.rt().proxy().stop();
         #[cfg(feature = "kde-palette")]
-        jfn_wl_kde_palette_post_window_cleanup();
+        crate::kde_palette::post_window_cleanup(self.rt());
     }
 
-    fn alloc_surface(&self) -> SurfaceHandle {
-        wl_ops::alloc_surface() as *mut c_void
+    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+        SurfaceHandle::from_ptr(wl_ops::alloc_surface(self.rt(), initial) as *mut c_void)
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
-        wl_ops::free_surface(s as *mut crate::wl_state::PlatformSurface);
+        wl_ops::free_surface(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+        );
     }
 
-    fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
-        let Some(frame) = (unsafe { to_dmabuf_frame(info) }) else {
-            return false;
-        };
-        wl_ops::surface_present(s as *mut crate::wl_state::PlatformSurface, &frame)
-    }
-
-    fn surface_present_software(
+    fn surface_present<'a>(
         &self,
         s: SurfaceHandle,
-        dirty: &[JfnRect],
-        buffer: *const c_void,
-        w: c_int,
-        h: c_int,
-    ) -> bool {
-        if buffer.is_null() || w <= 0 || h <= 0 {
-            return false;
-        }
-        let len = (w as usize)
-            .checked_mul(h as usize)
-            .and_then(|n| n.checked_mul(4));
-        let Some(len) = len else { return false };
-        let pixels = unsafe { std::slice::from_raw_parts(buffer as *const u8, len) };
-        wl_ops::surface_present_software(
-            s as *mut crate::wl_state::PlatformSurface,
-            dirty,
-            pixels,
-            w,
-            h,
+        frame: PaintFrame<'a>,
+    ) -> Result<Presented, PaintFrame<'a>> {
+        wl_ops::present(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+            frame,
         )
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
         wl_ops::surface_resize(
-            s as *mut crate::wl_state::PlatformSurface,
-            size.logical_w,
-            size.logical_h,
-            size.physical_w,
-            size.physical_h,
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+            size,
         );
     }
 
-    fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        wl_ops::surface_set_visible(
-            s as *mut crate::wl_state::PlatformSurface,
-            visible,
-            BG_R,
-            BG_G,
-            BG_B,
-        );
+    fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
+        wl_ops::window_target(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+        )
     }
 
-    fn restack(&self, ordered: &[SurfaceHandle]) {
+    fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
+        wl_ops::set_visibility(
+            self.rt(),
+            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
+            visibility,
+        )
+    }
+
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
         // SAFETY: a `&[SurfaceHandle]` (i.e. `&[*mut c_void]`) and a
         // `&[*mut PlatformSurface]` have identical layout; each handle was
         // minted by this backend's `alloc_surface`.
@@ -185,19 +174,18 @@ impl Platform for WaylandPlatform {
                 ordered.len(),
             )
         };
-        wl_ops::restack(typed);
+        wl_ops::restack(self.rt(), typed);
     }
 
-    fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {
-        crate::dropdown::backend()
-    }
-
-    fn context_menu_backend(&self) -> &'static dyn jfn_platform_abi::ContextMenuBackend {
-        crate::context_menu::backend()
+    fn menu_delivery(
+        &self,
+        _kind: jfn_platform_abi::MenuKind,
+    ) -> jfn_platform_abi::MenuDelivery<'_> {
+        jfn_platform_abi::MenuDelivery::Host(self.rt().menu_host())
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {
-        &crate::wlproxy_host::WlproxyMpvHost
+        &self.mpv_host
     }
 
     fn media_session(&self) -> &dyn jfn_platform_abi::MediaSink {
@@ -208,66 +196,76 @@ impl Platform for WaylandPlatform {
         jfn_linux_util::cef_paths()
     }
 
-    fn window_source(&self) -> Option<&'static dyn jfn_platform_abi::WindowSource> {
-        Some(&crate::window_source::WaylandWindowSource)
+    // the compositor creates nothing; the app owns the app window
+    fn window_owner(&self) -> WindowOwner<'_> {
+        WindowOwner::App(&self.window_source)
+    }
+
+    // the compositor's configure is the one authority for the window's size
+    fn resize_gate(&self) -> Option<&dyn ResizeGate> {
+        None
+    }
+
+    fn titlebar_controls(&self) -> Option<&dyn TitlebarControls> {
+        Some(&self.titlebar)
+    }
+
+    // the compositor places and sizes the window; nothing client-side
+    // constrains saved geometry
+    fn clamp_window_geometry(
+        &self,
+        g: jfn_platform_abi::WindowGeometry,
+    ) -> jfn_platform_abi::WindowGeometry {
+        g
+    }
+
+    // the Wayland event loop runs on its own thread; the app main thread has
+    // nothing to drain
+    fn pump(&self) {}
+
+    // platform init resolves shared-texture support, so CEF's bring-up cannot
+    // precede mpv's window here
+    fn cef_init_precedes_mpv_window(&self) -> bool {
+        false
     }
 
     fn set_fullscreen(&self, v: bool) {
-        crate::wl_ffi::jfn_wl_set_fullscreen(v);
+        self.rt().root().set_fullscreen(v);
     }
 
     fn toggle_fullscreen(&self) {
-        crate::wl_ffi::jfn_wl_toggle_fullscreen();
+        self.rt().root().toggle_fullscreen();
     }
 
-    fn window_minimize(&self) {
-        crate::wl_ffi::jfn_wl_window_minimize();
+    fn scale(&self) -> jfn_platform_abi::Scale {
+        self.rt().window().scale()
     }
 
-    fn window_toggle_maximize(&self) {
-        crate::wl_ffi::jfn_wl_window_toggle_maximize();
+    /// The output containing `at`, else the first usable output. When the
+    /// probe names no output this backend answers with the scale it reports
+    /// for its own window, logging the probe's error.
+    fn display_scale(&self, at: Option<jfn_platform_abi::WindowPos>) -> jfn_platform_abi::Scale {
+        let target = crate::scale_probe::ProbeTarget::at(at);
+        match crate::scale_probe::probe_scale(target) {
+            Ok(scale) => scale.scale(),
+            Err(err) => {
+                let scale = self.rt().window().scale();
+                tracing::warn!(
+                    target: "Main",
+                    "no usable output for {target:?} ({err}); Wayland reports {scale}"
+                );
+                scale
+            }
+        }
     }
 
-    fn window_start_move(&self) {
-        crate::wl_ffi::jfn_wl_window_start_move();
-    }
-
-    fn window_start_resize(&self, edge: c_int) {
-        crate::wl_ffi::jfn_wl_window_start_resize(edge);
-    }
-
-    fn begin_transition(&self) {
-        crate::wl_ffi::jfn_wl_begin_transition();
-    }
-
-    fn end_transition(&self) {
-        crate::wl_ffi::jfn_wl_end_transition();
-    }
-
-    fn in_transition(&self) -> bool {
-        crate::wl_ffi::jfn_wl_in_transition()
-    }
-
-    fn get_scale(&self) -> f32 {
-        jfn_wl_get_cached_scale()
-    }
-
-    fn effective_scale(&self, _mpv_display_hidpi_scale: f64) -> f32 {
-        self.get_scale()
-    }
-
-    fn get_display_scale(&self, x: c_int, y: c_int) -> f32 {
-        let s = jfn_wayland_scale_probe(x, y);
-        if s > 0.0 { s as f32 } else { 1.0 }
-    }
-
-    fn apply_boot_geometry(&self, g: &BootGeometry) {
-        jfn_wlproxy::jfn_wlproxy_set_initial_size(g.logical.w, g.logical.h);
-        jfn_wlproxy::jfn_wlproxy_set_initial_maximized(g.maximized);
+    // the compositor tells no client where its window is
+    fn query_window_position(&self) -> Option<jfn_platform_abi::WindowPos> {
+        None
     }
 
     fn set_cursor(&self, shape: CursorShape) {
-        crate::input_lifecycle::set_cursor_active(shape);
+        crate::input_lifecycle::set_cursor_active(self.rt(), shape);
     }
 
     fn set_idle_inhibit(&self, level: IdleInhibitLevel) {
@@ -279,7 +277,7 @@ impl Platform for WaylandPlatform {
         let g = ((rgb >> 8) & 0xFF) as u8;
         let b = (rgb & 0xFF) as u8;
 
-        jfn_wlproxy::jfn_wlproxy_set_background_color(r, g, b);
+        self.rt().root().set_background_color(r, g, b);
 
         #[cfg(feature = "kde-palette")]
         {
@@ -294,18 +292,18 @@ impl Platform for WaylandPlatform {
             hex[5] = hexdigit((b >> 4) & 0xF);
             hex[6] = hexdigit(b & 0xF);
             hex[7] = 0;
-            unsafe {
-                jfn_wl_kde_palette_set_color(r, g, b, hex.as_ptr() as *const c_char);
+            if let Ok(hex) = std::ffi::CStr::from_bytes_with_nul(&hex) {
+                crate::kde_palette::set_color(self.rt(), r, g, b, hex);
             }
         }
     }
 
     fn window_decorations_supported(&self) -> bool {
-        true
+        self.window_decoration_options().has_choice()
     }
 
-    fn theme_color_supported(&self) -> bool {
-        cfg!(feature = "kde-palette")
+    fn effective_decorations(&self) -> jfn_platform_abi::EffectiveDecorations {
+        self.rt().root().effective_decorations()
     }
 
     fn shared_texture_supported(&self) -> bool {
@@ -316,20 +314,30 @@ impl Platform for WaylandPlatform {
         self.shared_texture.store(false, Ordering::Release);
     }
 
-    fn clipboard_text_supported(&self) -> bool {
-        self.clipboard.load(Ordering::Acquire)
+    fn clipboard_read_text_async(&self, on_done: OnText) {
+        self.rt()
+            .selections()
+            .read_text_async(crate::selection::Kind::Clipboard, on_done);
     }
 
-    fn clear_clipboard_handler(&self) {
-        self.clipboard.store(false, Ordering::Release);
+    fn clipboard_write_text(&self, text: &str) {
+        self.rt()
+            .selections()
+            .write_text(crate::selection::Kind::Clipboard, text);
     }
 
-    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
-        if !self.clipboard.load(Ordering::Acquire) {
-            on_done("");
-            return;
-        }
-        crate::clipboard::clipboard_read_text_async(on_done);
+    fn primary_selection(&self) -> Option<&dyn jfn_platform_abi::PrimarySelection> {
+        self.rt()
+            .selections()
+            .primary_available()
+            .then_some(&self.primary as &dyn jfn_platform_abi::PrimarySelection)
+    }
+
+    /// jellyfin-web pastes by injection only where another client may read
+    /// this seat's clipboard without focus; elsewhere `frame.Paste()` is the
+    /// only path that reaches the page.
+    fn web_paste_reads_clipboard(&self) -> bool {
+        self.rt().selections().data_control_advertised()
     }
 
     fn open_external_url(&self, url: &str) {
@@ -343,6 +351,6 @@ impl Platform for WaylandPlatform {
 
 /// Build a boxed Wayland platform. Called from jfn_app_main on Linux when
 /// the selected backend is Wayland.
-pub fn make_wayland_platform() -> Box<dyn Platform> {
-    Box::new(WaylandPlatform::new())
+pub fn make_wayland_platform(paint_request: Option<WlPaintOverride>) -> Box<dyn Platform> {
+    Box::new(WaylandPlatform::new(paint_request))
 }

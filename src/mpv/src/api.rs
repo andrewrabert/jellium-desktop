@@ -541,18 +541,37 @@ pub unsafe fn jfn_mpv_set_geometry(g: *const c_char) {
     unsafe { set_str(c"geometry", g) };
 }
 
-/// Returns the parsed packed RGB color of mpv's `background-color`
-/// property (0x00RRGGBB), or 0 if the property is unavailable or
-/// malformed.
-pub fn jfn_mpv_get_background_color() -> u32 {
-    let p = unsafe { jfn_mpv_get_property_string(c"background-color".as_ptr()) };
-    if p.is_null() {
-        return 0;
+/// Reply id carried by the [`crate::Event::GetPropertyReply`] answering
+/// [`jfn_mpv_request_background_color`].
+pub const BACKGROUND_COLOR_REPLY: crate::event::ReplyUserdata = 1;
+
+/// Enqueues an async read of mpv's `background-color` on the core dispatch
+/// queue; never parks the caller on mpv's core lock. No-op without a live
+/// handle. The answer arrives as a `GetPropertyReply` tagged
+/// [`BACKGROUND_COLOR_REPLY`]; decode it with
+/// [`background_color_from_reply`].
+pub fn jfn_mpv_request_background_color() {
+    let h = raw();
+    if h.is_null() {
+        return;
     }
-    let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
-    let rgb = crate::color::parse(&s);
-    unsafe { jfn_mpv_free_string(p) };
-    rgb
+    unsafe {
+        sys::mpv_get_property_async(
+            h,
+            BACKGROUND_COLOR_REPLY,
+            c"background-color".as_ptr(),
+            sys::mpv_format::MPV_FORMAT_STRING,
+        )
+    };
+}
+
+/// Packed 0x00RRGGBB parsed from a [`BACKGROUND_COLOR_REPLY`] payload.
+/// `None` when the reply carried no string value.
+pub fn background_color_from_reply(value: &crate::PropertyValue) -> Option<u32> {
+    match value {
+        crate::PropertyValue::String(s) => Some(crate::color::parse(s)),
+        _ => None,
+    }
 }
 
 pub unsafe fn jfn_mpv_set_background_color_hex(hex: *const c_char) {

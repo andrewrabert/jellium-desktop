@@ -1,10 +1,14 @@
 use std::os::raw::c_int;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use jfn_platform_abi::cursor::CursorShape;
 
-use super::{Inner, platform_ops, tasks};
+use super::{Inner, tasks};
+use crate::platform_ops;
+
+/// CEF's `ERR_ABORTED`, taken from the generated bindings rather than its
+/// value.
+const ERR_ABORTED: c_int = cef::sys::cef_errorcode_t::ERR_ABORTED as c_int;
 
 impl Inner {
     pub(crate) fn on_fullscreen_mode_change(&self, fullscreen: bool) {
@@ -14,9 +18,7 @@ impl Inner {
     }
 
     pub(crate) fn emit_cursor(&self, shape: CursorShape) {
-        if let Some(handle) = self.cursor_handle() {
-            crate::browsers::route_cursor(handle, shape);
-        }
+        jfn_input::cursor::cursor_from_web(shape);
     }
 
     pub(crate) fn on_console_message(&self, level: c_int, msg: &str, src: &str, line: c_int) {
@@ -27,18 +29,20 @@ impl Inner {
         const LOGSEVERITY_DEFAULT: c_int = 0;
         let formatted = format!("{} ({}:{})", msg, src, line);
         let lvl = if level >= LOGSEVERITY_ERROR {
-            jfn_logging::LEVEL_ERROR
+            jfn_logging::Level::Error
         } else if level == LOGSEVERITY_WARNING {
-            jfn_logging::LEVEL_WARN
+            jfn_logging::Level::Warn
         } else if level == LOGSEVERITY_INFO || level == LOGSEVERITY_DEFAULT {
-            jfn_logging::LEVEL_INFO
+            jfn_logging::Level::Info
         } else {
             let _ = LOGSEVERITY_VERBOSE;
-            jfn_logging::LEVEL_DEBUG
+            jfn_logging::Level::Debug
         };
-        jfn_logging::log(jfn_logging::CATEGORY_JS, lvl, &formatted);
+        jfn_logging::log(jfn_logging::Category::Js, lvl, &formatted);
     }
 
+    /// Marks which navigation's document is now producing pixels; a frame of
+    /// that document still has to be presented before anything retires.
     pub(crate) fn on_load_end(&self, is_main: bool, code: c_int, url: &str) {
         let formatted = format!(
             "CefLayer::OnLoadEnd name={} main={} code={} url={}",
@@ -48,28 +52,21 @@ impl Inner {
             url,
         );
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_INFO,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Info,
             &formatted,
         );
         if is_main {
-            {
-                let _g = self.load_mtx.lock();
-                self.loaded.store(true, Ordering::Release);
-                self.load_cv.notify_all();
-            }
-            // A same-layer navigation (profile switch / login "Back to user
-            // selection") reloads the document without changing the active
-            // layer, so `jfn_browsers_set_active`'s refocus never runs and the
-            // reloaded page comes up unfocused on X11 OSR (no caret / no blue
-            // focus ring on the login inputs, though typing still works because
-            // the element is `document.activeElement`). Re-assert focus here,
-            // but only if we are the active top layer.
-            crate::browsers::jfn_browsers_refocus_if_active(self as *const Inner);
+            self.note_main_frame_loaded(url);
+            // A same-page reload (profile switch, add user, login "Back to
+            // user selection") brings the document back unfocused on X11 OSR:
+            // no caret or focus ring on the login inputs. Re-publish the
+            // router's focus belief so the reloaded page gets it again.
+            jfn_input::web_became_live();
         }
     }
 
-    pub(crate) fn on_load_error(&self, code: c_int, text: &str, url: &str) {
+    pub(crate) fn on_load_error(&self, is_main: bool, code: c_int, text: &str, url: &str) {
         let formatted = format!(
             "OnLoadError name={} url={} error={} {}",
             self.name_str(),
@@ -78,19 +75,17 @@ impl Inner {
             text,
         );
         jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_ERROR,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Error,
             &formatted,
         );
-    }
-
-    pub(crate) fn set_visible(&self, visible: bool) {
-        let surface = self.surface_ptr();
-        if surface.is_null() {
-            return;
-        }
-        if let Some(p) = platform_ops::ops() {
-            p.surface_set_visible(surface, visible);
+        // An aborted main-frame load is another navigation replacing this one,
+        // not a failure.
+        if is_main
+            && code != ERR_ABORTED
+            && let Some(navigation) = self.load_navigation(url)
+        {
+            self.report_web_event(crate::WebEvent::NavigationFailed(navigation));
         }
     }
 
@@ -98,15 +93,15 @@ impl Inner {
         let Some(p) = platform_ops::ops() else {
             return false;
         };
-        if !p.clipboard_text_supported() {
+        if !p.web_paste_reads_clipboard() {
             return false;
         }
         let inner = Arc::clone(self);
         p.clipboard_read_text_async(Box::new(move |text| {
-            if text.is_empty() {
+            let Some(text) = text.filter(|t| !t.is_empty()) else {
                 return;
-            }
-            tasks::post_paste_js(Arc::clone(&inner), text.to_string());
+            };
+            tasks::post_paste_js(Arc::clone(&inner), text.to_owned());
         }));
         true
     }

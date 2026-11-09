@@ -1,14 +1,13 @@
-use cef::{Browser, ImplListValue, ImplProcessMessage, ProcessMessage};
+use cef::{ImplListValue, ImplProcessMessage, ProcessMessage};
 use std::os::raw::c_int;
 use std::sync::Arc;
 
-use crate::app::userfree_to_string;
+use crate::cef_string::userfree_to_string;
 use crate::client::Inner;
 use crate::ipc::BrowserMessage;
 
 pub(super) fn on_process_message_received(
     inner: &Arc<Inner>,
-    browser: Option<&mut Browser>,
     message: Option<&mut ProcessMessage>,
 ) -> c_int {
     let Some(msg) = message else { return 0 };
@@ -43,25 +42,8 @@ pub(super) fn on_process_message_received(
             }
             1
         }
-        "menuItemSelected" => {
-            if let Some(cb) = inner.take_parked_menu_selection() {
-                cb(args.map_or(-1, |a| a.int(0)));
-            }
-            1
-        }
-        "menuDismissed" => {
-            if let Some(cb) = inner.take_parked_menu_selection() {
-                cb(-1);
-            }
-            1
-        }
-        n if crate::window_controls::is_window_message(n) => {
-            crate::window_controls::handle_window_op(n, args.as_ref(), browser);
-            1
-        }
         _ => {
-            let browser = browser.map(|b| b.clone());
-            let message = BrowserMessage::new(name, args, browser);
+            let message = BrowserMessage::new(name, args);
             if inner.invoke_message_handler(message) {
                 1
             } else {

@@ -7,6 +7,7 @@ use cef::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
+use crate::cef_string::userfree_to_string;
 use crate::embedded_js;
 use crate::injection::ExtraInfo;
 use crate::paint_scheduler::PaintScheduler;
@@ -23,6 +24,51 @@ const SCHEME_OPTION_CORS_ENABLED: i32 = 1 << 6;
 // V8 property attribute. Equivalent to V8_PROPERTY_ATTRIBUTE_READONLY.
 fn readonly_attr() -> V8Propertyattribute {
     V8Propertyattribute::from(sys::cef_v8_propertyattribute_t::V8_PROPERTY_ATTRIBUTE_READONLY)
+}
+
+// Baseline Chromium features disabled in every process (Google services,
+// telemetry, spell check). Merged with all other `disable-features`
+// contributors by `append_merged_features`.
+const DISABLED_FEATURES: &[&str] = &[
+    "PushMessaging",
+    "BackgroundSync",
+    "SafeBrowsing",
+    "Translate",
+    "OptimizationHints",
+    "MediaRouter",
+    "DialMediaRouteProvider",
+    "AcceptCHFrame",
+    "AutofillServerCommunication",
+    "CertificateTransparencyComponentUpdater",
+    "SyncNotificationServiceWhenSignedIn",
+    "SpellCheck",
+    "SpellCheckService",
+    "PasswordManager",
+    "ImmersiveReadAnything",
+];
+
+fn split_features(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+}
+
+// A feature-list switch is last-occurrence-wins in Chromium, so it must be
+// appended exactly once with every contributor's features merged in.
+fn append_merged_features(cl: &mut CommandLine, name: &str, mut features: Vec<String>) {
+    let key = CefString::from(name);
+    if cl.has_switch(Some(&key)) == 1 {
+        let existing = userfree_to_string(&cl.switch_value(Some(&key)));
+        features.extend(split_features(&existing));
+    }
+    let mut seen = std::collections::HashSet::new();
+    features.retain(|f| seen.insert(f.clone()));
+    cl.append_switch_with_value(
+        Some(&key),
+        Some(&CefString::from(features.join(",").as_str())),
+    );
 }
 
 // ----- App ------------------------------------------------------------------
@@ -80,13 +126,6 @@ wrap_app! {
             }
 
             for (name, value) in [
-                (
-                    "disable-features",
-                    "PushMessaging,BackgroundSync,SafeBrowsing,Translate,OptimizationHints,\
-                     MediaRouter,DialMediaRouteProvider,AcceptCHFrame,AutofillServerCommunication,\
-                     CertificateTransparencyComponentUpdater,SyncNotificationServiceWhenSignedIn,\
-                     SpellCheck,SpellCheckService,PasswordManager",
-                ),
                 ("google-api-key", ""),
                 ("google-default-client-id", ""),
                 ("google-default-client-secret", ""),
@@ -97,21 +136,36 @@ wrap_app! {
                 );
             }
 
+            // Chromium keeps only the last `disable-features` occurrence, so
+            // every contributor merges into one value appended exactly once:
+            // whatever is already on the command line (Chromium forwards the
+            // browser's set to subprocesses), the baseline below, and any
+            // pending switch.
+            let mut disable_features: Vec<String> = DISABLED_FEATURES
+                .iter()
+                .map(|f| (*f).to_string())
+                .collect();
+
             // Browser-process-only switches from CefRuntime::Set*().
             let is_browser_process = process_type
                 .map(|s| s.to_string().is_empty())
                 .unwrap_or(true);
             if is_browser_process {
                 for sw in state::snapshot_switches() {
-                    match sw.value {
-                        None => cl.append_switch(Some(&CefString::from(sw.name.as_str()))),
-                        Some(v) => cl.append_switch_with_value(
-                            Some(&CefString::from(sw.name.as_str())),
+                    match (sw.name.as_str(), sw.value) {
+                        ("disable-features", Some(v)) => {
+                            disable_features.extend(split_features(&v));
+                        }
+                        (name, None) => cl.append_switch(Some(&CefString::from(name))),
+                        (name, Some(v)) => cl.append_switch_with_value(
+                            Some(&CefString::from(name)),
                             Some(&CefString::from(v.as_str())),
                         ),
                     }
                 }
             }
+
+            append_merged_features(cl, "disable-features", disable_features);
         }
 
         fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
@@ -146,17 +200,13 @@ wrap_browser_process_handler! {
 
     impl BrowserProcessHandler {
         fn on_context_initialized(&self) {
-            jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_INFO, "CEF context initialized");
+            jfn_logging::log(jfn_logging::Category::Cef, jfn_logging::Level::Info, "CEF context initialized");
             crate::resource::register();
-            // Optional C-side callback (kept for any future C++ context-init
-            // hooks; currently unused now that scheme registration is in Rust).
-            if let Some(cb) = state::with_config(|c| c.on_context_initialized) {
-                cb();
-            }
         }
 
         fn on_schedule_message_pump_work(&self, delay_ms: i64) {
-            if let Some(host) = jfn_platform_abi::try_get().and_then(|p| p.cef_host()) {
+            if let Some(platform) = jfn_platform_abi::try_lease()
+                && let Some(host) = platform.cef_host() {
                 host.pump_schedule(delay_ms);
             }
         }
@@ -167,7 +217,7 @@ wrap_browser_process_handler! {
 //
 // Renderer-local map of browser identifier → injection profile passed through
 // extra_info at CreateBrowser time. Populated in on_browser_created, consumed
-// in on_context_created, erased in on_browser_destroyed.
+// in on_context_created, retained across renderer view teardown.
 
 #[derive(Default, Clone)]
 struct JfnRph {
@@ -192,21 +242,9 @@ wrap_render_process_handler! {
         }
 
         fn on_browser_destroyed(&self, _browser: Option<&mut Browser>) {
-            // Deliberately not removing the profile from `self.inner.profiles`
-            // here. CEF's RenderProcessHandler::OnBrowserDestroyed fires when
-            // the renderer-side view for a browser is torn down, which can
-            // happen on ordinary same-process navigations (observed on X11:
-            // repeated same-origin `location.href` reloads) without the
-            // logical CefBrowser ever actually closing. Removing the entry
-            // here left the next on_context_created for that same browser_id
-            // with no injection profile, silently skipping all script
-            // injection (native-shim.js, user-switch.js, etc.) — the cause of
-            // Settings menu items vanishing after a few profile switches.
-            //
-            // The map is keyed by browser_id and only ever grows by the
-            // handful of browsers this app creates per session (main,
-            // overlay, about, popups), so leaving stale entries in place is a
-            // bounded, negligible cost against a real correctness bug.
+            // Renderer view teardown can precede another context for the same
+            // logical browser during profile-switch navigation. Keep its injection
+            // metadata for the lifetime of this renderer process.
         }
 
         fn on_context_created(
@@ -570,38 +608,28 @@ fn run_user_scripts(profile: &ExtraInfo, frame: &Frame) {
         }
     }
     replace_first(&mut code, "__SERVER_URL__", &jfn_config::server_url());
-    replace_first(
-        &mut code,
-        "__SETTINGS_JSON__",
-        &jfn_config::cli_json(jfn_mpv::hwdec_options()),
-    );
+    replace_first(&mut code, "__SETTINGS_JSON__", &jfn_config::cli_json());
     replace_first(&mut code, "__APP_VERSION__", crate::APP_VERSION);
+    let decoration_options = profile
+        .window_decoration_options()
+        .iter()
+        .map(|wd| format!("'{}'", wd.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
     replace_first(
         &mut code,
-        "__THEME_COLOR_SUPPORTED__",
-        if profile.theme_color_supported() {
-            "true"
-        } else {
-            "false"
-        },
-    );
-    replace_first(
-        &mut code,
-        "__WINDOW_DECORATIONS_SUPPORTED__",
-        if profile.window_decorations_supported() {
-            "true"
-        } else {
-            "false"
-        },
+        "__WINDOW_DECORATION_OPTIONS__",
+        &format!("[{decoration_options}]"),
     );
 
     if let Some(dp) = profile.device_profile_json() {
         replace_first(&mut code, "__DEVICE_PROFILE_JSON__", dp);
     }
 
-    if let Some(wd) = profile.window_decorations() {
-        replace_first(&mut code, "__WINDOW_DECORATIONS__", wd);
-    }
+    let window_decorations = profile
+        .window_decorations()
+        .map_or_else(|| "null".to_string(), |wd| format!("'{wd}'"));
+    replace_first(&mut code, "__WINDOW_DECORATIONS__", &window_decorations);
 
     let url_uf = frame.url();
     let url = CefString::from(&url_uf);
@@ -617,19 +645,4 @@ fn ensure_renderer_settings_loaded() {
         jfn_config::settings_init(&path);
         let _ = jfn_config::settings_load();
     });
-}
-
-// ----- helpers --------------------------------------------------------------
-
-pub(crate) fn userfree_to_string(s: &CefStringUserfreeUtf16) -> String {
-    let raw: Option<&sys::_cef_string_utf16_t> = s.into();
-    raw.map(|r| {
-        if r.str_.is_null() || r.length == 0 {
-            String::new()
-        } else {
-            let slice = unsafe { std::slice::from_raw_parts(r.str_, r.length) };
-            String::from_utf16_lossy(slice)
-        }
-    })
-    .unwrap_or_default()
 }

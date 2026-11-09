@@ -13,6 +13,34 @@
     const PENDING_SWITCH_KEY = 'jfdPendingSwitch';
     const PENDING_SWITCH_TTL_MS = 15000;
 
+    // Every dimension in the picker is a multiple of this one unit, so the
+    // dialog is defined purely by proportion and carries no fixed pixel size.
+    //
+    // The old fixed 520px panel is fine on a laptop but tiny on a 4K TV across
+    // the room: when the display reports a 1.0 device scale factor CEF hands us
+    // the full pixel viewport, so anything sized in px shrinks to a sliver of
+    // the screen. vmin makes the picker a constant fraction of the screen at
+    // any resolution, and is correct on HiDPI too (there the CSS viewport is
+    // already divided by the scale factor, so it needs no special case).
+    //
+    // Both terms are references rather than tuned constants, and there is
+    // deliberately no upper bound — the picker keeps growing with the display:
+    //   1rem   - the document's own base font size, so the picker is never
+    //            smaller than the jellyfin-web UI it sits on top of.
+    //   vmin   - the smaller viewport axis, so it can't overflow on an
+    //            ultrawide or a short window.
+    const PICKER_UNIT = 'max(1rem, 1.6vmin)';
+    const PICKER_UNIT_VAR = '--jfd-picker-unit';
+
+    // Sizing helper: `u(3.3)` -> a length 3.3x the picker unit.
+    function u(n) {
+        return 'calc(var(' + PICKER_UNIT_VAR + ') * ' + n + ')';
+    }
+
+    // Row outlines are what separate profile entries, so they scale with
+    // everything else. The 1rem floor above keeps this at or above a hairline.
+    const PICKER_BORDER = u(0.07);
+
     // Class names that are structural to a menu-row icon span. Anything else on
     // a cloned icon span is the source row's glyph and must be stripped so our
     // icon shows instead of (e.g.) the "Sign Out" glyph.
@@ -318,11 +346,11 @@
         btn.style.cssText = [
             'display:flex',
             'align-items:center',
-            'gap:14px',
+            'gap:' + u(1),
             'width:100%',
-            'padding:14px',
-            'border:1px solid rgba(255,255,255,.18)',
-            'border-radius:8px',
+            'padding:' + u(1),
+            'border:' + PICKER_BORDER + ' solid rgba(255,255,255,.18)',
+            'border-radius:' + u(0.55),
             'background:rgba(255,255,255,.07)',
             'color:#fff',
             'text-align:left',
@@ -331,8 +359,8 @@
 
         const img = document.createElement('div');
         img.style.cssText = [
-            'width:48px',
-            'height:48px',
+            'width:' + u(3.3),
+            'height:' + u(3.3),
             'border-radius:50%',
             'background:#333',
             'background-size:cover',
@@ -347,12 +375,12 @@
         label.style.flex = '1';
         const name = document.createElement('div');
         name.textContent = profile.name || 'Unknown user';
-        name.style.cssText = 'font-size:1.05rem;font-weight:600';
+        name.style.cssText = 'font-size:' + u(1.15) + ';font-weight:600';
         label.appendChild(name);
         if (profile.serverName) {
             const server = document.createElement('div');
             server.textContent = profile.serverName;
-            server.style.cssText = 'font-size:.85rem;opacity:.72;margin-top:2px';
+            server.style.cssText = 'font-size:' + u(0.95) + ';opacity:.72;margin-top:' + u(0.15);
             label.appendChild(server);
         }
         btn.appendChild(label);
@@ -360,14 +388,14 @@
         if (profile.id === activeId) {
             const badge = document.createElement('div');
             badge.textContent = 'Current';
-            badge.style.cssText = 'font-size:.78rem;opacity:.75';
+            badge.style.cssText = 'font-size:' + u(0.87) + ';opacity:.75';
             btn.appendChild(badge);
         } else {
             const del = document.createElement('button');
             del.type = 'button';
             del.textContent = '×';
             del.title = 'Remove profile';
-            del.style.cssText = 'background:transparent;border:0;color:#fff;opacity:.5;cursor:pointer;font-size:1.4rem;padding:0 4px;line-height:1;flex:0 0 auto';
+            del.style.cssText = 'background:transparent;border:0;color:#fff;opacity:.5;cursor:pointer;font-size:' + u(1.55) + ';padding:0 ' + u(0.3) + ';line-height:1;flex:0 0 auto';
             del.addEventListener('click', (event) => {
                 event.stopPropagation();
                 deleteProfile(profile);
@@ -391,6 +419,8 @@
         const overlay = document.createElement('div');
         overlay.id = 'jfdUserSwitchOverlay';
         overlay.style.cssText = [
+            // Declared here so every descendant inherits it; see PICKER_UNIT.
+            PICKER_UNIT_VAR + ':' + PICKER_UNIT,
             'position:fixed',
             'inset:0',
             'z-index:2147483647',
@@ -398,7 +428,7 @@
             'align-items:center',
             'justify-content:center',
             'background:rgba(0,0,0,.72)',
-            'padding:24px',
+            'padding:' + u(1.7),
             'box-sizing:border-box',
             'visibility:visible',
             'opacity:1',
@@ -413,36 +443,36 @@
 
         const panel = document.createElement('div');
         panel.style.cssText = [
-            'width:min(520px,100%)',
-            'max-height:min(720px,100%)',
+            'width:min(' + u(36) + ',100%)',
+            'max-height:min(' + u(48) + ',100%)',
             'overflow:auto',
             'background:#101010',
-            'border:1px solid rgba(255,255,255,.16)',
-            'border-radius:8px',
-            'box-shadow:0 18px 60px rgba(0,0,0,.45)',
-            'padding:22px',
+            'border:' + PICKER_BORDER + ' solid rgba(255,255,255,.16)',
+            'border-radius:' + u(0.55),
+            'box-shadow:0 ' + u(1.25) + ' ' + u(4) + ' rgba(0,0,0,.45)',
+            'padding:' + u(1.5),
             'box-sizing:border-box',
             'color:#fff'
         ].join(';');
         overlay.appendChild(panel);
 
         const header = document.createElement('div');
-        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px';
+        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:' + u(1.1) + ';margin-bottom:' + u(1.25);
         const title = document.createElement('h2');
         title.textContent = "Who's watching?";
-        title.style.cssText = 'margin:0;font-size:1.35rem;font-weight:600';
+        title.style.cssText = 'margin:0;font-size:' + u(1.5) + ';font-weight:600';
         header.appendChild(title);
 
         const close = document.createElement('button');
         close.type = 'button';
         close.textContent = 'Close';
-        close.style.cssText = 'background:transparent;border:0;color:#fff;opacity:.8;cursor:pointer;font-size:.95rem';
+        close.style.cssText = 'background:transparent;border:0;color:#fff;opacity:.8;cursor:pointer;font-size:' + u(1.05);
         close.addEventListener('click', removePicker);
         header.appendChild(close);
         panel.appendChild(header);
 
         const list = document.createElement('div');
-        list.style.cssText = 'display:flex;flex-direction:column;gap:10px';
+        list.style.cssText = 'display:flex;flex-direction:column;gap:' + u(0.7);
         const activeId = currentUserId();
         for (const profile of profiles) {
             list.appendChild(buttonForProfile(profile, activeId));
@@ -452,7 +482,7 @@
         if (!profiles.length) {
             const empty = document.createElement('div');
             empty.textContent = 'No saved users yet.';
-            empty.style.cssText = 'padding:14px;border:1px solid rgba(255,255,255,.16);border-radius:8px;opacity:.78';
+            empty.style.cssText = 'padding:' + u(1) + ';border:' + PICKER_BORDER + ' solid rgba(255,255,255,.16);border-radius:' + u(0.55) + ';opacity:.78';
             panel.appendChild(empty);
         }
 
@@ -461,13 +491,13 @@
         add.textContent = 'Add user';
         add.style.cssText = [
             'width:100%',
-            'margin-top:14px',
-            'padding:13px 14px',
-            'border:1px solid rgba(255,255,255,.22)',
-            'border-radius:8px',
+            'margin-top:' + u(1),
+            'padding:' + u(0.9) + ' ' + u(1),
+            'border:' + PICKER_BORDER + ' solid rgba(255,255,255,.22)',
+            'border-radius:' + u(0.55),
             'background:transparent',
             'color:#fff',
-            'font-size:1rem',
+            'font-size:' + u(1.1),
             'cursor:pointer'
         ].join(';');
         add.addEventListener('click', addUser);

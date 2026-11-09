@@ -3,6 +3,9 @@
 [private]
 mod linux_common 'linux_common.just'
 
+scale := '1'
+prefer_csd := '1'
+
 # Build the app
 [group('build')]
 [linux]
@@ -13,13 +16,33 @@ build: linux_common::deps
 [group('run')]
 [linux]
 run *args: build
-    build/jellyfin-desktop {{args}}
+    build/jellium-desktop {{args}}
 
 # Run the mpv CLI
 [group('run')]
 [linux]
 run-mpv *args: build
     build/mpv-build/mpv {{args}}
+
+# Run the app inside a nested niri session (stdio stays on this terminal)
+[group('run')]
+[linux]
+[positional-arguments]
+run-niri *args:
+    env -u JUST_JUSTFILE -u JUST_WORKING_DIRECTORY '{{ source_directory() }}/niri-nested-run' --prefer-csd '{{ prefer_csd }}' just run "$@"
+
+# Run the app inside a nested Hyprland session (stdio stays on this terminal)
+[group('run')]
+[linux]
+[positional-arguments]
+run-hyprland *args:
+    env -u JUST_JUSTFILE -u JUST_WORKING_DIRECTORY '{{ source_directory() }}/hyprland-nested-run' --scale '{{ scale }}' just run "$@"
+
+# Run the app inside a cage kiosk session (stdio stays on this terminal)
+[group('run')]
+[linux]
+run-cage *args: build
+    cage -- build/jellium-desktop {{args}}
 
 [group('package')]
 mod appimage 'appimage/appimage.just'

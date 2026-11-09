@@ -1,22 +1,20 @@
-use super::{APP_DIR_NAME, env_or};
+use super::APP_DIR_NAME;
 use std::path::PathBuf;
 
 pub(super) const DEFAULT_LOG_TO_FILE: bool = true;
 
-fn local_appdata() -> String {
-    env_or("LOCALAPPDATA", &env_or("APPDATA", "C:"))
+fn local_appdata() -> PathBuf {
+    dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("C:"))
 }
 
 pub(super) fn config_base() -> PathBuf {
-    PathBuf::from(env_or("APPDATA", "C:"))
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from("C:"))
 }
 
 pub(super) fn cache_base() -> PathBuf {
-    PathBuf::from(local_appdata())
+    local_appdata()
 }
 
 pub(super) fn log_dir_path() -> PathBuf {
-    PathBuf::from(local_appdata())
-        .join(APP_DIR_NAME)
-        .join("Logs")
+    local_appdata().join(APP_DIR_NAME).join("Logs")
 }

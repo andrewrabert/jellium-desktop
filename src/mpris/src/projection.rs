@@ -7,9 +7,9 @@
 //!   - Rate locked to 0 while seeking|buffering|Starting
 //!
 //! Pass-through fields (volume, can_go_next, can_go_previous, metadata
-//! itself) are NOT computed here — they live in the sink's Content and
-//! copy straight into the view. The diff over those is trivial bool /
-//! double / struct equality and is handled by the caller.
+//! itself) are NOT computed here — they live in the sink's Content and are
+//! answered verbatim by the sink's property getters. Change detection runs
+//! over the emitted property values, not over these fields.
 
 use jfn_playback::PlaybackPhase;
 
@@ -60,15 +60,8 @@ fn status_for(phase: PlaybackPhase) -> MprisStatus {
     }
 }
 
-fn is_active(phase: PlaybackPhase) -> bool {
-    matches!(
-        phase,
-        PlaybackPhase::Playing | PlaybackPhase::Paused | PlaybackPhase::Starting
-    )
-}
-
 pub fn project(input: &ProjectInput) -> MprisDerived {
-    let active = is_active(input.phase);
+    let active = input.phase.is_active();
     // CanPause is true while committed to playing — Playing or Starting (user
     // already pressed play). Paused exposes Play, not Pause; Stopped exposes
     // neither.

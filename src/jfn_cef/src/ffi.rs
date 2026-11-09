@@ -23,13 +23,8 @@ use crate::state;
 //   argv it authored itself (`--type=renderer …` etc.). That argv is
 //   forwarded to `execute_process` so CEF can dispatch on `--type=`.
 //
-// Every Chromium switch jfn wants set is pushed by an explicit setter
-// (`jfn_cef_set_platform_switches`, `jfn_cef_set_disable_gpu_compositing`,
-// …) onto `state::pending_switches`, then drained into the browser's
-// `CefCommandLine` by `on_before_command_line_processing`. The setter
-// is the only mapping between jfn's CLI namespace and Chromium's switch
-// namespace. Name collisions are coincidence — the setter writes the
-// Chromium switch name in code, not by passthrough.
+// Initialization builds one immutable switch snapshot for App callbacks.
+// Chromium switch names are mapped explicitly, never passed through from CLI.
 //
 // CEF refcounts the App; constructing a fresh one in each FFI call is
 // safe because the underlying object outlives the local once CEF has
@@ -38,13 +33,7 @@ use crate::state;
 /// Subprocess dispatch + browser-process App construction.
 /// Returns -1 in the browser process (continue startup); returns the
 /// subprocess exit code otherwise.
-pub fn jfn_cef_start() -> c_int {
-    // Platform hook before the FIRST CEF API call (macOS loads the CEF
-    // framework here). `try_get`: Linux installs its platform after this
-    // runs, and CEF helper subprocesses never install one.
-    if let Some(host) = jfn_platform_abi::try_get().and_then(|p| p.cef_host()) {
-        host.before_start();
-    }
+pub(crate) fn jfn_cef_start(_runtime: &crate::LoadedCef) -> c_int {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = args::Args::new();
     let mut app = JfnAppBuilder::new(JfnApp::new());
@@ -55,27 +44,9 @@ pub fn jfn_cef_start() -> c_int {
     )
 }
 
-pub fn jfn_cef_set_log_severity(severity: c_int) {
-    state::with_config(|c| c.log_severity = severity);
-}
-
-pub fn jfn_cef_set_remote_debugging_port(port: c_int) {
-    state::with_config(|c| c.remote_debugging_port = port);
-}
-
-pub fn jfn_cef_set_disable_gpu_compositing(disable: bool) {
-    if disable {
-        state::with_config(|c| {
-            c.pending_switches.push(state::PendingSwitch {
-                name: "disable-gpu-compositing".to_string(),
-                value: None,
-            });
-        });
-    }
-}
-
-pub fn jfn_cef_set_platform_switches(backend: DisplayBackend) {
-    state::with_config(|c| match backend {
+fn platform_switches(backend: DisplayBackend) -> Vec<state::PendingSwitch> {
+    let mut c = state::Config::default();
+    match backend {
         DisplayBackend::Wayland => {
             c.pending_switches.push(state::PendingSwitch::with_value(
                 "ozone-platform",
@@ -100,20 +71,36 @@ pub fn jfn_cef_set_platform_switches(backend: DisplayBackend) {
             c.pending_switches
                 .push(state::PendingSwitch::with_value("password-store", "basic"));
         }
-        DisplayBackend::Windows => {}
-    });
+        DisplayBackend::Windows => {
+            c.pending_switches
+                .push(state::PendingSwitch::with_value("use-angle", "d3d11"));
+            // The LUID is a Windows-only concept; the arm itself compiles
+            // everywhere because `DisplayBackend` does.
+            #[cfg(windows)]
+            if let Some(luid) =
+                jfn_gpu_paint::surfaces().and_then(jfn_gpu_paint::Surfaces::adapter_luid)
+            {
+                c.pending_switches.push(state::PendingSwitch::with_value(
+                    "use-adapter-luid",
+                    &format!("{},{}", luid >> 32, luid as u32),
+                ));
+            }
+        }
+    };
+    c.pending_switches
 }
 
-/// Register the callback invoked from `BrowserProcessHandler::OnContextInitialized`.
-/// MUST be called before `jfn_cef_initialize`.
-pub fn jfn_cef_set_context_initialized_callback(cb: Option<extern "C" fn()>) {
-    state::with_config(|c| c.on_context_initialized = cb);
-}
-
-/// Builds CefSettings and calls `CefInitialize`. Returns true on success.
-pub fn jfn_cef_initialize() -> bool {
-    let cfg_severity = state::with_config(|c| c.log_severity);
-    let cfg_port = state::with_config(|c| c.remote_debugging_port);
+/// Builds CefSettings and calls `CefInitialize` once for the browser owner.
+pub(crate) fn jfn_cef_initialize(
+    _runtime: &crate::LoadedCef,
+    platform: &dyn jfn_platform_abi::Platform,
+    options: &crate::InitOptions,
+) -> Result<(), crate::InitError> {
+    let mut pending_switches = platform_switches(platform.display());
+    if options.disable_gpu_compositing {
+        pending_switches.push(state::PendingSwitch::flag("disable-gpu-compositing"));
+    }
+    state::configure(state::Config { pending_switches });
 
     // Settings.json singleton must be initialized before the renderer
     // process reads it during OnContextCreated.
@@ -124,24 +111,24 @@ pub fn jfn_cef_initialize() -> bool {
         no_sandbox: 1,
         windowless_rendering_enabled: 1,
         disable_signal_handlers: 1,
-        log_severity: log_severity_from_int(cfg_severity),
-        remote_debugging_port: cfg_port,
+        log_severity: options.log_severity.native(),
+        remote_debugging_port: options.remote_debugging_port.native(),
         locale: CefString::from("en-US"),
         user_agent: CefString::from(concat!(
-            "Mozilla/5.0 jellyfin-desktop/",
+            "Mozilla/5.0 jellium-desktop/",
             env!("JFN_APP_VERSION")
         )),
         root_cache_path: CefString::from(jfn_paths::cache_dir().to_string_lossy().as_ref()),
         ..Settings::default()
     };
-    let cef_host = jfn_platform_abi::try_get().and_then(|p| p.cef_host());
+    let cef_host = platform.cef_host();
     if cef_host.is_some() {
         settings.external_message_pump = 1;
     } else {
         settings.multi_threaded_message_loop = 1;
     }
 
-    fill_paths(&mut settings);
+    fill_paths(&mut settings, platform);
 
     // An external pump must install its run-loop hooks before
     // CefInitialize so the first OnScheduleMessagePumpWork (fired
@@ -157,8 +144,7 @@ pub fn jfn_cef_initialize() -> bool {
     let _sig_guard = jfn_platform_abi::SignalGuard::new();
 
     let mut app = JfnAppBuilder::new(JfnApp::new());
-    let full_argv =
-        jfn_platform_abi::try_get().is_some_and(|p| p.display().cef_full_browser_argv());
+    let full_argv = platform.display().cef_full_browser_argv();
     let main_args = if full_argv {
         args::Args::new().as_main_args().clone()
     } else {
@@ -174,12 +160,28 @@ pub fn jfn_cef_initialize() -> bool {
             args::Args::new().as_main_args().clone()
         }
     };
-    initialize(
+    let ok = initialize(
         Some(&main_args),
         Some(&settings),
         Some(&mut app),
         std::ptr::null_mut(),
-    ) == 1
+    ) == 1;
+    if !ok {
+        if let Some(host) = cef_host {
+            host.pump_shutdown();
+        }
+        crate::ready::stop();
+        return Err(crate::InitError::Native);
+    }
+    if crate::ready::post_cef_ready().is_err() {
+        if let Some(host) = cef_host {
+            host.pump_shutdown();
+        }
+        crate::ready::stop();
+        shutdown();
+        return Err(crate::InitError::Readiness);
+    }
+    Ok(())
 }
 
 // Construct Chromium's browser-process `MainArgs` as `[argv[0]]`. The
@@ -201,7 +203,7 @@ fn browser_main_args() -> MainArgs {
     let c = CLEAN.get_or_init(|| {
         let program = std::env::args()
             .next()
-            .unwrap_or_else(|| "jellyfin-desktop".to_string());
+            .unwrap_or_else(|| "jellium-desktop".to_string());
         let cstr = CString::new(program).unwrap_or_default();
         let cstr_ptr = cstr.as_ptr() as *mut c_char;
         // Keep the backing buffer alive for the process lifetime.
@@ -219,9 +221,9 @@ fn browser_main_args() -> MainArgs {
     }
 }
 
-pub fn jfn_cef_shutdown() {
+pub(crate) fn jfn_cef_shutdown(runtime: &crate::InitializedCef) {
     // Gate further external-pump dispatches before tearing down CEF state.
-    if let Some(host) = jfn_platform_abi::try_get().and_then(|p| p.cef_host()) {
+    if let Some(host) = runtime.platform().cef_host() {
         host.pump_shutdown();
     }
     shutdown();
@@ -229,17 +231,8 @@ pub fn jfn_cef_shutdown() {
 
 // ---- helpers ---------------------------------------------------------------
 
-fn log_severity_from_int(v: c_int) -> LogSeverity {
-    // cef_log_severity_t is a u32 C enum. Cast through the sys type so we
-    // don't depend on private repr details.
-    let raw: sys::cef_log_severity_t = unsafe { std::mem::transmute(v as u32) };
-    LogSeverity::from(raw)
-}
-
-fn fill_paths(settings: &mut Settings) {
-    let Some(paths) = jfn_platform_abi::try_get().map(|p| p.cef_paths()) else {
-        return;
-    };
+fn fill_paths(settings: &mut Settings, platform: &dyn jfn_platform_abi::Platform) {
+    let paths = platform.cef_paths();
     let set = |dst: &mut CefString, v: Option<std::path::PathBuf>| {
         if let Some(v) = v {
             *dst = CefString::from(v.to_string_lossy().as_ref());

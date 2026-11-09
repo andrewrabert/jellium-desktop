@@ -1,55 +1,40 @@
-use libc::{c_int, c_void};
+use std::ffi::c_int;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+
+use nix::sys::eventfd::{EfdFlags, EventFd};
 
 pub struct WakeEvent {
-    fd: c_int,
+    fd: EventFd,
 }
 
 impl WakeEvent {
     pub fn new() -> Option<Self> {
-        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if fd < 0 {
-            return None;
-        }
+        let fd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+            .ok()?;
         Some(WakeEvent { fd })
     }
 
     pub fn fd(&self) -> c_int {
-        self.fd
+        self.fd.as_raw_fd()
     }
 
     pub fn signal(&self) {
-        let val: u64 = 1;
-        unsafe {
-            libc::write(
-                self.fd,
-                &val as *const u64 as *const c_void,
-                core::mem::size_of::<u64>(),
-            );
-        }
+        crate::signal_raw_fd(self.fd.as_raw_fd());
     }
 
     pub fn drain(&self) {
-        let mut val: u64 = 0;
-        unsafe {
-            libc::read(
-                self.fd,
-                &mut val as *mut u64 as *mut c_void,
-                core::mem::size_of::<u64>(),
-            );
-        }
+        let _ = self.fd.read();
     }
 
     /// Block until signaled. Level-triggered, so a `signal()` that lands
     /// before the call returns immediately.
     pub fn wait(&self) {
-        crate::fd_wait::wait(self.fd);
+        crate::fd_wait::wait(self.fd.as_raw_fd());
     }
 }
 
-impl Drop for WakeEvent {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            unsafe { libc::close(self.fd) };
-        }
+impl AsFd for WakeEvent {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }

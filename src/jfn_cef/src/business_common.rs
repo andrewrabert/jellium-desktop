@@ -2,26 +2,9 @@
 //!
 //! Two groups, separated by the dividers below:
 //!   1. Generic CEF/Rust helpers — could lift into a `cef-rs-helpers` crate.
-//!   2. App-specific dispatch — Jellyfin-desktop config wiring.
+//!   2. App-specific dispatch — Jellium Desktop config wiring.
 
 use std::ffi::CString;
-
-/// Returns true if the supplied `MutexGuard`-bearing `Option` already holds
-/// a value — i.e. a singleton `init` is being called twice. Crashes loud in
-/// debug; logs + returns true in release so a programmer error never
-/// escalates. `caller` names the offending init for the log line.
-pub(crate) fn reject_double_init<T>(slot: &Option<T>, caller: &str) -> bool {
-    if slot.is_some() {
-        debug_assert!(false, "{caller} called twice");
-        jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_WARN,
-            &format!("{caller} called twice; ignoring"),
-        );
-        return true;
-    }
-    false
-}
 
 // --- generic Rust/C interop ------------------------------------------------
 
@@ -36,8 +19,8 @@ pub(crate) fn js_cstr_or_warn(label: &str, s: &str) -> Option<CString> {
         Ok(c) => Some(c),
         Err(_) => {
             jfn_logging::log(
-                jfn_logging::CATEGORY_CEF,
-                jfn_logging::LEVEL_WARN,
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Warn,
                 &format!("{label}: interior NUL in JS string; dropping IPC"),
             );
             None
@@ -50,22 +33,42 @@ pub(crate) fn js_cstr_or_warn(label: &str, s: &str) -> Option<CString> {
 /// `setSettingValue` IPC dispatch. Superset of the keys the overlay and the
 /// main web UI send today — both UIs share this single source of truth so
 /// new keys land in one place.
-pub(crate) fn apply_setting_value(_section: &str, key: &str, value: &str) {
+pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>) {
+    if key == "windowDecorations" {
+        jfn_config::set_window_decorations(value);
+        jfn_config::settings_save_async();
+        return;
+    }
+    let Some(value) = value else {
+        jfn_logging::log(
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Warn,
+            &format!("Null value for setting key: {_section}.{key}"),
+        );
+        return;
+    };
     match key {
-        "hwdec" => jfn_config::set_hwdec(value),
+        "hwdec" => match value.parse() {
+            Ok(hwdec) => jfn_config::set_hwdec(hwdec),
+            Err(e) => jfn_logging::log(
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Warn,
+                &format!("Ignoring setting {_section}.{key}: {e}"),
+            ),
+        },
         "audioPassthrough" => jfn_config::set_audio_passthrough(value),
         "audioExclusive" => jfn_config::set_audio_exclusive(value == "true"),
         "audioChannels" => jfn_config::set_audio_channels(value),
-        "windowDecorations" => jfn_config::set_window_decorations(value),
+        "transparentTitlebar" => jfn_config::set_transparent_titlebar(value == "true"),
         "hideScrollbar" => jfn_config::set_hide_scrollbar(value == "true"),
         "logLevel" => jfn_config::set_log_level(value),
         "forceTranscoding" => jfn_config::set_force_transcoding(value == "true"),
-        // Pass empty platform_default — Rust setter clears when raw equals
-        // the empty string. Neither caller has the live hostname handy here.
-        "deviceName" => jfn_config::set_device_name(value, ""),
+        "deviceName" => {
+            jfn_config::set_device_name(value, &jfn_config::default_device_name());
+        }
         _ => jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_WARN,
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Warn,
             &format!("Unknown setting key: {_section}.{key}"),
         ),
     }

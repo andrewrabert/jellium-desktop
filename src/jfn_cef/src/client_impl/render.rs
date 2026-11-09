@@ -1,5 +1,5 @@
 use cef::*;
-use std::os::raw::{c_int, c_void};
+use std::os::raw::c_int;
 use std::sync::Arc;
 
 use crate::client::Inner;
@@ -25,8 +25,10 @@ wrap_render_handler! {
             screen_info: Option<&mut ScreenInfo>,
         ) -> c_int {
             let Some(si) = screen_info else { return 0 };
-            let (scale, w, h) = self.inner.screen_info_values();
-            si.device_scale_factor = scale;
+            let Some((scale, w, h)) = self.inner.screen_info_values() else {
+                return 0;
+            };
+            si.device_scale_factor = scale.as_f32();
             si.rect = Rect { x: 0, y: 0, width: w, height: h };
             si.available_rect = si.rect.clone();
             1
@@ -60,14 +62,7 @@ wrap_render_handler! {
                         .collect()
                 })
                 .unwrap_or_default();
-            self.inner.on_paint(
-                is_popup,
-                if rects.is_empty() { std::ptr::null() } else { rects.as_ptr() },
-                rects.len(),
-                buffer as *const c_void,
-                width,
-                height,
-            );
+            self.inner.on_paint(is_popup, &rects, buffer, width, height);
         }
         fn on_accelerated_paint(
             &self,
@@ -83,10 +78,7 @@ wrap_render_handler! {
                 _ => return,
             };
             let Some(info) = info else { return };
-            // Convert back to the C-layout struct so the platform vtable can
-            // cast `const void*` to `CefAcceleratedPaintInfo*`.
-            let raw: sys::_cef_accelerated_paint_info_t = info.clone().into();
-            self.inner.on_accelerated_paint(is_popup, &raw as *const _ as *const c_void);
+            self.inner.on_accelerated_paint(is_popup, info);
         }
     }
 }

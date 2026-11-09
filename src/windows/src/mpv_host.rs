@@ -1,23 +1,19 @@
 //! Windows [`MpvHost`]: pre-create environment only.
 
-use std::ffi::c_char;
-
 use jfn_platform_abi::{MpvHost, WindowDecorations};
 
-pub struct WindowsMpvHost;
+pub(crate) struct WindowsMpvHost;
 
 impl MpvHost for WindowsMpvHost {
-    fn prepare(&self, _decorations: WindowDecorations) {
-        // Tell mpv to load the window icon from our exe resources. Set via
-        // _putenv_s — mpv reads it through the CRT's getenv, which
-        // SetEnvironmentVariableW (std::env::set_var) does not update.
-        unsafe extern "C" {
-            fn _putenv_s(name: *const c_char, value: *const c_char) -> i32;
-        }
-        let key = c"MPV_WINDOW_ICON";
-        let val = c"IDI_ICON1";
+    fn prepare(&self, _configured: Option<WindowDecorations>) {
         unsafe {
-            _putenv_s(key.as_ptr(), val.as_ptr());
+            std::env::set_var("MPV_WINDOW_ICON", "IDI_ICON1");
         }
+    }
+
+    /// Windows publishes no exact logical size; mpv's `osd-dimensions` is the
+    /// authority here.
+    fn logical_content_size(&self) -> Option<jfn_platform_abi::LogicalSize> {
+        None
     }
 }
