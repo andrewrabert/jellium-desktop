@@ -40,6 +40,7 @@ struct WinState {
     restore_maximized_on_unfullscreen: bool,
     wndproc_hook_raw: usize,
     input_thread: Option<JoinHandle<()>>,
+    initialized: bool,
 }
 
 impl WinState {
@@ -50,6 +51,7 @@ impl WinState {
             restore_maximized_on_unfullscreen: false,
             wndproc_hook_raw: 0,
             input_thread: None,
+            initialized: false,
         }
     }
 }
@@ -234,11 +236,53 @@ pub(crate) fn win_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::Platfo
     STATE.lock().input_thread = Some(join);
 
     crate::window::republish();
+    STATE.lock().initialized = true;
     tracing::info!("Windows DirectComposition compositor initialized");
     Ok(())
 }
 
+/// mpv replaced its VO window (a `d3d11-flip` change recreates it). Called on
+/// the mpv ingest worker, never from a window-message callback. Keeps the
+/// composition tree and surfaces alive and rebinds everything attached to the
+/// old HWND: the WndProc hook, the composition target, the input child window
+/// and the media session.
+pub(crate) fn win_on_window_handle_changed(id: i64) {
+    if id <= 0 || jfn_playback::shutdown::jfn_shutting_down() {
+        return;
+    }
+    let raw = id as usize;
+    let old_hook = {
+        let mut state = STATE.lock();
+        if !state.initialized || state.mpv_hwnd_raw == raw {
+            return;
+        }
+        tracing::info!(
+            "mpv VO window replaced: {:#x} -> {raw:#x}",
+            state.mpv_hwnd_raw
+        );
+        state.mpv_hwnd_raw = raw;
+        std::mem::take(&mut state.wndproc_hook_raw)
+    };
+    let hwnd = hwnd_from_raw(raw);
+    if old_hook != 0 {
+        let _ = unsafe { UnhookWindowsHookEx(HHOOK(old_hook as *mut c_void)) };
+    }
+    let tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    match unsafe { SetWindowsHookExW(WH_CALLWNDPROCRET, Some(mpv_wndproc_hook), None, tid) } {
+        Ok(hook) => STATE.lock().wndproc_hook_raw = hook.0 as usize,
+        Err(error) => tracing::error!("VO window hook rebind failed: {error}"),
+    }
+    if let Err(error) = crate::render::rebind(hwnd) {
+        tracing::error!("VO composition target rebind failed: {error}");
+    }
+    crate::input::jfn_input_windows_recreate(raw);
+    jfn_windows_sink::jfn_windows_sink_stop();
+    jfn_windows_sink::jfn_windows_sink_start_for(raw as isize);
+    crate::window::republish();
+}
+
 pub(crate) fn win_cleanup() {
+    STATE.lock().initialized = false;
     jfn_input_windows_stop_input_thread();
     let join = STATE.lock().input_thread.take();
     if let Some(j) = join {

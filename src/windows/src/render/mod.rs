@@ -167,6 +167,15 @@ pub(crate) fn init(hwnd: HWND) -> Result<(), jfn_platform_abi::PlatformInitError
     Ok(())
 }
 
+/// Point the composition target at a replacement mpv VO window. The visual
+/// tree and surfaces are kept; only the HWND target is recreated.
+pub(crate) fn rebind(hwnd: HWND) -> windows_core::Result<()> {
+    if let Some(devices) = STATE.lock().devices.as_mut() {
+        devices.rebind(hwnd)?;
+    }
+    Ok(())
+}
+
 /// Drop every remaining surface, then the devices. Runs after the WndProc
 /// hook is unhooked and the input thread is joined.
 pub(crate) fn cleanup() {

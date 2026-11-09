@@ -325,6 +325,10 @@ impl Platform for WindowsPlatform {
         }
     }
 
+    fn on_window_handle_changed(&self, id: i64) {
+        crate::platform::win_on_window_handle_changed(id);
+    }
+
     fn set_fullscreen(&self, v: bool) {
         win_set_fullscreen(v);
     }
