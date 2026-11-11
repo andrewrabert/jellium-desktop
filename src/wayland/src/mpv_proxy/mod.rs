@@ -37,6 +37,9 @@ use self::app::{AppStartup, run_app_state};
 
 pub struct Proxy {
     display_name: CString,
+    /// The original `WAYLAND_DISPLAY` value before any override.
+    /// We need this if we want to interact with the upstream compositor directly.
+    upstream_display_name: Option<String>,
     _app_thread: thread::JoinHandle<()>,
 }
 
@@ -141,6 +144,11 @@ impl ProxyShared {
         self.proxy.get().ok_or(())
     }
 
+    /// Returns the original `WAYLAND_DISPLAY` value before any override, if available.
+    pub(crate) fn upstream_display_name(&self) -> Option<&str> {
+        self.proxy.get()?.upstream_display_name.as_deref()
+    }
+
     pub(crate) fn stop(&self) {
         if let Some(proxy) = self.proxy.get() {
             proxy.stop();
@@ -160,11 +168,12 @@ pub fn start(rt: &'static WlRuntime) -> Option<Proxy> {
     // Capture upstream BEFORE the caller overrides WAYLAND_DISPLAY, so S_app
     // connects to the real compositor rather than our own socket.
     let upstream = std::env::var("WAYLAND_DISPLAY").ok();
+    let upstream_for_thread = upstream.clone();
 
     let (tx_app, rx_app) = crossbeam_channel::bounded::<Result<AppStartup, String>>(1);
     let app_thread = match thread::Builder::new()
         .name("proxy-app".into())
-        .spawn(move || run_app_state(rt, tx_app, upstream))
+        .spawn(move || run_app_state(rt, tx_app, upstream_for_thread))
     {
         Ok(h) => h,
         Err(e) => {
@@ -188,6 +197,7 @@ pub fn start(rt: &'static WlRuntime) -> Option<Proxy> {
         .store(startup.app_fd.into_raw_fd(), Ordering::Release);
     Some(Proxy {
         display_name: startup.display_name,
+        upstream_display_name: upstream,
         _app_thread: app_thread,
     })
 }
