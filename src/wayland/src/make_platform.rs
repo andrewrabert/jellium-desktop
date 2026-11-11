@@ -341,11 +341,17 @@ impl Platform for WaylandPlatform {
     }
 
     fn open_external_url(&self, url: &str) {
-        jfn_linux_util::open_url::open(url);
+        jfn_linux_util::open_url::open_with_wayland_display(
+            url,
+            self.rt().proxy().upstream_display_name(),
+        );
     }
 
     fn open_path(&self, path: &std::path::Path) {
-        jfn_linux_util::open_url::open(&path.to_string_lossy());
+        jfn_linux_util::open_url::open_with_wayland_display(
+            &path.to_string_lossy(),
+            self.rt().proxy().upstream_display_name(),
+        );
     }
 }
 
