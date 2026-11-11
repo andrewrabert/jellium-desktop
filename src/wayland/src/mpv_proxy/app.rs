@@ -28,7 +28,7 @@ use wl_proxy::protocols::wayland::wl_touch::WlTouch;
 use wl_proxy::protocols::xdg_shell::xdg_surface::{XdgSurface, XdgSurfaceHandler};
 use wl_proxy::protocols::xdg_shell::xdg_toplevel::XdgToplevel;
 use wl_proxy::protocols::xdg_shell::xdg_wm_base::{XdgWmBase, XdgWmBaseHandler};
-use wl_proxy::state::State;
+use wl_proxy::state::{RemoteDestructor, State};
 
 use crate::runtime::WlRuntime;
 
@@ -38,6 +38,7 @@ use super::{FracScaleMgrH, NoopClient, log_send};
 pub(super) struct AppStartup {
     pub(super) app_fd: OwnedFd,
     pub(super) display_name: CString,
+    pub(super) shutdown: RemoteDestructor,
 }
 
 struct AppShell {
@@ -139,8 +140,8 @@ impl AppMpv {
 
 impl Drop for AppMpv {
     fn drop(&mut self) {
-        // The worker exits only once its end of the bridge sees EOF, so every
-        // reference to the mpv client has to go before the join below.
+        // Release the bridge references, then explicitly stop and join the
+        // worker. Shutdown must also work when initialization was incomplete.
         let (shell_client, subsurface) = self
             .ctx
             .with_shell(|sh| (sh.mpv_client.take(), sh.mpv_subsurface.take()));
@@ -169,6 +170,15 @@ pub(super) fn run_app_state(
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(Err(format!("S_app build: {}", Report::new(e))));
+            return;
+        }
+    };
+    // State contains reference cycles; releasing the Rc alone does not close it.
+    let _destroy = state.create_destructor();
+    let shutdown = match state.create_remote_destructor() {
+        Ok(shutdown) => shutdown,
+        Err(e) => {
+            let _ = tx.send(Err(format!("S_app shutdown: {}", Report::new(e))));
             return;
         }
     };
@@ -217,6 +227,7 @@ pub(super) fn run_app_state(
         .send(Ok(AppStartup {
             app_fd,
             display_name,
+            shutdown,
         }))
         .is_err()
     {

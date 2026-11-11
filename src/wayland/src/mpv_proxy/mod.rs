@@ -11,6 +11,7 @@
 
 mod app;
 mod mpv;
+mod socket;
 
 use std::ffi::{CStr, CString};
 use std::os::fd::IntoRawFd;
@@ -29,6 +30,7 @@ use wl_proxy::protocols::fractional_scale_v1::wp_fractional_scale_v1::{
     WpFractionalScaleV1, WpFractionalScaleV1Handler,
 };
 use wl_proxy::protocols::wayland::wl_surface::WlSurface;
+use wl_proxy::state::RemoteDestructor;
 
 use crate::runtime::WlRuntime;
 use crate::window_state::WindowSize;
@@ -37,17 +39,30 @@ use self::app::{AppStartup, run_app_state};
 
 pub struct Proxy {
     display_name: CString,
-    _app_thread: thread::JoinHandle<()>,
+    worker: Mutex<Option<(RemoteDestructor, thread::JoinHandle<()>)>>,
 }
 
 impl Proxy {
-    /// The `WAYLAND_DISPLAY` value clients should connect to (e.g. "wayland-1").
+    /// The absolute socket path clients should connect to.
     pub(crate) fn display_name(&self) -> &CStr {
         &self.display_name
     }
 
-    /// The listener threads are detached; the OS cleans up on process exit.
-    fn stop(&self) {}
+    fn stop(&self) {
+        // Serialize stop calls through completion, including a failed publication.
+        if let Some((shutdown, thread)) = self.worker.lock().take() {
+            drop(shutdown);
+            if thread.join().is_err() {
+                tracing::error!(target: "MpvProxy", "app proxy thread panicked during shutdown");
+            }
+        }
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// The authoritative window size and the generation it was published at, in
@@ -142,6 +157,8 @@ impl ProxyShared {
     }
 
     pub(crate) fn stop(&self) {
+        // Initialization may have failed before app_display consumed this fd.
+        drop(self.take_app_client_fd());
         if let Some(proxy) = self.proxy.get() {
             proxy.stop();
         }
@@ -176,10 +193,12 @@ pub fn start(rt: &'static WlRuntime) -> Option<Proxy> {
         Ok(Ok(startup)) => startup,
         Ok(Err(msg)) => {
             eprintln!("proxy: {msg}");
+            let _ = app_thread.join();
             return None;
         }
         Err(_) => {
             eprintln!("proxy: app thread exited before publishing startup state");
+            let _ = app_thread.join();
             return None;
         }
     };
@@ -188,7 +207,7 @@ pub fn start(rt: &'static WlRuntime) -> Option<Proxy> {
         .store(startup.app_fd.into_raw_fd(), Ordering::Release);
     Some(Proxy {
         display_name: startup.display_name,
-        _app_thread: app_thread,
+        worker: Mutex::new(Some((startup.shutdown, app_thread))),
     })
 }
 
