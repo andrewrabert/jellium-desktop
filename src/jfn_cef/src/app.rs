@@ -217,7 +217,7 @@ wrap_browser_process_handler! {
 //
 // Renderer-local map of browser identifier → injection profile passed through
 // extra_info at CreateBrowser time. Populated in on_browser_created, consumed
-// in on_context_created, erased in on_browser_destroyed.
+// in on_context_created, retained across renderer view teardown.
 
 #[derive(Default, Clone)]
 struct JfnRph {
@@ -241,10 +241,10 @@ wrap_render_process_handler! {
                 .insert(id, ExtraInfo::from_dictionary(extra.clone()));
         }
 
-        fn on_browser_destroyed(&self, browser: Option<&mut Browser>) {
-            let Some(browser) = browser else { return };
-            let id = browser.identifier();
-            self.inner.profiles.lock().remove(&id);
+        fn on_browser_destroyed(&self, _browser: Option<&mut Browser>) {
+            // Renderer view teardown can precede another context for the same
+            // logical browser during profile-switch navigation. Keep its injection
+            // metadata for the lifetime of this renderer process.
         }
 
         fn on_context_created(

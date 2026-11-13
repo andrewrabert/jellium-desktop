@@ -58,6 +58,11 @@ impl Inner {
         );
         if is_main {
             self.note_main_frame_loaded(url);
+            // A same-page reload (profile switch, add user, login "Back to
+            // user selection") brings the document back unfocused on X11 OSR:
+            // no caret or focus ring on the login inputs. Re-publish the
+            // router's focus belief so the reloaded page gets it again.
+            jfn_input::web_became_live();
         }
     }
 
