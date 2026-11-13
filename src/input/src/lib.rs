@@ -15,6 +15,7 @@ pub mod route;
 pub mod scroll;
 pub mod sink;
 pub mod text;
+pub mod touch;
 
 pub use route::{ShellHit, ShellState, Target};
 pub use sink::{
@@ -22,6 +23,7 @@ pub use sink::{
     install_shell, install_web, on_shell_state_scoped, publish_field_edit, publish_shell_state,
     shell_state, web_became_live,
 };
+pub use touch::{Contact, PointerKind, TouchPhase, TouchPoint, WebTouch};
 
 use route::{is_text, route_key, route_pointer, to_web_point};
 use sink::{with_shell, with_web};
@@ -151,6 +153,62 @@ fn dispatch_scroll(x: i32, y: i32, dx: i32, dy: i32, mods: u32) {
             with_web(|b| b.send_mouse_wheel(w.x, w.y, mods, dx, dy));
         }
         _ => {}
+    }
+}
+
+static TOUCHES: parking_lot::Mutex<touch::Touches> = parking_lot::Mutex::new(touch::Touches::new());
+
+/// One event of a touch point; a release or cancel carries the point's last
+/// position. Each point is routed on its press by [`route::hit`] and stays with
+/// that owner: jellyfin-web takes the point as a touch or pen event, the shell
+/// overlay as its left button, and a press on the titlebar's drag region or a
+/// resize grip starts that window gesture.
+pub fn jfn_input_dispatch_touch(point: TouchPoint, phase: TouchPhase, mods: u32) {
+    let p = LogicalPoint {
+        x: point.x as i32,
+        y: point.y as i32,
+    };
+    let state = sink::shell_state();
+    let delivery = TOUCHES.lock().route(
+        point.contact,
+        phase,
+        state.map(|state| route::hit(state, p)),
+    );
+    match delivery {
+        touch::Delivery::Web(phase, id) => {
+            let Some(state) = state else {
+                return;
+            };
+            let touch = WebTouch {
+                id,
+                x: point.x as f32,
+                y: (point.y - f64::from(state.reserved_strip)) as f32,
+                pressure: point.pressure,
+                kind: point.kind,
+                phase,
+                modifiers: mods,
+            };
+            with_web(|b| b.send_touch_event(touch));
+        }
+        touch::Delivery::ShellButton(phase) => with_shell(|s| match phase {
+            TouchPhase::Pressed => {
+                s.send_mouse_move(p, mods, false);
+                s.send_mouse_click(p, mods, MBT_LEFT, false, 1);
+            }
+            TouchPhase::Moved => s.send_mouse_move(p, mods, false),
+            // No cursor stays behind a lifted finger to hover anything.
+            TouchPhase::Released => {
+                s.send_mouse_click(p, mods, MBT_LEFT, true, 1);
+                s.send_mouse_move(p, mods, true);
+            }
+            // Released outside the window, so the press activates nothing.
+            TouchPhase::Cancelled => {
+                s.send_mouse_click(LogicalPoint { x: -1, y: -1 }, mods, MBT_LEFT, true, 1);
+                s.send_mouse_move(p, mods, true);
+            }
+        }),
+        touch::Delivery::WindowGesture(hit) => with_shell(|s| s.window_gesture(hit)),
+        touch::Delivery::Drop => {}
     }
 }
 

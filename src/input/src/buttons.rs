@@ -10,3 +10,7 @@ pub const BTN_SIDE: u32 = 0x113;
 pub const BTN_EXTRA: u32 = 0x114;
 pub const BTN_FORWARD: u32 = 0x115;
 pub const BTN_BACK: u32 = 0x116;
+/// A stylus's first and second barrel buttons; which is which physically
+/// depends on the pen.
+pub const BTN_STYLUS: u32 = 0x14b;
+pub const BTN_STYLUS2: u32 = 0x14c;

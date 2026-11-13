@@ -13,7 +13,9 @@ use error_reporter::Report;
 use wl_proxy::baseline::Baseline;
 use wl_proxy::client::Client;
 use wl_proxy::object::{ConcreteObject, Object, ObjectCoreApi, ObjectRcUtils};
+use wl_proxy::protocols::ObjectInterface;
 use wl_proxy::protocols::fractional_scale_v1::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+use wl_proxy::protocols::tablet_v2::zwp_tablet_manager_v2::ZwpTabletManagerV2;
 use wl_proxy::protocols::viewporter::wp_viewport::{WpViewport, WpViewportHandler};
 use wl_proxy::protocols::viewporter::wp_viewporter::{WpViewporter, WpViewporterHandler};
 use wl_proxy::protocols::wayland::wl_display::{WlDisplay, WlDisplayHandler};
@@ -316,6 +318,26 @@ struct MpvRegistryH {
     ctx: MpvCtx,
 }
 impl WlRegistryHandler for MpvRegistryH {
+    /// mpv shares the app's compositor client, and a compositor sends a tool's
+    /// events to one tool object of the client under it — Hyprland takes the
+    /// client's last. mpv's input is blocked, so a tablet seat of mpv's would
+    /// swallow the pen; hidden, the app's own is the client's only one.
+    fn handle_global(
+        &mut self,
+        slf: &Rc<WlRegistry>,
+        name: u32,
+        interface: ObjectInterface,
+        version: u32,
+    ) {
+        if interface == ZwpTabletManagerV2::INTERFACE {
+            return;
+        }
+        log_send(
+            "wl_registry.global",
+            slf.try_send_global(name, interface, version),
+        );
+    }
+
     fn handle_bind(&mut self, slf: &Rc<WlRegistry>, name: u32, id: Rc<dyn Object>) {
         match id.interface() {
             XdgWmBase::INTERFACE => {

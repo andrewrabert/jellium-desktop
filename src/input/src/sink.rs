@@ -32,6 +32,7 @@ pub trait WebInput: Send + Sync {
     );
     fn send_mouse_move(&self, x: c_int, y: c_int, modifiers: u32, leave: bool);
     fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int);
+    fn send_touch_event(&self, touch: crate::touch::WebTouch);
     fn set_focus(&self, focus: bool);
     fn navigate_history(&self, forward: bool);
     fn undo(&self);
@@ -327,6 +328,8 @@ mod tests {
             _delta_y: c_int,
         ) {
         }
+
+        fn send_touch_event(&self, _touch: crate::touch::WebTouch) {}
 
         fn set_focus(&self, focus: bool) {
             TAKEN.lock().push(focus);
