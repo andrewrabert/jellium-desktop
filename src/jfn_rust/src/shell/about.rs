@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use iced_core::text::{IntoFragment, Wrapping};
 use iced_core::widget::Id;
 use iced_core::{Alignment, Element, Length, Padding};
-use iced_widget::{Text, button, column, container, image, row, text};
+use iced_widget::{Text, Widget as _, button, column, container, image, row, text};
 
 use crate::shell::controls;
 use crate::shell::theme::{self, Theme};
@@ -80,7 +80,7 @@ impl About {
                     message,
                 )
             }
-            None => wrapped(value).into(),
+            None => wrapped(value).boxed(),
         };
         metadata_row(wrapped(label).class(Some(theme::MUTED)), value)
     }
@@ -94,32 +94,32 @@ impl About {
 }
 
 fn about_layout<'a, Message: 'a, Renderer: iced_core::Renderer + 'a>(
-    logo: impl Into<Element<'a, Message, Theme, Renderer>>,
-    rows: impl Into<Element<'a, Message, Theme, Renderer>>,
+    logo: impl iced_core::Widget<Message, Theme, Renderer> + 'a,
+    rows: impl iced_core::Widget<Message, Theme, Renderer> + 'a,
 ) -> Element<'a, Message, Theme, Renderer> {
-    column![container(logo).padding(Padding::from([8, 0])), rows.into()]
+    column![container(logo).padding(Padding::from([8, 0])), rows]
         .spacing(16)
         .width(Length::Fill)
         .align_x(Alignment::Center)
-        .into()
+        .boxed()
 }
 
 fn metadata_row<'a, Message: 'a, Renderer: iced_core::Renderer + 'a>(
-    label: impl Into<Element<'a, Message, Theme, Renderer>>,
-    value: impl Into<Element<'a, Message, Theme, Renderer>>,
+    label: impl iced_core::Widget<Message, Theme, Renderer> + 'a,
+    value: impl iced_core::Widget<Message, Theme, Renderer> + 'a,
 ) -> Element<'a, Message, Theme, Renderer> {
     row![
         container(label).width(Length::Fixed(140.0)),
         container(value).width(Length::Fill),
     ]
     .width(Length::Fill)
-    .into()
+    .boxed()
 }
 
 /// Panel text that wraps on a word where it can and inside a token where it
 /// cannot: a path is one unbreakable word, and word wrapping alone paints it
 /// past the width its column was given.
-fn wrapped<'a>(content: impl IntoFragment<'a>) -> Text<'a, Theme, iced_wgpu::Renderer> {
+fn wrapped<'a>(content: impl IntoFragment<'a>) -> Text<'a, Theme> {
     text(content).wrapping(Wrapping::WordOrGlyph)
 }
 
@@ -143,6 +143,7 @@ mod tests {
     fn about_layout_fills_rows_and_centers_the_logo() {
         use iced_core::layout::Limits;
         use iced_core::widget::Tree;
+        use iced_core::{Layout, Widget as _};
         use iced_widget::Space;
 
         let rows = iced_widget::column![
@@ -155,25 +156,25 @@ mod tests {
                 .height(Length::Fixed(1.0)),
             rows,
         );
-        let mut tree = Tree::new(content.as_widget());
-        tree.diff(content.as_widget_mut());
+        let mut tree = Tree::new(&content);
+        tree.diff(&mut content);
         let parent = iced_core::Size::new(632.0, 400.0);
-        let node = content.as_widget_mut().layout(
-            &mut tree,
-            &(),
-            &Limits::new(iced_core::Size::ZERO, parent),
-        );
-        let children = node.children();
-        let logo = children[0].bounds();
-        let rows = &children[1];
-        let first_row = &rows.children()[0];
-        let row_children = first_row.children();
-        let value = row_children[1].bounds();
+        content.layout(&mut tree, &(), &Limits::new(iced_core::Size::ZERO, parent));
+        let root = Layout::new(tree.size);
+        let mut children = root.iter(&tree.children);
+        let (logo, _) = children.next().expect("logo");
+        let logo = logo.bounds();
+        let (rows, rows_tree) = children.next().expect("rows");
+        let (first_row, first_row_tree) = rows.iter(&rows_tree.children).next().expect("first row");
+        let mut row_children = first_row.iter(&first_row_tree.children);
+        let (label, _) = row_children.next().expect("label");
+        let (value, _) = row_children.next().expect("value");
+        let value = value.bounds();
 
-        assert_eq!(node.bounds().width, parent.width);
+        assert_eq!(root.bounds().width, parent.width);
         assert_eq!(rows.bounds().width, parent.width);
         assert_eq!(first_row.bounds().width, parent.width);
-        assert_eq!(row_children[0].bounds().width, 140.0);
+        assert_eq!(label.bounds().width, 140.0);
         assert_eq!(value.x, 140.0);
         assert_eq!(value.x + value.width, first_row.bounds().width);
         assert_eq!(

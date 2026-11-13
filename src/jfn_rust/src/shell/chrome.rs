@@ -58,7 +58,7 @@ fn update(f: impl FnOnce(&mut ChromeInputs)) {
 
 use iced_core::{Alignment, Element, Length, Point, Rectangle, Size, mouse};
 use iced_widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
-use iced_widget::{button, container, row, space};
+use iced_widget::{Widget as _, button, container, row, space};
 
 use crate::shell::theme::{self, Theme};
 
@@ -124,7 +124,7 @@ impl Titlebar {
         .width(Length::Fill)
         .height(height)
         .class(theme::ContainerClass::Chrome)
-        .into()
+        .boxed()
     }
 
     pub fn update(&mut self, message: Message) {
@@ -161,7 +161,7 @@ fn control(
     .height(Length::Fill)
     .padding(0)
     .class(class)
-    .into()
+    .boxed()
 }
 
 impl<Message> canvas::Program<Message, Theme, iced_wgpu::Renderer> for Icon {
