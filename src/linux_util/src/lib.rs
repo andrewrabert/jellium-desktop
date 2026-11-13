@@ -13,6 +13,7 @@ pub mod idle_inhibit;
 pub mod input;
 mod keysym;
 pub mod menu;
+pub mod mesa;
 pub mod open_url;
 pub mod xkb;
 

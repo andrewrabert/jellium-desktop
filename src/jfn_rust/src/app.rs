@@ -902,6 +902,10 @@ pub fn jfn_app_main() -> c_int {
     let opts = resolve_startup_options(&cli);
 
     init_logging(opts.log_file.as_deref(), &opts.log_level, &version);
+    #[cfg(target_os = "linux")]
+    if let Some(value) = jfn_linux_util::mesa::apply_amd_dcc_workaround(version.major) {
+        tracing::info!(target: "Main", "CEF {} on Linux: AMD_DEBUG={value}", version.major);
+    }
     let metadata = match application_metadata(version) {
         Ok(metadata) => metadata,
         Err(error) => {
