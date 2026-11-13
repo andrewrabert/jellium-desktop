@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use iced_core::widget::Id;
 use iced_core::{Alignment, Color, Element, Length, Padding};
-use iced_widget::{button, column, container, image, text};
+use iced_widget::{Widget as _, button, column, container, image, text};
 
 use crate::connection::{FADE, Screen};
 
@@ -53,7 +53,7 @@ impl Connect {
             Screen::Failed => self.failure_view(),
             Screen::Working { .. } | Screen::Retiring { .. } => self.spinner_view(screen),
             Screen::Form { url } => self.form_view(url),
-            Screen::Gone => iced_widget::space::horizontal().into(),
+            Screen::Gone => iced_widget::space::horizontal().boxed(),
         };
         container(body)
             .width(Length::Fill)
@@ -62,7 +62,7 @@ impl Connect {
             .align_x(Alignment::Center)
             .align_y(Alignment::Center)
             .class(theme::ContainerClass::Backdrop)
-            .into()
+            .boxed()
     }
 
     fn form_view<'a>(&'a self, url: &'a str) -> Element<'a, Message, Theme, iced_wgpu::Renderer> {
@@ -84,7 +84,7 @@ impl Connect {
         .spacing(16)
         .width(Length::Fixed(450.0))
         .align_x(Alignment::Center)
-        .into()
+        .boxed()
     }
 
     fn spinner_view(&self, screen: &Screen) -> Element<'_, Message, Theme, iced_wgpu::Renderer> {
@@ -102,7 +102,7 @@ impl Connect {
         ]
         .spacing(32)
         .align_x(Alignment::Center)
-        .into()
+        .boxed()
     }
 
     fn failure_view(&self) -> Element<'_, Message, Theme, iced_wgpu::Renderer> {
@@ -115,7 +115,7 @@ impl Connect {
         ]
         .spacing(32)
         .align_x(Alignment::Center)
-        .into()
+        .boxed()
     }
 
     /// `chrome` opaque while the screen is up, faded to zero alpha across the

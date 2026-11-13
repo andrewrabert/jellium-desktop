@@ -22,8 +22,8 @@ use iced_core::widget::Id;
 use iced_core::widget::operation::Focusable;
 use iced_core::widget::{self, Widget};
 use iced_core::{
-    Background, Border, Color, Element, Event, Length, Padding, Pixels, Point, Rectangle, Shell,
-    Size, Vector, alignment, clipboard, mouse, renderer, window,
+    Background, Border, Color, Event, Font, Length, Padding, Pixels, Point, Rectangle, Shell, Size,
+    Vector, alignment, clipboard, mouse, renderer, window,
 };
 
 use jfn_platform_abi::DisplayBackend;
@@ -32,7 +32,6 @@ use crate::shell::theme::Theme;
 
 type Renderer = iced_wgpu::Renderer;
 type TextEditor = <Renderer as text::Renderer>::Editor;
-type Font = <Renderer as text::Renderer>::Font;
 
 /// The field's fill, border and text colours.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -172,18 +171,21 @@ impl State {
     /// The caret, in the coordinates of the editor's origin.
     pub fn caret(&self) -> Point {
         match self.editor.selection() {
-            editor::Selection::Caret(position) => position,
-            editor::Selection::Range(ranges) => ranges.last().map_or(Point::ORIGIN, |range| {
-                Point::new(range.x + range.width, range.y)
-            }),
+            Some(editor::Selection::Caret(position)) => position,
+            Some(editor::Selection::Range(ranges)) => {
+                ranges.last().map_or(Point::ORIGIN, |range| {
+                    Point::new(range.x + range.width, range.y)
+                })
+            }
+            None => Point::ORIGIN,
         }
     }
 
     /// The selection's rectangles, in the coordinates of the editor's origin.
     pub fn selection_bounds(&self) -> Vec<Rectangle> {
         match self.editor.selection() {
-            editor::Selection::Caret(_) => Vec::new(),
-            editor::Selection::Range(ranges) => ranges,
+            Some(editor::Selection::Range(ranges)) => ranges.to_vec(),
+            Some(editor::Selection::Caret(_)) | None => Vec::new(),
         }
     }
 
@@ -399,15 +401,15 @@ impl<'a, Message: Clone + 'a> Field<'a, Message> {
     }
 
     fn text_size(&self, renderer: &Renderer) -> Pixels {
-        self.size.unwrap_or_else(|| renderer.default_size())
+        self.size.unwrap_or_else(|| renderer.text_size())
     }
 
     fn font(&self, renderer: &Renderer) -> Font {
-        renderer.default_font()
+        renderer.font()
     }
 
     /// The text the placeholder is drawn from, laid out to `bounds`.
-    fn placeholder_text(&self, renderer: &Renderer, bounds: Size) -> Text<&'a str, Font> {
+    fn placeholder_text(&self, renderer: &Renderer, bounds: Size) -> Text<&'a str> {
         Text {
             content: self.placeholder,
             bounds,
@@ -517,6 +519,8 @@ impl Focusable for OperationFocus<'_> {
     }
 }
 
+impl<Message> widget::Meta for Field<'_, Message> {}
+
 impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
     fn tag(&self) -> widget::tree::Tag {
         widget::tree::Tag::of::<State>()
@@ -533,17 +537,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
         }
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut widget::Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
+    fn layout(&mut self, tree: &mut widget::Tree, renderer: &Renderer, limits: &layout::Limits) {
         let state = tree.state.downcast_mut::<State>();
         let text_size = self.text_size(renderer);
         let line_height = f32::from(LineHeight::default().to_absolute(text_size));
         let limits = limits.width(self.width);
-        let inner = limits.shrink(self.padding).max();
+        let inner = limits.shrink(self.padding).max;
         let text_bounds = Size::new(inner.width, line_height);
 
         state.adopt(self.value);
@@ -555,27 +554,25 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
             Wrapping::None,
             text::Alignment::Default,
             renderer.hint_factor(),
-            &mut text::highlighter::PlainText,
+            &mut text::parser::PlainText,
         );
         let _ = state
             .placeholder
             .update(self.placeholder_text(renderer, text_bounds));
 
-        let node = layout::Node::new(
-            limits
-                .height(line_height + self.padding.y())
-                .max()
-                .expand(Size::ZERO),
+        tree.size = layout::atomic(
+            &limits,
+            self.width,
+            Length::Fixed(line_height + self.padding.y()),
         );
         state.origin = Vector::new(self.padding.left, self.padding.top);
-        node
     }
 
     fn update(
         &mut self,
         tree: &mut widget::Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
@@ -620,7 +617,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
         renderer: &mut Renderer,
         _theme: &Theme,
         _defaults: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         _cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
@@ -661,7 +658,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
     fn mouse_interaction(
         &self,
         _tree: &widget::Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
@@ -676,7 +673,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
     fn operate(
         &mut self,
         tree: &mut widget::Tree,
-        layout: Layout<'_>,
+        layout: Layout,
+        _viewport: &Rectangle,
         _renderer: &Renderer,
         operation: &mut dyn widget::Operation,
     ) {
@@ -690,12 +688,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Field<'_, Message> {
             operation.focusable(Some(&self.id), layout.bounds(), &mut focus);
         }
         operation.custom(Some(&self.id), layout.bounds(), state as &mut dyn Any);
-    }
-}
-
-impl<'a, Message: Clone + 'a> From<Field<'a, Message>> for Element<'a, Message, Theme, Renderer> {
-    fn from(field: Field<'a, Message>) -> Self {
-        Element::new(field)
     }
 }
 
@@ -751,7 +743,7 @@ mod tests {
             Wrapping::None,
             text::Alignment::Default,
             Some(1.0),
-            &mut text::highlighter::PlainText,
+            &mut text::parser::PlainText,
         );
     }
 
@@ -780,7 +772,10 @@ mod tests {
         let mut shell = Shell::new(&window::Headless, waker, &mut messages);
         field.apply_update(&mut state, editor::Update::Unfocus, &mut shell);
         drop(shell);
-        messages.drain().collect()
+        messages
+            .drain()
+            .map(|(message, _receipt)| message)
+            .collect()
     }
 
     #[test]
