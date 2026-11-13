@@ -9,11 +9,20 @@ use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 
 /// The DComp device, the HWND composition target, and the root visual every
 /// surface parents into.
+///
+/// Stays on the original tier-1 `DCompositionCreateDevice`: this app's
+/// target hardware (confirmed on an actual TV machine, not just an RDP test
+/// session) returns `E_NOINTERFACE` from `DCompositionCreateDevice3` itself
+/// — DirectComposition tier 3 is unsupported outright here, not merely
+/// unsupported per-visual, so `IDCompositionVisual3` (`SetVisible`) is never
+/// reachable. `Layer::set_visible` uses a tier-1-compatible technique
+/// instead (see its own comment).
 pub(crate) struct Devices {
     device: IDCompositionDevice,
     // Keep-alive, never read: dropping the target unbinds the visual tree
-    // from the HWND.
-    _target: IDCompositionTarget,
+    // from the HWND. `Option` so `rebind` can drop the old target *before*
+    // attaching `root` to a new one — see `rebind`'s own comment.
+    _target: Option<IDCompositionTarget>,
     root: IDCompositionVisual,
 }
 
@@ -27,20 +36,52 @@ impl Devices {
             device.Commit()?;
             Ok(Devices {
                 device,
-                _target: target,
+                _target: Some(target),
                 root,
             })
         }
     }
 
+    /// Rebinds the composition target to `hwnd` — mpv recreating its VO
+    /// window (e.g. going from idle to active playback) replaces the HWND
+    /// entirely, and the old target only composites onto the now-destroyed
+    /// one.
+    ///
+    /// Confirmed on real hardware: a first version of this retried only
+    /// `CreateTargetForHwnd` and never logged a single retry before the
+    /// caller's failure log, meaning that call wasn't what failed —
+    /// `target.SetRoot(&self.root)` or `Commit()` was, almost certainly
+    /// because the *old* target (still alive in `self._target`, overwritten
+    /// only on success) still held `root` as its own root at that point.
+    /// DirectComposition can reject attaching a visual that's already
+    /// another target's root. Dropping the old target first, then retrying
+    /// the whole create+attach+commit sequence as one unit, covers both that
+    /// and the plain `CreateTargetForHwnd`-not-ready-yet race.
     pub(crate) fn rebind(&mut self, hwnd: HWND) -> windows_core::Result<()> {
-        unsafe {
-            let target = self.device.CreateTargetForHwnd(hwnd, false)?;
-            target.SetRoot(&self.root)?;
-            self.device.Commit()?;
-            self._target = target;
+        self._target = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let attempt = unsafe {
+                self.device
+                    .CreateTargetForHwnd(hwnd, false)
+                    .and_then(|target| {
+                        target.SetRoot(&self.root)?;
+                        self.device.Commit()?;
+                        Ok(target)
+                    })
+            };
+            match attempt {
+                Ok(target) => {
+                    self._target = Some(target);
+                    return Ok(());
+                }
+                Err(e) if std::time::Instant::now() < deadline => {
+                    tracing::warn!(target: "platform", "composition target rebind retrying after: {e:?}");
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(e) => return Err(e),
+            }
         }
-        Ok(())
     }
 
     pub(crate) fn root(&self) -> &IDCompositionVisual {

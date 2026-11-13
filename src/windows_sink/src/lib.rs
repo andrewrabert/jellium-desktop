@@ -7,7 +7,8 @@
 //! Public entry points:
 //!   * `jfn_windows_sink_start_for(hwnd)` — start the sink (SMTC binds to the
 //!     mpv window via GetForWindow).
-//!   * `jfn_windows_sink_stop()` — signal the thread to exit at next wake.
+//!   * `jfn_windows_sink_stop()` — stop the sink and block until its
+//!     consumer thread has actually exited.
 
 #![cfg(target_os = "windows")]
 

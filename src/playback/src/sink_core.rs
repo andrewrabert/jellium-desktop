@@ -144,6 +144,13 @@ mod harness {
     /// disconnects the consumer once the queue drains.
     static EVENT_TX: Mutex<Option<Sender<PlaybackEvent>>> = Mutex::new(None);
 
+    /// Consumer-thread join handle for the currently running sink, if any.
+    /// `stop()` joins this before returning so a caller that immediately
+    /// calls `run_sink()` again (e.g. `win_on_window_handle_changed`
+    /// rebinding SMTC to a new mpv HWND) never has the old and new
+    /// consumer threads' native transport teardown/init overlap.
+    static CONSUMER_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
     /// The coordinator sink registration is process-wide and survives
     /// stop/run cycles, so it happens at most once.
     static REGISTER_SINK: Once = Once::new();
@@ -175,19 +182,25 @@ mod harness {
 
         REGISTER_SINK.call_once(|| crate::ffi::register_event_sink(Box::new(on_event)));
 
-        if let Err(e) = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name(thread_name.to_owned())
             .spawn(move || consumer_thread(rx, build))
         {
-            drop(EVENT_TX.lock().take());
-            eprintln!("[playback] failed to spawn media-sink thread: {e}");
+            Ok(handle) => *CONSUMER_HANDLE.lock() = Some(handle),
+            Err(e) => {
+                drop(EVENT_TX.lock().take());
+                eprintln!("[playback] failed to spawn media-sink thread: {e}");
+            }
         }
     }
 
-    /// Drop the producer end. The consumer delivers whatever is already
-    /// queued, tears down, and exits. No-op if not running.
+    /// Drop the producer end and block until the consumer thread has
+    /// actually drained, torn down and exited. No-op if not running.
     pub fn stop() {
         drop(EVENT_TX.lock().take());
+        if let Some(handle) = CONSUMER_HANDLE.lock().take() {
+            let _ = handle.join();
+        }
     }
 
     fn consumer_thread<S: QueuedSink>(rx: Receiver<PlaybackEvent>, build: impl FnOnce() -> S) {

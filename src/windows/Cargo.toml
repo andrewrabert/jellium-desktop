@@ -18,6 +18,7 @@ jfn-windows-sink = { path = "../windows_sink" }
 cef.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectComposition",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
