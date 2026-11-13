@@ -7,8 +7,6 @@ use crate::shell::state::ChromeInputs;
 static INPUTS: Mutex<ChromeInputs> = Mutex::new(ChromeInputs {
     client_side_decorations: false,
     fullscreen: false,
-    video_active: false,
-    osd_visible: false,
 });
 
 type Listener = Box<dyn Fn(ChromeInputs) + Send + Sync>;
@@ -22,16 +20,6 @@ pub fn inputs() -> ChromeInputs {
 /// Registered once by `shell_start`; fired on every change.
 pub fn set_listener(f: Listener) {
     *LISTENER.lock() = Some(f);
-}
-
-/// jellyfin-web's video OSD visibility, pushed from `jfn_playback::chrome`.
-pub fn set_osd_visible(visible: bool) {
-    update(|i| i.osd_visible = visible);
-}
-
-/// jellyfin-web is playing video, pushed from `jfn_playback::chrome`.
-pub fn set_video_active(active: bool) {
-    update(|i| i.video_active = active);
 }
 
 pub fn set_client_side_decorations(client_side: bool) {
