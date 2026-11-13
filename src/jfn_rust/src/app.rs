@@ -1265,6 +1265,29 @@ extern "C" fn h_theme_set_mpv_bg(hex: *const c_char) {
     unsafe { jfn_mpv::api::jfn_mpv_set_background_color_hex(hex) };
 }
 
+/// Applies the configured startup window mode once, after the first page is
+/// on screen (or immediately when there is no server page to wait for).
+pub(crate) fn apply_startup_window_mode() {
+    static APPLIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if APPLIED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    match jfn_config::startup_window_mode() {
+        jfn_config::StartupWindowMode::Fullscreen => plat().set_fullscreen(true),
+        jfn_config::StartupWindowMode::Maximized => {
+            if plat().window_owner().source().snapshot().maximized {
+                return;
+            }
+            if let Some(controls) = plat().titlebar_controls() {
+                controls.toggle_maximize();
+            } else {
+                jfn_mpv::api::jfn_mpv_set_window_maximized(true);
+            }
+        }
+        jfn_config::StartupWindowMode::Windowed => {}
+    }
+}
+
 /// Owns the run_with_cef body — invoked once by `jfn_app_main`.
 fn run_with_cef(
     boot: ReadyBoot,
@@ -1305,6 +1328,9 @@ fn run_with_cef(
         }
     };
     WEB_OVERLAY.lock().replace(overlay.clone());
+    if plat().cef_host().is_some() || jfn_config::server_url().is_empty() {
+        apply_startup_window_mode();
+    }
     RunningRuntime {
         resources,
         manager_thread,

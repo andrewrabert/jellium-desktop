@@ -270,6 +270,7 @@ impl Connection {
     pub(crate) fn frame_presented(&mut self, presented: jfn_cef::NavigationPresented) {
         if self.finish_navigation(presented.navigation(), Instant::now()) {
             jfn_color::theme::jfn_theme_color_on_connect_dismissed();
+            crate::app::apply_startup_window_mode();
         }
     }
 

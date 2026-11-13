@@ -47,10 +47,39 @@ impl Default for JfnWindowGeometry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartupWindowMode {
+    #[default]
+    Windowed,
+    Maximized,
+    Fullscreen,
+}
+
+impl StartupWindowMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Windowed => "windowed",
+            Self::Maximized => "maximized",
+            Self::Fullscreen => "fullscreen",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "windowed" => Some(Self::Windowed),
+            "maximized" => Some(Self::Maximized),
+            "fullscreen" => Some(Self::Fullscreen),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SettingsData {
     server_url: String,
     hwdec: Hwdec,
+    startup_window_mode: StartupWindowMode,
     audio_passthrough: String,
     audio_channels: String,
     log_level: String,
@@ -69,6 +98,7 @@ impl Default for SettingsData {
         Self {
             server_url: String::new(),
             hwdec: Hwdec::default(),
+            startup_window_mode: StartupWindowMode::default(),
             audio_passthrough: String::new(),
             audio_channels: String::new(),
             log_level: String::new(),
@@ -115,6 +145,9 @@ struct SettingsFile {
 
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     hwdec: Option<Hwdec>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    startup_window_mode: Option<StartupWindowMode>,
 
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     audio_passthrough: Option<String>,
@@ -193,6 +226,7 @@ where
 #[serde(rename_all = "camelCase")]
 struct CliSettings<'a> {
     hwdec: Hwdec,
+    startup_window_mode: StartupWindowMode,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     audio_passthrough: Option<&'a str>,
@@ -228,6 +262,9 @@ impl SettingsData {
     fn overlay(&mut self, file: SettingsFile) {
         if let Some(v) = file.server_url {
             self.server_url = v;
+        }
+        if let Some(v) = file.startup_window_mode {
+            self.startup_window_mode = v;
         }
         if let Some(v) = file.hwdec {
             self.hwdec = v;
@@ -299,6 +336,8 @@ impl SettingsData {
             window_x: position.then_some(self.window.x),
             window_y: position.then_some(self.window.y),
             window_maximized: Some(self.window.maximized),
+            startup_window_mode: (self.startup_window_mode != StartupWindowMode::default())
+                .then_some(self.startup_window_mode),
             hwdec: (self.hwdec != Hwdec::default()).then_some(self.hwdec),
             audio_passthrough: (!self.audio_passthrough.is_empty())
                 .then(|| self.audio_passthrough.clone()),
@@ -317,6 +356,7 @@ impl SettingsData {
     fn cli_json(&self) -> String {
         let view = CliSettings {
             hwdec: self.hwdec,
+            startup_window_mode: self.startup_window_mode,
             audio_passthrough: (!self.audio_passthrough.is_empty())
                 .then_some(self.audio_passthrough.as_str()),
             audio_exclusive: self.audio_exclusive.then_some(true),
@@ -509,6 +549,14 @@ macro_rules! bool_accessors {
 
 string_accessors!(server_url, set_server_url, server_url);
 
+pub fn startup_window_mode() -> StartupWindowMode {
+    state().lock().data.startup_window_mode
+}
+
+pub fn set_startup_window_mode(v: StartupWindowMode) {
+    state().lock().data.startup_window_mode = v;
+}
+
 pub fn hwdec() -> Hwdec {
     state().lock().data.hwdec
 }
@@ -646,6 +694,45 @@ mod tests {
         SettingsData, SettingsFile, WindowDecorations, default_device_name, normalize_device_name,
     };
 
+    #[test]
+    fn personal_startup_mode_survives_legacy_settings_round_trip() {
+        for (wire, expected) in [
+            ("windowed", super::StartupWindowMode::Windowed),
+            ("maximized", super::StartupWindowMode::Maximized),
+            ("fullscreen", super::StartupWindowMode::Fullscreen),
+        ] {
+            let json =
+                serde_json::json!({"startupWindowMode": wire, "serverUrl": "http://example.test"});
+            let mut data = SettingsData::default();
+            data.overlay(serde_json::from_value(json).unwrap());
+            assert_eq!(data.startup_window_mode, expected);
+            let saved = serde_json::to_value(data.to_file()).unwrap();
+            let mut reloaded = SettingsData::default();
+            reloaded.overlay(serde_json::from_value(saved).unwrap());
+            assert_eq!(reloaded.startup_window_mode, expected);
+            assert_eq!(reloaded.server_url, "http://example.test");
+        }
+    }
+
+    #[test]
+    fn invalid_startup_mode_does_not_discard_other_settings() {
+        for value in [
+            serde_json::json!("unsupported"),
+            serde_json::json!(17),
+            serde_json::Value::Null,
+        ] {
+            let mut data = SettingsData::default();
+            data.overlay(
+                serde_json::from_value(serde_json::json!({
+                    "startupWindowMode": value, "serverUrl": "http://example.test"
+                }))
+                .unwrap(),
+            );
+            assert_eq!(data.startup_window_mode, super::StartupWindowMode::Windowed);
+            assert_eq!(data.server_url, "http://example.test");
+        }
+    }
+
     const PLATFORM: &str = "platform-host";
 
     /// Top-level keys in the order they appear in the text; `serde_json::Value`
@@ -698,6 +785,7 @@ mod tests {
     fn every_key_writes_in_schema_order() {
         let data = SettingsData {
             server_url: "http://host".into(),
+            startup_window_mode: super::StartupWindowMode::default(),
             hwdec: "auto".parse().expect("auto is offered everywhere"),
             audio_passthrough: "eac3".into(),
             audio_channels: "stereo".into(),
@@ -809,6 +897,7 @@ mod tests {
             keys(&text),
             [
                 "hwdec",
+                "startupWindowMode",
                 "transparentTitlebar",
                 "forceTranscoding",
                 "hideScrollbar",

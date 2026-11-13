@@ -565,8 +565,14 @@ impl Platform for MacosPlatform {
         macos_apply_stack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
-    fn menu_delivery(&self, _kind: MenuKind) -> MenuDelivery<'_> {
-        MenuDelivery::Host(&crate::menu::NsMenuHost)
+    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery<'_> {
+        match kind {
+            MenuKind::ContextMenu => MenuDelivery::Host(&crate::menu::NsMenuHost),
+            // CEF's OSR <select> popup on macOS opens at most once: every
+            // later click gets OnPopupShow(false) with no show, so the NSMenu
+            // never appears (#534). Draw dropdowns in the page, as X11 does.
+            MenuKind::Dropdown => MenuDelivery::Page,
+        }
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {
