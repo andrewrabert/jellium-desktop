@@ -73,8 +73,8 @@ impl Snapshot {
 pub struct Fields(Vec<Snapshot>);
 
 impl Fields {
-    pub fn collect<Message>(
-        ui: &mut UserInterface<'_, Message, Theme, iced_wgpu::Renderer>,
+    pub fn collect<'a, Message: 'a>(
+        ui: &mut UserInterface<'a, Message, Theme, iced_wgpu::Renderer>,
         renderer: &iced_wgpu::Renderer,
     ) -> Fields {
         let mut collect = Collect(Vec::new());

@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use iced_core::widget::Id;
 use iced_core::{Color, Element};
+use iced_widget::Widget as _;
 
 use crate::connection::{Connection, Screen};
 
@@ -187,9 +188,11 @@ impl Stack {
         screen: &'a Screen,
     ) -> Element<'a, Message, Theme, iced_wgpu::Renderer> {
         match self.top() {
-            Some(View::Connect(connect)) => connect.view(screen).map(Message::Connect),
-            Some(View::SettingsOverlay(overlay)) => overlay.view().map(Message::SettingsOverlay),
-            None => iced_widget::space::horizontal().into(),
+            Some(View::Connect(connect)) => connect.view(screen).map(Message::Connect).boxed(),
+            Some(View::SettingsOverlay(overlay)) => {
+                overlay.view().map(Message::SettingsOverlay).boxed()
+            }
+            None => iced_widget::space::horizontal().boxed(),
         }
     }
 

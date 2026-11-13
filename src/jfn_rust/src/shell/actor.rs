@@ -13,6 +13,7 @@ use iced_core::mouse::{self, Cursor};
 use iced_core::widget::{Id, Operation as _};
 use iced_core::{Element, Event, Point, Size, clipboard, renderer, shell, window};
 use iced_runtime::user_interface::{self, UserInterface};
+use iced_widget::Widget as _;
 use jfn_gpu_paint::{Acquired, Presented};
 use jfn_platform_abi::{
     FrameSource, LogicalPoint, LogicalSize, SurfaceHandle, Visibility, WindowExtent,
@@ -328,12 +329,12 @@ impl Model {
     /// The modal stack's own view, then the titlebar, then nothing.
     fn view(&self) -> Element<'_, Message, Theme, iced_wgpu::Renderer> {
         if self.stack.occupied() {
-            return self.stack.view(&self.screen).map(Message::Modal);
+            return self.stack.view(&self.screen).map(Message::Modal).boxed();
         }
         if self.titlebar_shown() {
-            return self.titlebar.view().map(Message::Chrome);
+            return self.titlebar.view().map(Message::Chrome).boxed();
         }
-        iced_widget::space::horizontal().into()
+        iced_widget::space::horizontal().boxed()
     }
 
     fn transition(&mut self, transition: Transition) {
@@ -1004,7 +1005,7 @@ fn update_ui(
         .collect();
     events.clear();
 
-    let messages: Vec<Message> = bus.drain().collect();
+    let messages: Vec<Message> = bus.drain().map(|(message, _receipt)| message).collect();
     let (interaction, redraw) = match &state {
         user_interface::State::Updated {
             mouse_interaction,
@@ -1106,8 +1107,8 @@ enum Deferred {
 }
 
 /// Applies every pass of a chained widget operation.
-fn operate_all<Message>(
-    ui: &mut UserInterface<'_, Message, Theme, iced_wgpu::Renderer>,
+fn operate_all<'a, Message: 'a>(
+    ui: &mut UserInterface<'a, Message, Theme, iced_wgpu::Renderer>,
     renderer: &iced_wgpu::Renderer,
     operation: &mut dyn iced_core::widget::Operation,
 ) {
@@ -1121,8 +1122,8 @@ fn operate_all<Message>(
 
 /// Applies every queued [`Apply`] and returns what `Cut` and `Copy` produced,
 /// in order.
-fn apply_queued<Message>(
-    ui: &mut UserInterface<'_, Message, Theme, iced_wgpu::Renderer>,
+fn apply_queued<'a, Message: 'a>(
+    ui: &mut UserInterface<'a, Message, Theme, iced_wgpu::Renderer>,
     renderer: &iced_wgpu::Renderer,
     queued: &mut Vec<Apply>,
 ) -> Vec<String> {
