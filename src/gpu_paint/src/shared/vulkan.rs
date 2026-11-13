@@ -290,14 +290,20 @@ unsafe fn import(
         usage: wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     };
-    let texture = unsafe { device.create_texture_from_hal::<vulkan::Api>(hal_texture, &desc) };
+    let texture = unsafe {
+        device.create_texture_from_hal::<vulkan::Api>(
+            hal_texture,
+            &desc,
+            wgpu::TextureUses::UNINITIALIZED,
+        )
+    };
     Ok((texture, image.as_raw()))
 }
 
 /// Acquire an imported dmabuf image from the foreign producer queue into
 /// our graphics queue and the shader-read layout. Without this the GPU
 /// samples an image it does not own and faults (device lost). Must use the
-/// raw HAL encoding API only: wgpu 29 forbids mixing raw and normal wgpu
+/// raw HAL encoding API only: wgpu forbids mixing raw and normal wgpu
 /// commands in the same `CommandEncoder`.
 pub(crate) fn acquire_barrier(
     device: &wgpu::Device,

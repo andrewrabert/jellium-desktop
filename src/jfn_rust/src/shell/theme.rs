@@ -86,7 +86,12 @@ impl iced_core::widget::text::Catalog for Theme {
     fn style(&self, class: &Self::Class<'_>) -> iced_core::widget::text::Style {
         iced_core::widget::text::Style {
             color: Some(class.unwrap_or(TEXT)),
+            selection: None,
         }
+    }
+
+    fn selection(&self) -> Color {
+        ACCENT
     }
 }
 
@@ -226,6 +231,10 @@ impl iced_widget::checkbox::Catalog for Theme {
             },
             text_color: Some(TEXT),
         }
+    }
+
+    fn selection(&self) -> Color {
+        ACCENT
     }
 }
 

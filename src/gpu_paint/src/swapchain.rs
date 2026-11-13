@@ -54,6 +54,7 @@ impl<'ctx> Swapchain<'ctx> {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: FORMAT,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: extent.0,
             height: extent.1,
             present_mode: present.mode(),
@@ -174,7 +175,7 @@ impl<'ctx> Frame<'ctx> {
             encode(&view);
         }
         drop(view);
-        texture.present();
+        ctx.queue.present(texture);
         Presented::issued()
     }
 
