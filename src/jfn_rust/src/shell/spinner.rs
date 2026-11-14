@@ -4,6 +4,7 @@
 use std::time::Instant;
 
 use iced_core::{Color, Element, Length, Point, Rectangle, Size, mouse};
+use iced_widget::Widget as _;
 use iced_widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 
 use crate::shell::theme::Theme;
@@ -33,7 +34,7 @@ impl Spinner {
         Canvas::new(self)
             .width(Length::Fixed(DIAMETER))
             .height(Length::Fixed(DIAMETER))
-            .into()
+            .boxed()
     }
 }
 

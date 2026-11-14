@@ -3,7 +3,7 @@
 use iced_core::widget::Id;
 use iced_core::widget::operation::scrollable::AbsoluteOffset;
 use iced_core::{Alignment, Color, Element, Length, Padding};
-use iced_widget::{Container, button, column, container, mouse_area, row, text};
+use iced_widget::{Container, Widget as _, button, column, container, mouse_area, row, text};
 
 use crate::shell::about::About;
 use crate::shell::controls;
@@ -180,8 +180,8 @@ impl SettingsOverlay {
         .align_y(Alignment::Center)
         .spacing(12);
         let content = match self.active {
-            Tab::Settings => self.settings.view().map(Message::Settings),
-            Tab::About => self.about.view().map(Message::About),
+            Tab::Settings => self.settings.view().map(Message::Settings).boxed(),
+            Tab::About => self.about.view().map(Message::About).boxed(),
         };
         let body = column![header, content].spacing(18);
         let card = mouse_area(card(body)).on_press(Message::Swallow);
@@ -196,7 +196,7 @@ impl SettingsOverlay {
                 .class(theme::ContainerClass::Backdrop),
         )
         .on_press(Message::Dismiss)
-        .into()
+        .boxed()
     }
 
     pub fn backdrop(&self) -> Color {
@@ -214,12 +214,7 @@ impl SettingsOverlay {
     }
 }
 
-fn card<'a, Message: 'a, Renderer>(
-    body: impl Into<Element<'a, Message, Theme, Renderer>>,
-) -> Container<'a, Message, Theme, Renderer>
-where
-    Renderer: iced_core::Renderer,
-{
+fn card<'a, W>(body: W) -> Container<'a, W, Theme> {
     container(body)
         .width(Length::Fixed(680.0))
         .height(Length::FillPortion(9))
@@ -239,9 +234,9 @@ fn tab_class(selected: bool) -> theme::ButtonClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced_core::Widget;
     use iced_core::layout::Limits;
     use iced_core::widget::Tree;
+    use iced_core::{Layout, Widget};
     use iced_widget::Space;
 
     fn outer_card_bounds(tab: Tab, viewport: iced_core::Size) -> iced_core::Rectangle {
@@ -251,14 +246,16 @@ mod tests {
                 .width(Length::Fixed(1.0))
                 .height(Length::Fixed(1.0)),
         };
-        let mut card = card::<Message, ()>(body);
-        let mut tree = Tree::new(&card as &dyn Widget<Message, Theme, ()>);
-        card.layout(
+        let mut card = card(body);
+        let mut tree = Tree::new::<Message, Theme, ()>(&card);
+        tree.diff::<Message, Theme, ()>(&mut card);
+        Widget::<Message, Theme, ()>::layout(
+            &mut card,
             &mut tree,
             &(),
             &Limits::new(iced_core::Size::ZERO, viewport),
-        )
-        .bounds()
+        );
+        Layout::new(tree.size).bounds()
     }
 
     #[test]
