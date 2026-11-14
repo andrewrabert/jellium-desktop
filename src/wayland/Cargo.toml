@@ -43,5 +43,8 @@ wayland-protocols = { version = "0.32", features = ["client", "staging", "unstab
 wayland-protocols-plasma = { version = "0.3", features = ["client"], optional = true }
 xkbcommon = "0.9"
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

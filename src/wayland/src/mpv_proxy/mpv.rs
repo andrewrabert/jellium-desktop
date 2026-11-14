@@ -10,6 +10,8 @@ use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use crossbeam_channel::{Sender, bounded};
 use error_reporter::Report;
+use nix::fcntl::{Flock, FlockArg};
+use wl_proxy::acceptor::Acceptor;
 use wl_proxy::baseline::Baseline;
 use wl_proxy::client::Client;
 use wl_proxy::object::{ConcreteObject, Object, ObjectCoreApi, ObjectRcUtils};
@@ -34,7 +36,7 @@ use wl_proxy::state::State;
 use crate::runtime::WlRuntime;
 use crate::window_state::WindowSize;
 
-use super::{FracScaleMgrH, NoopClient, log_send};
+use super::{FracScaleMgrH, NoopClient, log_send, remove_proxy_socket_files};
 
 pub(super) struct MpvWorker {
     thread: Option<JoinHandle<()>>,
@@ -44,11 +46,12 @@ impl MpvWorker {
     pub(super) fn spawn(
         rt: &'static WlRuntime,
         bridge: OwnedFd,
+        upstream: Option<String>,
     ) -> Result<(Self, CString), String> {
         let (tx, rx) = bounded::<Result<CString, String>>(1);
         let thread = thread::Builder::new()
             .name("proxy-mpv".into())
-            .spawn(move || run_mpv_state(rt, tx, bridge))
+            .spawn(move || run_mpv_state(rt, tx, bridge, upstream))
             .map_err(|e| format!("mpv thread spawn failed: {e}"))?;
 
         match rx.recv() {
@@ -135,7 +138,92 @@ impl MpvCtx {
     }
 }
 
-fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, bridge: OwnedFd) {
+/// Lock on the upstream display's lock file, held only while the
+/// acceptor is created: inside a sandbox the host's lock is not
+/// visible, so the allocator would otherwise take its name.
+struct UpstreamDisplayGuard {
+    _lock: Flock<std::fs::File>,
+}
+
+impl UpstreamDisplayGuard {
+    /// Best-effort reservation of the upstream display name. The lock
+    /// file is left in place when the guard drops; a failed reservation
+    /// only proves the name is taken when the host holds the lock.
+    fn reserve(upstream: Option<&str>, runtime_dir: Option<&std::path::Path>) -> Option<Self> {
+        let name = upstream?;
+        let dir = runtime_dir?;
+        let name = if name.contains('/') {
+            // The allocator tries the basename in the runtime dir,
+            // so a path into it can still conflict.
+            let path = std::path::Path::new(name);
+            let basename = path.file_name()?.to_str()?;
+            let parent = path.parent()?;
+            let canonical_same = match (std::fs::canonicalize(parent), std::fs::canonicalize(dir)) {
+                (Ok(p), Ok(d)) => p == d,
+                _ => false,
+            };
+            if parent != dir && !canonical_same {
+                return None;
+            }
+            basename
+        } else {
+            name
+        };
+        let lock_path = dir.join(format!("{name}.lock"));
+        let lock_file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::debug!(target: "MpvProxy", "upstream display {name} lock open failed: {e}");
+                return None;
+            }
+        };
+        let lock = match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => lock,
+            Err((_, e)) => {
+                if matches!(e, nix::errno::Errno::EAGAIN) {
+                    tracing::debug!(target: "MpvProxy", "upstream display {name} already locked");
+                } else {
+                    tracing::debug!(target: "MpvProxy", "upstream display {name} lock failed: {e}");
+                }
+                return None;
+            }
+        };
+        tracing::debug!(target: "MpvProxy", "reserved upstream display {name} for acceptor creation");
+        Some(Self { _lock: lock })
+    }
+}
+
+/// Cleanup is best-effort: it does not run on process abort or
+/// `panic = "abort"`, and stale files are reclaimed because the
+/// allocator relies on flocks, which die with the process.
+struct AcceptorCleanup {
+    acceptor: Option<Rc<Acceptor>>,
+    runtime_dir: Option<std::path::PathBuf>,
+    display_name: String,
+}
+
+impl Drop for AcceptorCleanup {
+    fn drop(&mut self) {
+        // Close the listener before unlinking its socket: unlinking a bound
+        // socket's path leaves the listener reachable on the unlinked inode
+        // until it drops.
+        drop(self.acceptor.take());
+        remove_proxy_socket_files(self.runtime_dir.as_deref(), &self.display_name);
+    }
+}
+
+fn run_mpv_state(
+    rt: &'static WlRuntime,
+    tx: Sender<Result<CString, String>>,
+    bridge: OwnedFd,
+    upstream: Option<String>,
+) {
     let state = match State::builder(Baseline::ALL_OF_THEM)
         .with_log_prefix("jfn-mpv")
         .with_server_fd(&Rc::new(bridge))
@@ -147,6 +235,8 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
             return;
         }
     };
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let upstream_guard = UpstreamDisplayGuard::reserve(upstream.as_deref(), runtime_dir.as_deref());
     let acceptor = match state.create_acceptor(1000) {
         Ok(a) => a,
         Err(e) => {
@@ -154,7 +244,15 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
             return;
         }
     };
-    let name = match CString::new(acceptor.display()) {
+    // The acceptor holds its own lock for the name it took from here on.
+    drop(upstream_guard);
+    let display_name = acceptor.display().to_owned();
+    let _acceptor_cleanup = AcceptorCleanup {
+        acceptor: Some(acceptor),
+        runtime_dir,
+        display_name: display_name.clone(),
+    };
+    let name = match CString::new(display_name.as_str()) {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(Err(format!("display name has NUL: {e}")));
@@ -470,5 +568,47 @@ impl XdgToplevelHandler for MpvToplevelH {
     }
     fn handle_unset_fullscreen(&mut self, _slf: &Rc<XdgToplevel>) {
         reassert_mpv_state(&self.ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpstreamDisplayGuard;
+
+    #[test]
+    fn guard_holds_upstream_lock_until_dropped() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let guard = UpstreamDisplayGuard::reserve(Some("wayland-1"), Some(dir));
+        assert!(guard.is_some());
+        assert!(UpstreamDisplayGuard::reserve(Some("wayland-1"), Some(dir)).is_none());
+        drop(guard);
+        assert!(UpstreamDisplayGuard::reserve(Some("wayland-1"), Some(dir)).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn reserve_accepts_path_inside_runtime_dir() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let upstream = format!("{}/wayland-1", dir.display());
+        let guard = UpstreamDisplayGuard::reserve(Some(&upstream), Some(dir));
+        assert!(guard.is_some());
+        assert!(UpstreamDisplayGuard::reserve(Some("wayland-1"), Some(dir)).is_none());
+        drop(guard);
+        assert!(UpstreamDisplayGuard::reserve(Some("wayland-1"), Some(dir)).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn reserve_ignores_names_it_cannot_conflict_with() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        assert!(UpstreamDisplayGuard::reserve(None, Some(dir)).is_none());
+        assert!(
+            UpstreamDisplayGuard::reserve(Some("/run/user/1000/wayland-1"), Some(dir)).is_none()
+        );
+        assert!(UpstreamDisplayGuard::reserve(Some("wayland-1"), None).is_none());
+        Ok(())
     }
 }

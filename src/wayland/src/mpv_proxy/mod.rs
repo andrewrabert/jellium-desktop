@@ -49,8 +49,20 @@ impl Proxy {
         &self.display_name
     }
 
-    /// The listener threads are detached; the OS cleans up on process exit.
+    /// Cleanup of the socket and lock files is done by `AcceptorCleanup`
+    /// when the mpv worker exits.
     fn stop(&self) {}
+}
+
+fn remove_proxy_socket_files(runtime_dir: Option<&std::path::Path>, display_name: &str) {
+    if display_name.is_empty() || display_name.contains('/') || display_name.contains("..") {
+        return;
+    }
+    let Some(dir) = runtime_dir else {
+        return;
+    };
+    let _ = std::fs::remove_file(dir.join(display_name));
+    let _ = std::fs::remove_file(dir.join(format!("{display_name}.lock")));
 }
 
 /// The authoritative window size and the generation it was published at, in
@@ -230,5 +242,65 @@ impl WpFractionalScaleV1Handler for FracScaleH {
             "wp_fractional_scale_v1.preferred_scale",
             slf.try_send_preferred_scale(scale),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_proxy_socket_files;
+
+    #[test]
+    fn removes_both_files_when_present() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let socket = temp.path().join("wayland-2");
+        let lock = temp.path().join("wayland-2.lock");
+        std::fs::write(&socket, b"socket")?;
+        std::fs::write(&lock, b"lock")?;
+        remove_proxy_socket_files(Some(temp.path()), "wayland-2");
+        assert!(!socket.exists());
+        assert!(!lock.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_files_are_ignored() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        remove_proxy_socket_files(Some(temp.path()), "wayland-2");
+        assert!(!temp.path().join("wayland-2").exists());
+        assert!(!temp.path().join("wayland-2.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn no_runtime_dir_removes_nothing() {
+        remove_proxy_socket_files(None, "wayland-2");
+    }
+
+    #[test]
+    fn rejected_names_leave_files_untouched() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        // Empty: a naive join would target the runtime dir itself, and
+        // `format!("{name}.lock")` would target `.lock`.
+        let dot_lock = temp.path().join(".lock");
+        std::fs::write(&dot_lock, b"keep")?;
+        remove_proxy_socket_files(Some(temp.path()), "");
+        assert!(dot_lock.exists());
+
+        // `../x`: a naive join would delete the parent's file.
+        let sub = temp.path().join("sub");
+        std::fs::create_dir(&sub)?;
+        let parent_file = temp.path().join("x");
+        std::fs::write(&parent_file, b"keep")?;
+        remove_proxy_socket_files(Some(&sub), "../x");
+        assert!(parent_file.exists());
+
+        // Absolute: `Path::join` discards the base, so a naive join would
+        // delete the sentinel itself.
+        let sentinel = temp.path().join("sentinel");
+        std::fs::write(&sentinel, b"keep")?;
+        let absolute = sentinel.to_string_lossy();
+        remove_proxy_socket_files(Some(temp.path()), &absolute);
+        assert!(sentinel.exists());
+        Ok(())
     }
 }

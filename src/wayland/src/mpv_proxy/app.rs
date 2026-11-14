@@ -205,7 +205,7 @@ pub(super) fn run_app_state(
     client_m.display().set_handler(ForwardDisplayH);
     ctx.with_shell(|sh| sh.mpv_client = Some(client_m.clone()));
 
-    let (mpv_worker, display_name) = match MpvWorker::spawn(rt, mpv_bridge) {
+    let (mpv_worker, display_name) = match MpvWorker::spawn(rt, mpv_bridge, upstream) {
         Ok(worker) => worker,
         Err(e) => {
             let _ = tx.send(Err(e));
