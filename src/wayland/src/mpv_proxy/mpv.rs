@@ -1,7 +1,10 @@
 use std::cell::RefCell;
 use std::ffi::CString;
+use std::io;
 use std::mem::size_of;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixListener;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
@@ -11,7 +14,6 @@ use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use crossbeam_channel::{Sender, bounded};
 use error_reporter::Report;
 use wl_proxy::baseline::Baseline;
-use wl_proxy::client::Client;
 use wl_proxy::object::{ConcreteObject, Object, ObjectCoreApi, ObjectRcUtils};
 use wl_proxy::protocols::fractional_scale_v1::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wl_proxy::protocols::viewporter::wp_viewport::{WpViewport, WpViewportHandler};
@@ -29,14 +31,16 @@ use wl_proxy::protocols::xdg_shell::xdg_toplevel::{
     XdgToplevel, XdgToplevelHandler, XdgToplevelState,
 };
 use wl_proxy::protocols::xdg_shell::xdg_wm_base::{XdgWmBase, XdgWmBaseHandler};
-use wl_proxy::state::State;
+use wl_proxy::state::{RemoteDestructor, State};
 
 use crate::runtime::WlRuntime;
 use crate::window_state::WindowSize;
 
+use super::socket::ProxySocket;
 use super::{FracScaleMgrH, NoopClient, log_send};
 
 pub(super) struct MpvWorker {
+    shutdown: Option<RemoteDestructor>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -45,15 +49,16 @@ impl MpvWorker {
         rt: &'static WlRuntime,
         bridge: OwnedFd,
     ) -> Result<(Self, CString), String> {
-        let (tx, rx) = bounded::<Result<CString, String>>(1);
+        let (tx, rx) = bounded::<Result<(CString, RemoteDestructor), String>>(1);
         let thread = thread::Builder::new()
             .name("proxy-mpv".into())
             .spawn(move || run_mpv_state(rt, tx, bridge))
             .map_err(|e| format!("mpv thread spawn failed: {e}"))?;
 
         match rx.recv() {
-            Ok(Ok(display_name)) => Ok((
+            Ok(Ok((display_name, shutdown))) => Ok((
                 Self {
+                    shutdown: Some(shutdown),
                     thread: Some(thread),
                 },
                 display_name,
@@ -70,9 +75,19 @@ impl MpvWorker {
     }
 
     pub(super) fn join(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        // Wake the worker even if bridge/client references are still alive.
+        drop(self.shutdown.take());
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::error!(target: "MpvProxy", "mpv proxy thread panicked during shutdown");
         }
+    }
+}
+
+impl Drop for MpvWorker {
+    fn drop(&mut self) {
+        self.join();
     }
 }
 
@@ -135,7 +150,11 @@ impl MpvCtx {
     }
 }
 
-fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, bridge: OwnedFd) {
+fn run_mpv_state(
+    rt: &'static WlRuntime,
+    tx: Sender<Result<(CString, RemoteDestructor), String>>,
+    bridge: OwnedFd,
+) {
     let state = match State::builder(Baseline::ALL_OF_THEM)
         .with_log_prefix("jfn-mpv")
         .with_server_fd(&Rc::new(bridge))
@@ -147,14 +166,22 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
             return;
         }
     };
-    let acceptor = match state.create_acceptor(1000) {
-        Ok(a) => a,
+    let _destroy = state.create_destructor();
+    let shutdown = match state.create_remote_destructor() {
+        Ok(shutdown) => shutdown,
         Err(e) => {
-            let _ = tx.send(Err(format!("S_mpv acceptor: {}", Report::new(e))));
+            let _ = tx.send(Err(format!("S_mpv shutdown: {}", Report::new(e))));
             return;
         }
     };
-    let name = match CString::new(acceptor.display()) {
+    let socket = match ProxySocket::new() {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = tx.send(Err(format!("S_mpv socket: {e}")));
+            return;
+        }
+    };
+    let name = match CString::new(socket.path().as_os_str().as_bytes()) {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(Err(format!("display name has NUL: {e}")));
@@ -162,7 +189,6 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
         }
     };
     let ctx = MpvCtx::new(rt);
-    state.set_handler(MpvShimStateH { ctx: ctx.clone() });
 
     let (wake, wake_source) = match calloop::ping::make_ping() {
         Ok(p) => p,
@@ -179,6 +205,21 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
         }
     };
     let handle = event_loop.handle();
+    let listener = match socket.listener.try_clone() {
+        Ok(listener) => listener,
+        Err(e) => {
+            let _ = tx.send(Err(format!("S_mpv listener clone: {e}")));
+            return;
+        }
+    };
+    let listener_source = Generic::new(listener, Interest::READ, Mode::Level);
+    if let Err(e) = handle.insert_source(listener_source, |_, listener, mpv: &mut MpvLoop| {
+        mpv.accept_clients(listener)?;
+        Ok(PostAction::Continue)
+    }) {
+        let _ = tx.send(Err(format!("S_mpv listener source: {e}")));
+        return;
+    }
     if let Err(e) = handle.insert_source(wake_source, |(), (), _: &mut MpvLoop| {}) {
         let _ = tx.send(Err(format!("S_mpv wake source: {e}")));
         return;
@@ -202,7 +243,8 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
     }
     let _wake_guard = WakeGuard(rt);
 
-    if tx.send(Ok(name)).is_err() {
+    tracing::debug!(target: "MpvProxy", pid = std::process::id(), path = %socket.path().display(), "proxy socket bound");
+    if tx.send(Ok((name, shutdown))).is_err() {
         return;
     }
     drop(tx);
@@ -219,6 +261,10 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
     if let Err(e) = event_loop.run(None, &mut mpv, MpvLoop::settle) {
         eprintln!("proxy: S_mpv event loop: {e}");
     }
+    // Close all registered listener fds before removing our private namespace.
+    drop(event_loop);
+    mpv.state.destroy();
+    tracing::debug!(target: "MpvProxy", path = %socket.path().display(), "releasing proxy socket");
 }
 
 struct MpvLoop {
@@ -229,7 +275,31 @@ struct MpvLoop {
 }
 
 impl MpvLoop {
+    fn accept_clients(&self, listener: &UnixListener) -> io::Result<()> {
+        loop {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let client = self
+                .state
+                .add_client(&Rc::new(stream.into()))
+                .map_err(|e| io::Error::other(Report::new(e).to_string()))?;
+            // add_client does not invoke StateHandler::new_client.
+            client.set_handler(NoopClient);
+            client.display().set_handler(MpvDisplayH {
+                ctx: self.ctx.clone(),
+            });
+        }
+    }
+
     fn settle(&mut self) {
+        if !self.state.is_not_destroyed() {
+            self.signal.stop();
+            return;
+        }
         // Reconcile before every sleep, not only after dispatch: a size raised
         // before the wake was published delivers no ping, so servicing it here is
         // the only thing that keeps it from sleeping out an otherwise-idle
@@ -282,18 +352,6 @@ fn emit_mpv_configure(ctx: &MpvCtx, size: WindowSize) -> bool {
             true
         }
         None => false,
-    }
-}
-
-struct MpvShimStateH {
-    ctx: MpvCtx,
-}
-impl wl_proxy::state::StateHandler for MpvShimStateH {
-    fn new_client(&mut self, client: &Rc<Client>) {
-        client.set_handler(NoopClient);
-        client.display().set_handler(MpvDisplayH {
-            ctx: self.ctx.clone(),
-        });
     }
 }
 
