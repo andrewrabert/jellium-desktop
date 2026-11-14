@@ -270,6 +270,7 @@ wrap_render_process_handler! {
             inject_jmp_native(browser, &profile, ctx);
             PaintScheduler::on_context_created(profile.shared_textures_enabled(), frame);
             run_user_scripts(&profile, frame);
+            crate::user_scripts::inject_for_frame(frame);
         }
 
         fn on_process_message_received(
