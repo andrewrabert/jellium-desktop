@@ -483,7 +483,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f48d6e78916f115e21933b44c39bd20de0bd25c753fb86b61fb4e2b84b001877"
 dependencies = [
  "cef-dll-sys",
- "libloading 0.9.0",
+ "libloading 0.9.1",
  "objc2",
  "windows-sys 0.61.2",
 ]
@@ -1017,7 +1017,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1677,7 +1677,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c91d8cffac8849493a82233811bd02b2b183b8cf39bf704de0fa0841b737595"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -2740,7 +2740,7 @@ dependencies = [
  "jfn-mailbox",
  "jfn-platform-abi",
  "khronos-egl",
- "libloading 0.9.0",
+ "libloading 0.9.1",
  "nix",
  "parking_lot",
  "tiny-skia",
@@ -2799,7 +2799,7 @@ version = "0.1.0-dev"
 dependencies = [
  "block2",
  "jfn-playback",
- "libloading 0.9.0",
+ "libloading 0.9.1",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -2946,7 +2946,7 @@ dependencies = [
  "jfn-platform-abi",
  "jfn-playback",
  "jfn-wake-event",
- "libloading 0.9.0",
+ "libloading 0.9.1",
  "nix",
  "parking_lot",
  "smithay-client-toolkit",
@@ -3204,9 +3204,9 @@ dependencies = [
 
 [[package]]
 name = "libloading"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
 dependencies = [
  "cfg-if",
  "windows-link",
@@ -4292,7 +4292,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4736,7 +4736,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5209,9 +5209,9 @@ checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "uuid"
-version = "1.29.1"
+version = "1.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a06f08a856b009bc7bbaf7d3e79808595d032dd19074c0c2ef26e49e03e6bdc"
+checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -5679,7 +5679,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6218,9 +6218,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.4.2"
+version = "9.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df3845f734baabdd02de353a20580e30ceccd03897def44a4eb8e9654992e294"
+checksum = "e3476fd497ac8af5b1ec7b51acab7bef380f7e8dd8e0487595bafd839417a302"
 dependencies = [
  "constant_time_eq",
  "crc32fast",
