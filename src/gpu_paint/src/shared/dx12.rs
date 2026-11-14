@@ -127,6 +127,7 @@ impl Importer {
                     usage: wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 },
+                wgpu::TextureUses::UNINITIALIZED,
             )
         };
         Ok(Imported {
