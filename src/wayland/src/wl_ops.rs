@@ -191,7 +191,11 @@ pub(crate) fn surface_resize(
     if let Some(surface) = s.surface.as_ref() {
         surface.set_destination(logical.w, logical.h);
     }
-    if let Some(actor) = s.layer_actor.as_ref() {
+    // The external owner resizes its own wgpu swapchain; a layer-actor
+    // viewport reapply would bare-commit that wgpu-owned surface.
+    if !s.external
+        && let Some(actor) = s.layer_actor.as_ref()
+    {
         actor.resize(logical.w, logical.h, physical.w, physical.h);
     }
     st.flush();

@@ -10,6 +10,7 @@ use crate::FrameSize;
 /// The variant also fixes the size policy — see [`crate::painter::SizePolicy`]
 /// — because whether the swapchain *is* the window is a property of the target,
 /// not a caller preference.
+#[derive(Clone, Copy)]
 pub enum WindowTarget {
     /// X11 (xcb) — `connection` is an `xcb_connection_t*`, `window` is the XID.
     /// `visual` is the ARGB visual ID. `screen` is the screen index.
@@ -20,10 +21,10 @@ pub enum WindowTarget {
         visual: u32,
     },
     /// Wayland — `display` is `wl_display*`, `surface` is `wl_surface*`. The
-    /// swapchain owns every buffer this surface carries: no other client code
-    /// attaches one. The surface's owner still commits it with no buffer to
-    /// empty it, and blocks on that commit's acknowledgement before returning,
-    /// so such a commit never interleaves with a present.
+    /// swapchain owns every buffer for this surface: no other client code
+    /// attaches one. The owner drops this surface before a bare hide commit and
+    /// rebuilds it on show, so no raw commit interleaves with the WSI's
+    /// explicit-sync points.
     Wayland {
         display: NonNull<c_void>,
         surface: NonNull<c_void>,

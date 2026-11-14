@@ -596,8 +596,11 @@ impl Loop {
                 drop(tx.send(Work::Redraw));
             }) as Arc<dyn Fn() + Send + Sync>
         };
-        let painter = Painter::new(gpu, target, extent, Arc::clone(&wake))
+        let mut painter = Painter::new(gpu, target, extent, Arc::clone(&wake))
             .map_err(LoopStartError::Painter)?;
+        // The first platform visibility commit must not race the WSI surface
+        // `new` just configured; the first shown frame rebuilds it.
+        painter.release();
         let connection = crate::connection::Connection::new(jfn_config::server_url());
         let model = Model {
             stack: Stack::empty(metadata, crate::shell::settings::Settings::new),
@@ -615,7 +618,7 @@ impl Loop {
             move || wake()
         });
         publish(&model, extent);
-        apply_visibility(surface, &model);
+        apply_visibility(&mut painter, surface, &model);
         Ok(Loop {
             actions,
             surface,
@@ -896,7 +899,7 @@ impl Loop {
         }
         this.immediate = true;
         publish(&this.model, this.current);
-        apply_visibility(this.surface, &this.model);
+        apply_visibility(&mut this.painter, this.surface, &this.model);
     }
 }
 
@@ -1073,16 +1076,10 @@ fn paint(
     cursor: Cursor,
     redraw: &Redraw,
 ) -> Painted {
-    match apply_visibility(surface, model) {
+    match apply_visibility(painter, surface, model) {
         Visibility::Hidden => Painted::Hidden,
         Visibility::Shown => match painter.acquire() {
-            Acquired::Deferred(deferred) => match deferred.retry_at() {
-                Some(at) => Painted::Deferred(at),
-                None => {
-                    redraw.request_frame();
-                    Painted::Requested
-                }
-            },
+            Acquired::Deferred(deferred) => deferred_paint(deferred, redraw),
             Acquired::Frame(frame) => {
                 ui.draw(
                     painter.renderer(),
@@ -1093,6 +1090,16 @@ fn paint(
                 Painted::Shown(painter.present(frame))
             }
         },
+    }
+}
+
+fn deferred_paint(deferred: jfn_gpu_paint::Deferred, redraw: &Redraw) -> Painted {
+    match deferred.retry_at() {
+        Some(at) => Painted::Deferred(at),
+        None => {
+            redraw.request_frame();
+            Painted::Requested
+        }
     }
 }
 
@@ -1289,14 +1296,28 @@ fn publish(model: &Model, extent: WindowExtent) {
 /// Writes the overlay surface's visibility and returns once the commit
 /// carrying it has landed. The surface's own backend holds the value; the model
 /// holds only what it asked for.
-fn apply_visibility(surface: SurfaceHandle, model: &Model) -> Visibility {
+///
+/// A visibility transition is also where the WSI surface is released (before
+/// hiding) or left to be rebuilt by the next presented frame (after showing).
+/// Only transitions call the platform: repeating `Shown` on every pass would
+/// commit the wgpu-owned surface behind the WSI's back.
+fn apply_visibility(painter: &mut Painter, surface: SurfaceHandle, model: &Model) -> Visibility {
+    let desired = model.visibility();
+    if desired == painter.visibility() {
+        return desired;
+    }
+    if !desired.is_shown() {
+        painter.release();
+    }
     let Some(lease) = jfn_platform_abi::try_lease() else {
-        return Visibility::Hidden;
+        return painter.visibility();
     };
-    lease
+    let applied = lease
         .platform()
-        .set_surface_visibility(surface, model.visibility())
-        .acknowledged()
+        .set_surface_visibility(surface, desired)
+        .acknowledged();
+    painter.set_visibility(applied);
+    applied
 }
 
 fn wait_for_target(

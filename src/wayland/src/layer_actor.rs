@@ -376,21 +376,27 @@ pub(crate) enum Action<F> {
 /// the final desired `visibility`: a frame arriving in the same wake as a
 /// coalesced hide+show is presented, not dropped.
 ///
+/// A surface owned by wgpu's Wayland WSI must never be committed here: the WSI
+/// sets explicit-sync points on the surface before its own commit, and a bare
+/// commit interleaved with them is a `no_buffer` protocol error. Its next
+/// presented frame carries the new viewport instead.
+///
 /// # Examples
 /// ```ignore
-/// let action = decide(Some(7u32), Visibility::Shown, false);
+/// let action = decide(Some(7u32), Visibility::Shown, false, false);
 /// assert_eq!(action, Action::Present(7));
 /// ```
 pub(crate) fn decide<F>(
     pending: Option<F>,
     visibility: Visibility,
     viewport_dirty: bool,
+    wgpu_owned: bool,
 ) -> Action<F> {
     if !visibility.is_shown() {
         Action::Hide
     } else if let Some(frame) = pending {
         Action::Present(frame)
-    } else if viewport_dirty {
+    } else if viewport_dirty && !wgpu_owned {
         Action::ReapplyViewport
     } else {
         Action::Nop
@@ -520,7 +526,12 @@ fn run(
             None => (None, None),
         };
         let wake = Wake {
-            action: decide(pending, visibility, viewport_dirty),
+            action: decide(
+                pending,
+                visibility,
+                viewport_dirty,
+                runner.surface_is_wgpu_owned(),
+            ),
             source,
             visibility,
             viewport,
@@ -601,9 +612,12 @@ impl Runner {
             Action::Nop => false,
         };
 
+        let wgpu_owned = self.surface_is_wgpu_owned();
+
         // The visibility gate keeps this fallback commit off a hidden GPU/WSI
-        // surface, whose buffers the compositor's swapchain owns.
-        if visibility.is_shown() && !layer_committed && viewport_dirty {
+        // surface, whose buffers the compositor's swapchain owns. A wgpu-owned
+        // surface must also be left for its next presented frame.
+        if visibility.is_shown() && !layer_committed && viewport_dirty && !wgpu_owned {
             // Zero source args leave the latched source untouched; only the
             // destination is rescaled to the new logical size.
             layer.set_viewport(0, 0, viewport.lw, viewport.lh);
@@ -613,12 +627,16 @@ impl Runner {
 
         // A request completes only on a commit carrying it, and that commit is
         // the last one this wake issues, so its acknowledgement stands for
-        // everything before it.
+        // everything before it. A wgpu-owned surface already committed through
+        // wgpu; another commit here would race its explicit-sync points, so
+        // the display round-trip stands in for it.
         let acked = request_seq.map(|seq| {
-            (
-                seq,
-                layer.commit_acked(self.rt.callbacks(), &self.qh, carries_buffer),
-            )
+            let acked = if wgpu_owned {
+                layer.sync_acked(self.rt.callbacks(), &self.qh)
+            } else {
+                layer.commit_acked(self.rt.callbacks(), &self.qh, carries_buffer)
+            };
+            (seq, acked)
         });
         if acked.is_some() {
             layer_committed = true;
@@ -633,6 +651,21 @@ impl Runner {
 }
 
 impl Runner {
+    /// Whether wgpu's Wayland WSI owns this surface's commit stream. Such a
+    /// surface must only be committed through wgpu: a bare commit can land
+    /// between the explicit-sync points the WSI sets and its buffer attach.
+    fn surface_is_wgpu_owned(&self) -> bool {
+        matches!(self.backend, Backend::Gpu { painter: Some(_) })
+    }
+
+    /// Destroys the WSI surface, and with it the wl_surface's explicit-sync
+    /// object, before a path that commits the surface itself.
+    fn release_wgpu_surface(&mut self) {
+        if let Backend::Gpu { painter } = &mut self.backend {
+            drop(painter.take());
+        }
+    }
+
     fn set_current(&mut self, buf: Option<AttachedBuffer>) {
         self.current = buf;
     }
@@ -641,6 +674,11 @@ impl Runner {
     /// about a surface's position changes with its visibility. Always commits,
     /// so it always reports `true`.
     fn hide(&mut self, layer: &LayerSurface) -> bool {
+        // Release the WSI surface before the empty commit: it carries the
+        // surface's explicit-sync object, and detaching a buffer while a point
+        // is pending is a `no_buffer` protocol error. The next present builds a
+        // fresh surface.
+        self.release_wgpu_surface();
         layer.attach_none();
         layer.commit();
         self.set_current(None);
@@ -683,7 +721,14 @@ impl Runner {
                 }
                 self.present_shm(layer, vps, p)
             }
-            PendingFrame::Dmabuf(frame) => self.present_dmabuf(layer, vps, frame),
+            PendingFrame::Dmabuf(frame) => {
+                // A shared dmabuf is attached by the compositor path, not
+                // wgpu. Release any WSI surface first: its explicit-sync
+                // object would otherwise remain associated with this
+                // wl_surface and every raw commit would violate the protocol.
+                self.release_wgpu_surface();
+                self.present_dmabuf(layer, vps, frame)
+            }
         }
     }
 
@@ -1060,26 +1105,40 @@ mod tests {
     #[test]
     fn coalesced_hide_then_show_frame_presents() {
         assert_eq!(
-            decide(Some(7u32), Visibility::Shown, false),
+            decide(Some(7u32), Visibility::Shown, false, false),
             Action::Present(7)
         );
     }
 
     #[test]
     fn hide_alone_hides() {
-        assert_eq!(decide(None::<u32>, Visibility::Hidden, false), Action::Hide);
+        assert_eq!(
+            decide(None::<u32>, Visibility::Hidden, false, false),
+            Action::Hide
+        );
     }
 
     #[test]
     fn hide_outranks_a_pending_frame() {
-        assert_eq!(decide(Some(7u32), Visibility::Hidden, true), Action::Hide);
+        assert_eq!(
+            decide(Some(7u32), Visibility::Hidden, true, false),
+            Action::Hide
+        );
     }
 
     #[test]
     fn viewport_dirty_snapshot_reapplies_viewport() {
         assert_eq!(
-            decide(None::<u32>, Visibility::Shown, true),
+            decide(None::<u32>, Visibility::Shown, true, false),
             Action::ReapplyViewport
+        );
+    }
+
+    #[test]
+    fn wgpu_owned_surface_leaves_viewport_to_its_next_frame() {
+        assert_eq!(
+            decide(None::<u32>, Visibility::Shown, true, true),
+            Action::Nop
         );
     }
 
