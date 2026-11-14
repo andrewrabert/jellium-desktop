@@ -122,6 +122,7 @@ impl Importer {
                     height,
                     depth: 1,
                 },
+                None,
             )
         };
         let texture = unsafe {
@@ -141,6 +142,7 @@ impl Importer {
                     usage: wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 },
+                wgpu::TextureUses::UNINITIALIZED,
             )
         };
         self.cached = Some(Cached {
