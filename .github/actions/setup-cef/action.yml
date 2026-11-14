@@ -13,8 +13,9 @@ runs:
           | jq -r 'first(.packages[] | select(.name=="cef") | .version) // error("cannot determine version")')
         echo "version=$version" >> "$GITHUB_OUTPUT"
 
-    - name: Cache CEF
-      uses: actions/cache@v6
+    - name: Restore CEF
+      id: cef-cache
+      uses: actions/cache/restore@v6
       with:
         path: .cache/cef
         key: cef-${{ inputs.platform }}-${{ steps.cef.outputs.version }}
@@ -22,3 +23,10 @@ runs:
     - name: Download CEF
       shell: bash
       run: cargo xtask fetch-cef
+
+    - name: Save CEF
+      if: steps.cef-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: .cache/cef
+        key: ${{ steps.cef-cache.outputs.cache-primary-key }}
