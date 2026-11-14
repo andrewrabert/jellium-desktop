@@ -52,7 +52,10 @@ impl serde::Serialize for Hwdec {
 
 impl<'de> serde::Deserialize<'de> for Hwdec {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = <&str>::deserialize(deserializer)?;
+        // Owned, not borrowed: settings.json is read through `lenient`,
+        // which hands over an owned `serde_json::Value`, and a borrowed
+        // `&str` cannot come out of one, so every saved mode was dropped.
+        let value = String::deserialize(deserializer)?;
         value.parse().map_err(serde::de::Error::custom)
     }
 }
@@ -110,5 +113,19 @@ mod tests {
             error.to_string(),
             "'garbage' is not a hardware-decode mode this OS offers"
         );
+    }
+
+    /// settings.json is read through `lenient` (an owned `serde_json::Value`),
+    /// so a saved mode must survive that path and garbage must still be ignored.
+    #[test]
+    fn saved_mode_survives_settings_load() {
+        let load = |json: &str| {
+            serde_json::from_str::<crate::SettingsFile>(json)
+                .expect("valid json")
+                .hwdec
+                .map(Hwdec::as_str)
+        };
+        assert_eq!(load(r#"{"hwdec":"auto"}"#), Some("auto"));
+        assert_eq!(load(r#"{"hwdec":"garbage"}"#), None);
     }
 }
