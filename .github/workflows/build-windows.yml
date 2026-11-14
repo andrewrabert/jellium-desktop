@@ -59,6 +59,7 @@ jobs:
             ${{ matrix.pkg_prefix }}-vulkan-loader
             ${{ matrix.pkg_prefix }}-shaderc
             ${{ matrix.pkg_prefix }}-spirv-cross
+            ${{ matrix.pkg_prefix }}-luajit
             ${{ matrix.pkg_prefix }}-llvm
 
       - name: Build mpv from source
