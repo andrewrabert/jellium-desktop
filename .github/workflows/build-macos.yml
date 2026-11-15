@@ -48,14 +48,41 @@ jobs:
             molten-vk \
             sdl3 \
             libunibreak \
-            zimg
+            zimg \
+            shaderc
+
+      # Homebrew publishes no x86_64-macOS bottle for libplacebo >= 7.387.0
+      # (mpv's minimum), so the Intel runner builds it from source. Same tag
+      # as the Flatpak manifest and build-macos-legacy.yml. brew's libplacebo
+      # stays installed for ffmpeg; PKG_CONFIG_PATH makes mpv's meson pick
+      # this one and the bundler ships both dylibs.
+      - name: Cache built libplacebo (x86_64)
+        if: matrix.arch == 'x86_64'
+        id: deps-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/jellyfin-deps
+          key: deps-x86_64-libplacebo-v7.387.0-${{ matrix.runner }}-v1
+
+      - name: Build libplacebo from source (x86_64)
+        if: matrix.arch == 'x86_64' && steps.deps-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --recursive --branch v7.387.0 https://code.videolan.org/videolan/libplacebo.git /tmp/libplacebo-src
+          meson setup /tmp/libplacebo-src/build /tmp/libplacebo-src \
+            --prefix="$HOME/jellyfin-deps" --buildtype=release \
+            -Ddemos=false -Dtests=false -Dvulkan=enabled
+          meson install -C /tmp/libplacebo-src/build --strip
 
       - uses: ./.github/actions/setup-cef
         with:
           platform: ${{ github.workflow }}-${{ matrix.arch }}
 
       - name: Build app bundle
-        run: cargo xtask install --prefix build/output
+        run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            export PKG_CONFIG_PATH="$HOME/jellyfin-deps/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          fi
+          cargo xtask install --prefix build/output
 
       - name: Create DMG
         run: |
