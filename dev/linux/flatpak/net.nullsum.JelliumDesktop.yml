@@ -104,8 +104,8 @@ modules:
         sources:
           - type: git
             url: https://github.com/haasn/libplacebo.git
-            tag: v7.360.1
-            commit: cee9b076f2c63104ccfd497fa79c39a867293ec4
+            tag: v7.387.0
+            commit: 275f7dea27924cdd34ab2e6c20e448b6bc4fab65
             x-checker-data:
               type: git
               tag-pattern: ^v([\d.]+)$
