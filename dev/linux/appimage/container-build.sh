@@ -46,6 +46,9 @@ cp -a /usr/lib64 "$APPDIR/usr/lib"
 # mpv lib (xtask build copies it next to jellium-desktop)
 cp "$BUILD"/libmpv.so.2 "$APPDIR/usr/lib/"
 
+# libplacebo built from source in the image (see Dockerfile); mpv links it.
+cp -a /usr/local/lib64/libplacebo.so.* "$APPDIR/usr/lib/"
+
 # Fedora's ffmpeg links GnuTLS; GnuTLS needs a system priority file from
 # crypto-policies. Bundle the DEFAULT one; AppRun points GNUTLS_SYSTEM_PRIORITY_FILE at it.
 mkdir -p "$APPDIR/usr/share/crypto-policies/DEFAULT"
