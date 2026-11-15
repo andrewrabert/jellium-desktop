@@ -54,5 +54,13 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
     if let Some(dir) = &args.external_mpv {
         xfs::copy_glob(&dir.join("lib"), prefix, &["*.dll"])?;
     }
+
+    let scripts_src = crate::paths::repo_root()
+        .join("resources")
+        .join("mpv")
+        .join("scripts");
+    if scripts_src.exists() {
+        xfs::copy_dir_recursive(&scripts_src, &prefix.join("mpv").join("scripts"))?;
+    }
     Ok(prefix.to_path_buf())
 }
