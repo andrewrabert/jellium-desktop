@@ -40,7 +40,11 @@ impl WindowGeometryController {
     /// `None` when the saved logical size does not map to a representable
     /// physical one at the reported scale.
     pub fn boot(&self) -> Option<BootGeometry> {
-        let g = jfn_config::window_geometry();
+        let mut g = jfn_config::window_geometry();
+        // Startup mode is explicit, independent of the previous session's mode.
+        // Apply it after native/browser readiness, not during mpv VO creation.
+        g.maximized = matches!(plat().window_owner(), jfn_platform_abi::WindowOwner::App(_))
+            && jfn_config::startup_window_mode() == jfn_config::StartupWindowMode::Maximized;
         let at = (g.x >= 0 && g.y >= 0).then_some(jfn_platform_abi::WindowPos { x: g.x, y: g.y });
         let scale = plat().display_scale(at);
         resolve_boot(g, scale, |w| plat().clamp_window_geometry(w))
