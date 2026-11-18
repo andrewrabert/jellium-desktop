@@ -1,12 +1,14 @@
 //! Generate libmpv bindings (`mpv/client.h`) and configure linkage.
 //!
 //! Header source order:
-//!   1. `JFN_MPV_INCLUDE_DIR` env override (set by xtask during in-tree build).
+//!   1. `JFN_MPV_INCLUDE_DIR` env override (set by xtask during in-tree build;
+//!      macOS and Windows only).
 //!   2. `EXTERNAL_MPV_DIR` env override.
 //!   3. pkg-config `mpv` (system install / `/opt/jellium-desktop/libmpv`).
-//!   4. Vendored `third_party/mpv/include`.
+//!   4. Vendored `third_party/mpv/include` (macOS and Windows only).
 //!
-//! Linkage: `JFN_MPV_LIB_DIR` (in-tree meson build dir) or `EXTERNAL_MPV_DIR/lib`
+//! Linkage: `JFN_MPV_LIB_DIR` (in-tree meson build dir; macOS and Windows only)
+//! or `EXTERNAL_MPV_DIR/lib`
 //! emit a `rustc-link-search`; otherwise pkg-config supplies it.
 //! `cargo:rustc-link-lib=mpv` always emitted.
 
@@ -157,12 +159,18 @@ fn resolve_paths() -> BuildResult<(Vec<PathBuf>, bool)> {
     let mut includes: Vec<PathBuf> = Vec::new();
     let mut linked = false;
 
-    if let Ok(dir) = env::var("JFN_MPV_INCLUDE_DIR") {
-        includes.push(PathBuf::from(dir));
-    }
+    // The mpv submodule (in-tree build + vendored headers) is macOS and
+    // Windows only.
+    let submodule = cfg!(any(target_os = "macos", target_os = "windows"));
 
-    if let Ok(dir) = env::var("JFN_MPV_LIB_DIR") {
-        println!("cargo:rustc-link-search=native={dir}");
+    if submodule {
+        if let Ok(dir) = env::var("JFN_MPV_INCLUDE_DIR") {
+            includes.push(PathBuf::from(dir));
+        }
+
+        if let Ok(dir) = env::var("JFN_MPV_LIB_DIR") {
+            println!("cargo:rustc-link-search=native={dir}");
+        }
     }
 
     if let Ok(dir) = env::var("EXTERNAL_MPV_DIR") {
@@ -185,7 +193,7 @@ fn resolve_paths() -> BuildResult<(Vec<PathBuf>, bool)> {
     // Vendored fallback (header-only — does not configure linkage).
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let vendored = manifest.join("../../third_party/mpv/include");
-    if vendored.exists() {
+    if submodule && vendored.exists() {
         includes.push(vendored);
     }
 

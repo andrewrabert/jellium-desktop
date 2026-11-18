@@ -48,9 +48,11 @@ pub struct BuildArgs {
     #[arg(long)]
     pub cef_path: Option<PathBuf>,
     /// Use the named external libmpv directory (must contain include/ and lib/).
+    /// Without it, macOS and Windows build the mpv submodule; elsewhere the
+    /// system libmpv found via pkg-config is linked.
     #[arg(long, env = "EXTERNAL_MPV_DIR")]
     pub external_mpv: Option<PathBuf>,
-    /// Also build the standalone mpv CLI binary from the submodule.
+    /// Also build the standalone mpv CLI binary from the submodule (macOS and Windows only).
     #[arg(long)]
     pub mpv_cli: bool,
     /// Disable the KWin per-window titlebar color feature (drops the default cargo feature).

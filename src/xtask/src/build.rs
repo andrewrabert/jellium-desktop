@@ -12,11 +12,17 @@ pub fn run(args: &BuildArgs) -> Result<()> {
     };
     println!("Found CEF: {}", cef_info.version);
 
+    // The mpv submodule is built on macOS and Windows only; elsewhere the
+    // system libmpv is linked.
+    let submodule_mpv =
+        cfg!(any(target_os = "macos", target_os = "windows")) && args.external_mpv.is_none();
     let (mpv_info, used_external_mpv) = if let Some(dir) = &args.external_mpv {
         println!("Using external mpv from: {}", dir.display());
         (mpv::external(dir)?, true)
-    } else {
+    } else if submodule_mpv {
         (mpv::build(&out, args.mpv_cli)?, false)
+    } else {
+        (mpv::system()?, true)
     };
 
     // Cargo invocation — mirror the env CMake passes today.
@@ -57,7 +63,7 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         cmd.env("EXTERNAL_MPV_DIR", dir);
         cmd.env_remove("JFN_MPV_INCLUDE_DIR");
         cmd.env_remove("JFN_MPV_LIB_DIR");
-    } else {
+    } else if submodule_mpv {
         cmd.env_remove("EXTERNAL_MPV_DIR");
         cmd.env(
             "JFN_MPV_INCLUDE_DIR",
@@ -65,11 +71,12 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         );
         cmd.env("JFN_MPV_LIB_DIR", &mpv_info.build_dir);
     }
+    // Otherwise jfn-mpv's build script resolves the system libmpv via pkg-config.
 
     // Linux: rpath system / out-of-tree lib dirs into the binary so it
     // resolves DT_NEEDED entries that aren't shipped alongside it.
-    // In-tree builds (.cache/cef + meson mpv) stay relocatable —
-    // libs are staged next to the binary and $ORIGIN handles them.
+    // The in-tree CEF (.cache/cef) stays relocatable — its libs are staged
+    // next to the binary and $ORIGIN handles them.
     if cfg!(target_os = "linux") {
         let mut rpaths: Vec<String> = Vec::new();
         if cef_info.link_external {

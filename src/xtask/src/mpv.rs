@@ -85,6 +85,30 @@ pub fn external(dir: &Path) -> Result<Mpv> {
     })
 }
 
+/// Locate the system libmpv through pkg-config. The jfn-mpv build script
+/// resolves headers and linkage from the same pkg-config entry.
+pub fn system() -> Result<Mpv> {
+    let query = |arg: &str| -> Result<String> {
+        let output = Command::new("pkg-config")
+            .args([arg, "mpv"])
+            .output()
+            .context("spawn pkg-config")?;
+        if !output.status.success() {
+            bail!(
+                "system libmpv not found via pkg-config: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let version = query("--modversion")?;
+    let libdir = query("--variable=libdir")?;
+    println!("Using system mpv {version} from: {libdir}");
+    Ok(Mpv {
+        build_dir: PathBuf::from(libdir),
+    })
+}
+
 pub fn library_path(build_dir: &Path) -> PathBuf {
     build_dir.join(LINK_NAME)
 }

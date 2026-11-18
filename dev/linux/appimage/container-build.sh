@@ -1,8 +1,8 @@
 #!/bin/sh
 # Run inside the appimage build container (jellium-desktop-appimage:base).
 # Bind mounts (set up by `just appimage build`):
-#   /src           rw  -- repo root (CEF + submodules must be populated by host)
-#   /build         rw  -- cargo + meson incremental state, persists on host
+#   /src           rw  -- repo root (CEF must be populated by host)
+#   /build         rw  -- cargo incremental state, persists on host
 #   /host-output   rw  -- .AppImage output dir
 # Env:
 #   VERSION        -- version string for the output filename
@@ -43,10 +43,9 @@ cp "$BUILD"/libvk_swiftshader.so "$APPDIR/usr/bin/"
 # Fedora x86_64: shared libs live in /usr/lib64; /usr/lib holds noarch only.
 cp -a /usr/lib64 "$APPDIR/usr/lib"
 
-# mpv lib (xtask build copies it next to jellium-desktop)
-cp "$BUILD"/libmpv.so.2 "$APPDIR/usr/lib/"
-
-# libplacebo built from source in the image (see Dockerfile); mpv links it.
+# mpv and the libplacebo it links, both built from source in the image
+# (see Dockerfile).
+cp -a /usr/local/lib64/libmpv.so.* "$APPDIR/usr/lib/"
 cp -a /usr/local/lib64/libplacebo.so.* "$APPDIR/usr/lib/"
 
 # Fedora's ffmpeg links GnuTLS; GnuTLS needs a system priority file from

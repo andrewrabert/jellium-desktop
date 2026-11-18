@@ -1,5 +1,4 @@
-# Toolchain image for building jellium-desktop AppImages.
-# Source build, mpv build, AppDir assembly, and packaging all happen at
+# Source build, AppDir assembly, and packaging all happen at
 # `podman run` time via container-build.sh (bind-mounted from the repo at
 # /src/dev/linux/appimage/container-build.sh), with host bind mounts for
 # incremental state. See container-build.sh and dev/linux/appimage/appimage.just.
@@ -8,8 +7,6 @@ FROM fedora:44
 # can decode the media and the device profile advertises it to the server.
 # ffmpeg-devel below pulls it in; --allowerasing handles the swap for the
 # libplacebo/libass deps.
-# Fedora's libplacebo (7.360.1) stays installed for ffmpeg; mpv needs
-# >= 7.387.0, built from source below into /usr/local.
 RUN dnf -y upgrade && \
     dnf -y install \
         "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
@@ -36,11 +33,14 @@ RUN dnf -y upgrade && \
         wget file patchelf desktop-file-utils && \
     dnf clean all
 
-# libplacebo >= 7.387.0 (mpv requirement); same tag as the Flatpak manifest
-# and build-macos-legacy.yml. Installed to /usr/local so it coexists with
+ARG LIBPLACEBO_VERSION=v7.387.0
+ARG MPV_VERSION=v0.42.0
+
+# libplacebo for mpv; same tag as the Flatpak manifest and
+# build-macos-legacy.yml. Installed to /usr/local so it coexists with
 # Fedora's libplacebo that ffmpeg links. PKG_CONFIG_PATH makes mpv's meson
 # pick it; container-build.sh bundles the resulting .so into the AppDir.
-RUN git clone --depth 1 --recursive --branch v7.387.0 \
+RUN git clone --depth 1 --recursive --branch "${LIBPLACEBO_VERSION}" \
         https://github.com/haasn/libplacebo.git /tmp/libplacebo && \
     meson setup /tmp/libplacebo/build /tmp/libplacebo \
         --prefix=/usr/local --libdir=lib64 --buildtype=release \
@@ -48,6 +48,18 @@ RUN git clone --depth 1 --recursive --branch v7.387.0 \
     meson install -C /tmp/libplacebo/build --strip && \
     rm -rf /tmp/libplacebo
 ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig
+
+# `cargo xtask build` finds this libmpv through pkg-config; ldconfig lets the
+# linker resolve its libplacebo dependency. container-build.sh bundles the .so.
+RUN git clone --depth 1 --branch "${MPV_VERSION}" \
+        https://github.com/mpv-player/mpv.git /tmp/mpv && \
+    meson setup /tmp/mpv/build /tmp/mpv \
+        --prefix=/usr/local --libdir=lib64 --default-library=shared \
+        -Dlibmpv=true -Dcplayer=false -Dlua=luajit && \
+    meson install -C /tmp/mpv/build --strip && \
+    rm -rf /tmp/mpv && \
+    echo /usr/local/lib64 > /etc/ld.so.conf.d/usr-local-lib64.conf && \
+    ldconfig
 
 WORKDIR /opt/tools
 RUN ARCH="$(uname -m)" && \

@@ -10,19 +10,13 @@ prefer_csd := '1'
 [group('build')]
 [linux]
 build: linux_common::deps
-    cargo xtask build --mpv-cli
+    cargo xtask build
 
 # Run the app
 [group('run')]
 [linux]
 run *args: build
     build/jellium-desktop {{args}}
-
-# Run the mpv CLI
-[group('run')]
-[linux]
-run-mpv *args: build
-    build/mpv-build/mpv {{args}}
 
 # Run the app inside a nested niri session (stdio stays on this terminal)
 [group('run')]

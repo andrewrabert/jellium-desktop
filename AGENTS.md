@@ -3,11 +3,10 @@
 ## Build / Run
 All app code is Rust; the cargo workspace lives in `src/` and produces the `jellium-desktop` binary. Everything is driven through `just` — recipes are OS-gated via `[macos]`/`[linux]`/`[windows]` attributes, so the same command works everywhere:
 ```
-just deps      # one-time: submodules, CEF download, macOS brew packages
+just deps      # one-time: CEF download, submodules (macOS and Windows only), macOS brew packages
 just build     # build + stage a runnable tree in build/ (+ .app bundle on macOS)
 just test      # run the workspace test suite (depends on build)
 just run       # run with debug logging → logs to build/run.log
-just run-mpv   # run the bundled mpv CLI directly (mpv-only debugging)
 just clean     # remove build/ and dist/, cargo clean
 just fmt        # format the workspace (cargo fmt)
 just fmt-check  # check formatting without writing
@@ -31,7 +30,7 @@ writing a justification for it is the failure mode, not the mitigation.
 
 ## Architecture
 - **CEF** (Chromium Embedded Framework) — hosts jellyfin-web as an embedded browser; handles JS-to-Rust IPC for player control commands and renders the UI as an overlay texture above the video layer. Multi-process: browser process (main app, owns CefBrowser), renderer process (V8/Blink), GPU process. IPC via `CefProcessMessage`. Bindings via `cef-dll-sys`; project glue lives in `src/jfn_cef`.
-- **mpv** (fork in `third_party/mpv`) — video playback; the desktop client injects native shims to override browser media playback. mpv owns its own window + GPU; libmpv is used only for the control plane (properties/commands/events).
+- **mpv** (fork in `third_party/mpv`, macOS and Windows only) — video playback; the desktop client injects native shims to override browser media playback. mpv owns its own window + GPU; libmpv is used only for the control plane (properties/commands/events).
 - Wayland subsurface for video layer (Linux). Platform crates: `src/macos`, `src/windows`, plus Wayland/X11 paths under `src/`.
 
 ## mpv Integration

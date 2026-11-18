@@ -1,12 +1,6 @@
 set working-directory := '../..'
 
-# Ensure submodules and CEF are present
 [group('deps')]
 [linux]
 deps:
-    #!/bin/sh
-    set -eu
-    if ! [ -e third_party/mpv/.git ]; then
-        git submodule update --init --recursive
-    fi
     cargo xtask fetch-cef
