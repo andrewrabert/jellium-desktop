@@ -322,6 +322,12 @@
             this.onPlaybackStart = (e, player) => {
                 console.debug('[Media] playbackstart event, player:', !!player);
 
+                // Attach first: the position and queue queries below resolve
+                // through the attached player.
+                if (player && player !== self.attachedPlayer) {
+                    self.attachPlayer(player);
+                }
+
                 const state = self._playerState(player);
 
                 if (state && state.NowPlayingItem) {
@@ -332,10 +338,6 @@
                 if (window.jmpNative) window.jmpNative.notifyPlaybackState('Playing');
                 self.startPositionUpdates();
                 self.updateQueueState();
-
-                if (player && player !== self.attachedPlayer) {
-                    self.attachPlayer(player);
-                }
             };
 
             this.onPlaybackStop = (e, stopInfo) => {
