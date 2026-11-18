@@ -72,8 +72,13 @@ modules:
       - /share/icons/hicolor/*/apps/mpv*
       - /share/zsh
     sources:
-      - type: dir
-        path: ../../../third_party/mpv
+      - type: git
+        url: https://github.com/mpv-player/mpv.git
+        tag: v0.42.0
+        commit: b0841e8c4d156b8403dc1876c4cbd9011eb583f3
+        x-checker-data:
+          type: git
+          tag-pattern: ^v([\d.]+)$
     modules:
       - name: luajit
         no-autogen: true

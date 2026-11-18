@@ -23,12 +23,13 @@ pub fn stage_mpv_scripts(out: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn stage_mpv(out: &Path, mpv_info: &mpv::Mpv, used_external: bool, _bin: &Path) -> Result<()> {
-    if !used_external {
-        let runtime = mpv::runtime_library_name();
-        xfs::copy_file(&mpv_info.build_dir.join(runtime), &out.join(runtime))?;
+pub fn stage_mpv(out: &Path, _mpv: &mpv::Mpv, _used_external: bool, _bin: &Path) -> Result<()> {
+    // libmpv is resolved from the system or the external prefix. One staged
+    // by an older build would shadow it through the binary's $ORIGIN rpath.
+    match std::fs::remove_file(out.join(mpv::runtime_library_name())) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<PathBuf> {
@@ -43,14 +44,12 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
         xfs::copy_dir_recursive(&cef.dir.join("locales"), &prefix.join("locales"))?;
     }
 
+    // With the system libmpv there is nothing to ship.
     if let Some(dir) = &args.external_mpv {
         xfs::copy_file(
             &dir.join("lib").join("libmpv.so"),
             &prefix.join("libmpv.so"),
         )?;
-    } else {
-        let runtime = mpv::runtime_library_name();
-        xfs::copy_file(&build_dir.join(runtime), &prefix.join(runtime))?;
     }
 
     let scripts_src = paths::repo_root()

@@ -54,5 +54,4 @@ Available recipes:
 
     [run]
     run *args     # Run the app
-    run-mpv *args # Run the mpv CLI
 ```
