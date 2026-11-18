@@ -112,12 +112,15 @@ impl Platform for WaylandPlatform {
         crate::lifecycle::cleanup(self.rt());
     }
 
-    fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
-        if let Err(e) = self.rt().proxy().stop() {
-            tracing::warn!(target: "Main", "remove proxy socket: {e}");
-        }
+    fn post_window_cleanup(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+    ) -> Result<(), jfn_platform_abi::HostReleaseError> {
+        let stopped = self.rt().proxy().stop();
+        // Every release runs; a failed one is reported after the rest.
         #[cfg(feature = "kde-palette")]
         crate::kde_palette::post_window_cleanup(self.rt());
+        stopped.map_err(|e| jfn_platform_abi::HostReleaseError::new("mpv proxy socket removal", e))
     }
 
     fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {

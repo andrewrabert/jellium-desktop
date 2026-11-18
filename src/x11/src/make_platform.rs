@@ -52,8 +52,12 @@ impl Platform for X11Platform {
 
     // Runs after mpv_terminate_destroy: mpv's embedded window is gone, so the
     // top-level's connection can finally close.
-    fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
+    fn post_window_cleanup(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+    ) -> Result<(), jfn_platform_abi::HostReleaseError> {
         crate::geometry::drop_toplevel_connection();
+        Ok(())
     }
 
     fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {

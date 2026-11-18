@@ -485,7 +485,12 @@ impl Platform for MacosPlatform {
 
     // mpv's window is gone by the time this runs and AppKit owns nothing past
     // cleanup
-    fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {}
+    fn post_window_cleanup(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+    ) -> Result<(), jfn_platform_abi::HostReleaseError> {
+        Ok(())
+    }
 
     fn window_decoration_options(&self) -> jfn_platform_abi::DecorationOptions {
         jfn_platform_abi::DecorationOptions::all()

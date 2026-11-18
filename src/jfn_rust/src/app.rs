@@ -444,6 +444,8 @@ enum CleanupError {
     Cef(#[from] jfn_cef::ShutdownError),
     #[error(transparent)]
     Platform(#[from] jfn_platform_abi::PlatformBusy),
+    #[error(transparent)]
+    HostRelease(#[from] jfn_platform_abi::HostReleaseError),
 }
 #[derive(Debug)]
 struct CleanupErrors(Vec<CleanupError>);
@@ -524,7 +526,8 @@ impl NativePhase for PreparedNative {
             .cleanup(|| Ok::<(), std::convert::Infallible>(()))
         {
             Ok(()) => Ok(()),
-            Err((never, _)) => match never {},
+            Err(jfn_platform_abi::PostWindowError::Termination { error, .. }) => match error {},
+            Err(jfn_platform_abi::PostWindowError::HostRelease(error)) => Err(error.into()),
         }
     }
 }
@@ -532,12 +535,13 @@ impl NativePhase for MpvNative {
     fn cleanup(self) -> Result<(), CleanupError> {
         match self.prepared.cleanup(|| self.mpv.terminate()) {
             Ok(()) => Ok(()),
-            Err((error, post_window)) => {
+            Err(jfn_platform_abi::PostWindowError::Termination { error, post_window }) => {
                 let detail = error.to_string();
                 error.abandon();
                 post_window.abandon();
                 Err(CleanupError::Termination(detail))
             }
+            Err(jfn_platform_abi::PostWindowError::HostRelease(error)) => Err(error.into()),
         }
     }
 }
@@ -558,6 +562,7 @@ impl NativePhase for InitializedNative {
                 post_window.abandon();
                 Err(CleanupError::Termination(detail))
             }
+            Err(jfn_platform_abi::PlatformCleanupError::HostRelease(error)) => Err(error.into()),
         }
     }
 }
