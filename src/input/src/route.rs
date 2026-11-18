@@ -108,7 +108,7 @@ pub fn is_text(ch: char, modifiers: u32, is_system_key: bool) -> bool {
     !ch.is_control()
         && !is_system_key
         && !held(ef::EVENTFLAG_COMMAND_DOWN)
-        && !(held(ef::EVENTFLAG_CONTROL_DOWN) && !held(ef::EVENTFLAG_ALT_DOWN))
+        && (!held(ef::EVENTFLAG_CONTROL_DOWN) || held(ef::EVENTFLAG_ALT_DOWN))
 }
 
 /// The xdg_toplevel resize-edge mask under `p`, or `None`.
