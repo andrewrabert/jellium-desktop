@@ -45,13 +45,16 @@ function makeNative() {
     };
 }
 
-function makePlayer(timeMs) {
+function makePlayer(timeMs, { mediaType = 'Video', rate = 1.25 } = {}) {
     return {
-        name: 'MPV Video Player',
+        name: 'MPV ' + mediaType + ' Player',
         isLocalPlayer: true,
         _t: timeMs,
+        // Stands in for jellyfin-web's per-player streamInfo.item, which
+        // onPlaybackStopped nulls when the next item uses another player.
+        _item: { Id: 'a', Name: 'Item A', MediaType: mediaType },
         currentTime() { return this._t; },
-        getPlaybackRate() { return 1.25; }
+        getPlaybackRate() { return rate; }
     };
 }
 
@@ -77,7 +80,7 @@ function makePlaybackManager() {
         },
         getPlayerState(player = this._currentPlayer) {
             if (!player) throw new Error('player cannot be null');
-            return { NowPlayingItem: { Id: 'a', Name: 'Item A', MediaType: 'Video' } };
+            return player._item ? { NowPlayingItem: player._item } : {};
         },
         duration(player = this._currentPlayer) {
             if (!player) throw new Error('player cannot be null');
@@ -217,4 +220,35 @@ test('destroy really unbinds the player and manager handlers', () => {
     for (const name of ['playing', 'pause', 'ratechange', 'timeupdate']) {
         assert.deepStrictEqual(player._callbacks[name], [], name);
     }
+});
+
+test('switching player reports the queue and rate from the new player', () => {
+    const { Plugin, native } = load();
+    const pm = makePlaybackManager();
+    const qm = pm._playQueueManager;
+    const video = makePlayer(0, { mediaType: 'Video', rate: 1.5 });
+    const audio = makePlayer(0, { mediaType: 'Audio', rate: 1.0 });
+    const plugin = new Plugin({ playbackManager: pm, inputManager: null });
+    const queue = () => native.calls.filter(c => c[0] === 'queue').map(c => c.slice(1));
+
+    pm._currentPlayer = video;
+    Events.trigger(pm, 'playbackstart', [video]);
+
+    // Real stop.
+    qm.reset();
+    Events.trigger(pm, 'playbackstop', [{ nextMediaType: null }]);
+    video._item = null;
+    pm._currentPlayer = null;
+
+    // Music starts on the audio player, first track of two. Previous is
+    // always available for music.
+    qm._playlist = [{ Id: 'm1' }, { Id: 'm2' }];
+    qm._index = 0;
+    pm._currentPlayer = audio;
+    Events.trigger(pm, 'playbackstart', [audio]);
+
+    assert.strictEqual(plugin.attachedPlayer, audio);
+    assert.deepStrictEqual(queue().at(-1), [true, true]);
+    assert.strictEqual(plugin.positionTracking.rate, 1.0);
+    assert.deepStrictEqual(video._callbacks.playing, []);
 });
