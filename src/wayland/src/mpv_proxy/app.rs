@@ -152,8 +152,10 @@ impl Drop for AppMpv {
         drop(shell_client);
         drop(subsurface);
         drop(self.client.take());
-        if let Some(mut worker) = self.worker.take() {
-            worker.join();
+        if let Some(mut worker) = self.worker.take()
+            && let Err(e) = worker.join()
+        {
+            tracing::error!(target: "MpvProxy", "{}", Report::new(e));
         }
     }
 }
@@ -210,7 +212,7 @@ pub(super) fn run_app_state(
     let (mpv_worker, mpv_startup) = match MpvWorker::spawn(rt, mpv_bridge) {
         Ok(worker) => worker,
         Err(e) => {
-            let _ = tx.send(Err(e));
+            let _ = tx.send(Err(Report::new(e).to_string()));
             return;
         }
     };

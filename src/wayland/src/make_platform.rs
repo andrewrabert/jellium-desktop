@@ -113,7 +113,9 @@ impl Platform for WaylandPlatform {
     }
 
     fn post_window_cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
-        self.rt().proxy().stop();
+        if let Err(e) = self.rt().proxy().stop() {
+            tracing::warn!(target: "Main", "remove proxy socket: {e}");
+        }
         #[cfg(feature = "kde-palette")]
         crate::kde_palette::post_window_cleanup(self.rt());
     }
