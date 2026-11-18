@@ -151,7 +151,7 @@ fn wake_mpv_on_window_change() -> jfn_platform_abi::WindowSubscription {
     jfn_platform_abi::subscribe_window_changed(jfn_mpv::api::jfn_mpv_wakeup)
 }
 
-fn setup_mpv_environment() {
+fn setup_mpv_environment() -> Result<(), jfn_platform_abi::PlatformInitError> {
     let mpv_home = jfn_paths::mpv_home();
     unsafe {
         std::env::set_var("MPV_HOME", &mpv_home);
@@ -159,7 +159,7 @@ fn setup_mpv_environment() {
 
     plat()
         .mpv_host()
-        .prepare(jfn_config::configured_window_decorations());
+        .prepare(jfn_config::configured_window_decorations())
 }
 
 struct StartupOptions {
@@ -1003,7 +1003,10 @@ fn run_app(
     };
     let mpv_boot = plat().window_owner().apply_boot_geometry(&boot);
 
-    setup_mpv_environment();
+    if let Err(error) = setup_mpv_environment() {
+        tracing::error!(target: "Main", "{error}");
+        return 1;
+    }
 
     // Hosts that own their toplevel create it here, before mpv init, so its
     // window ID can be handed to mpv as `wid`.

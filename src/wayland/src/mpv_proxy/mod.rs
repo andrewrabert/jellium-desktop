@@ -146,10 +146,11 @@ impl ProxyShared {
         }
     }
 
-    /// Publish the running proxy. Returns `Err` if one was already set.
-    pub(crate) fn set_proxy(&self, proxy: Proxy) -> Result<&Proxy, ()> {
-        self.proxy.set(proxy).map_err(|_| ())?;
-        self.proxy.get().ok_or(())
+    pub(crate) fn set_proxy(&self, proxy: Proxy) -> Result<&Proxy, ProxyStartError> {
+        self.proxy
+            .set(proxy)
+            .map_err(|_| ProxyStartError::AlreadyStarted)?;
+        self.proxy.get().ok_or(ProxyStartError::AlreadyStarted)
     }
 
     /// Returns the original `WAYLAND_DISPLAY` value before any override, if available.
@@ -170,38 +171,37 @@ fn log_send(op: &str, res: Result<(), wl_proxy::object::ObjectError>) {
     }
 }
 
-pub fn start(rt: &'static WlRuntime) -> Option<Proxy> {
+#[derive(Debug, thiserror::Error)]
+pub enum ProxyStartError {
+    #[error("app thread spawn failed: {0}")]
+    Spawn(io::Error),
+    #[error("{0}")]
+    Startup(String),
+    #[error("app thread exited before publishing startup state")]
+    Exited,
+    #[error("proxy already started")]
+    AlreadyStarted,
+}
+
+pub fn start(rt: &'static WlRuntime) -> Result<Proxy, ProxyStartError> {
     // Capture upstream BEFORE the caller overrides WAYLAND_DISPLAY, so S_app
     // connects to the real compositor rather than our own socket.
     let upstream = std::env::var("WAYLAND_DISPLAY").ok();
     let upstream_for_thread = upstream.clone();
 
     let (tx_app, rx_app) = crossbeam_channel::bounded::<Result<AppStartup, String>>(1);
-    let app_thread = match thread::Builder::new()
+    let app_thread = thread::Builder::new()
         .name("proxy-app".into())
         .spawn(move || run_app_state(rt, tx_app, upstream_for_thread))
-    {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("proxy: app thread spawn failed: {e}");
-            return None;
-        }
-    };
-    let startup = match rx_app.recv() {
-        Ok(Ok(startup)) => startup,
-        Ok(Err(msg)) => {
-            eprintln!("proxy: {msg}");
-            return None;
-        }
-        Err(_) => {
-            eprintln!("proxy: app thread exited before publishing startup state");
-            return None;
-        }
-    };
+        .map_err(ProxyStartError::Spawn)?;
+    let startup = rx_app
+        .recv()
+        .map_err(|_| ProxyStartError::Exited)?
+        .map_err(ProxyStartError::Startup)?;
     rt.proxy()
         .app_client_fd
         .store(startup.app_fd.into_raw_fd(), Ordering::Release);
-    Some(Proxy {
+    Ok(Proxy {
         display_name: startup.display_name,
         upstream_display_name: upstream,
         socket_dir: Mutex::new(Some(startup.socket_dir)),
