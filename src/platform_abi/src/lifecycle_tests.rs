@@ -29,8 +29,9 @@ impl Platform for Backend {
     fn cleanup(&self, _access: &LifecycleAccess) {
         self.events.lock().push("detach backend");
     }
-    fn post_window_cleanup(&self, _access: &LifecycleAccess) {
+    fn post_window_cleanup(&self, _access: &LifecycleAccess) -> Result<(), HostReleaseError> {
         self.events.lock().push("release host");
+        Ok(())
     }
     fn display(&self) -> DisplayBackend {
         unreachable!("lifecycle test never calls this platform operation")
@@ -229,6 +230,7 @@ fn busy_cleanup_returns_backend_and_window_owner_for_retry() {
         Ok(()) => panic!("cleanup ran with a dependent alive"),
         Err(PlatformCleanupError::Busy { runtime, terminate }) => (runtime, terminate),
         Err(PlatformCleanupError::Termination { .. }) => panic!("termination attempted while busy"),
+        Err(PlatformCleanupError::HostRelease(_)) => panic!("host released while busy"),
     };
     assert_eq!(*backend.events.lock(), ["acquired host"]);
     assert!(

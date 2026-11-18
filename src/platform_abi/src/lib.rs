@@ -468,7 +468,7 @@ pub trait Platform: Send + Sync {
     /// `mpv` is the opaque libmpv `mpv_handle` — a raw C handle, stays raw.
     fn init(&self, access: &LifecycleAccess, mpv: *mut c_void) -> Result<(), PlatformInitError>;
     fn cleanup(&self, access: &LifecycleAccess);
-    fn post_window_cleanup(&self, access: &LifecycleAccess);
+    fn post_window_cleanup(&self, access: &LifecycleAccess) -> Result<(), HostReleaseError>;
 
     // Per-surface
     /// The surface starts in `initial`; no surface is born at a default.
@@ -951,7 +951,7 @@ impl PreparedPlatform {
             _thread: std::marker::PhantomData,
         })
     }
-    pub fn cleanup<F, E>(self, terminate_window: F) -> Result<(), (E, PostWindowCleanup)>
+    pub fn cleanup<F, E>(self, terminate_window: F) -> Result<(), PostWindowError<E>>
     where
         F: FnOnce() -> Result<(), E>,
     {
@@ -1032,9 +1032,11 @@ impl PlatformRuntime {
         };
         remaining
             .retry(terminate_window)
-            .map_err(|(error, post_window)| PlatformCleanupError::Termination {
-                error,
-                post_window,
+            .map_err(|failure| match failure {
+                PostWindowError::Termination { error, post_window } => {
+                    PlatformCleanupError::Termination { error, post_window }
+                }
+                PostWindowError::HostRelease(error) => PlatformCleanupError::HostRelease(error),
             })
     }
 }
@@ -1050,6 +1052,49 @@ pub enum PlatformCleanupError<F, E> {
         error: E,
         post_window: PostWindowCleanup,
     },
+    /// The window is gone and every cleanup phase ran; nothing is retained.
+    HostRelease(HostReleaseError),
+}
+
+pub enum PostWindowError<E> {
+    /// Window termination is unconfirmed; the host is retained for a retry.
+    Termination {
+        error: E,
+        post_window: PostWindowCleanup,
+    },
+    /// The window is gone and post-window cleanup ran, but the backend could
+    /// not release something. Nothing is retained.
+    HostRelease(HostReleaseError),
+}
+
+/// A backend resource that outlives the window could not be released.
+#[derive(Debug)]
+pub struct HostReleaseError {
+    operation: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl HostReleaseError {
+    pub fn new(
+        operation: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self {
+            operation,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for HostReleaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.operation, self.source)
+    }
+}
+impl std::error::Error for HostReleaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
 }
 
 /// Backend detachment completed; the host must remain until window termination
@@ -1065,20 +1110,20 @@ impl PostWindowCleanup {
     pub fn retry<E>(
         self,
         terminate_window: impl FnOnce() -> Result<(), E>,
-    ) -> Result<(), (E, Self)> {
+    ) -> Result<(), PostWindowError<E>> {
         match terminate_window() {
-            Ok(()) => {
-                self.finish();
-                Ok(())
-            }
-            Err(error) => Err((error, self)),
+            Ok(()) => self.finish().map_err(PostWindowError::HostRelease),
+            Err(error) => Err(PostWindowError::Termination {
+                error,
+                post_window: self,
+            }),
         }
     }
     /// The owner calls this only after successfully running retained window
     /// termination work. No other backend cleanup operation is repeated.
-    pub fn finish(self) {
+    pub fn finish(self) -> Result<(), HostReleaseError> {
         self.platform
-            .post_window_cleanup(&LifecycleAccess { _private: () });
+            .post_window_cleanup(&LifecycleAccess { _private: () })
     }
     /// Retain the native host until process exit when termination is uncertain.
     pub fn abandon(self) {}
