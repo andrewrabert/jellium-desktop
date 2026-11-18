@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 
 use crossbeam_channel::Sender;
 use error_reporter::Report;
+use tempfile::TempDir;
 use wl_proxy::baseline::Baseline;
 use wl_proxy::client::Client;
 use wl_proxy::object::{ConcreteObject, Object, ObjectCoreApi, ObjectError, ObjectRcUtils};
@@ -38,6 +39,7 @@ use super::{FracScaleMgrH, NoopClient, log_send};
 pub(super) struct AppStartup {
     pub(super) app_fd: OwnedFd,
     pub(super) display_name: CString,
+    pub(super) socket_dir: TempDir,
 }
 
 struct AppShell {
@@ -205,7 +207,7 @@ pub(super) fn run_app_state(
     client_m.display().set_handler(ForwardDisplayH);
     ctx.with_shell(|sh| sh.mpv_client = Some(client_m.clone()));
 
-    let (mpv_worker, display_name) = match MpvWorker::spawn(rt, mpv_bridge) {
+    let (mpv_worker, mpv_startup) = match MpvWorker::spawn(rt, mpv_bridge) {
         Ok(worker) => worker,
         Err(e) => {
             let _ = tx.send(Err(e));
@@ -216,7 +218,8 @@ pub(super) fn run_app_state(
     if tx
         .send(Ok(AppStartup {
             app_fd,
-            display_name,
+            display_name: mpv_startup.display_name,
+            socket_dir: mpv_startup.socket_dir,
         }))
         .is_err()
     {
