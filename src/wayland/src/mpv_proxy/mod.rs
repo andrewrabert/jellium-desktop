@@ -14,6 +14,7 @@ mod mpv;
 mod socket;
 
 use std::ffi::{CStr, CString};
+use std::io;
 use std::os::fd::IntoRawFd;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -56,12 +57,8 @@ impl Proxy {
 
     /// Removes the socket from the filesystem so nothing outlives the process.
     /// The listener threads are detached; the OS cleans up on process exit.
-    fn stop(&self) {
-        if let Some(dir) = self.socket_dir.lock().take()
-            && let Err(e) = dir.close()
-        {
-            tracing::warn!(target: "MpvProxy", "remove proxy socket: {e}");
-        }
+    fn stop(&self) -> io::Result<()> {
+        self.socket_dir.lock().take().map_or(Ok(()), TempDir::close)
     }
 }
 
@@ -73,7 +70,6 @@ struct PublishedSize {
     generation: u32,
 }
 
-/// What the proxy's two threads share with the rest of the process.
 pub(crate) struct ProxyShared {
     /// `None` until the host toplevel has been configured — there is no
     /// boot/default to fall back to, so mpv only ever mirrors real geometry.
@@ -161,10 +157,8 @@ impl ProxyShared {
         self.proxy.get()?.upstream_display_name.as_deref()
     }
 
-    pub(crate) fn stop(&self) {
-        if let Some(proxy) = self.proxy.get() {
-            proxy.stop();
-        }
+    pub(crate) fn stop(&self) -> io::Result<()> {
+        self.proxy.get().map_or(Ok(()), Proxy::stop)
     }
 }
 

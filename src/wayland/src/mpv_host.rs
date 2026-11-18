@@ -49,7 +49,9 @@ fn start_proxy(rt: &'static WlRuntime, configured: Option<WindowDecorations>) {
     let disp = proxy.display_name().to_string_lossy().into_owned();
     if disp.is_empty() {
         tracing::error!(target: "Main", "proxy display name empty; aborting proxy");
-        rt.proxy().stop();
+        if let Err(e) = rt.proxy().stop() {
+            tracing::warn!(target: "Main", "remove proxy socket: {e}");
+        }
         return;
     }
     tracing::info!(target: "Main", "proxy listening on {disp}");
