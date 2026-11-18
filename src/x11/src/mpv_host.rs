@@ -3,7 +3,10 @@ use jfn_platform_abi::{MpvHost, WindowDecorations};
 pub struct X11MpvHost;
 
 impl MpvHost for X11MpvHost {
-    fn prepare(&self, _configured: Option<WindowDecorations>) {
+    fn prepare(
+        &self,
+        _configured: Option<WindowDecorations>,
+    ) -> Result<(), jfn_platform_abi::PlatformInitError> {
         // Resolve the paint tier — creating the app's Vulkan instance — before
         // the proxy repoints DISPLAY and before mpv init, so NVIDIA's ICD lazy
         // global init runs against the real server and beats mpv's VO thread to
@@ -12,6 +15,7 @@ impl MpvHost for X11MpvHost {
         if !crate::mpv_proxy::start() {
             tracing::error!(target: "Main", "x11 mpv proxy failed to start; mpv will connect directly");
         }
+        Ok(())
     }
 
     fn ensure_host_window(&self) {

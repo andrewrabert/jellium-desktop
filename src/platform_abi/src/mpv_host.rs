@@ -22,7 +22,13 @@ pub trait MpvHost: Send + Sync {
     /// position-critical setup (window-ownership proxies, env vars mpv
     /// reads during init) belongs here. `configured` is the user's explicit
     /// decoration preference; `None` leaves the choice to the platform.
-    fn prepare(&self, _configured: Option<WindowDecorations>) {}
+    /// An error means mpv cannot be hosted and startup must not go on.
+    fn prepare(
+        &self,
+        _configured: Option<WindowDecorations>,
+    ) -> Result<(), crate::PlatformInitError> {
+        Ok(())
+    }
 
     /// Whether the host window state mpv's VO depends on (scale, first
     /// configure) is known. Gates VO-startup completion — not VO state

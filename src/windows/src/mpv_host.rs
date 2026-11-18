@@ -5,10 +5,14 @@ use jfn_platform_abi::{MpvHost, WindowDecorations};
 pub(crate) struct WindowsMpvHost;
 
 impl MpvHost for WindowsMpvHost {
-    fn prepare(&self, _configured: Option<WindowDecorations>) {
+    fn prepare(
+        &self,
+        _configured: Option<WindowDecorations>,
+    ) -> Result<(), jfn_platform_abi::PlatformInitError> {
         unsafe {
             std::env::set_var("MPV_WINDOW_ICON", "IDI_ICON1");
         }
+        Ok(())
     }
 
     /// Windows publishes no exact logical size; mpv's `osd-dimensions` is the

@@ -31,7 +31,10 @@ fn metal_has_mac2_family() -> bool {
 pub struct MacosMpvHost;
 
 impl MpvHost for MacosMpvHost {
-    fn prepare(&self, _configured: Option<WindowDecorations>) {
+    fn prepare(
+        &self,
+        _configured: Option<WindowDecorations>,
+    ) -> Result<(), jfn_platform_abi::PlatformInitError> {
         unsafe {
             // Used by mpv's macOS Cocoa Common to locate the bundle.
             let key = c"MPVBUNDLE";
@@ -61,6 +64,7 @@ impl MpvHost for MacosMpvHost {
                 );
             }
         }
+        Ok(())
     }
 
     fn run_vo_wait(&self, pump: &mut dyn FnMut(VoWait) -> std::ops::ControlFlow<()>) {

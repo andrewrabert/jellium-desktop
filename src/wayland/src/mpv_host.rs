@@ -3,7 +3,7 @@
 
 use crate::mpv_proxy::start;
 use crate::runtime::WlRuntime;
-use jfn_platform_abi::{MpvHost, WindowDecorations};
+use jfn_platform_abi::{MpvHost, PlatformInitError, WindowDecorations};
 
 pub struct WaylandMpvHost {
     rt: &'static WlRuntime,
@@ -16,8 +16,8 @@ impl WaylandMpvHost {
 }
 
 impl MpvHost for WaylandMpvHost {
-    fn prepare(&self, configured: Option<WindowDecorations>) {
-        start_proxy(self.rt, configured);
+    fn prepare(&self, configured: Option<WindowDecorations>) -> Result<(), PlatformInitError> {
+        start_proxy(self.rt, configured)
     }
 
     fn host_ready(&self) -> bool {
@@ -37,24 +37,18 @@ impl MpvHost for WaylandMpvHost {
     fn detach(&self) {}
 }
 
-fn start_proxy(rt: &'static WlRuntime, configured: Option<WindowDecorations>) {
-    let Some(proxy) = start(rt) else {
-        tracing::error!(target: "Main", "proxy start failed; continuing without proxy");
-        return;
-    };
-    let Ok(proxy) = rt.proxy().set_proxy(proxy) else {
-        tracing::error!(target: "Main", "proxy already started");
-        return;
-    };
+/// The app's own Wayland connection runs through the proxy, so without it
+/// there is no display to initialize the platform on.
+fn start_proxy(
+    rt: &'static WlRuntime,
+    configured: Option<WindowDecorations>,
+) -> Result<(), PlatformInitError> {
+    let proxy = start(rt)
+        .and_then(|proxy| rt.proxy().set_proxy(proxy))
+        .map_err(|e| PlatformInitError::backend("Wayland mpv proxy start", e))?;
     let disp = proxy.display_name().to_string_lossy().into_owned();
-    if disp.is_empty() {
-        tracing::error!(target: "Main", "proxy display name empty; aborting proxy");
-        if let Err(e) = rt.proxy().stop() {
-            tracing::warn!(target: "Main", "remove proxy socket: {e}");
-        }
-        return;
-    }
     tracing::info!(target: "Main", "proxy listening on {disp}");
     rt.root().set_decorations(configured);
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &disp) };
+    Ok(())
 }
