@@ -1,7 +1,10 @@
 use std::cell::RefCell;
 use std::ffi::CString;
+use std::io;
 use std::mem::size_of;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixListener;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
@@ -10,8 +13,8 @@ use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use crossbeam_channel::{Sender, bounded};
 use error_reporter::Report;
+use tempfile::TempDir;
 use wl_proxy::baseline::Baseline;
-use wl_proxy::client::Client;
 use wl_proxy::object::{ConcreteObject, Object, ObjectCoreApi, ObjectRcUtils};
 use wl_proxy::protocols::fractional_scale_v1::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wl_proxy::protocols::viewporter::wp_viewport::{WpViewport, WpViewportHandler};
@@ -34,7 +37,13 @@ use wl_proxy::state::State;
 use crate::runtime::WlRuntime;
 use crate::window_state::WindowSize;
 
+use super::socket::ProxySocket;
 use super::{FracScaleMgrH, NoopClient, log_send};
+
+pub(super) struct MpvStartup {
+    pub(super) display_name: CString,
+    pub(super) socket_dir: TempDir,
+}
 
 pub(super) struct MpvWorker {
     thread: Option<JoinHandle<()>>,
@@ -44,19 +53,19 @@ impl MpvWorker {
     pub(super) fn spawn(
         rt: &'static WlRuntime,
         bridge: OwnedFd,
-    ) -> Result<(Self, CString), String> {
-        let (tx, rx) = bounded::<Result<CString, String>>(1);
+    ) -> Result<(Self, MpvStartup), String> {
+        let (tx, rx) = bounded::<Result<MpvStartup, String>>(1);
         let thread = thread::Builder::new()
             .name("proxy-mpv".into())
             .spawn(move || run_mpv_state(rt, tx, bridge))
             .map_err(|e| format!("mpv thread spawn failed: {e}"))?;
 
         match rx.recv() {
-            Ok(Ok(display_name)) => Ok((
+            Ok(Ok(startup)) => Ok((
                 Self {
                     thread: Some(thread),
                 },
-                display_name,
+                startup,
             )),
             Ok(Err(message)) => {
                 let _ = thread.join();
@@ -64,7 +73,7 @@ impl MpvWorker {
             }
             Err(_) => {
                 let _ = thread.join();
-                Err("mpv thread exited before sending display name".to_owned())
+                Err("mpv thread exited before publishing startup state".to_owned())
             }
         }
     }
@@ -135,7 +144,7 @@ impl MpvCtx {
     }
 }
 
-fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, bridge: OwnedFd) {
+fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<MpvStartup, String>>, bridge: OwnedFd) {
     let state = match State::builder(Baseline::ALL_OF_THEM)
         .with_log_prefix("jfn-mpv")
         .with_server_fd(&Rc::new(bridge))
@@ -147,22 +156,25 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
             return;
         }
     };
-    let acceptor = match state.create_acceptor(1000) {
-        Ok(a) => a,
+    let socket = match ProxySocket::bind() {
+        Ok(s) => s,
         Err(e) => {
-            let _ = tx.send(Err(format!("S_mpv acceptor: {}", Report::new(e))));
+            let _ = tx.send(Err(format!("S_mpv socket: {e}")));
             return;
         }
     };
-    let name = match CString::new(acceptor.display()) {
+    let display_name = match CString::new(socket.path().as_os_str().as_bytes()) {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(Err(format!("display name has NUL: {e}")));
             return;
         }
     };
+    let ProxySocket {
+        listener,
+        dir: socket_dir,
+    } = socket;
     let ctx = MpvCtx::new(rt);
-    state.set_handler(MpvShimStateH { ctx: ctx.clone() });
 
     let (wake, wake_source) = match calloop::ping::make_ping() {
         Ok(p) => p,
@@ -192,6 +204,15 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
         let _ = tx.send(Err(format!("S_mpv poll source: {e}")));
         return;
     }
+    let listener_source = Generic::new(listener, Interest::READ, Mode::Level);
+    let inserted = handle.insert_source(listener_source, |_, listener, mpv: &mut MpvLoop| {
+        mpv.accept_clients(listener);
+        Ok(PostAction::Continue)
+    });
+    if let Err(e) = inserted {
+        let _ = tx.send(Err(format!("S_mpv listener source: {e}")));
+        return;
+    }
 
     *rt.proxy().mpv_wake.lock() = Some(wake);
     struct WakeGuard(&'static WlRuntime);
@@ -202,7 +223,11 @@ fn run_mpv_state(rt: &'static WlRuntime, tx: Sender<Result<CString, String>>, br
     }
     let _wake_guard = WakeGuard(rt);
 
-    if tx.send(Ok(name)).is_err() {
+    let startup = MpvStartup {
+        display_name,
+        socket_dir,
+    };
+    if tx.send(Ok(startup)).is_err() {
         return;
     }
     drop(tx);
@@ -245,6 +270,33 @@ impl MpvLoop {
         }
     }
 
+    fn accept_clients(&self, listener: &UnixListener) {
+        loop {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    eprintln!("proxy: S_mpv accept: {e}");
+                    self.signal.stop();
+                    return;
+                }
+            };
+            let client = match self.state.add_client(&Rc::new(OwnedFd::from(stream))) {
+                Ok(client) => client,
+                Err(e) => {
+                    eprintln!("proxy: S_mpv add client: {}", Report::new(e));
+                    self.signal.stop();
+                    return;
+                }
+            };
+            client.set_handler(NoopClient);
+            client.display().set_handler(MpvDisplayH {
+                ctx: self.ctx.clone(),
+            });
+        }
+    }
+
     fn dispatch_available(&mut self) {
         if let Err(e) = self.state.dispatch_available() {
             eprintln!("proxy: S_mpv dispatch: {}", Report::new(e));
@@ -282,18 +334,6 @@ fn emit_mpv_configure(ctx: &MpvCtx, size: WindowSize) -> bool {
             true
         }
         None => false,
-    }
-}
-
-struct MpvShimStateH {
-    ctx: MpvCtx,
-}
-impl wl_proxy::state::StateHandler for MpvShimStateH {
-    fn new_client(&mut self, client: &Rc<Client>) {
-        client.set_handler(NoopClient);
-        client.display().set_handler(MpvDisplayH {
-            ctx: self.ctx.clone(),
-        });
     }
 }
 

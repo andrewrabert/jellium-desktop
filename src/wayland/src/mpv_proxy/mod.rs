@@ -11,6 +11,7 @@
 
 mod app;
 mod mpv;
+mod socket;
 
 use std::ffi::{CStr, CString};
 use std::os::fd::IntoRawFd;
@@ -21,6 +22,7 @@ use std::thread;
 
 use error_reporter::Report;
 use parking_lot::Mutex;
+use tempfile::TempDir;
 use wl_proxy::client::ClientHandler;
 use wl_proxy::protocols::fractional_scale_v1::wp_fractional_scale_manager_v1::{
     WpFractionalScaleManagerV1, WpFractionalScaleManagerV1Handler,
@@ -40,17 +42,27 @@ pub struct Proxy {
     /// The original `WAYLAND_DISPLAY` value before any override.
     /// We need this if we want to interact with the upstream compositor directly.
     upstream_display_name: Option<String>,
+    /// Holds the socket's name on the filesystem until `stop`.
+    socket_dir: Mutex<Option<TempDir>>,
     _app_thread: thread::JoinHandle<()>,
 }
 
 impl Proxy {
-    /// The `WAYLAND_DISPLAY` value clients should connect to (e.g. "wayland-1").
+    /// The `WAYLAND_DISPLAY` value clients should connect to: the absolute path
+    /// of the proxy's socket.
     pub(crate) fn display_name(&self) -> &CStr {
         &self.display_name
     }
 
+    /// Removes the socket from the filesystem so nothing outlives the process.
     /// The listener threads are detached; the OS cleans up on process exit.
-    fn stop(&self) {}
+    fn stop(&self) {
+        if let Some(dir) = self.socket_dir.lock().take()
+            && let Err(e) = dir.close()
+        {
+            tracing::warn!(target: "MpvProxy", "remove proxy socket: {e}");
+        }
+    }
 }
 
 /// The authoritative window size and the generation it was published at, in
@@ -198,6 +210,7 @@ pub fn start(rt: &'static WlRuntime) -> Option<Proxy> {
     Some(Proxy {
         display_name: startup.display_name,
         upstream_display_name: upstream,
+        socket_dir: Mutex::new(Some(startup.socket_dir)),
         _app_thread: app_thread,
     })
 }

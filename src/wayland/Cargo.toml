@@ -35,6 +35,7 @@ libloading = "0.9"
 nix.workspace = true
 wl-proxy = { version = "0.1.4", features = ["all-protocols"] }
 tracing.workspace = true
+tempfile.workspace = true
 smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["xkbcommon"] }
 thiserror.workspace = true
 wayland-backend = { version = "0.3", features = ["client_system"] }
