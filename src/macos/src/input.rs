@@ -67,8 +67,9 @@ const NS_TRACKING_IN_VISIBLE_RECT: u64 = 0x200;
 
 use jfn_input::key::{KeyReport, PhysicalKey};
 use jfn_input::{
-    jfn_input_dispatch_history_nav, jfn_input_dispatch_key, jfn_input_dispatch_mouse_button,
-    jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll_precise, jfn_input_dispatch_utf16,
+    HistoryDirection, PointerMotion, jfn_input_dispatch_history_nav, jfn_input_dispatch_key,
+    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_move,
+    jfn_input_dispatch_scroll_precise, jfn_input_dispatch_utf16,
 };
 
 use crate::dispatch::post_to_main;
@@ -359,7 +360,8 @@ define_class!(
         fn other_mouse_down(&self, event: &AnyObject) {
             let n: isize = unsafe { msg_send![event, buttonNumber] };
             if n == NS_MOUSE_BUTTON_BACK || n == NS_MOUSE_BUTTON_FORWARD {
-                jfn_input_dispatch_history_nav(if n == NS_MOUSE_BUTTON_FORWARD { 1 } else { 0 });
+                let forward = n == NS_MOUSE_BUTTON_FORWARD;
+                jfn_input_dispatch_history_nav(HistoryDirection::from_forward(forward));
                 return;
             }
             dispatch_mouse_button(self, event, BTN_MIDDLE, true);
@@ -594,7 +596,7 @@ fn dispatch_mouse_move(view: &InputView, event: &AnyObject, leave: bool) {
     jfn_input_dispatch_mouse_move(
         WindowPoint::from_window(loc.x, loc.y),
         mods,
-        if leave { 1 } else { 0 },
+        PointerMotion::from_leave(leave),
     );
 }
 

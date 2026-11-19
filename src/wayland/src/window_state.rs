@@ -91,12 +91,23 @@ impl WindowExtent {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Titlebar {
+    Unstated,
+    Present,
+    Absent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the published window state has moved on")]
+pub(crate) struct Superseded;
+
 struct Inner {
     scale: Option<Scale120>,
     unstated: crate::scale::UnstatedLog,
     extent: Option<WindowExtent>,
     generation: u64,
-    titlebar_present: Option<bool>,
+    titlebar: Titlebar,
     web_top: Option<c_int>,
     basis: WindowBasis,
 }
@@ -167,7 +178,7 @@ impl WindowState {
                 unstated: crate::scale::UnstatedLog::new(),
                 extent: None,
                 generation: 0,
-                titlebar_present: None,
+                titlebar: Titlebar::Unstated,
                 web_top: None,
                 basis: WindowBasis::default(),
             }),
@@ -187,9 +198,16 @@ impl WindowState {
         (PublishedWindow::from_inner(&st), st.basis)
     }
 
-    pub(crate) fn with_basis<R>(&self, basis: WindowBasis, f: impl FnOnce() -> R) -> Option<R> {
+    pub(crate) fn with_basis<R>(
+        &self,
+        basis: WindowBasis,
+        f: impl FnOnce() -> R,
+    ) -> Result<R, Superseded> {
         let st = self.inner.read();
-        (st.basis == basis).then(f)
+        if st.basis != basis {
+            return Err(Superseded);
+        }
+        Ok(f())
     }
 
     pub(crate) fn representable(&self, logical: WindowSize) -> Result<(), BuildError> {
@@ -252,9 +270,14 @@ impl WindowState {
                     }
                     st.generation = extent.generation;
                     st.extent = Some(extent);
-                    let web_top = st
-                        .titlebar_present
-                        .map(|present| jfn_platform_abi::web_top(decorations, fullscreen, present));
+                    let web_top = match st.titlebar {
+                        Titlebar::Unstated => None,
+                        stated => Some(jfn_platform_abi::web_top(
+                            decorations,
+                            fullscreen,
+                            stated == Titlebar::Present,
+                        )),
+                    };
                     let moved = st.set_web_top(web_top);
                     Ok((extent, st.web_top, resized || moved))
                 }
@@ -286,10 +309,15 @@ impl WindowState {
         let decorations = rt.root().effective_decorations();
         let (fullscreen, changed) = {
             let mut st = self.inner.write();
-            if st.titlebar_present == Some(present) {
+            let titlebar = if present {
+                Titlebar::Present
+            } else {
+                Titlebar::Absent
+            };
+            if st.titlebar == titlebar {
                 return;
             }
-            st.titlebar_present = Some(present);
+            st.titlebar = titlebar;
             let Some(extent) = st.extent else {
                 return;
             };

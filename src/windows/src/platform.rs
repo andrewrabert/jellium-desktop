@@ -100,7 +100,10 @@ pub(crate) fn win_is_fullscreen() -> bool {
 /// `GetDpiForWindow`/96 once the window exists, `GetDpiForSystem`/96 before
 /// it does.
 pub(crate) fn win_get_scale() -> Result<jfn_platform_abi::Scale, WindowStateError> {
-    Ok(crate::window::client_scale()?.unwrap_or_else(win_display_scale))
+    match crate::window::client_scale() {
+        Err(WindowStateError::NoWindow) => Ok(win_display_scale()),
+        sampled => sampled,
+    }
 }
 
 pub(crate) fn win_display_scale() -> jfn_platform_abi::Scale {

@@ -96,12 +96,43 @@ fn target_for_key() -> Target {
     sink::shell_state().map_or(Target::None, route_key)
 }
 
-pub fn jfn_input_dispatch_mouse_move(p: WindowPoint, mods: u32, leave: c_int) {
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerMotion {
+    Within = 0,
+    Leave = 1,
+}
+
+impl PointerMotion {
+    pub fn from_leave(leave: bool) -> Self {
+        if leave { Self::Leave } else { Self::Within }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryDirection {
+    Back = 0,
+    Forward = 1,
+}
+
+impl HistoryDirection {
+    pub fn from_forward(forward: bool) -> Self {
+        if forward { Self::Forward } else { Self::Back }
+    }
+}
+
+pub fn outside_window() -> WindowPoint {
+    WindowPoint::from_window(-1.0, -1.0)
+}
+
+pub fn jfn_input_dispatch_mouse_move(p: WindowPoint, mods: u32, motion: PointerMotion) {
+    let leave = motion == PointerMotion::Leave;
     match target_for_pointer(p) {
-        Ok((Target::Shell, _)) => with_shell(|s| s.send_mouse_move(p, mods, leave != 0)),
+        Ok((Target::Shell, _)) => with_shell(|s| s.send_mouse_move(p, mods, leave)),
         Ok((Target::Web, Some(routing))) => {
             let w = to_web_point(p, routing.web_top);
-            with_web(|b| b.send_mouse_move(w, mods, leave != 0));
+            with_web(|b| b.send_mouse_move(w, mods, leave));
         }
         Ok(_) => {}
         Err(e) => report_window_state(&e),
@@ -232,13 +263,7 @@ pub fn jfn_input_dispatch_touch(id: i32, phase: TouchPhase, p: WindowPoint, mods
             }
             // Released outside the window, so the press activates nothing.
             TouchPhase::Cancelled => {
-                s.send_mouse_click(
-                    WindowPoint::from_window(-1.0, -1.0),
-                    mods,
-                    MBT_LEFT,
-                    true,
-                    1,
-                );
+                s.send_mouse_click(outside_window(), mods, MBT_LEFT, true, 1);
                 s.send_mouse_move(p, mods, true);
             }
         }),
@@ -248,9 +273,9 @@ pub fn jfn_input_dispatch_touch(id: i32, phase: TouchPhase, p: WindowPoint, mods
 }
 
 /// Routed like a key: dropped while a modal owns input.
-pub fn jfn_input_dispatch_history_nav(forward: c_int) {
+pub fn jfn_input_dispatch_history_nav(direction: HistoryDirection) {
     if target_for_key() == Target::Web {
-        with_web(|b| b.navigate_history(forward != 0));
+        with_web(|b| b.navigate_history(direction == HistoryDirection::Forward));
     }
 }
 

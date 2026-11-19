@@ -6,7 +6,7 @@ use xkbcommon::xkb::compose::{COMPILE_NO_FLAGS, STATE_NO_FLAGS, State, Status, T
 
 use crate::keysym;
 use jfn_input::key::{KeyReport, PhysicalKey};
-use jfn_input::{jfn_input_dispatch_history_nav, jfn_input_dispatch_key};
+use jfn_input::{HistoryDirection, jfn_input_dispatch_history_nav, jfn_input_dispatch_key};
 
 // The compose state is fed from the key-dispatch thread and read back on the
 // same call, so it lives on that thread rather than behind a lock.
@@ -80,7 +80,7 @@ pub fn jfn_input_dispatch_key_raw(keysym: u32, native_code: u32, mods: u32, pres
     const XF86_FORWARD: u32 = 0x1008FF27;
     if keysym == XF86_BACK || keysym == XF86_FORWARD {
         if pressed != 0 {
-            jfn_input_dispatch_history_nav((keysym == XF86_FORWARD) as c_int);
+            jfn_input_dispatch_history_nav(HistoryDirection::from_forward(keysym == XF86_FORWARD));
         }
         return;
     }

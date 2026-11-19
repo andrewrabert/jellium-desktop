@@ -7,7 +7,7 @@
 //! files round-trip unchanged.
 
 use jfn_mailbox::Mailbox;
-use jfn_platform_abi::WindowDecorations;
+use jfn_platform_abi::{WindowDecorations, WindowPos};
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -24,8 +24,7 @@ const DEVICE_NAME_MAX: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct JfnWindowGeometry {
-    pub x: i32,
-    pub y: i32,
+    pub position: Option<WindowPos>,
     pub width: i32,
     pub height: i32,
     pub logical_width: i32,
@@ -36,14 +35,19 @@ pub struct JfnWindowGeometry {
 impl Default for JfnWindowGeometry {
     fn default() -> Self {
         Self {
-            x: -1,
-            y: -1,
+            position: None,
             width: 0,
             height: 0,
             logical_width: 0,
             logical_height: 0,
             maximized: false,
         }
+    }
+}
+
+impl JfnWindowGeometry {
+    pub fn saved_position(x: i32, y: i32) -> Option<WindowPos> {
+        (x >= 0 && y >= 0).then_some(WindowPos { x, y })
     }
 }
 
@@ -257,11 +261,8 @@ impl SettingsData {
         if let Some(v) = file.window_logical_height {
             self.window.logical_height = v;
         }
-        if let Some(v) = file.window_x {
-            self.window.x = v;
-        }
-        if let Some(v) = file.window_y {
-            self.window.y = v;
+        if let (Some(x), Some(y)) = (file.window_x, file.window_y) {
+            self.window.position = JfnWindowGeometry::saved_position(x, y);
         }
         if let Some(v) = file.window_maximized {
             self.window.maximized = v;
@@ -289,15 +290,14 @@ impl SettingsData {
     fn to_file(&self) -> SettingsFile {
         let size = self.window.width > 0 && self.window.height > 0;
         let logical = self.window.logical_width > 0 && self.window.logical_height > 0;
-        let position = self.window.x >= 0 && self.window.y >= 0;
         SettingsFile {
             server_url: Some(self.server_url.clone()),
             window_width: size.then_some(self.window.width),
             window_height: size.then_some(self.window.height),
             window_logical_width: logical.then_some(self.window.logical_width),
             window_logical_height: logical.then_some(self.window.logical_height),
-            window_x: position.then_some(self.window.x),
-            window_y: position.then_some(self.window.y),
+            window_x: self.window.position.map(|p| p.x),
+            window_y: self.window.position.map(|p| p.y),
             window_maximized: Some(self.window.maximized),
             hwdec: (self.hwdec != Hwdec::default()).then_some(self.hwdec),
             audio_passthrough: (!self.audio_passthrough.is_empty())
@@ -643,7 +643,8 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SettingsData, SettingsFile, WindowDecorations, default_device_name, normalize_device_name,
+        SettingsData, SettingsFile, WindowDecorations, WindowPos, default_device_name,
+        normalize_device_name,
     };
 
     const PLATFORM: &str = "platform-host";
@@ -704,8 +705,7 @@ mod tests {
             log_level: "debug".into(),
             device_name: "box".into(),
             window: super::JfnWindowGeometry {
-                x: 1,
-                y: 2,
+                position: Some(WindowPos { x: 1, y: 2 }),
                 width: 3,
                 height: 4,
                 logical_width: 5,
@@ -753,7 +753,7 @@ mod tests {
         assert_eq!(data.server_url, "http://host");
         assert!(data.transparent_titlebar);
         assert!(data.hide_scrollbar);
-        assert_eq!(data.window.x, -1);
+        assert_eq!(data.window.position, None);
     }
 
     #[test]
