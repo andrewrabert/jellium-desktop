@@ -131,6 +131,12 @@ pub enum MenuOpenError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MenuHideError {
+    #[error("the end request could not be delivered to the menu thread")]
+    Undeliverable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MenuShutdownError {
     #[error("menu thread panicked")]
     ThreadPanicked,
@@ -143,7 +149,9 @@ pub trait MenuHost: Send + Sync {
 
     fn open(&self, req: MenuRequest) -> Result<MenuHandle, MenuOpenError>;
 
-    fn hide(&self, _handle: MenuHandle) {}
+    fn hide(&self, _handle: MenuHandle) -> Result<(), MenuHideError> {
+        Ok(())
+    }
 
     /// Resolves any pending selection with [`MENU_DISMISSED`].
     fn shutdown(&self) -> Result<(), MenuShutdownError> {

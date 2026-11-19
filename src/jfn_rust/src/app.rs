@@ -66,7 +66,11 @@ enum BootError {
 
 impl BootError {
     fn exit_code(&self) -> c_int {
-        if matches!(self, Self::Canceled) { 0 } else { 1 }
+        if matches!(self, Self::Canceled) {
+            EXIT_SUCCESS
+        } else {
+            EXIT_FAILURE
+        }
     }
 }
 
@@ -76,6 +80,9 @@ struct CefInit {
     /// Whether CEF composites through shared textures.
     shared_textures: bool,
 }
+
+const EXIT_SUCCESS: c_int = 0;
+const EXIT_FAILURE: c_int = 1;
 
 pub(crate) const DEFAULT_LOG_FILTER: &str = "info";
 
@@ -300,7 +307,10 @@ fn wait_for_vo_window(mut boot: BackgroundCapture) -> Result<ReadyBoot, BootErro
             return Break(());
         }
         loop {
-            match consume_boot_event(&mut boot, jfn_mpv::api::wait_event_owned(0.0)) {
+            match consume_boot_event(
+                &mut boot,
+                jfn_mpv::api::wait_event_owned(jfn_mpv::api::NO_WAIT),
+            ) {
                 BootEvent::Idle => break,
                 BootEvent::Fatal => return Break(()),
                 BootEvent::Ingest(error) => {
@@ -315,7 +325,10 @@ fn wait_for_vo_window(mut boot: BackgroundCapture) -> Result<ReadyBoot, BootErro
             return Break(());
         }
         if wait == jfn_platform_abi::VoWait::Event {
-            match consume_boot_event(&mut boot, jfn_mpv::api::wait_event_owned(-1.0)) {
+            match consume_boot_event(
+                &mut boot,
+                jfn_mpv::api::wait_event_owned(jfn_mpv::api::WAIT_FOREVER),
+            ) {
                 BootEvent::Fatal => return Break(()),
                 BootEvent::Ingest(error) => {
                     outcome = Err(error.into());
@@ -810,7 +823,11 @@ impl RunningRuntime {
         if let Err(error) = &cleanup {
             tracing::error!(target: "Main", "shutdown: {error}");
         }
-        i32::from(ingestion.is_err() || manager.is_err() || cleanup.is_err())
+        if ingestion.is_err() || manager.is_err() || cleanup.is_err() {
+            EXIT_FAILURE
+        } else {
+            EXIT_SUCCESS
+        }
     }
 }
 
@@ -942,7 +959,7 @@ pub fn jfn_app_main() -> c_int {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("CEF startup: {error}");
-            return 1;
+            return EXIT_FAILURE;
         }
     };
     let cef_runtime = match cef_runtime.dispatch() {
@@ -957,7 +974,7 @@ pub fn jfn_app_main() -> c_int {
     let cli = cli::Cli::parse();
     if cli.version {
         print_version(&version);
-        return 0;
+        return EXIT_SUCCESS;
     }
     if let Some(path) = &cli.config_dir {
         jfn_paths::set_config_dir_override(path.into());
@@ -981,7 +998,7 @@ pub fn jfn_app_main() -> c_int {
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::error!(target: "Main", "application metadata: {error}");
-            return 1;
+            return EXIT_FAILURE;
         }
     };
 
@@ -996,14 +1013,14 @@ pub fn jfn_app_main() -> c_int {
         Ok(instance) => instance,
         Err(e) => {
             tracing::error!(target: "Main", "establishing instance identity: {e}");
-            return 1;
+            return EXIT_FAILURE;
         }
     };
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(e) => {
             tracing::error!(target: "Main", "tokio runtime: {e}");
-            return 1;
+            return EXIT_FAILURE;
         }
     };
     // The accept loop lives on `runtime`'s workers while `run_app` blocks the
@@ -1016,7 +1033,7 @@ pub fn jfn_app_main() -> c_int {
         Start::AlreadyRunning => runtime.block_on(notify_running(&instance)),
         Start::Failed(e) => {
             tracing::error!(target: "Main", "could not start instance IPC: {e}");
-            1
+            EXIT_FAILURE
         }
     }
 }
@@ -1033,7 +1050,7 @@ async fn notify_running(instance: &Instance) -> c_int {
         Ok(None) => tracing::warn!(target: "Main", "existing instance closed without ack"),
         Err(e) => tracing::warn!(target: "Main", "could not signal existing instance: {e}"),
     }
-    0
+    EXIT_SUCCESS
 }
 
 fn run_app(
@@ -1046,7 +1063,7 @@ fn run_app(
         Ok(prepared) => prepared,
         Err(error) => {
             tracing::error!(target: "Main", "{error}");
-            return 1;
+            return EXIT_FAILURE;
         }
     };
     let resources = StartupResources {
@@ -1071,14 +1088,14 @@ fn run_app(
         }
         Err(e) => {
             tracing::error!(target: "Main", "boot geometry: {e}");
-            return 1;
+            return EXIT_FAILURE;
         }
     };
     let mpv_boot = plat().window_owner().apply_boot_geometry(&boot);
 
     if let Err(error) = setup_mpv_environment() {
         tracing::error!(target: "Main", "{error}");
-        return 1;
+        return EXIT_FAILURE;
     }
 
     // Hosts that own their toplevel create it here, before mpv init, so its
@@ -1108,7 +1125,7 @@ fn run_app(
     });
     let Some(mpv) = MpvRuntime::new(raw) else {
         tracing::error!(target: "Main", "mpv handle init failed");
-        return 1;
+        return EXIT_FAILURE;
     };
     let mut resources = resources.with_mpv(mpv);
     tracing::info!(target: "Main",
@@ -1116,7 +1133,7 @@ fn run_app(
 
     if !jfn_playback::ingest_driver::jfn_playback_observe_mpv_properties(backend_byte) {
         tracing::error!(target: "Main", "observe_mpv_properties failed");
-        return 1;
+        return EXIT_FAILURE;
     }
 
     // force-window=yes keeps VO creation on mpv's core thread. The user's
@@ -1140,7 +1157,7 @@ fn run_app(
         Ok(resources) => resources,
         Err(error) => {
             tracing::error!(target: "Main", "{error}");
-            return 1;
+            return EXIT_FAILURE;
         }
     };
     let platform = &resources.native.get().platform;
@@ -1155,7 +1172,7 @@ fn run_app(
             }
             Err(error) => {
                 tracing::error!(target: "Main", "shell overlay unavailable: {error}");
-                return 1;
+                return EXIT_FAILURE;
             }
         };
     // fontdb's directory walk must not run while Chromium is manipulating
@@ -1164,7 +1181,7 @@ fn run_app(
         && let Err(error) = fonts.join()
     {
         tracing::error!(target: "Main", "{error}");
-        return 1;
+        return EXIT_FAILURE;
     }
 
     // CEF's process bring-up needs nothing mpv owns; where the platform
@@ -1178,7 +1195,7 @@ fn run_app(
             }
             Err(error) => {
                 tracing::error!(target: "Main", "{error}");
-                return 1;
+                return EXIT_FAILURE;
             }
         }
     } else {
@@ -1188,7 +1205,7 @@ fn run_app(
         Ok(boot) => boot,
         Err(error) => {
             let code = error.exit_code();
-            if code == 0 {
+            if code == EXIT_SUCCESS {
                 tracing::info!(target: "Main", "{error}");
             } else {
                 tracing::error!(target: "Main", "{error}");
@@ -1202,7 +1219,7 @@ fn run_app(
             Err(error) => {
                 // Product policy: failure of the connect/settings UI is fatal.
                 tracing::error!(target: "Main", "shell startup: {error}");
-                return 1;
+                return EXIT_FAILURE;
             }
         }
     }
@@ -1362,8 +1379,10 @@ extern "C" fn h_browsers_set_refresh_rate(hz: f64) {
         return;
     };
     jfn_gpu_paint::report_refresh(jfn_gpu_paint::RefreshSource::MpvDisplayFps, rate);
-    if let Some(overlay) = WEB_OVERLAY.lock().clone() {
-        overlay.set_refresh_rate(rate);
+    if let Some(overlay) = WEB_OVERLAY.lock().clone()
+        && let Err(e) = overlay.set_refresh_rate(rate)
+    {
+        tracing::error!(target: "Main", "refresh rate {hz} Hz not applied: {e}");
     }
 }
 extern "C" fn h_theme_set_titlebar(rgb: u32) {
@@ -1392,19 +1411,25 @@ fn run_with_cef(
             Ok(cef) => resources.services.cef = Some(cef),
             Err(error) => {
                 tracing::error!(target: "Main", "{error}");
-                return 1;
+                return EXIT_FAILURE;
             }
         }
     }
     let (hz, rate) = boot_display_hz();
     if let Err(e) = boot_mpv_reconcile(hz) {
         tracing::error!(target: "Main", "[FLOW] mpv size reconcile: {e}");
-        return 1;
+        return EXIT_FAILURE;
     }
     resources.services.playback = Some(initialize_playback_coordination());
+    // Mode posts made before the coordinator existed were dropped, and no
+    // wakeup replays them.
+    if let Err(e) = jfn_playback::ingest_driver::jfn_playback_reconcile_window_mode() {
+        tracing::error!(target: "Main", "window mode reconcile: {e}");
+        return EXIT_FAILURE;
+    }
     let Some(cef) = resources.services.cef.as_ref() else {
         tracing::error!(target: "Main", "startup invariant violated: overlay acquisition requires initialized CEF");
-        return 1;
+        return EXIT_FAILURE;
     };
     let StartedOverlay {
         manager_thread,
@@ -1413,7 +1438,7 @@ fn run_with_cef(
         Ok(started) => started,
         Err(error) => {
             tracing::error!(target: "Main", "overlay startup: {error}");
-            return 1;
+            return EXIT_FAILURE;
         }
     };
     WEB_OVERLAY.lock().replace(overlay.clone());
@@ -1438,11 +1463,11 @@ mod lifecycle_tests {
             ),
             BootEvent::Fatal
         ));
-        assert_eq!(BootError::MpvTerminated.exit_code(), 1);
-        assert_eq!(BootError::Canceled.exit_code(), 0);
+        assert_eq!(BootError::MpvTerminated.exit_code(), EXIT_FAILURE);
+        assert_eq!(BootError::Canceled.exit_code(), EXIT_SUCCESS);
         assert_eq!(
             BootError::Wake(std::io::Error::other("injected wake failure")).exit_code(),
-            1
+            EXIT_FAILURE
         );
     }
     #[test]

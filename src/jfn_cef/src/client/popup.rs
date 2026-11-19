@@ -1,7 +1,5 @@
 use cef::rc::Rc;
-use cef::{
-    ImplBrowserHost, ImplTask, KeyEvent, Task, ThreadId, WrapTask, post_task, sys, wrap_task,
-};
+use cef::{ImplBrowserHost, ImplTask, KeyEvent, Task, WrapTask, sys, wrap_task};
 use jfn_platform_abi::{MenuOpenError, WindowStateError};
 use std::sync::Arc;
 
@@ -75,7 +73,7 @@ impl Inner {
             Self::reset_popup_state(&mut p);
         }
         if !show {
-            self.hide_dropdown();
+            Self::report_hide(self.hide_dropdown());
             return;
         }
         self.send_process_message_named("getPopupOptions");
@@ -170,7 +168,7 @@ impl Inner {
             let authority = Arc::clone(&inner.session);
             authority.dispatch(|| {
                 let mut task = DispatchPopupTask::new(inner, idx, selected, selectable.clone());
-                if post_task(ThreadId::UI, Some(&mut task)) != 1 {
+                if crate::ui_task::post_ui(&mut task).is_err() {
                     jfn_logging::log(
                         jfn_logging::Category::Cef,
                         jfn_logging::Level::Error,
@@ -205,16 +203,17 @@ impl Inner {
         Ok(())
     }
 
-    fn hide_dropdown(&self) {
+    fn hide_dropdown(&self) -> Result<(), jfn_platform_abi::MenuHideError> {
         match self.dropdown() {
             MenuDelivery::Host(host) => {
                 let handle = self.popup.lock().menu.take();
-                if let Some(handle) = handle {
-                    host.hide(handle);
-                }
+                handle.map_or(Ok(()), |handle| host.hide(handle))
             }
-            MenuDelivery::Composited => self.surface().popup_hide(),
-            MenuDelivery::Page => {}
+            MenuDelivery::Composited => {
+                self.surface().popup_hide();
+                Ok(())
+            }
+            MenuDelivery::Page => Ok(()),
         }
     }
 
@@ -231,7 +230,17 @@ impl Inner {
         if !was_visible {
             return;
         }
-        self.hide_dropdown();
+        Self::report_hide(self.hide_dropdown());
+    }
+
+    fn report_hide(hidden: Result<(), jfn_platform_abi::MenuHideError>) {
+        if let Err(e) = hidden {
+            jfn_logging::log(
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Error,
+                &format!("dropdown menu hide: {e}"),
+            );
+        }
     }
 
     pub(super) fn popup_rect(&self) -> (i32, i32) {

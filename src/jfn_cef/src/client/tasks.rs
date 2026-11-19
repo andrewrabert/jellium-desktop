@@ -1,10 +1,11 @@
 use cef::rc::Rc;
-use cef::{ImplTask, Task, ThreadId, WrapTask, post_delayed_task, post_task, wrap_task};
+use cef::{ImplTask, Task, WrapTask, wrap_task};
 use crossbeam_channel::Sender;
 use std::sync::Arc;
 
 use super::Inner;
 use crate::frame_rate::FrameRate;
+use crate::ui_task::{UiTaskRejected, post_ui, post_ui_delayed};
 use crate::web_overlay::CloseDeliveryError;
 
 wrap_task! {
@@ -13,17 +14,22 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.inner.session.dispatch(|| self.inner.apply_pending_resize());
+            if let Some(Err(e)) = self.inner.session.dispatch(|| self.inner.apply_pending_resize()) {
+                jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("pending resize: {e}"),
+                );
+            }
         }
     }
 }
 
-pub(super) fn post_apply_resize(inner: Arc<Inner>, delay_ms: i64) {
+pub(super) fn post_apply_resize(inner: Arc<Inner>, delay_ms: i64) -> Result<(), UiTaskRejected> {
     let session = Arc::clone(&inner.session);
-    session.dispatch(|| {
-        let mut task = ApplyResizeTask::new(inner);
-        let _ = post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
-    });
+    session
+        .dispatch(|| post_ui_delayed(&mut ApplyResizeTask::new(inner), delay_ms))
+        .unwrap_or(Ok(()))
 }
 
 wrap_task! {
@@ -38,12 +44,11 @@ wrap_task! {
     }
 }
 
-pub(super) fn post_set_refresh(inner: Arc<Inner>, target: FrameRate) {
+pub(super) fn post_set_refresh(inner: Arc<Inner>, target: FrameRate) -> Result<(), UiTaskRejected> {
     let session = Arc::clone(&inner.session);
-    session.dispatch(|| {
-        let mut task = SetRefreshTask::new(inner, target);
-        let _ = post_task(ThreadId::UI, Some(&mut task));
-    });
+    session
+        .dispatch(|| post_ui(&mut SetRefreshTask::new(inner, target)))
+        .unwrap_or(Ok(()))
 }
 
 wrap_task! {
@@ -60,12 +65,11 @@ wrap_task! {
     }
 }
 
-pub(super) fn post_paste_js(inner: Arc<Inner>, text: String) {
+pub(super) fn post_paste_js(inner: Arc<Inner>, text: String) -> Result<(), UiTaskRejected> {
     let session = Arc::clone(&inner.session);
-    session.dispatch(|| {
-        let mut task = PasteJsTask::new(inner, text);
-        let _ = post_task(ThreadId::UI, Some(&mut task));
-    });
+    session
+        .dispatch(|| post_ui(&mut PasteJsTask::new(inner, text)))
+        .unwrap_or(Ok(()))
 }
 
 wrap_task! {
@@ -94,7 +98,7 @@ pub(crate) fn post_close_and_wait(
     let owner_disconnected = inner.owner_disconnection();
     let (delivered, delivery) = crossbeam_channel::bounded(1);
     let mut task = CloseTask::new(inner, delivered);
-    let accepted = post_task(ThreadId::UI, Some(&mut task)) != 0;
+    let accepted = crate::ui_task::post_ui(&mut task).is_ok();
     drop(task);
     if !accepted {
         return Err(CloseDeliveryError::PostRejected);
@@ -137,12 +141,11 @@ wrap_task! {
     }
 }
 
-pub(crate) fn post_set_hidden(inner: Arc<Inner>, hidden: bool) {
+pub(crate) fn post_set_hidden(inner: Arc<Inner>, hidden: bool) -> Result<(), UiTaskRejected> {
     let session = Arc::clone(&inner.session);
-    session.dispatch(|| {
-        let mut task = SetHiddenTask::new(inner, hidden);
-        let _ = post_task(ThreadId::UI, Some(&mut task));
-    });
+    session
+        .dispatch(|| post_ui(&mut SetHiddenTask::new(inner, hidden)))
+        .unwrap_or(Ok(()))
 }
 
 #[cfg(test)]

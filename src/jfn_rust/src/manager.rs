@@ -190,6 +190,21 @@ fn manager_loop(overlay: &jfn_cef::WebOverlay) -> Result<(), ManagerError> {
     }
 }
 
+fn hide(
+    overlay: &jfn_cef::WebOverlay,
+    hidden: bool,
+    from: LifecycleState,
+    to: LifecycleState,
+) -> LifecycleState {
+    match overlay.set_hidden(hidden) {
+        Ok(()) => to,
+        Err(e) => {
+            tracing::error!(target: "Main", "web overlay hidden={hidden}: {e}; staying {from:?}");
+            from
+        }
+    }
+}
+
 fn transition(
     overlay: &jfn_cef::WebOverlay,
     state: LifecycleState,
@@ -202,24 +217,11 @@ fn transition(
             run_shutdown(overlay)?;
             Ok(ShuttingDown)
         }
-        (Running, ManagerMsg::SetVisible(false)) => {
-            overlay.set_hidden(true);
-            Ok(Hidden)
-        }
-        (Hidden, ManagerMsg::SetVisible(true)) => {
-            overlay.set_hidden(false);
-            Ok(Running)
-        }
-        (Running | Hidden, ManagerMsg::Suspend) => {
-            if state == Running {
-                overlay.set_hidden(true);
-            }
-            Ok(Suspended)
-        }
-        (Suspended, ManagerMsg::Resume) => {
-            overlay.set_hidden(false);
-            Ok(Running)
-        }
+        (Running, ManagerMsg::SetVisible(false)) => Ok(hide(overlay, true, state, Hidden)),
+        (Hidden, ManagerMsg::SetVisible(true)) => Ok(hide(overlay, false, state, Running)),
+        (Running, ManagerMsg::Suspend) => Ok(hide(overlay, true, state, Suspended)),
+        (Hidden, ManagerMsg::Suspend) => Ok(Suspended),
+        (Suspended, ManagerMsg::Resume) => Ok(hide(overlay, false, state, Running)),
         _ => Ok(state),
     }
 }

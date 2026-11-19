@@ -1,7 +1,7 @@
 use cef::rc::Rc;
 use cef::{
     EventFlags, ImplRunContextMenuCallback, ImplTask, MenuId, RunContextMenuCallback, Task,
-    ThreadId, WrapTask, post_task, wrap_task,
+    WrapTask, wrap_task,
 };
 use std::os::raw::{c_int, c_void};
 use std::sync::Arc;
@@ -17,16 +17,25 @@ impl Inner {
         let inner = Arc::clone(self);
         MenuSelection::new(move |id| {
             let authority = Arc::clone(&inner.session);
-            authority.dispatch(|| {
-                let mut task = DispatchMenuResultTask::new(inner, session, id);
-                let _ = post_task(ThreadId::UI, Some(&mut task));
-            });
+            if let Some(Err(e)) = authority.dispatch(|| {
+                crate::ui_task::post_ui(&mut DispatchMenuResultTask::new(inner, session, id))
+            }) {
+                jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("context menu selection {id}: {e}"),
+                );
+            }
         })
     }
 
-    fn dispatch_menu_result(self: &Arc<Self>, session: Session, id: c_int) {
+    fn dispatch_menu_result(
+        self: &Arc<Self>,
+        session: Session,
+        id: c_int,
+    ) -> Result<(), crate::ui_task::UiTaskRejected> {
         if !self.menu_resolve(session) {
-            return;
+            return Ok(());
         }
         let pending = self.take_pending_menu_callback();
         // Ids below USER_FIRST are CEF built-in commands; only cont() executes them.
@@ -34,19 +43,18 @@ impl Inner {
             if let Some(cb) = pending {
                 cb.cont(id, EventFlags::default());
             }
-            return;
+            return Ok(());
         }
         if let Some(cb) = pending {
             cb.cancel();
         }
         if id < 0 {
-            return;
+            return Ok(());
         }
         let inner = Arc::clone(self);
-        self.session.dispatch(|| {
-            let mut task = DispatchMenuCommandTask::new(inner, id);
-            let _ = post_task(ThreadId::UI, Some(&mut task));
-        });
+        self.session
+            .dispatch(|| crate::ui_task::post_ui(&mut DispatchMenuCommandTask::new(inner, id)))
+            .unwrap_or(Ok(()))
     }
 
     fn dispatch_menu_command(&self, id: c_int) {
@@ -95,7 +103,15 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.inner.session.dispatch(|| self.inner.dispatch_menu_result(self.session, self.id));
+            if let Some(Err(e)) =
+                self.inner.session.dispatch(|| self.inner.dispatch_menu_result(self.session, self.id))
+            {
+                jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("context menu command {}: {e}", self.id),
+                );
+            }
         }
     }
 }

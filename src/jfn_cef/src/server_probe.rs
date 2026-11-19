@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 use cef::rc::Rc;
-use cef::{ThreadId, post_task, wrap_task};
+use cef::wrap_task;
 
 use jfn_jellyfin::{extract_base_url, is_valid_public_info, normalize_input};
 
@@ -67,7 +67,7 @@ impl Probe {
             .dispatch(|| {
                 session.track_producer(disconnected);
                 let mut task = StartTask::new(Arc::clone(&state));
-                post_task(ThreadId::UI, Some(&mut task)) == 1
+                crate::ui_task::post_ui(&mut task).is_ok()
             })
             .unwrap_or(false);
         if !accepted {

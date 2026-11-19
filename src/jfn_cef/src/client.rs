@@ -359,8 +359,11 @@ impl Inner {
         &self.surface
     }
 
-    pub(crate) fn apply_view_size(self: &Arc<Self>, size: jfn_platform_abi::SurfaceSize) {
-        self.resize(size);
+    pub(crate) fn apply_view_size(
+        self: &Arc<Self>,
+        size: jfn_platform_abi::SurfaceSize,
+    ) -> Result<(), crate::ui_task::UiTaskRejected> {
+        self.resize(size)
     }
 
     pub(crate) fn menu_open(&self) -> Option<Session> {
