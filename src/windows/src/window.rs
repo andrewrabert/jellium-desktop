@@ -68,9 +68,9 @@ pub(crate) fn start_notifier() {
     }));
 }
 
-#[derive(Clone, Debug, PartialEq, thiserror::Error)]
-#[error("the window-changed notifier thread panicked: {0}")]
-pub(crate) struct NotifierPanicked(String);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the window-changed notifier thread panicked")]
+pub(crate) struct NotifierPanicked;
 
 /// Stop and join the notifier thread. Pending dirtiness is dropped; the
 /// process is tearing down.
@@ -81,19 +81,7 @@ pub(crate) fn stop_notifier() -> Result<(), NotifierPanicked> {
     };
     NOTIFY.lock().stop = true;
     NOTIFY_WAKE.notify_one();
-    handle
-        .join()
-        .map_err(|payload| NotifierPanicked(panic_message(&*payload)))
-}
-
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_owned()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "non-string panic payload".to_owned()
-    }
+    handle.join().map_err(|_| NotifierPanicked)
 }
 
 pub(crate) fn sample() -> Result<Option<PhysicalSize>, WindowStateError> {
@@ -101,8 +89,7 @@ pub(crate) fn sample() -> Result<Option<PhysicalSize>, WindowStateError> {
         return Ok(None);
     };
     let mut rc = RECT::default();
-    unsafe { GetClientRect(hwnd, &mut rc) }
-        .map_err(|e| ClientExtentError::ClientRect(e.code().0))?;
+    unsafe { GetClientRect(hwnd, &mut rc) }.map_err(|_| ClientExtentError::ClientRect)?;
     let client = PhysicalSize {
         w: rc.right - rc.left,
         h: rc.bottom - rc.top,
@@ -137,10 +124,9 @@ pub(crate) fn sample() -> Result<Option<PhysicalSize>, WindowStateError> {
 /// system on Windows (`vo_calc_window_geometry` uses the working area).
 fn window_placement(hwnd: HWND) -> Result<WindowPlacement, WindowStateError> {
     let mut wr = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut wr) }
-        .map_err(|e| WindowStateError::WindowRect(e.code().0))?;
+    unsafe { GetWindowRect(hwnd, &mut wr) }.map_err(|_| WindowStateError::WindowRect)?;
     let monitor = Monitor::of(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
-        .map_err(|e| WindowStateError::MonitorInfo(e.code().0))?;
+        .map_err(|_| WindowStateError::MonitorInfo)?;
     let work = monitor.work_area();
     Ok(WindowPlacement::new(
         monitor.name(),

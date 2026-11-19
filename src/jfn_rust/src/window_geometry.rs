@@ -458,7 +458,7 @@ mod tests {
     }
 
     fn failing_clamp(_: &WindowGeometry) -> Result<PlacedGeometry, ClampError> {
-        Err(ClampError::Monitors(0))
+        Err(ClampError::Monitors)
     }
 
     #[test]

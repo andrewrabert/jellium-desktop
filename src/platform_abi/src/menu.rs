@@ -128,10 +128,10 @@ pub enum MenuOpenError {
     StaleBasis,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MenuShutdownError {
-    #[error("menu thread panicked: {0}")]
-    ThreadPanicked(String),
+    #[error("menu thread panicked")]
+    ThreadPanicked,
 }
 
 pub trait MenuHost: Send + Sync {

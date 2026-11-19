@@ -6,7 +6,9 @@
 //! C++ original.
 
 use jfn_gpu_paint::SharedTexture;
-use jfn_platform_abi::{Ack, Content, PaintFrame, Presented, Visibility, VisibilityCommit};
+use jfn_platform_abi::{
+    Ack, Content, PaintFrame, Presented, Unrepresentable, Visibility, VisibilityCommit,
+};
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
@@ -135,7 +137,7 @@ pub(crate) fn free_surface(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
 pub(crate) fn restack(
     rt: &'static WlRuntime,
     ordered: &[*mut PlatformSurface],
-) -> Result<(), PlaceError> {
+) -> Result<(), Unrepresentable> {
     let Some(mut st) = core(rt) else {
         return Ok(());
     };
@@ -202,7 +204,7 @@ struct Covered {
 fn covered(
     s: &PlatformSurface,
     extent: crate::window_state::PublishedWindow,
-) -> Result<Covered, jfn_platform_abi::Unrepresentable> {
+) -> Result<Covered, Unrepresentable> {
     let (logical, physical) = (extent.logical(), extent.physical());
     let top = match s.placement {
         jfn_platform_abi::SurfacePlacement::Window => 0,
@@ -220,14 +222,10 @@ fn covered(
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
-#[error("surface top: {0}")]
-pub(crate) struct PlaceError(#[from] jfn_platform_abi::Unrepresentable);
-
 fn place(
     s: &PlatformSurface,
     extent: crate::window_state::PublishedWindow,
-) -> Result<(), PlaceError> {
+) -> Result<(), Unrepresentable> {
     let c = covered(s, extent)?;
     if let Some(sub) = s.subsurface.as_ref() {
         sub.set_position(0, c.top);
@@ -244,7 +242,7 @@ fn place(
 fn place_all(
     surfaces: &[*mut PlatformSurface],
     extent: crate::window_state::PublishedWindow,
-) -> Result<(), PlaceError> {
+) -> Result<(), Unrepresentable> {
     let mut placed = Ok(());
     for &p in surfaces.iter().filter(|p| !p.is_null()) {
         let result = place(unsafe { surface_mut(p) }, extent);
@@ -415,7 +413,10 @@ pub(crate) fn present<'a>(
     }))
 }
 
-pub(crate) fn on_configure(rt: &'static WlRuntime, fullscreen: bool) -> Result<(), PlaceError> {
+pub(crate) fn on_configure(
+    rt: &'static WlRuntime,
+    fullscreen: bool,
+) -> Result<(), Unrepresentable> {
     let Some(ext) = rt.window().window_extent() else {
         return Ok(());
     };

@@ -37,22 +37,14 @@ static MENU: OnceLock<SoftwareMenu> = OnceLock::new();
 enum BuildError {
     #[error("no host services, paint services, published parent or screen")]
     NoMenuSite,
-    #[error("anchor: {0}")]
+    #[error(transparent)]
     Anchor(#[from] Unrepresentable),
-    #[error("window id: {0}")]
-    WindowId(#[source] ReplyOrIdError),
-    #[error("create_window: {0}")]
-    CreateWindow(#[source] ConnectionError),
-    #[error("graphics context id: {0}")]
-    GcId(#[source] ReplyOrIdError),
-    #[error("create_gc: {0}")]
-    CreateGc(#[source] ReplyError),
-    #[error("map_window: {0}")]
-    MapWindow(#[source] ReplyError),
-    #[error("raise window: {0}")]
-    Raise(#[source] ReplyError),
-    #[error("get_geometry: {0}")]
-    Geometry(#[source] ReplyError),
+    #[error(transparent)]
+    Id(#[from] ReplyOrIdError),
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
+    #[error(transparent)]
+    Reply(#[from] ReplyError),
     #[error("{cause}; releasing the window failed: {cleanup}")]
     Unwind {
         #[source]
@@ -63,12 +55,10 @@ enum BuildError {
 
 #[derive(Debug, thiserror::Error)]
 enum PresentError {
-    #[error("no shared memory buffer for {w}x{h}")]
-    Shm { w: i32, h: i32 },
-    #[error("shm_put_image: {0}")]
-    PutImage(#[source] ConnectionError),
-    #[error("flush: {0}")]
-    Flush(#[source] ConnectionError),
+    #[error("no shared memory buffer")]
+    Shm,
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -410,31 +400,29 @@ impl PopupLoop {
         let (anchor, size) = (place.anchor, place.view.physical());
         let site = menu_site(&self.conn).ok_or(BuildError::NoMenuSite)?;
         let (wx, wy) = self.place(&site, anchor, size)?;
-        let win = self.conn.generate_id().map_err(BuildError::WindowId)?;
+        let win = self.conn.generate_id()?;
         let aux = CreateWindowAux::new()
             .background_pixel(0)
             .border_pixel(0)
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE)
             .colormap(site.colormap);
-        self.conn
-            .create_window(
-                site.depth,
-                win,
-                site.root,
-                wx as i16,
-                wy as i16,
-                size.w as u16,
-                size.h as u16,
-                0,
-                WindowClass::INPUT_OUTPUT,
-                site.visual,
-                &aux,
-            )
-            .map_err(BuildError::CreateWindow)?;
+        self.conn.create_window(
+            site.depth,
+            win,
+            site.root,
+            wx as i16,
+            wy as i16,
+            size.w as u16,
+            size.h as u16,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            site.visual,
+            &aux,
+        )?;
         let gc = match self.conn.generate_id() {
             Ok(gc) => gc,
-            Err(e) => return Err(self.unwind(BuildError::GcId(e), win, None)),
+            Err(e) => return Err(self.unwind(e.into(), win, None)),
         };
         if let Err(e) = self.realize(win, gc) {
             return Err(self.unwind(e, win, Some(gc)));
@@ -464,22 +452,16 @@ impl PopupLoop {
 
     fn realize(&self, win: u32, gc: u32) -> Result<(), BuildError> {
         let conn = &*self.conn;
-        let create_gc = conn
-            .create_gc(gc, win, &CreateGCAux::new())
-            .map_err(|e| BuildError::CreateGc(e.into()))?;
-        let map = conn
-            .map_window(win)
-            .map_err(|e| BuildError::MapWindow(e.into()))?;
-        let raise = conn
-            .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
-            .map_err(|e| BuildError::Raise(e.into()))?;
+        let create_gc = conn.create_gc(gc, win, &CreateGCAux::new())?;
+        let map = conn.map_window(win)?;
+        let raise =
+            conn.configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
         conn.get_geometry(win)
             .map_err(ReplyError::from)
-            .and_then(|cookie| cookie.reply())
-            .map_err(BuildError::Geometry)?;
-        create_gc.check().map_err(BuildError::CreateGc)?;
-        map.check().map_err(BuildError::MapWindow)?;
-        raise.check().map_err(BuildError::Raise)?;
+            .and_then(|cookie| cookie.reply())?;
+        create_gc.check()?;
+        map.check()?;
+        raise.check()?;
         Ok(())
     }
 
@@ -519,7 +501,7 @@ impl PopupLoop {
         };
         let (w, h) = (paint.buffer.w.max(1), paint.buffer.h.max(1));
         if !shm_alloc(&mut window.buf, &conn, w, h) {
-            return Err(PresentError::Shm { w, h });
+            return Err(PresentError::Shm);
         }
         let pixels = window.buf.pixels_mut();
         let len = pixels.len().min(paint.pixels.len());
@@ -540,9 +522,8 @@ impl PopupLoop {
             false,
             window.buf.seg(),
             0,
-        )
-        .map_err(PresentError::PutImage)?;
-        conn.flush().map_err(PresentError::Flush)
+        )?;
+        Ok(conn.flush()?)
     }
 
     fn try_grab(&mut self) {

@@ -121,15 +121,12 @@ fn wide(s: &str) -> Vec<u16> {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MenuTrackError {
-    #[error("menu scale: {0}")]
+    #[error(transparent)]
     Scale(#[from] WindowStateError),
-    #[error("menu anchor: {0}")]
+    #[error(transparent)]
     Anchor(#[from] Unrepresentable),
-    #[error("{operation}: {source}")]
-    Win32 {
-        operation: &'static str,
-        source: windows::core::Error,
-    },
+    #[error(transparent)]
+    Win32(#[from] windows::core::Error),
     #[error("{tracked}; DestroyMenu: {destroy}")]
     Unwound {
         tracked: Box<MenuTrackError>,
@@ -137,17 +134,11 @@ pub(crate) enum MenuTrackError {
     },
 }
 
-impl MenuTrackError {
-    fn win32(operation: &'static str) -> impl FnOnce(windows::core::Error) -> Self {
-        move |source| Self::Win32 { operation, source }
-    }
-}
-
 pub(crate) fn on_input_message(hwnd: HWND, msg: u32) -> Result<(), MenuTrackError> {
     let tracking = TRACKING.load(Ordering::Acquire);
     if msg == WM_JFN_MENU_END {
         if tracking {
-            unsafe { EndMenu() }.map_err(MenuTrackError::win32("EndMenu"))?;
+            unsafe { EndMenu() }?;
         }
         return Ok(());
     }
@@ -155,9 +146,8 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) -> Result<(), MenuTrackErro
         return Ok(());
     }
     if tracking {
-        unsafe { EndMenu() }.map_err(MenuTrackError::win32("EndMenu"))?;
-        unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_TRACK, WPARAM(0), LPARAM(0)) }
-            .map_err(MenuTrackError::win32("PostMessageW(WM_JFN_MENU_TRACK)"))?;
+        unsafe { EndMenu() }?;
+        unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_TRACK, WPARAM(0), LPARAM(0)) }?;
         return Ok(());
     }
     let Some(pending) = PENDING.lock().take() else {
@@ -167,7 +157,7 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) -> Result<(), MenuTrackErro
         Ok(menu) => menu,
         Err(source) => {
             pending.on_selected.resolve(MENU_DISMISSED);
-            return Err(MenuTrackError::win32("CreatePopupMenu")(source));
+            return Err(source.into());
         }
     };
 
@@ -181,7 +171,7 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) -> Result<(), MenuTrackErro
     pending.on_selected.resolve(picked);
     match (tracked, destroyed) {
         (Ok(_), Ok(())) => Ok(()),
-        (Ok(_), Err(source)) => Err(MenuTrackError::win32("DestroyMenu")(source)),
+        (Ok(_), Err(source)) => Err(source.into()),
         (Err(e), Ok(())) => Err(e),
         (Err(e), Err(destroy)) => Err(MenuTrackError::Unwound {
             tracked: Box::new(e),
@@ -193,8 +183,7 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) -> Result<(), MenuTrackErro
 fn track(hwnd: HWND, menu: HMENU, pending: &Pending) -> Result<Option<c_int>, MenuTrackError> {
     for item in &pending.items {
         if item.separator {
-            unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }
-                .map_err(MenuTrackError::win32("AppendMenuW(MF_SEPARATOR)"))?;
+            unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }?;
             continue;
         }
         if item.id <= 0 {
@@ -213,8 +202,7 @@ fn track(hwnd: HWND, menu: HMENU, pending: &Pending) -> Result<Option<c_int>, Me
                 item.id as usize,
                 PCWSTR::from_raw(label.as_ptr()),
             )
-        }
-        .map_err(MenuTrackError::win32("AppendMenuW(MF_STRING)"))?;
+        }?;
     }
 
     let scale = win_get_scale()?;
@@ -222,9 +210,7 @@ fn track(hwnd: HWND, menu: HMENU, pending: &Pending) -> Result<Option<c_int>, Me
         x: scale.to_physical(pending.x)?,
         y: scale.to_physical(pending.y)?,
     };
-    unsafe { ClientToScreen(hwnd, &mut pt) }
-        .ok()
-        .map_err(MenuTrackError::win32("ClientToScreen"))?;
+    unsafe { ClientToScreen(hwnd, &mut pt) }.ok()?;
 
     if let Some(toplevel) = crate::platform::win_hwnd() {
         let _ = unsafe { SetForegroundWindow(toplevel) };
@@ -236,7 +222,6 @@ fn track(hwnd: HWND, menu: HMENU, pending: &Pending) -> Result<Option<c_int>, Me
         TPM_RETURNCMD.0 | TPM_NONOTIFY.0 | TPM_LEFTALIGN.0 | TPM_TOPALIGN.0 | TPM_RIGHTBUTTON.0;
     let picked = unsafe { TrackPopupMenuEx(menu, flags, pt.x, pt.y, hwnd, None) };
     TRACKING.store(false, Ordering::Release);
-    unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) }
-        .map_err(MenuTrackError::win32("PostMessageW(WM_NULL)"))?;
+    unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) }?;
     Ok((picked.0 != NO_COMMAND).then_some(picked.0))
 }

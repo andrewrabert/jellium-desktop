@@ -582,12 +582,12 @@ pub struct Bounds {
 pub enum ClampError {
     #[error("the visible frame names no pixel bounds: {0}")]
     VisibleFrame(#[from] PointsToPixelsError),
-    #[error("the working area could not be read (HRESULT {0:#010x})")]
-    WorkArea(i32),
-    #[error("the monitors could not be enumerated (HRESULT {0:#010x})")]
-    Monitors(i32),
-    #[error("a monitor's info could not be read (HRESULT {0:#010x})")]
-    MonitorInfo(i32),
+    #[error("the working area could not be read")]
+    WorkArea,
+    #[error("the monitors could not be enumerated")]
+    Monitors,
+    #[error("a monitor's info could not be read")]
+    MonitorInfo,
 }
 
 /// Saved window geometry: size plus an optional top-left position. `None`
@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     fn refuse(_: &ScreenName) -> Result<Option<TargetScreen>, ClampError> {
-        Err(ClampError::Monitors(0))
+        Err(ClampError::Monitors)
     }
 
     fn placed_on(
@@ -1128,7 +1128,7 @@ mod tests {
     fn a_failed_screen_lookup_fails_the_clamp() {
         assert_eq!(
             clamp_to_screen(&named("DISPLAY2", 800, 600, 100, 50), refuse, primary),
-            Err(ClampError::Monitors(0))
+            Err(ClampError::Monitors)
         );
     }
 

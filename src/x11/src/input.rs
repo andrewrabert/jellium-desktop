@@ -159,17 +159,17 @@ enum QueuedInputEvent {
 
 #[derive(Debug, thiserror::Error)]
 enum KeymapError {
-    #[error("no keymap for xkb device {0}")]
-    Keymap(i32),
-    #[error("no keyboard state for xkb device {0}")]
-    State(i32),
+    #[error("no keymap for the xkb device")]
+    Keymap,
+    #[error("no keyboard state for the xkb device")]
+    State,
 }
 
 #[derive(Debug, thiserror::Error)]
 enum InputError {
-    #[error("keymap update: {0}")]
+    #[error(transparent)]
     Keymap(#[from] KeymapError),
-    #[error("pointer extent: {0}")]
+    #[error(transparent)]
     Extent(#[from] ExtentError),
     #[error("input dispatch thread gone")]
     DispatchClosed,
@@ -270,11 +270,11 @@ fn update_keymap(conn: &xcb::Connection, st: &mut State) -> Result<(), KeymapErr
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     );
     if kmap.get_raw_ptr().is_null() {
-        return Err(KeymapError::Keymap(st.xkb_device_id));
+        return Err(KeymapError::Keymap);
     }
     let new_state = xkb_x11::state_new_from_device(&kmap, conn, st.xkb_device_id);
     if new_state.get_raw_ptr().is_null() {
-        return Err(KeymapError::State(st.xkb_device_id));
+        return Err(KeymapError::State);
     }
     st.xkb_kmap = Some(kmap);
     st.xkb_st = Some(new_state);

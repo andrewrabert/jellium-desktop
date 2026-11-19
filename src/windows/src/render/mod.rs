@@ -363,9 +363,9 @@ pub(crate) fn window_target(h: SurfaceHandle) -> Option<WindowTarget> {
 
 #[derive(Copy, Clone, Debug, PartialEq, thiserror::Error)]
 pub(crate) enum PopupPlaceError {
-    #[error("popup scale: {0}")]
+    #[error(transparent)]
     Scale(#[from] WindowStateError),
-    #[error("popup offset: {0}")]
+    #[error(transparent)]
     Offset(#[from] Unrepresentable),
 }
 

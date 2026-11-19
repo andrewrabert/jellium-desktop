@@ -38,7 +38,7 @@ impl Monitor {
 
     pub(crate) fn find(name: &ScreenName) -> Result<Option<TargetScreen>, ClampError> {
         for (index, handle) in enumerate()?.into_iter().enumerate() {
-            let monitor = Monitor::of(handle).map_err(|e| ClampError::MonitorInfo(e.code().0))?;
+            let monitor = Monitor::of(handle).map_err(|_| ClampError::MonitorInfo)?;
             if monitor.name().as_ref() == Some(name) {
                 return Ok(Some(TargetScreen {
                     mpv: MpvScreen::Index(index),
@@ -66,6 +66,6 @@ fn enumerate() -> Result<Vec<HMONITOR>, ClampError> {
     let data = LPARAM(std::ptr::from_mut(&mut found) as isize);
     unsafe { EnumDisplayMonitors(None, None, Some(collect), data) }
         .ok()
-        .map_err(|e| ClampError::Monitors(e.code().0))?;
+        .map_err(|_| ClampError::Monitors)?;
     Ok(found)
 }
