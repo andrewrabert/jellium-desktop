@@ -39,8 +39,8 @@ use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_s
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use xkbcommon::xkb;
 
-use jfn_input::TouchPhase;
 use jfn_input::buttons::{BTN_BACK, BTN_EXTRA, BTN_FORWARD, BTN_SIDE};
+use jfn_input::{HistoryDirection, PointerMotion, TouchPhase};
 use jfn_platform_abi::WindowPoint;
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_ALT_DOWN, EVENTFLAG_CONTROL_DOWN, EVENTFLAG_SHIFT_DOWN,
@@ -78,11 +78,11 @@ impl SeatShared {
     }
 }
 
-pub type MouseMoveFn = fn(p: WindowPoint, mods: u32, leave: c_int);
+pub type MouseMoveFn = fn(p: WindowPoint, mods: u32, motion: PointerMotion);
 pub type MouseButtonFn = fn(button: u32, pressed: c_int, p: WindowPoint, mods: u32);
 pub type PointerCancelFn = fn();
 pub type ScrollFn = fn(p: WindowPoint, dx: i32, dy: i32, mods: u32);
-pub type HistoryNavFn = fn(forward: c_int);
+pub type HistoryNavFn = fn(direction: HistoryDirection);
 pub type KbFocusFn = fn(gained: c_int);
 pub type KeyFn = fn(keysym: u32, native_code: u32, mods: u32, pressed: c_int);
 pub type CharFn = fn(codepoint: u32, mods: u32, native_code: u32);
@@ -979,13 +979,14 @@ impl InputTarget for ContentInput {
     }
     fn motion(&self, at: &SurfacePoint, modifiers: u32, leave: bool) {
         if let (Some(f), Some(p)) = (self.cb.mouse_move, self.window_point(at)) {
-            f(p, modifiers, i32::from(leave));
+            f(p, modifiers, PointerMotion::from_leave(leave));
         }
     }
     fn button(&self, button: u32, pressed: bool, at: &SurfacePoint, modifiers: u32) {
         if matches!(button, BTN_SIDE | BTN_EXTRA | BTN_BACK | BTN_FORWARD) {
             if pressed && let Some(f) = self.cb.history_nav {
-                f(i32::from(matches!(button, BTN_EXTRA | BTN_FORWARD)));
+                let forward = matches!(button, BTN_EXTRA | BTN_FORWARD);
+                f(HistoryDirection::from_forward(forward));
             }
             return;
         }

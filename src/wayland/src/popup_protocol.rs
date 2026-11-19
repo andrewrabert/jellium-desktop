@@ -1,6 +1,7 @@
 //! Popup protocol objects share the seat's event queue and dispatch owner.
 use crate::input::State;
 use crate::protocol::InputTarget;
+use crate::window_state::Superseded;
 use jfn_platform_abi::{Generation, LogicalSize, MenuPaint, MenuPlacement, WindowPoint};
 use smithay_client_toolkit::compositor::Surface;
 use smithay_client_toolkit::error::GlobalError;
@@ -186,12 +187,12 @@ impl State {
             self.open_popup(generation, place, input.clone(), parent)
         });
         match created {
-            Some(Ok(())) => {}
-            Some(Err(e)) => {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
                 tracing::error!(target: "Main", "menu popup: {e}");
                 input.dismissed();
             }
-            None => input.dismissed(),
+            Err(Superseded) => input.dismissed(),
         }
     }
 
@@ -253,15 +254,15 @@ impl State {
             .window()
             .with_basis(paint.basis, || self.attach_popup(&paint));
         match attached {
-            Some(Ok(())) => {}
-            Some(Err(e)) if !first => {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if !first => {
                 tracing::debug!(target: "Main", "popup frame: {e}; the frame on screen stands");
             }
-            Some(Err(e)) => {
+            Ok(Err(e)) => {
                 tracing::error!(target: "Main", "popup first frame: {e}; dismissed");
                 self.dismiss_popup(generation);
             }
-            None => self.dismiss_popup(generation),
+            Err(Superseded) => self.dismiss_popup(generation),
         }
     }
 

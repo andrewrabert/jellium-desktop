@@ -61,9 +61,9 @@ use jfn_platform_abi::{LogicalPoint, PhysicalPoint, WindowExtent, WindowStateErr
 
 use jfn_input::key::{KeyReport, PhysicalKey};
 use jfn_input::{
-    jfn_input_dispatch_history_nav, jfn_input_dispatch_key, jfn_input_dispatch_keyboard_focus,
-    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll,
-    jfn_input_dispatch_utf16,
+    HistoryDirection, PointerMotion, jfn_input_dispatch_history_nav, jfn_input_dispatch_key,
+    jfn_input_dispatch_keyboard_focus, jfn_input_dispatch_mouse_button,
+    jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll, jfn_input_dispatch_utf16,
 };
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 
@@ -298,8 +298,7 @@ fn is_button_down(msg: u32) -> bool {
 /// the extent `crate::window` last sampled. The identity before the first
 /// sample exists.
 fn view_point(x: i32, y: i32) -> Result<LogicalPoint, WindowStateError> {
-    let extent = crate::window::client_extent()?;
-    Ok(crate::scale::view_point(extent, PhysicalPoint { x, y }))
+    crate::scale::view_point(crate::window::client_extent(), PhysicalPoint { x, y })
 }
 
 fn window_point(p: LogicalPoint) -> jfn_platform_abi::WindowPoint {
@@ -307,15 +306,7 @@ fn window_point(p: LogicalPoint) -> jfn_platform_abi::WindowPoint {
 }
 
 /// One debug line per press.
-fn log_press(
-    msg: u32,
-    physical: PhysicalPoint,
-    logical: LogicalPoint,
-    extent: Option<WindowExtent>,
-) {
-    let Some(extent) = extent else {
-        return;
-    };
+fn log_press(msg: u32, physical: PhysicalPoint, logical: LogicalPoint, extent: WindowExtent) {
     let logical_size = extent.logical();
     let physical_size = extent.physical();
     let scale = extent.scale();
@@ -344,7 +335,11 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
         WM_MOUSEMOVE => {
             match view_point(get_x_lparam(lp), get_y_lparam(lp)) {
-                Ok(p) => jfn_input_dispatch_mouse_move(window_point(p), mouse_modifiers(wp), 0),
+                Ok(p) => jfn_input_dispatch_mouse_move(
+                    window_point(p),
+                    mouse_modifiers(wp),
+                    PointerMotion::Within,
+                ),
                 Err(e) => tracing::error!(target: "platform", "mouse move dropped: {e}"),
             }
             return LRESULT(0);
@@ -352,9 +347,9 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
         WM_MOUSELEAVE => {
             jfn_input_dispatch_mouse_move(
-                window_point(LogicalPoint { x: -1, y: -1 }),
+                jfn_input::outside_window(),
                 mouse_modifiers(wp),
-                1,
+                PointerMotion::Leave,
             );
             return LRESULT(0);
         }
@@ -369,15 +364,15 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 x: get_x_lparam(lp),
                 y: get_y_lparam(lp),
             };
-            let extent = match crate::window::client_extent() {
-                Ok(extent) => extent,
+            let sampled = crate::window::client_extent();
+            let p = match crate::scale::view_point(sampled, physical) {
+                Ok(p) => p,
                 Err(e) => {
                     tracing::error!(target: "platform", "mouse button dropped: {e}");
                     return LRESULT(0);
                 }
             };
-            let p = crate::scale::view_point(extent, physical);
-            if down {
+            if down && let Ok(extent) = sampled {
                 log_press(msg, physical, p, extent);
             }
             jfn_input_dispatch_mouse_button(
@@ -392,8 +387,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         WM_XBUTTONDOWN | WM_XBUTTONUP => {
             let btn = get_xbutton_wparam(wp);
             if msg == WM_XBUTTONDOWN {
-                let fwd = if btn == XBUTTON2 { 1 } else { 0 };
-                jfn_input_dispatch_history_nav(fwd);
+                jfn_input_dispatch_history_nav(HistoryDirection::from_forward(btn == XBUTTON2));
             }
             return LRESULT(1);
         }
@@ -401,11 +395,11 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         WM_APPCOMMAND => {
             let cmd = get_appcommand_lparam(lp) as u32;
             if cmd == APPCOMMAND_BROWSER_BACKWARD.0 {
-                jfn_input_dispatch_history_nav(0);
+                jfn_input_dispatch_history_nav(HistoryDirection::Back);
                 return LRESULT(1);
             }
             if cmd == APPCOMMAND_BROWSER_FORWARD.0 {
-                jfn_input_dispatch_history_nav(1);
+                jfn_input_dispatch_history_nav(HistoryDirection::Forward);
                 return LRESULT(1);
             }
         }
@@ -450,8 +444,8 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
             if vk == VK_BROWSER_BACK.0 || vk == VK_BROWSER_FORWARD.0 {
                 if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-                    let fwd = if vk == VK_BROWSER_FORWARD.0 { 1 } else { 0 };
-                    jfn_input_dispatch_history_nav(fwd);
+                    let forward = vk == VK_BROWSER_FORWARD.0;
+                    jfn_input_dispatch_history_nav(HistoryDirection::from_forward(forward));
                 }
                 return LRESULT(0);
             }

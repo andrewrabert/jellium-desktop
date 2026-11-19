@@ -19,8 +19,8 @@ use xcb::{Xid, XidNew, x};
 use xkbcommon::xkb::{self, x11 as xkb_x11};
 
 use jfn_input::{
-    jfn_input_dispatch_char, jfn_input_dispatch_history_nav, jfn_input_dispatch_mouse_button,
-    jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll,
+    HistoryDirection, PointerMotion, jfn_input_dispatch_char, jfn_input_dispatch_history_nav,
+    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll,
 };
 use jfn_linux_util::input::{compose_feed, compose_pending, jfn_input_dispatch_key_raw};
 use jfn_playback::shutdown::jfn_shutdown_register_waker;
@@ -125,7 +125,7 @@ enum QueuedInputEvent {
         modifiers: u32,
     },
     HistoryNav {
-        forward: c_int,
+        direction: HistoryDirection,
     },
     KeyboardFocus {
         gained: bool,
@@ -141,7 +141,7 @@ enum QueuedInputEvent {
         x: i32,
         y: i32,
         modifiers: u32,
-        leave: c_int,
+        motion: PointerMotion,
     },
     Scroll {
         x: i32,
@@ -317,7 +317,7 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) -> Result<(), InputErro
             queue(
                 &st.dispatch,
                 QueuedInputEvent::HistoryNav {
-                    forward: (sym == XKB_KEY_XF86FORWARD) as c_int,
+                    direction: HistoryDirection::from_forward(sym == XKB_KEY_XF86FORWARD),
                 },
             )
         } else {
@@ -420,7 +420,7 @@ fn handle_button(
             return queue(
                 &st.dispatch,
                 QueuedInputEvent::HistoryNav {
-                    forward: (button == 9) as c_int,
+                    direction: HistoryDirection::from_forward(button == 9),
                 },
             );
         }
@@ -490,7 +490,7 @@ fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) -> Result<(), I
             x: st.ptr_x,
             y: st.ptr_y,
             modifiers: cef_modifiers(st),
-            leave: 0,
+            motion: PointerMotion::Within,
         },
     )
 }
@@ -506,7 +506,7 @@ fn handle_enter(st: &mut State, ev: &xcb::x::EnterNotifyEvent) -> Result<(), Inp
             x: st.ptr_x,
             y: st.ptr_y,
             modifiers: cef_modifiers(st),
-            leave: 0,
+            motion: PointerMotion::Within,
         },
     )
 }
@@ -518,7 +518,7 @@ fn handle_leave(st: &State, _ev: &xcb::x::LeaveNotifyEvent) -> Result<(), InputE
             x: st.ptr_x,
             y: st.ptr_y,
             modifiers: cef_modifiers(st),
-            leave: 1,
+            motion: PointerMotion::Leave,
         },
     )
 }
@@ -735,7 +735,7 @@ fn dispatch_input_event(ev: QueuedInputEvent) {
         QueuedInputEvent::Text { text, modifiers } => {
             jfn_input::jfn_input_dispatch_text(&text, modifiers)
         }
-        QueuedInputEvent::HistoryNav { forward } => jfn_input_dispatch_history_nav(forward),
+        QueuedInputEvent::HistoryNav { direction } => jfn_input_dispatch_history_nav(direction),
         QueuedInputEvent::KeyboardFocus { gained } => {
             jfn_input::jfn_input_dispatch_keyboard_focus(c_int::from(gained));
         }
@@ -750,8 +750,8 @@ fn dispatch_input_event(ev: QueuedInputEvent) {
             x,
             y,
             modifiers,
-            leave,
-        } => jfn_input_dispatch_mouse_move(window_point(x, y), modifiers, leave),
+            motion,
+        } => jfn_input_dispatch_mouse_move(window_point(x, y), modifiers, motion),
         QueuedInputEvent::Scroll {
             x,
             y,

@@ -6,7 +6,7 @@ use std::num::NonZeroU64;
 #[cfg(target_os = "windows")]
 use jfn_platform_abi::WindowPos;
 use jfn_platform_abi::{
-    ExtentError, LogicalPoint, PhysicalPoint, PhysicalSize, Scale, WindowExtent,
+    ExtentError, LogicalPoint, PhysicalPoint, PhysicalSize, Scale, WindowExtent, WindowStateError,
 };
 
 /// The DPI every Windows scale is expressed against.
@@ -79,11 +79,15 @@ impl From<ClientExtentError> for jfn_platform_abi::WindowStateError {
     }
 }
 
-/// The pointer position in the space `extent`'s logical size names.
-///
-/// The identity before the first sample exists.
-pub fn view_point(extent: Option<WindowExtent>, p: PhysicalPoint) -> LogicalPoint {
-    extent.map_or(LogicalPoint { x: p.x, y: p.y }, |e| e.to_logical_point(p))
+pub fn view_point(
+    sampled: Result<WindowExtent, WindowStateError>,
+    p: PhysicalPoint,
+) -> Result<LogicalPoint, WindowStateError> {
+    match sampled {
+        Ok(extent) => Ok(extent.to_logical_point(p)),
+        Err(WindowStateError::NoWindow) => Ok(LogicalPoint { x: p.x, y: p.y }),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -116,18 +120,18 @@ mod tests {
 
     #[test]
     fn the_last_physical_pixel_maps_to_the_last_logical_pixel_at_every_covered_scale() {
-        let corners: Vec<Result<(LogicalPoint, LogicalPoint), ClientExtentError>> = COVERED_DPI
+        let corners: Vec<Result<(LogicalPoint, LogicalPoint), WindowStateError>> = COVERED_DPI
             .into_iter()
             .map(|dpi| {
                 let e = extent(CLIENT, dpi)?;
                 let logical = e.logical();
                 let last = view_point(
-                    Some(e),
+                    Ok(e),
                     PhysicalPoint {
                         x: CLIENT.w - 1,
                         y: CLIENT.h - 1,
                     },
-                );
+                )?;
                 Ok((
                     last,
                     LogicalPoint {
@@ -137,7 +141,7 @@ mod tests {
                 ))
             })
             .collect();
-        let agrees: Vec<Result<bool, ClientExtentError>> = corners
+        let agrees: Vec<Result<bool, WindowStateError>> = corners
             .into_iter()
             .map(|pair| pair.map(|(got, want)| got == want))
             .collect();
@@ -162,8 +166,11 @@ mod tests {
     #[test]
     fn a_pointer_maps_by_the_identity_before_the_first_sample() {
         assert_eq!(
-            view_point(None, PhysicalPoint { x: 37, y: 11 }),
-            LogicalPoint { x: 37, y: 11 }
+            view_point(
+                Err(WindowStateError::NoWindow),
+                PhysicalPoint { x: 37, y: 11 }
+            ),
+            Ok(LogicalPoint { x: 37, y: 11 })
         );
     }
 }

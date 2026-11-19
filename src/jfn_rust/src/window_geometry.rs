@@ -39,8 +39,7 @@ impl WindowGeometryController {
     /// scale + clamp from the platform.
     pub fn boot(&self) -> Result<BootGeometry, BootGeometryError> {
         let g = jfn_config::window_geometry();
-        let at = (g.x >= 0 && g.y >= 0).then_some(jfn_platform_abi::WindowPos { x: g.x, y: g.y });
-        let scale = plat().display_scale(at);
+        let scale = plat().display_scale(g.position);
         resolve_boot(g, scale, |w| plat().clamp_window_geometry(w))
     }
 
@@ -86,7 +85,11 @@ fn resolve_boot(
     let physical = logical.to_physical(scale)?;
     // clamp operates on physical backing pixels; on Wayland it's the identity,
     // so the logical size we seed the toplevel with is unaffected.
-    let saved = WindowGeometry::from_raw(physical.w, physical.h, g.x, g.y);
+    let saved = WindowGeometry {
+        w: physical.w,
+        h: physical.h,
+        position: g.position,
+    };
     let boot = |geometry| BootGeometry::from_clamped(logical, scale, geometry, g.maximized);
     match clamp(saved) {
         Ok(clamped) => Ok(boot(clamped)),
@@ -160,8 +163,9 @@ fn geometry_to_persist(
         logical_width: logical.w,
         logical_height: logical.h,
         maximized: false,
-        x: window.position.map_or(-1, |p| p.x),
-        y: window.position.map_or(-1, |p| p.y),
+        position: window
+            .position
+            .and_then(|p| JfnWindowGeometry::saved_position(p.x, p.y)),
     }))
 }
 
@@ -214,7 +218,7 @@ mod tests {
         let g = geometry_to_persist(&ws, JfnWindowGeometry::default(), false)
             .unwrap()
             .unwrap();
-        assert_eq!((g.x, g.y), (-1, -1));
+        assert_eq!(g.position, None);
         assert_eq!((g.width, g.height), (2400, 1350));
         assert_eq!((g.logical_width, g.logical_height), (1600, 900));
         assert!(!g.maximized);
@@ -229,7 +233,7 @@ mod tests {
         let g = geometry_to_persist(&ws, JfnWindowGeometry::default(), false)
             .unwrap()
             .unwrap();
-        assert_eq!((g.x, g.y), (100, 50));
+        assert_eq!(g.position, Some(WindowPos { x: 100, y: 50 }));
         assert_eq!((g.logical_width, g.logical_height), (1280, 720));
     }
 

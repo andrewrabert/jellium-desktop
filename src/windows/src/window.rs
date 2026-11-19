@@ -18,7 +18,13 @@ use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsZo
 
 use crate::scale::ClientExtentError;
 
-static WINDOW_STATE: Mutex<Option<WindowState>> = Mutex::new(None);
+#[derive(Clone, Copy)]
+enum Stored {
+    Unsampled,
+    Sampled(WindowState),
+}
+
+static WINDOW_STATE: Mutex<Stored> = Mutex::new(Stored::Unsampled);
 
 struct NotifyState {
     dirty: bool,
@@ -113,8 +119,8 @@ pub(crate) fn sample() -> Result<Option<PhysicalSize>, WindowStateError> {
         web_top: 0,
         basis: jfn_platform_abi::WindowBasis::FIXED,
     };
-    let previous = WINDOW_STATE.lock().replace(state);
-    if previous.map(|p| p.extent) != Some(extent) {
+    let previous = std::mem::replace(&mut *WINDOW_STATE.lock(), Stored::Sampled(state));
+    if !matches!(previous, Stored::Sampled(p) if p.extent == extent) {
         log_sample(hwnd, dpi, extent);
     }
     Ok(Some(client))
@@ -183,32 +189,27 @@ pub(crate) fn publish_deferred() -> Result<Option<PhysicalSize>, WindowStateErro
 }
 
 pub(crate) fn stored_window_state() -> Result<WindowState, WindowStateError> {
-    if let Some(state) = *WINDOW_STATE.lock() {
+    if let Stored::Sampled(state) = *WINDOW_STATE.lock() {
         return Ok(state);
     }
     sample()?;
     let stored = *WINDOW_STATE.lock();
-    stored.ok_or(WindowStateError::NoWindow)
-}
-
-pub(crate) fn existing_window_state() -> Result<Option<WindowState>, WindowStateError> {
-    match stored_window_state() {
-        Ok(state) => Ok(Some(state)),
-        Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => Ok(None),
-        Err(e) => Err(e),
+    match stored {
+        Stored::Sampled(state) => Ok(state),
+        Stored::Unsampled => Err(WindowStateError::NoWindow),
     }
 }
 
-pub(crate) fn client_extent() -> Result<Option<WindowExtent>, WindowStateError> {
-    Ok(existing_window_state()?.map(|state| state.extent))
+pub(crate) fn client_extent() -> Result<WindowExtent, WindowStateError> {
+    Ok(stored_window_state()?.extent)
 }
 
-pub(crate) fn client_scale() -> Result<Option<Scale>, WindowStateError> {
-    Ok(client_extent()?.as_ref().map(WindowExtent::scale))
+pub(crate) fn client_scale() -> Result<Scale, WindowStateError> {
+    Ok(client_extent()?.scale())
 }
 
 pub(crate) fn clear() {
-    *WINDOW_STATE.lock() = None;
+    *WINDOW_STATE.lock() = Stored::Unsampled;
 }
 
 pub(crate) struct WinWindowSource;
