@@ -1,7 +1,7 @@
 use jfn_linux_util::menu::MenuInputEvent;
 use jfn_platform_abi::{
-    Generation, LogicalSize, MenuClose, MenuHandle, MenuMetrics, MenuPaint, MenuPlacement,
-    PopupSurface, WindowBasis,
+    Generation, LogicalSize, MENU_DISMISSED, MenuClose, MenuHandle, MenuHost, MenuMetrics,
+    MenuOpenError, MenuPaint, MenuPlacement, MenuShutdownError, PopupSurface, WindowBasis,
 };
 
 use crate::popup_protocol::{PopupCommand, PopupParent};
@@ -29,7 +29,9 @@ impl PopupSurface for WlPopupSurface {
 
     fn create(&self, generation: Generation, place: MenuPlacement) {
         let Some(window) = self.rt.root().window() else {
-            self.rt.menu().on_done(generation);
+            if let Some(menu) = self.rt.menu() {
+                menu.on_done(generation);
+            }
             return;
         };
         send(
@@ -68,17 +70,21 @@ fn send(rt: &WlRuntime, command: PopupCommand) {
 pub(crate) struct WlMenuHost {
     pub(crate) rt: &'static WlRuntime,
 }
-impl jfn_platform_abi::MenuHost for WlMenuHost {
-    fn open(&self, request: jfn_platform_abi::MenuRequest) -> Option<MenuHandle> {
-        self.rt
-            .menu()
-            .open_triggered(request, self.rt.seat().last_input_serial())
+impl MenuHost for WlMenuHost {
+    fn open(&self, request: jfn_platform_abi::MenuRequest) -> Result<MenuHandle, MenuOpenError> {
+        let Some(menu) = self.rt.menu() else {
+            request.on_selected.resolve(MENU_DISMISSED);
+            return Err(MenuOpenError::EngineUnavailable);
+        };
+        menu.open_triggered(request, self.rt.seat().last_input_serial())
     }
     fn hide(&self, handle: MenuHandle) {
-        self.rt.menu().hide(handle);
+        if let Some(menu) = self.rt.menu() {
+            menu.hide(handle);
+        }
     }
-    fn shutdown(&self) {
-        self.rt.menu().shutdown();
+    fn shutdown(&self) -> Result<(), MenuShutdownError> {
+        self.rt.menu().map_or(Ok(()), MenuHost::shutdown)
     }
 }
 
@@ -94,10 +100,14 @@ impl crate::protocol::InputTarget for MenuInput {
         let _ = self.popup.set(surface.clone());
     }
     fn configured(&self, size: LogicalSize) {
-        self.rt.menu().on_ready(self.generation, size);
+        if let Some(menu) = self.rt.menu() {
+            menu.on_ready(self.generation, size);
+        }
     }
     fn dismissed(&self) {
-        self.rt.menu().on_done(self.generation);
+        if let Some(menu) = self.rt.menu() {
+            menu.on_done(self.generation);
+        }
     }
     fn motion(&self, at: &SurfacePoint, _: u32, leave: bool) {
         if !leave {
@@ -110,15 +120,11 @@ impl crate::protocol::InputTarget for MenuInput {
         }
     }
     fn scroll(&self, _: &SurfacePoint, _: i32, dy: i32, _: u32) {
-        self.rt
-            .menu()
-            .input(self.generation, MenuInputEvent::Scroll(dy));
+        self.deliver(MenuInputEvent::Scroll(dy));
     }
     fn key(&self, event: &smithay_client_toolkit::seat::keyboard::KeyEvent, pressed: bool, _: u32) {
         if pressed {
-            self.rt
-                .menu()
-                .input(self.generation, MenuInputEvent::Key(event.keysym.raw()));
+            self.deliver(MenuInputEvent::Key(event.keysym.raw()));
         }
     }
 }
@@ -127,8 +133,12 @@ impl MenuInput {
         let Some(at) = self.popup.get().and_then(|popup| at.menu_point(popup)) else {
             return;
         };
-        self.rt
-            .menu()
-            .input(self.generation, MenuInputEvent::Pointer { at, press });
+        self.deliver(MenuInputEvent::Pointer { at, press });
+    }
+
+    fn deliver(&self, event: MenuInputEvent) {
+        if let Some(menu) = self.rt.menu() {
+            menu.input(self.generation, event);
+        }
     }
 }

@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use crate::app_conn::AppConn;
 use crate::decoration_probe::DecorationGlobals;
 use crate::selection::Selections;
-use jfn_linux_util::menu::SoftwareMenu;
+use jfn_linux_util::menu::{MenuSpawnError, SoftwareMenu};
 
 use crate::input::{InputThread, SeatShared};
 use crate::mpv_proxy::ProxyShared;
@@ -100,12 +100,14 @@ impl WlRuntime {
         self.input.set(thread).map_err(|_| ())
     }
 
-    pub(crate) fn menu(&'static self) -> &'static SoftwareMenu {
-        self.menu.get_or_init(|| {
-            SoftwareMenu::spawn(std::sync::Arc::new(crate::popup::WlPopupSurface {
-                rt: self,
-            }))
-        })
+    pub(crate) fn start_menu(&'static self) -> Result<&'static SoftwareMenu, MenuSpawnError> {
+        if let Some(menu) = self.menu.get() {
+            return Ok(menu);
+        }
+        let menu = SoftwareMenu::spawn(std::sync::Arc::new(crate::popup::WlPopupSurface {
+            rt: self,
+        }))?;
+        Ok(self.menu.get_or_init(|| menu))
     }
 
     pub(crate) fn menu_host(&'static self) -> &'static crate::popup::WlMenuHost {
@@ -113,7 +115,7 @@ impl WlRuntime {
             .get_or_init(|| crate::popup::WlMenuHost { rt: self })
     }
 
-    pub(crate) fn try_menu(&self) -> Option<&SoftwareMenu> {
+    pub(crate) fn menu(&self) -> Option<&SoftwareMenu> {
         self.menu.get()
     }
 

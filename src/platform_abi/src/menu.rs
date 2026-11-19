@@ -116,15 +116,35 @@ pub enum MenuDelivery<'a> {
     Page,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MenuOpenError {
+    #[error("the menu has no selectable item")]
+    NothingSelectable,
+    #[error("the menu engine is not running")]
+    EngineUnavailable,
+    #[error("no window to raise the menu from")]
+    NoWindow,
+    #[error("the window state the menu was requested under has been replaced")]
+    StaleBasis,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MenuShutdownError {
+    #[error("menu thread panicked: {0}")]
+    ThreadPanicked(String),
+}
+
 pub trait MenuHost: Send + Sync {
     fn warm(&self) {}
 
-    fn open(&self, req: MenuRequest) -> Option<MenuHandle>;
+    fn open(&self, req: MenuRequest) -> Result<MenuHandle, MenuOpenError>;
 
     fn hide(&self, _handle: MenuHandle) {}
 
     /// Resolves any pending selection with [`MENU_DISMISSED`].
-    fn shutdown(&self) {}
+    fn shutdown(&self) -> Result<(), MenuShutdownError> {
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]

@@ -9,7 +9,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use jfn_platform_abi::{
-    MENU_DISMISSED, MenuHandle, MenuHost, MenuItem, MenuRequest, MenuSelection, menu_has_selectable,
+    MENU_DISMISSED, MenuHandle, MenuHost, MenuItem, MenuOpenError, MenuRequest, MenuSelection,
+    MenuShutdownError, menu_has_selectable,
 };
 use parking_lot::Mutex;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
@@ -56,10 +57,14 @@ fn next_handle() -> MenuHandle {
 pub(crate) struct WinMenuHost;
 
 impl MenuHost for WinMenuHost {
-    fn open(&self, req: MenuRequest) -> Option<MenuHandle> {
-        let (Some(hwnd), true) = (input_hwnd(), menu_has_selectable(&req.items)) else {
+    fn open(&self, req: MenuRequest) -> Result<MenuHandle, MenuOpenError> {
+        if !menu_has_selectable(&req.items) {
             req.on_selected.resolve(MENU_DISMISSED);
-            return None;
+            return Err(MenuOpenError::NothingSelectable);
+        }
+        let Some(hwnd) = input_hwnd() else {
+            req.on_selected.resolve(MENU_DISMISSED);
+            return Err(MenuOpenError::NoWindow);
         };
         let handle = next_handle();
         *CURRENT.lock() = Some(handle);
@@ -74,7 +79,7 @@ impl MenuHost for WinMenuHost {
             prev.on_selected.resolve(MENU_DISMISSED);
         }
         let _ = unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_TRACK, WPARAM(0), LPARAM(0)) };
-        Some(handle)
+        Ok(handle)
     }
 
     fn hide(&self, handle: MenuHandle) {
@@ -89,12 +94,13 @@ impl MenuHost for WinMenuHost {
         post_end();
     }
 
-    fn shutdown(&self) {
+    fn shutdown(&self) -> Result<(), MenuShutdownError> {
         let pending = PENDING.lock().take();
         if let Some(pending) = pending {
             pending.on_selected.resolve(MENU_DISMISSED);
         }
         post_end();
+        Ok(())
     }
 }
 

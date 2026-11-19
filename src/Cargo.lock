@@ -2709,6 +2709,7 @@ dependencies = [
  "libloading 0.9.1",
  "nix",
  "parking_lot",
+ "thiserror 2.0.21",
  "tiny-skia",
  "tracing",
  "xkbcommon 0.9.0",
