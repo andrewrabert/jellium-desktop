@@ -60,6 +60,8 @@ enum BootError {
     Canceled,
     #[error("mpv terminated before its window became ready")]
     MpvTerminated,
+    #[error("mpv event during startup: {0}")]
+    Ingest(#[from] jfn_playback::ingest_driver::IngestError),
 }
 
 impl BootError {
@@ -301,6 +303,10 @@ fn wait_for_vo_window(mut boot: BackgroundCapture) -> Result<ReadyBoot, BootErro
             match consume_boot_event(&mut boot, jfn_mpv::api::wait_event_owned(0.0)) {
                 BootEvent::Idle => break,
                 BootEvent::Fatal => return Break(()),
+                BootEvent::Ingest(error) => {
+                    outcome = Err(error.into());
+                    return Break(());
+                }
                 BootEvent::Consumed => {}
             }
         }
@@ -308,13 +314,15 @@ fn wait_for_vo_window(mut boot: BackgroundCapture) -> Result<ReadyBoot, BootErro
             outcome = Ok(ready);
             return Break(());
         }
-        if wait == jfn_platform_abi::VoWait::Event
-            && matches!(
-                consume_boot_event(&mut boot, jfn_mpv::api::wait_event_owned(-1.0)),
-                BootEvent::Fatal
-            )
-        {
-            return Break(());
+        if wait == jfn_platform_abi::VoWait::Event {
+            match consume_boot_event(&mut boot, jfn_mpv::api::wait_event_owned(-1.0)) {
+                BootEvent::Fatal => return Break(()),
+                BootEvent::Ingest(error) => {
+                    outcome = Err(error.into());
+                    return Break(());
+                }
+                BootEvent::Idle | BootEvent::Consumed => {}
+            }
         }
         Continue(())
     });
@@ -1180,7 +1188,11 @@ fn run_app(
         Ok(boot) => boot,
         Err(error) => {
             let code = error.exit_code();
-            tracing::info!(target: "Main", "{error}");
+            if code == 0 {
+                tracing::info!(target: "Main", "{error}");
+            } else {
+                tracing::error!(target: "Main", "{error}");
+            }
             return code;
         }
     };
@@ -1227,6 +1239,7 @@ enum BootEvent {
     Fatal,
     /// Folded into boot state.
     Consumed,
+    Ingest(jfn_playback::ingest_driver::IngestError),
 }
 
 /// Log messages reach tracing, the background-color reply applies the startup
@@ -1259,12 +1272,10 @@ fn consume_boot_event(boot: &mut BackgroundCapture, event: jfn_mpv::api::WaitEve
             BootEvent::Consumed
         }
         jfn_mpv::api::WaitEvent::Event(event) => {
-            if let Err(e) =
-                jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(&event, plat())
-            {
-                tracing::error!(target: "mpv", "{e}");
+            match jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(&event, plat()) {
+                Ok(_) => BootEvent::Consumed,
+                Err(error) => BootEvent::Ingest(error),
             }
-            BootEvent::Consumed
         }
     }
 }
@@ -1387,7 +1398,8 @@ fn run_with_cef(
     }
     let (hz, rate) = boot_display_hz();
     if let Err(e) = boot_mpv_reconcile(hz) {
-        tracing::error!(target: "Main", "[FLOW] mpv size reconcile: {e}; mpv keeps its size");
+        tracing::error!(target: "Main", "[FLOW] mpv size reconcile: {e}");
+        return 1;
     }
     resources.services.playback = Some(initialize_playback_coordination());
     let Some(cef) = resources.services.cef.as_ref() else {
