@@ -270,7 +270,9 @@ pub(crate) struct PlatformSurface {
     pub visibility: Visibility,
     pub layer_actor: Option<LayerActor>,
     /// Set by `Platform::surface_window_target`. The actor attaches no buffer
-    /// and drops every present for a surface with this set.
+    /// and drops every present for a surface with this set. Visibility
+    /// transitions may still commit it, but only after its owner has released
+    /// the WSI surface and before it rebuilds one.
     pub external: bool,
     pub top_logical: i32,
     pub top_physical: i32,

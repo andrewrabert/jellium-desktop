@@ -133,6 +133,17 @@ impl LayerSurface {
         callbacks.arm(&self.conn.display().sync(qh, ()))
     }
 
+    /// Arms a display round-trip without committing the surface. Used when a
+    /// wgpu-owned surface already committed the frame itself and a second
+    /// commit would race the Wayland WSI's explicit-sync points.
+    pub(crate) fn sync_acked(
+        &self,
+        callbacks: &'static Callbacks,
+        qh: &QueueHandle<DispatchState>,
+    ) -> Acked {
+        callbacks.arm(&self.conn.display().sync(qh, ()))
+    }
+
     pub(crate) fn flush(&self) {
         let _ = self.conn.flush();
     }
