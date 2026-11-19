@@ -84,7 +84,6 @@ pub fn hit(routing: Routing, p: WindowPoint) -> ShellHit {
     ShellHit::Drag
 }
 
-/// `Target::Shell` for every hit but [`ShellHit::Miss`].
 pub fn route_pointer(routing: Routing, p: WindowPoint) -> Target {
     match hit(routing, p) {
         ShellHit::Miss => Target::Web,
@@ -92,7 +91,6 @@ pub fn route_pointer(routing: Routing, p: WindowPoint) -> Target {
     }
 }
 
-/// A modal takes every key; otherwise every key goes to jellyfin-web.
 pub fn route_key(state: ShellState) -> Target {
     if state.modal_open {
         Target::Shell

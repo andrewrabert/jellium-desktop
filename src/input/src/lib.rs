@@ -201,7 +201,6 @@ pub fn jfn_input_dispatch_scroll(p: WindowPoint, dx: i32, dy: i32, mods: u32) {
     dispatch_scroll(p, dx, dy, mods);
 }
 
-/// Variant that lets the caller flag a precision (trackpad) delta.
 pub fn jfn_input_dispatch_scroll_precise(
     p: WindowPoint,
     dx: i32,
