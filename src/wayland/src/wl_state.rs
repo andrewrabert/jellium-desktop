@@ -272,20 +272,21 @@ pub(crate) struct PlatformSurface {
     /// Set by `Platform::surface_window_target`. The actor attaches no buffer
     /// and drops every present for a surface with this set.
     pub external: bool,
-    pub top_logical: i32,
-    pub top_physical: i32,
+    pub placement: jfn_platform_abi::SurfacePlacement,
 }
 
 impl PlatformSurface {
-    pub(crate) fn new(visibility: Visibility) -> PlatformSurface {
+    pub(crate) fn new(
+        visibility: Visibility,
+        placement: jfn_platform_abi::SurfacePlacement,
+    ) -> PlatformSurface {
         PlatformSurface {
             surface: None,
             subsurface: None,
             visibility,
             layer_actor: None,
             external: false,
-            top_logical: 0,
-            top_physical: 0,
+            placement,
         }
     }
 }

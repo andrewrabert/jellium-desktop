@@ -301,6 +301,10 @@ fn view_point(x: i32, y: i32) -> LogicalPoint {
     crate::scale::view_point(crate::window::client_extent(), PhysicalPoint { x, y })
 }
 
+fn window_point(p: LogicalPoint) -> jfn_platform_abi::WindowPoint {
+    jfn_platform_abi::WindowPoint::from_window(f64::from(p.x), f64::from(p.y))
+}
+
 /// One debug line per press.
 fn log_press(msg: u32, physical: PhysicalPoint, logical: LogicalPoint) {
     let Some(extent) = crate::window::client_extent() else {
@@ -334,12 +338,16 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
         WM_MOUSEMOVE => {
             let p = view_point(get_x_lparam(lp), get_y_lparam(lp));
-            jfn_input_dispatch_mouse_move(p.x, p.y, mouse_modifiers(wp), 0);
+            jfn_input_dispatch_mouse_move(window_point(p), mouse_modifiers(wp), 0);
             return LRESULT(0);
         }
 
         WM_MOUSELEAVE => {
-            jfn_input_dispatch_mouse_move(-1, -1, mouse_modifiers(wp), 1);
+            jfn_input_dispatch_mouse_move(
+                window_point(LogicalPoint { x: -1, y: -1 }),
+                mouse_modifiers(wp),
+                1,
+            );
             return LRESULT(0);
         }
 
@@ -360,8 +368,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             jfn_input_dispatch_mouse_button(
                 msg_to_button_code(msg),
                 if down { 1 } else { 0 },
-                p.x,
-                p.y,
+                window_point(p),
                 mouse_modifiers(wp),
             );
             return LRESULT(0);
@@ -398,7 +405,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
             let p = view_point(pt.x, pt.y);
-            jfn_input_dispatch_scroll(p.x, p.y, 0, delta, mouse_modifiers(wp));
+            jfn_input_dispatch_scroll(window_point(p), 0, delta, mouse_modifiers(wp));
             return LRESULT(0);
         }
 
@@ -412,7 +419,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
             let p = view_point(pt.x, pt.y);
-            jfn_input_dispatch_scroll(p.x, p.y, delta, 0, mouse_modifiers(wp));
+            jfn_input_dispatch_scroll(window_point(p), delta, 0, mouse_modifiers(wp));
             return LRESULT(0);
         }
 

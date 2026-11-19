@@ -3,7 +3,7 @@ use iced_graphics::text::cosmic_text::{
 };
 use tiny_skia::{Color as SkColor, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
 
-use jfn_platform_abi::{MenuItem, Scale};
+use jfn_platform_abi::{MenuItem, Scale, Unrepresentable};
 
 // Logical (unscaled) metrics; multiplied by the display scale at layout time.
 const FONT_PX: f32 = 13.0;
@@ -145,9 +145,11 @@ impl Default for Fonts {
     }
 }
 
-/// `None` when the reported scale does not map one of the menu's logical
-/// metrics to a physical one.
-pub fn layout(fonts: &mut Fonts, items: &[MenuItem], scale: Scale) -> Option<Layout> {
+pub fn layout(
+    fonts: &mut Fonts,
+    items: &[MenuItem],
+    scale: Scale,
+) -> Result<Layout, Unrepresentable> {
     let s = scale.as_f32();
     let font_px = FONT_PX * s;
     let row_h = scale.to_physical(ROW_H)?;
@@ -182,7 +184,7 @@ pub fn layout(fonts: &mut Fonts, items: &[MenuItem], scale: Scale) -> Option<Lay
     }
     let height = y + pad_y;
 
-    Some(Layout {
+    Ok(Layout {
         width,
         height,
         rows,

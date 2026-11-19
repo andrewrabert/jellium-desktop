@@ -1,13 +1,15 @@
 use std::collections::VecDeque;
 use std::ffi::c_int;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use jfn_mailbox::Mailbox;
 use jfn_platform_abi::{
-    Generation, LogicalPoint, MENU_DISMISSED, MenuClose, MenuHost, MenuItem, MenuMetrics,
-    MenuPaint, MenuPlacement, MenuRequest, MenuSelection, PhysicalSize, PopupSurface, WindowExtent,
-    menu_has_selectable, menu_initial_row,
+    ExtentError, Generation, LogicalSize, MENU_DISMISSED, MenuClose, MenuHandle, MenuHost,
+    MenuItem, MenuMetrics, MenuPaint, MenuPlacement, MenuRequest, MenuSelection, PhysicalSize,
+    PopupSurface, Unrepresentable, WindowBasis, WindowExtent, WindowPoint, menu_has_selectable,
+    menu_initial_row,
 };
 use parking_lot::Mutex;
 
@@ -15,23 +17,6 @@ use crate::menu::interaction_fsm::{self, MenuEffect, MenuEvent, MenuState as Fsm
 use crate::menu::render::{self, Fonts, Layout, blit_bgra};
 
 const WHEEL_DETENT: f32 = 120.0;
-
-/// Proof that the surface holding the menu's generation has been configured.
-///
-/// [`SurfaceOp::MapArmed`] attaches that surface's first buffer, which a
-/// compositor answers with `xdg_surface.error.unconfigured_buffer` before it
-/// has configured the surface. Mintable only inside [`SoftwareMenu::on_ready`],
-/// the configure callback, and carried by [`Phase::Armed`] for the configure
-/// that arrives before the layout.
-mod configured {
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(super) struct Configured(());
-
-    pub(super) fn configured() -> Configured {
-        Configured(())
-    }
-}
-use configured::Configured;
 
 /// A pointer position relative to the menu's top-left, in the unit the backend
 /// delivers it.
@@ -48,6 +33,7 @@ pub enum MenuInputEvent {
     Pointer { at: MenuPoint, press: bool },
     Key(u32),
     Scroll(c_int),
+    Expose,
 }
 
 pub struct SoftwareMenu {
@@ -77,169 +63,125 @@ impl SoftwareMenu {
         }
     }
 
-    /// Starts a requested menu and captures its input serial in the same
-    /// state transaction. The backend receives creation only after the menu
-    /// exists, so an immediate configure/dismissal cannot precede installation.
-    pub fn open_triggered(&self, req: MenuRequest, serial: u32) {
-        self.open_impl(req, Some(serial));
+    pub fn open_triggered(&self, req: MenuRequest, serial: u32) -> Option<MenuHandle> {
+        self.open_impl(req, serial)
     }
 
-    fn open_impl(&self, req: MenuRequest, trigger: Option<u32>) {
+    fn open_impl(&self, req: MenuRequest, serial: u32) -> Option<MenuHandle> {
         if !self.render_thread_alive() || !menu_has_selectable(&req.items) {
-            self.emitter
-                .update(|s| close_current(s, MenuClose::Speculative));
             req.on_selected.resolve(MENU_DISMISSED);
-            return;
+            return None;
         }
+        let surface = &self.emitter.surface;
+        let mut refused = None;
+        let mut handle = None;
         self.emitter.update(|s| {
-            let resolve = s
-                .menu
-                .as_mut()
-                .and_then(|m| m.on_selected.take())
-                .map(Resolve::dismissed);
-            if let Some(serial) = trigger {
-                s.active = false;
-                if let Some(generation) = s.generation {
-                    queue(
-                        s,
-                        SurfaceOp::Destroy {
-                            generation,
-                            reason: MenuClose::Finished,
-                        },
-                    );
-                }
-                let generation = next_generation(s);
-                s.generation = Some(generation);
-                s.phase = Phase::AwaitArmed;
-                queue(
-                    s,
-                    SurfaceOp::Arm {
-                        generation,
-                        anchor: LogicalPoint { x: req.x, y: req.y },
-                        serial,
-                    },
-                );
+            if surface.window_basis() != req.basis {
+                refused = Some(req.on_selected);
+                return None;
             }
-            s.menu = Some(Menu {
+            let resolve = close_current(s, MenuClose::Finished);
+            let id = next_id(&mut s.next_session);
+            handle = Some(MenuHandle::new(id));
+            s.session = Session::Laying(Menu {
+                id,
                 fsm: FsmState {
                     active: menu_initial_row(&req.items, req.initial),
                 },
                 items: Arc::new(req.items),
-                laid: None,
                 width: req.width,
                 on_selected: Some(req.on_selected),
-                anchor: LogicalPoint { x: req.x, y: req.y },
+                anchor: req.anchor,
+                basis: req.basis,
+                serial,
             });
-            if s.phase == Phase::Idle {
-                let generation = next_generation(s);
-                s.generation = Some(generation);
-            }
             s.job = Some(RenderJob::Shape);
             resolve
         });
+        if let Some(selection) = refused {
+            selection.resolve(MENU_DISMISSED);
+        }
+        handle
     }
 
     fn render_thread_alive(&self) -> bool {
         self.thread.lock().is_some()
     }
 
-    /// `serial` must still be grab-worthy at the call. No-op when the render
-    /// thread is absent.
-    pub fn arm(&self, x: c_int, y: c_int, serial: u32) {
-        if !self.render_thread_alive() {
-            return;
-        }
+    pub fn on_ready(&self, generation: Generation, configured: LogicalSize) {
+        let surface = &self.emitter.surface;
         self.emitter.update(|s| {
-            let resolve = clear_menu(s).map(Resolve::dismissed);
-            let generation = next_generation(s);
-            s.generation = Some(generation);
-            s.phase = Phase::AwaitArmed;
-            queue(
-                s,
-                SurfaceOp::Arm {
-                    generation,
-                    anchor: LogicalPoint { x, y },
-                    serial,
-                },
-            );
-            resolve
-        });
-    }
-
-    pub fn dismiss_if_speculative(&self) {
-        self.emitter.update(|s| {
-            if s.menu.is_some() || s.phase == Phase::Idle {
+            let Session::Created(live) = &mut s.session else {
+                return None;
+            };
+            if live.generation != generation {
                 return None;
             }
-            close_current(s, MenuClose::Speculative)
-        });
-    }
-
-    pub fn on_ready(&self, generation: Generation) {
-        self.emitter.update(|s| {
-            if s.generation != Some(generation) {
-                return None;
+            if surface.window_basis() != live.menu.basis {
+                return close_current(s, MenuClose::Finished);
             }
-            match s.phase {
-                Phase::AwaitArmed => {
-                    let configured = configured::configured();
-                    if s.menu.as_ref().is_some_and(|m| m.laid.is_some()) {
-                        return begin_menu(s, configured);
+            let asked = view(&live.laid).map(|v| v.logical());
+            if let Err(e) = &asked {
+                tracing::error!(target: "menu", "menu extent as asked: {e}");
+            }
+            if asked != Ok(configured) {
+                let scale = live.laid.metrics.scale;
+                match scale.to_physical(configured.h) {
+                    Ok(h) => live.laid.view_ph = live.laid.view_ph.min(h),
+                    Err(e) => {
+                        tracing::error!(target: "menu", "configured menu height: {e}");
                     }
-                    s.phase = Phase::Armed(configured);
                 }
-                Phase::AwaitMenu => {
-                    // The placement the arm (or `begin_menu`) carried still
-                    // stands; only the pixels are missing.
-                    s.phase = Phase::Shown;
-                    request_paint(s);
-                }
-                Phase::Idle | Phase::Armed(_) | Phase::Shown => {}
+                let active = live.menu.fsm.active;
+                scroll_active_into_view(&mut live.laid, active);
             }
+            let Session::Created(live) = std::mem::take(&mut s.session) else {
+                return None;
+            };
+            s.session = Session::Shown(live);
+            request_paint(s);
             None
         });
     }
 
     pub fn on_done(&self, generation: Generation) {
         self.emitter.update(|s| {
-            if s.generation != Some(generation) {
+            if s.session.generation() != Some(generation) {
                 return None;
             }
             close_current(s, MenuClose::External)
         });
     }
 
-    /// Ignored unless a layout exists to hit-test against.
-    pub fn motion(&self, at: MenuPoint) {
-        self.pointer(at, false);
-    }
-
-    /// Ignored unless a layout exists to hit-test against.
-    pub fn press(&self, at: MenuPoint) {
-        self.pointer(at, true);
-    }
-
-    fn pointer(&self, at: MenuPoint, press: bool) {
-        self.input_impl(None, MenuInputEvent::Pointer { at, press });
-    }
-
-    pub fn key(&self, keysym: u32) {
-        self.input_impl(None, MenuInputEvent::Key(keysym));
+    pub fn window_changed(&self) {
+        let surface = &self.emitter.surface;
+        self.emitter.update(|s| {
+            let basis = s.session.menu()?.basis;
+            if surface.window_basis() == basis {
+                return None;
+            }
+            close_current(s, MenuClose::Finished)
+        });
     }
 
     /// Stale events from a retired native object cannot affect its successor.
     pub fn input(&self, generation: Generation, event: MenuInputEvent) {
-        self.input_impl(Some(generation), event);
-    }
-
-    fn input_impl(&self, generation: Option<Generation>, event: MenuInputEvent) {
         self.emitter.update(|s| {
-            if generation.is_some_and(|generation| s.generation != Some(generation)) {
+            let Session::Shown(live) = &mut s.session else {
+                return None;
+            };
+            if live.generation != generation {
                 return None;
             }
             match event {
                 MenuInputEvent::Pointer { at, press } => {
-                    let (x, y) = s.menu.as_ref().and_then(|m| buffer_point(m, at))?;
+                    let (x, y) = match buffer_point(&live.laid, at) {
+                        Ok(point) => point,
+                        Err(e) => {
+                            tracing::error!(target: "menu", "menu pointer position: {e}");
+                            return None;
+                        }
+                    };
                     step(
                         s,
                         if press {
@@ -249,14 +191,9 @@ impl SoftwareMenu {
                         },
                     )
                 }
-                MenuInputEvent::Key(keysym) => {
-                    if !s.active {
-                        return None;
-                    }
-                    step(s, MenuEvent::Key(keysym))
-                }
+                MenuInputEvent::Key(keysym) => step(s, MenuEvent::Key(keysym)),
                 MenuInputEvent::Scroll(dy) => {
-                    let laid = s.menu.as_mut()?.laid.as_mut()?;
+                    let laid = &mut live.laid;
                     if laid.view_ph >= laid.content.h {
                         return None;
                     }
@@ -269,59 +206,34 @@ impl SoftwareMenu {
                     request_paint(s);
                     None
                 }
+                MenuInputEvent::Expose => {
+                    request_paint(s);
+                    None
+                }
             }
         });
     }
 
-    /// Accepted whenever the menu is active, layout or not.
-    pub fn dismiss(&self) {
-        self.emitter.update(|s| {
-            if !s.active {
-                return None;
-            }
-            step(s, MenuEvent::Dismiss)
-        });
-    }
-
-    pub fn expose(&self) {
-        self.emitter.update(|s| {
-            if s.menu.as_ref().is_some_and(|m| m.laid.is_some()) {
-                request_paint(s);
-            }
-            None
-        });
-    }
-
-    /// ±120 per detent, positive = wheel up.
-    pub fn scroll(&self, dy: c_int) {
-        self.input_impl(None, MenuInputEvent::Scroll(dy));
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.emitter.mailbox.peek(|s| s.active)
-    }
-
-    pub fn is_engaged(&self) -> bool {
-        self.emitter.mailbox.peek(|s| s.phase != Phase::Idle)
-    }
-
-    pub fn has_menu(&self) -> bool {
-        self.emitter.mailbox.peek(|s| s.menu.is_some())
+    #[cfg(test)]
+    fn is_engaged(&self) -> bool {
+        self.emitter
+            .mailbox
+            .peek(|s| !matches!(s.session, Session::Idle))
     }
 }
 
 impl MenuHost for SoftwareMenu {
     fn warm(&self) {}
 
-    fn open(&self, req: MenuRequest) {
-        self.open_impl(req, None);
+    fn open(&self, req: MenuRequest) -> Option<MenuHandle> {
+        self.open_impl(req, 0)
     }
 
-    fn hide(&self) {
+    fn hide(&self, handle: MenuHandle) {
         self.emitter.update(|s| {
-            // A hide can be the tail of a previous cycle arriving after the
-            // next press already armed a fresh popup.
-            s.menu.as_ref()?;
+            if s.session.menu().map(|m| MenuHandle::new(m.id)) != Some(handle) {
+                return None;
+            }
             close_current(s, MenuClose::Finished)
         });
     }
@@ -399,27 +311,12 @@ impl Resolve {
     }
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-enum Phase {
-    #[default]
-    Idle,
-    AwaitArmed,
-    /// The surface is configured and holds the grab, with no menu on it.
-    Armed(Configured),
-    AwaitMenu,
-    Shown,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum RenderJob {
     Paint,
     Shape,
 }
 
-/// What one layout pass settled: the laid-out menu, the metrics the surface
-/// reported for it, and the sizes those two name. Written only by
-/// [`on_layout`], so no site above the surface names a scale or a size the
-/// surface did not.
 struct Laid {
     layout: Arc<Layout>,
     metrics: MenuMetrics,
@@ -432,27 +329,55 @@ struct Laid {
 }
 
 struct Menu {
+    id: NonZeroU64,
     items: Arc<Vec<MenuItem>>,
     fsm: FsmState,
-    /// `None` until [`on_layout`] delivers the surface's metrics.
-    laid: Option<Laid>,
     /// Desired logical width; `<= 0` is content-sized.
     width: c_int,
     on_selected: Option<MenuSelection>,
-    /// Anchor in logical (view) coordinates.
-    anchor: LogicalPoint,
+    anchor: WindowPoint,
+    basis: WindowBasis,
+    serial: u32,
+}
+
+struct Live {
+    menu: Menu,
+    laid: Laid,
+    generation: Generation,
+}
+
+#[derive(Default)]
+enum Session {
+    #[default]
+    Idle,
+    Laying(Menu),
+    Created(Live),
+    Shown(Live),
+}
+
+impl Session {
+    fn menu(&self) -> Option<&Menu> {
+        match self {
+            Session::Idle => None,
+            Session::Laying(menu) => Some(menu),
+            Session::Created(live) | Session::Shown(live) => Some(&live.menu),
+        }
+    }
+
+    fn generation(&self) -> Option<Generation> {
+        match self {
+            Session::Idle | Session::Laying(_) => None,
+            Session::Created(live) | Session::Shown(live) => Some(live.generation),
+        }
+    }
 }
 
 #[derive(Default)]
 struct MenuState {
-    phase: Phase,
-    generation: Option<Generation>,
+    session: Session,
+    next_session: u64,
     next_generation: u64,
-    active: bool,
-    menu: Option<Menu>,
     job: Option<RenderJob>,
-    /// Surface ops in issue order, drained by [`Emitter::flush`]; independent of
-    /// the session, so a queued teardown survives `clear_menu`.
     pending: VecDeque<SurfaceOp>,
     /// A flush owns `pending`; cleared only when the queue is observed empty
     /// under the same lock.
@@ -461,15 +386,7 @@ struct MenuState {
 }
 
 enum SurfaceOp {
-    Arm {
-        generation: Generation,
-        anchor: LogicalPoint,
-        serial: u32,
-    },
-    MapArmed {
-        generation: Generation,
-    },
-    Reposition {
+    Create {
         generation: Generation,
         place: MenuPlacement,
     },
@@ -483,13 +400,7 @@ enum SurfaceOp {
 impl SurfaceOp {
     fn emit(self, surface: &dyn PopupSurface) {
         match self {
-            SurfaceOp::Arm {
-                generation,
-                anchor,
-                serial,
-            } => surface.arm(generation, anchor, serial),
-            SurfaceOp::MapArmed { generation } => surface.map_armed(generation),
-            SurfaceOp::Reposition { generation, place } => surface.reposition(generation, place),
+            SurfaceOp::Create { generation, place } => surface.create(generation, place),
             SurfaceOp::Present(paint) => surface.present(paint),
             SurfaceOp::Destroy { generation, reason } => surface.destroy(generation, reason),
         }
@@ -502,7 +413,7 @@ fn queue(state: &mut MenuState, op: SurfaceOp) {
 
 enum Job {
     Shape {
-        generation: Generation,
+        id: NonZeroU64,
         items: Arc<Vec<MenuItem>>,
         width: i32,
     },
@@ -516,20 +427,19 @@ enum Job {
 
 fn take_job(state: &mut MenuState) -> Option<Job> {
     let job = state.job.take()?;
-    let generation = state.generation?;
-    let menu = state.menu.as_ref()?;
-    match job {
-        RenderJob::Shape => Some(Job::Shape {
-            generation,
+    match (&state.session, job) {
+        (Session::Laying(menu), RenderJob::Shape) => Some(Job::Shape {
+            id: menu.id,
             items: Arc::clone(&menu.items),
             width: menu.width,
         }),
-        RenderJob::Paint => Some(Job::Paint {
-            generation,
-            items: Arc::clone(&menu.items),
-            layout: Arc::clone(&menu.laid.as_ref()?.layout),
-            active: menu.fsm.active,
+        (Session::Shown(live), RenderJob::Paint) => Some(Job::Paint {
+            generation: live.generation,
+            items: Arc::clone(&live.menu.items),
+            layout: Arc::clone(&live.laid.layout),
+            active: live.menu.fsm.active,
         }),
+        _ => None,
     }
 }
 
@@ -543,10 +453,7 @@ fn request_paint(state: &mut MenuState) {
 
 /// The extent the menu's presented size names: the full content width and the
 /// visible height, in both spaces.
-///
-/// `None` when the reported scale does not map that physical size to a logical
-/// one, or when it is below two pixels on an axis.
-fn view(laid: &Laid) -> Option<WindowExtent> {
+fn view(laid: &Laid) -> Result<WindowExtent, ExtentError> {
     let scale = laid.metrics.scale;
     let physical = PhysicalSize {
         w: laid.content.w,
@@ -555,45 +462,13 @@ fn view(laid: &Laid) -> Option<WindowExtent> {
     WindowExtent::new(physical, scale, physical.to_logical(scale)?)
 }
 
-/// The placement the menu's anchor and presented size name.
-///
-/// `None` before a layout, and when the presented size names no extent.
-fn placement(menu: &Menu) -> Option<MenuPlacement> {
-    Some(MenuPlacement {
-        anchor: menu.anchor,
-        view: view(menu.laid.as_ref()?)?,
-    })
-}
-
-/// Closes the menu and resolves its selection as dismissed, logging `what`
-/// beside the menu's own size and reported scale. The one answer to a menu
-/// the engine cannot place; without it the grab stands over an empty
-/// surface.
-fn close_unplaceable(state: &mut MenuState, what: &'static str) -> Option<Resolve> {
-    if let Some(laid) = state.menu.as_ref().and_then(|m| m.laid.as_ref()) {
-        tracing::error!(
-            target: "menu",
-            "menu {what} {}x{} is unrepresentable at scale {}; closing",
-            laid.content.w,
-            laid.view_ph,
-            laid.metrics.scale
-        );
-    }
-    close_current(state, MenuClose::Finished)
-}
-
-/// Buffer coordinates, physical px including the scroll offset. `None` before
-/// a layout gives the menu a presented size.
-///
-/// Logical input converts through the scale the surface reported.
-fn buffer_point(menu: &Menu, at: MenuPoint) -> Option<(c_int, c_int)> {
-    let laid = menu.laid.as_ref()?;
+fn buffer_point(laid: &Laid, at: MenuPoint) -> Result<(c_int, c_int), Unrepresentable> {
     let scale = laid.metrics.scale;
     let (x, y) = match at {
         MenuPoint::Physical { x, y } => (x, y),
         MenuPoint::Logical { x, y } => (scale.to_physical(x)?, scale.to_physical(y)?),
     };
-    Some((x, y + laid.scroll))
+    Ok((x, y + laid.scroll))
 }
 
 fn row_height(laid: &Laid) -> c_int {
@@ -621,74 +496,104 @@ fn scroll_active_into_view(laid: &mut Laid, active: c_int) {
 
 fn on_layout(
     state: &mut MenuState,
-    generation: Generation,
-    layout: Layout,
+    surface: &dyn PopupSurface,
+    id: NonZeroU64,
+    layout: Result<Layout, Unrepresentable>,
     metrics: MenuMetrics,
 ) -> Option<Resolve> {
-    if state.generation != Some(generation) {
+    let Session::Laying(menu) = &state.session else {
+        return None;
+    };
+    if menu.id != id {
         return None;
     }
-    let menu = state.menu.as_mut()?;
+    let layout = match layout {
+        Ok(layout) => layout,
+        Err(e) => {
+            tracing::error!(target: "menu", "menu layout: {e}; closing");
+            return close_current(state, MenuClose::Finished);
+        }
+    };
+    if surface.window_basis() != menu.basis {
+        return close_current(state, MenuClose::Finished);
+    }
     let content = PhysicalSize {
         w: layout.width,
         h: layout.height,
     };
-    let (anchor, width, active) = (menu.anchor, menu.width, menu.fsm.active);
-    let laid = menu.laid.insert(Laid {
+    let mut laid = Laid {
         layout: Arc::new(layout),
         metrics,
         content,
         view_ph: content.h,
         scroll: 0,
-    });
-    let Some(anchor_ph_y) = metrics.scale.to_physical(anchor.y) else {
-        return close_unplaceable(state, "anchor");
     };
-    laid.view_ph = view_ph(
-        content.h,
-        row_height(laid),
-        width,
-        metrics.clamp_ph,
-        anchor_ph_y,
-    );
-    scroll_active_into_view(laid, active);
-    match state.phase {
-        Phase::Armed(configured) => begin_menu(state, configured),
-        Phase::Idle => {
-            state.phase = Phase::AwaitArmed;
-            queue(
-                state,
-                SurfaceOp::Arm {
-                    generation,
-                    anchor,
-                    // 0: no triggering press; the surface substitutes whatever
-                    // serial it still has.
-                    serial: 0,
-                },
+    let (_, anchor_y) = menu.anchor.floor();
+    let placed = metrics
+        .scale
+        .to_physical(anchor_y)
+        .map_err(ExtentError::from)
+        .and_then(|anchor_ph_y| {
+            laid.view_ph = view_ph(
+                content.h,
+                row_height(&laid),
+                menu.width,
+                metrics.clamp_ph,
+                anchor_ph_y,
             );
-            None
+            view(&laid)
+        });
+    let view = match placed {
+        Ok(view) => view,
+        Err(e) => {
+            tracing::error!(target: "menu", "menu extent: {e}; closing");
+            return close_current(state, MenuClose::Finished);
         }
-        Phase::Shown => {
-            let Some(place) = state.menu.as_ref().and_then(placement) else {
-                return close_unplaceable(state, "presented size");
-            };
-            queue(state, SurfaceOp::Reposition { generation, place });
-            request_paint(state);
-            None
-        }
-        Phase::AwaitArmed | Phase::AwaitMenu => None,
-    }
+    };
+    scroll_active_into_view(&mut laid, menu.fsm.active);
+    let Session::Laying(menu) = std::mem::take(&mut state.session) else {
+        return None;
+    };
+    let generation = next_id(&mut state.next_generation);
+    let place = MenuPlacement {
+        anchor: menu.anchor,
+        view,
+        serial: menu.serial,
+        basis: menu.basis,
+    };
+    state.session = Session::Created(Live {
+        menu,
+        laid,
+        generation,
+    });
+    queue(state, SurfaceOp::Create { generation, place });
+    None
 }
 
-fn on_pixels(state: &mut MenuState, generation: Generation, pixels: Vec<u8>) -> Option<Resolve> {
-    if state.generation != Some(generation) {
+fn on_pixels(
+    state: &mut MenuState,
+    surface: &dyn PopupSurface,
+    generation: Generation,
+    pixels: Vec<u8>,
+) -> Option<Resolve> {
+    let Session::Shown(live) = &state.session else {
+        return None;
+    };
+    if live.generation != generation {
         return None;
     }
-    let laid = state.menu.as_ref()?.laid.as_ref()?;
-    let buffer = laid.content;
-    let scroll = laid.scroll;
-    let Some(view) = view(laid) else {
-        return close_unplaceable(state, "presented size");
+    let basis = live.menu.basis;
+    if surface.window_basis() != basis {
+        return close_current(state, MenuClose::Finished);
+    }
+    let buffer = live.laid.content;
+    let scroll = live.laid.scroll;
+    let view = match view(&live.laid) {
+        Ok(view) => view,
+        Err(e) => {
+            tracing::error!(target: "menu", "menu presented extent: {e}; closing");
+            return close_current(state, MenuClose::Finished);
+        }
     };
     queue(
         state,
@@ -698,85 +603,55 @@ fn on_pixels(state: &mut MenuState, generation: Generation, pixels: Vec<u8>) -> 
             buffer,
             scroll,
             view,
+            basis,
         }),
     );
     None
 }
 
-/// Maps the armed surface, activating the grab before the menu has pixels,
-/// then places the menu on it. The one constructor of [`SurfaceOp::MapArmed`],
-/// so no buffer is committed to a surface the compositor has not configured.
-fn begin_menu(state: &mut MenuState, configured: Configured) -> Option<Resolve> {
-    let Configured { .. } = configured;
-    let generation = state.generation?;
-    let menu = state.menu.as_ref()?;
-    let Some(place) = placement(menu) else {
-        return close_unplaceable(state, "presented size");
-    };
-    state.active = true;
-    state.phase = Phase::AwaitMenu;
-    // Maps the armed surface, activating the grab before the menu has pixels.
-    queue(state, SurfaceOp::MapArmed { generation });
-    queue(state, SurfaceOp::Reposition { generation, place });
-    None
-}
-
 fn step(state: &mut MenuState, ev: MenuEvent) -> Option<Resolve> {
-    let menu = state.menu.as_mut()?;
-    let layout = menu.laid.as_ref().map(|l| Arc::clone(&l.layout));
-    let items = Arc::clone(&menu.items);
-    let effects = interaction_fsm::step(&mut menu.fsm, &ev, layout.as_deref(), &items);
-    let active = menu.fsm.active;
-    if matches!(ev, MenuEvent::Key(_))
-        && let Some(laid) = menu.laid.as_mut()
-    {
-        scroll_active_into_view(laid, active);
+    let Session::Shown(live) = &mut state.session else {
+        return None;
+    };
+    let layout = Arc::clone(&live.laid.layout);
+    let items = Arc::clone(&live.menu.items);
+    let effects = interaction_fsm::step(&mut live.menu.fsm, &ev, Some(&*layout), &items);
+    let active = live.menu.fsm.active;
+    if matches!(ev, MenuEvent::Key(_)) {
+        scroll_active_into_view(&mut live.laid, active);
     }
     for effect in effects {
         match effect {
             MenuEffect::Redraw => request_paint(state),
             MenuEffect::Close(id) => {
-                let generation = state.generation;
-                let resolve = clear_menu(state).map(|selection| Resolve { selection, id });
-                if let Some(generation) = generation {
-                    queue(
-                        state,
-                        SurfaceOp::Destroy {
-                            generation,
-                            reason: MenuClose::Finished,
-                        },
-                    );
-                }
-                return resolve;
+                return close(state, MenuClose::Finished)
+                    .map(|selection| Resolve { selection, id });
             }
         }
     }
     None
 }
 
-/// Clears the session, queues the surface teardown and returns the pending
-/// selection, resolved as [`MENU_DISMISSED`].
 fn close_current(state: &mut MenuState, reason: MenuClose) -> Option<Resolve> {
-    let generation = state.generation;
-    let resolve = clear_menu(state).map(Resolve::dismissed);
+    close(state, reason).map(Resolve::dismissed)
+}
+
+fn close(state: &mut MenuState, reason: MenuClose) -> Option<MenuSelection> {
+    state.job = None;
+    let (mut menu, generation) = match std::mem::take(&mut state.session) {
+        Session::Idle => return None,
+        Session::Laying(menu) => (menu, None),
+        Session::Created(live) | Session::Shown(live) => (live.menu, Some(live.generation)),
+    };
     if let Some(generation) = generation {
         queue(state, SurfaceOp::Destroy { generation, reason });
     }
-    resolve
+    menu.on_selected.take()
 }
 
-fn clear_menu(state: &mut MenuState) -> Option<MenuSelection> {
-    state.active = false;
-    state.phase = Phase::Idle;
-    state.generation = None;
-    state.job = None;
-    state.menu.take().and_then(|mut m| m.on_selected.take())
-}
-
-fn next_generation(state: &mut MenuState) -> Generation {
-    let v = state.next_generation.wrapping_add(1);
-    state.next_generation = v;
-    Generation::new(v).unwrap_or(Generation::MIN)
+fn next_id(counter: &mut u64) -> NonZeroU64 {
+    *counter = counter.wrapping_add(1);
+    NonZeroU64::new(*counter).unwrap_or(NonZeroU64::MIN)
 }
 
 fn view_ph(ph: i32, row_h: i32, width: i32, clamp_ph: Option<i32>, anchor_ph_y: i32) -> i32 {
@@ -802,24 +677,16 @@ fn run(emitter: &Emitter) {
         }
         let Some(job) = job else { continue };
         match job {
-            Job::Shape {
-                generation,
-                items,
-                width,
-            } => {
+            Job::Shape { id, items, width } => {
                 let metrics = emitter.surface.metrics();
-                let Some(mut layout) = render::layout(&mut fonts, &items, metrics.scale) else {
-                    tracing::error!(target: "menu", "menu metrics are unrepresentable at scale {}", metrics.scale);
-                    continue;
-                };
-                if width > 0 {
-                    let Some(width) = metrics.scale.to_physical(width) else {
-                        tracing::error!(target: "menu", "requested width {width} is unrepresentable at scale {}", metrics.scale);
-                        continue;
-                    };
-                    layout.width = width;
-                }
-                emitter.update(|s| on_layout(s, generation, layout, metrics));
+                let layout =
+                    render::layout(&mut fonts, &items, metrics.scale).and_then(|mut layout| {
+                        if width > 0 {
+                            layout.width = metrics.scale.to_physical(width)?;
+                        }
+                        Ok(layout)
+                    });
+                emitter.update(|s| on_layout(s, &*emitter.surface, id, layout, metrics));
             }
             Job::Paint {
                 generation,
@@ -832,7 +699,7 @@ fn run(emitter: &Emitter) {
                 };
                 let mut pixels = vec![0u8; (pm.width() as usize) * (pm.height() as usize) * 4];
                 blit_bgra(&pm, &mut pixels);
-                emitter.update(|s| on_pixels(s, generation, pixels));
+                emitter.update(|s| on_pixels(s, &*emitter.surface, generation, pixels));
             }
         }
     }
@@ -847,25 +714,10 @@ mod tests {
 
     use super::*;
 
-    struct NoopSurface;
-
-    impl PopupSurface for NoopSurface {
-        fn metrics(&self) -> MenuMetrics {
-            MenuMetrics {
-                scale: Scale::ONE,
-                clamp_ph: None,
-            }
-        }
-        fn arm(&self, _generation: Generation, _anchor: LogicalPoint, _serial: u32) {}
-        fn map_armed(&self, _generation: Generation) {}
-        fn reposition(&self, _generation: Generation, _place: MenuPlacement) {}
-        fn present(&self, _paint: MenuPaint) {}
-        fn destroy(&self, _generation: Generation, _reason: MenuClose) {}
-    }
-
     #[derive(Default)]
     struct RecordingSurface {
         seen: Mutex<Vec<&'static str>>,
+        basis: Mutex<WindowBasis>,
     }
 
     impl PopupSurface for RecordingSurface {
@@ -875,14 +727,11 @@ mod tests {
                 clamp_ph: None,
             }
         }
-        fn arm(&self, _generation: Generation, _anchor: LogicalPoint, _serial: u32) {
-            self.seen.lock().push("arm");
+        fn window_basis(&self) -> WindowBasis {
+            *self.basis.lock()
         }
-        fn map_armed(&self, _generation: Generation) {
-            self.seen.lock().push("map_armed");
-        }
-        fn reposition(&self, _generation: Generation, _place: MenuPlacement) {
-            self.seen.lock().push("reposition");
+        fn create(&self, _generation: Generation, _place: MenuPlacement) {
+            self.seen.lock().push("create");
         }
         fn present(&self, _paint: MenuPaint) {
             self.seen.lock().push("present");
@@ -892,8 +741,6 @@ mod tests {
         }
     }
 
-    /// Queues a `Destroy` from inside `arm`, i.e. while the leader is
-    /// draining.
     #[derive(Default)]
     struct ReentrantSurface {
         seen: Mutex<Vec<&'static str>>,
@@ -907,8 +754,11 @@ mod tests {
                 clamp_ph: None,
             }
         }
-        fn arm(&self, generation: Generation, _anchor: LogicalPoint, _serial: u32) {
-            self.seen.lock().push("arm");
+        fn window_basis(&self) -> WindowBasis {
+            WindowBasis::FIXED
+        }
+        fn create(&self, generation: Generation, _place: MenuPlacement) {
+            self.seen.lock().push("create");
             if let Some(emitter) = self.emitter.get() {
                 emitter.update(|s| {
                     queue(
@@ -921,12 +771,6 @@ mod tests {
                     None
                 });
             }
-        }
-        fn map_armed(&self, _generation: Generation) {
-            self.seen.lock().push("map_armed");
-        }
-        fn reposition(&self, _generation: Generation, _place: MenuPlacement) {
-            self.seen.lock().push("reposition");
         }
         fn present(&self, _paint: MenuPaint) {
             self.seen.lock().push("present");
@@ -944,16 +788,18 @@ mod tests {
         }
     }
 
-    fn menu_with_thread(alive: bool) -> SoftwareMenu {
-        menu_on(Arc::new(NoopSurface), alive)
+    fn recorded(alive: bool) -> (Arc<RecordingSurface>, SoftwareMenu) {
+        let surface = Arc::new(RecordingSurface::default());
+        let menu = menu_on(Arc::clone(&surface) as Arc<dyn PopupSurface>, alive);
+        (surface, menu)
     }
 
     fn request_row(items: Vec<MenuItem>, initial: c_int) -> (MenuRequest, Receiver<c_int>) {
         let (tx, rx): (Sender<c_int>, Receiver<c_int>) = channel();
         let req = MenuRequest {
             items,
-            x: 0,
-            y: 0,
+            anchor: WindowPoint::from_window(0.0, 0.0),
+            basis: WindowBasis::FIXED,
             width: 0,
             initial,
             on_selected: MenuSelection::new(move |id| {
@@ -967,23 +813,16 @@ mod tests {
         request_row(items, MENU_DISMISSED)
     }
 
-    fn menu_at(scale: Scale, layout: Option<Layout>) -> Menu {
-        Menu {
-            items: Arc::new(vec![selectable_item()]),
-            fsm: FsmState::default(),
-            laid: layout.map(|layout| Laid {
-                layout: Arc::new(layout),
-                metrics: MenuMetrics {
-                    scale,
-                    clamp_ph: None,
-                },
-                content: PhysicalSize { w: 150, h: 90 },
-                view_ph: 90,
-                scroll: 0,
-            }),
-            width: 0,
-            on_selected: None,
-            anchor: LogicalPoint { x: 0, y: 0 },
+    fn laid_at(scale: Scale) -> Laid {
+        Laid {
+            layout: Arc::new(Layout::for_test(150, 90, Vec::new(), Vec::new())),
+            metrics: MenuMetrics {
+                scale,
+                clamp_ph: None,
+            },
+            content: PhysicalSize { w: 150, h: 90 },
+            view_ph: 90,
+            scroll: 0,
         }
     }
 
@@ -996,23 +835,15 @@ mod tests {
         }
     }
 
-    /// Marks the session live the way a delivered layout would, without a
-    /// render thread.
-    fn force_active(menu: &SoftwareMenu) {
+    fn deliver_layout_result(menu: &SoftwareMenu, layout: Result<Layout, Unrepresentable>) {
+        let surface = Arc::clone(&menu.emitter.surface);
         menu.emitter.update(|s| {
-            s.active = true;
-            None
-        });
-    }
-
-    /// Feeds a layout the way the render thread's `Shape` job would.
-    fn deliver_layout_sized(menu: &SoftwareMenu, w: i32, h: i32) {
-        menu.emitter.update(|s| {
-            let generation = s.generation?;
+            let id = s.session.menu()?.id;
             on_layout(
                 s,
-                generation,
-                Layout::for_test(w, h, Vec::new(), Vec::new()),
+                &*surface,
+                id,
+                layout,
                 MenuMetrics {
                     scale: Scale::ONE,
                     clamp_ph: None,
@@ -1021,115 +852,185 @@ mod tests {
         });
     }
 
+    fn deliver_layout_sized(menu: &SoftwareMenu, w: i32, h: i32) {
+        deliver_layout_result(menu, Ok(Layout::for_test(w, h, Vec::new(), Vec::new())));
+    }
+
     fn deliver_layout(menu: &SoftwareMenu) {
         deliver_layout_sized(menu, 100, 40);
     }
 
-    /// Acknowledges the popup the way the compositor's first configure would.
-    fn deliver_ready(menu: &SoftwareMenu) {
-        if let Some(generation) = menu.emitter.mailbox.peek(|s| s.generation) {
-            menu.on_ready(generation);
+    fn deliver_ready(menu: &SoftwareMenu, configured: LogicalSize) {
+        if let Some(generation) = menu.emitter.mailbox.peek(|s| s.session.generation()) {
+            menu.on_ready(generation, configured);
         }
     }
 
-    #[test]
-    fn a_keyboard_opened_menu_commits_no_buffer_before_its_surface_is_configured() {
-        let surface = Arc::new(RecordingSurface::default());
-        let menu = menu_on(Arc::clone(&surface) as Arc<dyn PopupSurface>, true);
-        let (req, _rx) = request(vec![selectable_item()]);
-        menu.open(req);
-        deliver_layout(&menu);
-        assert_eq!(*surface.seen.lock(), vec!["arm"]);
-        deliver_ready(&menu);
-        assert_eq!(*surface.seen.lock(), vec!["arm", "map_armed", "reposition"]);
+    fn view_ph_of(menu: &SoftwareMenu) -> Option<c_int> {
+        menu.emitter.mailbox.peek(|s| match &s.session {
+            Session::Created(live) | Session::Shown(live) => Some(live.laid.view_ph),
+            Session::Idle | Session::Laying(_) => None,
+        })
     }
 
     #[test]
-    fn a_pointer_armed_menu_commits_no_buffer_before_its_surface_is_configured() {
-        let surface = Arc::new(RecordingSurface::default());
-        let menu = menu_on(Arc::clone(&surface) as Arc<dyn PopupSurface>, true);
-        menu.arm(0, 0, 1);
-        assert_eq!(*surface.seen.lock(), vec!["arm"]);
-        deliver_ready(&menu);
-        assert_eq!(*surface.seen.lock(), vec!["arm"]);
+    fn a_menu_creates_its_surface_once_and_only_after_its_layout() {
+        let (surface, menu) = recorded(true);
         let (req, _rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_some());
+        assert!(surface.seen.lock().is_empty());
         deliver_layout(&menu);
-        assert_eq!(*surface.seen.lock(), vec!["arm", "map_armed", "reposition"]);
+        assert_eq!(*surface.seen.lock(), vec!["create"]);
+        deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
+        deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
+        assert_eq!(*surface.seen.lock(), vec!["create"]);
     }
 
     #[test]
-    fn a_menu_whose_size_names_no_extent_closes_instead_of_holding_the_grab() {
-        let surface = Arc::new(RecordingSurface::default());
-        let menu = menu_on(Arc::clone(&surface) as Arc<dyn PopupSurface>, true);
-        menu.arm(0, 0, 1);
-        deliver_ready(&menu);
+    fn a_menu_whose_size_names_no_extent_closes_without_a_surface() {
+        let (surface, menu) = recorded(true);
         let (req, rx) = request(vec![selectable_item()]);
         menu.open(req);
         deliver_layout_sized(&menu, 1, 1);
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
-        assert!(!menu.has_menu());
         assert!(!menu.is_engaged());
-        assert_eq!(*surface.seen.lock(), vec!["arm", "destroy"]);
+        assert!(surface.seen.lock().is_empty());
     }
 
     #[test]
-    fn a_relayout_while_shown_repositions_the_popup() {
-        let surface = Arc::new(RecordingSurface::default());
-        let menu = menu_on(Arc::clone(&surface) as Arc<dyn PopupSurface>, true);
+    fn a_configured_size_equal_to_the_request_leaves_the_height_untouched() {
+        let (_surface, menu) = recorded(true);
         let (req, _rx) = request(vec![selectable_item()]);
         menu.open(req);
         deliver_layout(&menu);
-        deliver_ready(&menu);
-        deliver_ready(&menu);
+        deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
+        assert_eq!(view_ph_of(&menu), Some(40));
+    }
+
+    #[test]
+    fn a_configured_size_never_raises_the_visible_height() {
+        let (_surface, menu) = recorded(true);
+        let (req, _rx) = request(vec![selectable_item()]);
+        menu.open(req);
         deliver_layout(&menu);
-        assert_eq!(
-            *surface.seen.lock(),
-            vec!["arm", "map_armed", "reposition", "reposition"]
-        );
+        deliver_ready(&menu, LogicalSize { w: 100, h: 90 });
+        assert_eq!(view_ph_of(&menu), Some(40));
+    }
+
+    #[test]
+    fn a_smaller_configured_size_lowers_the_visible_height() {
+        let (_surface, menu) = recorded(true);
+        let (req, _rx) = request(vec![selectable_item()]);
+        menu.open(req);
+        deliver_layout(&menu);
+        deliver_ready(&menu, LogicalSize { w: 100, h: 30 });
+        assert_eq!(view_ph_of(&menu), Some(30));
     }
 
     #[test]
     fn hide_resolves_the_pending_selection_as_dismissed() {
-        let menu = menu_with_thread(true);
+        let (_surface, menu) = recorded(true);
         let (req, rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        let handle = menu.open(req);
         assert!(rx.try_recv().is_err());
-        menu.hide();
+        if let Some(handle) = handle {
+            menu.hide(handle);
+        }
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
     }
 
     #[test]
-    fn a_menu_with_no_selectable_item_is_refused_and_resolved() {
-        let menu = menu_with_thread(true);
+    fn a_hide_for_a_replaced_menu_leaves_its_successor_open() {
+        let (_surface, menu) = recorded(true);
+        let (first, first_rx) = request(vec![selectable_item()]);
+        let stale = menu.open(first);
+        let (second, second_rx) = request(vec![selectable_item()]);
+        menu.open(second);
+        assert_eq!(first_rx.try_recv(), Ok(MENU_DISMISSED));
+        if let Some(stale) = stale {
+            menu.hide(stale);
+        }
+        assert!(second_rx.try_recv().is_err());
+        assert!(menu.is_engaged());
+    }
+
+    #[test]
+    fn a_refused_request_resolves_itself_and_leaves_the_live_menu_open() {
+        let (_surface, menu) = recorded(true);
+        let (live, live_rx) = request(vec![selectable_item()]);
+        menu.open(live);
         let (req, rx) = request(vec![MenuItem {
             id: 0,
             label: String::new(),
             enabled: false,
             separator: true,
         }]);
-        menu.open(req);
+        assert!(menu.open(req).is_none());
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
-        assert!(!menu.has_menu());
+        assert!(live_rx.try_recv().is_err());
+        assert!(menu.is_engaged());
     }
 
     #[test]
     fn open_without_a_render_thread_resolves_and_leaves_the_state_idle() {
-        let menu = menu_with_thread(false);
+        let (_surface, menu) = recorded(false);
         let (req, rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_none());
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
-        assert!(!menu.has_menu());
         assert!(!menu.is_engaged());
     }
 
     #[test]
-    fn a_queued_create_reaches_the_surface_before_a_later_destroy() {
-        let surface = Arc::new(RecordingSurface::default());
-        let menu = menu_on(Arc::clone(&surface) as Arc<dyn PopupSurface>, true);
-        menu.arm(0, 0, 1);
-        menu.dismiss_if_speculative();
-        assert_eq!(*surface.seen.lock(), vec!["arm", "destroy"]);
+    fn a_request_under_a_replaced_window_state_is_refused() {
+        let (surface, menu) = recorded(true);
+        *surface.basis.lock() = WindowBasis::FIXED.next();
+        let (req, rx) = request(vec![selectable_item()]);
+        assert!(menu.open(req).is_none());
+        assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
+        assert!(!menu.is_engaged());
+    }
+
+    #[test]
+    fn a_window_change_before_the_layout_arrives_closes_the_menu() {
+        let (surface, menu) = recorded(true);
+        let (req, rx) = request(vec![selectable_item()]);
+        menu.open(req);
+        *surface.basis.lock() = WindowBasis::FIXED.next();
+        deliver_layout(&menu);
+        assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
+        assert!(surface.seen.lock().is_empty());
+    }
+
+    #[test]
+    fn a_layout_error_for_the_current_session_dismisses_the_request() {
+        let (surface, menu) = recorded(true);
+        let (req, rx) = request(vec![selectable_item()]);
+        menu.open(req);
+        deliver_layout_result(
+            &menu,
+            Err(Unrepresentable {
+                value: c_int::MAX,
+                scale: Scale::ONE,
+            }),
+        );
+        assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
+        assert!(!menu.is_engaged());
+        assert!(surface.seen.lock().is_empty());
+    }
+
+    #[test]
+    fn a_window_change_closes_a_menu_that_is_sitting_open() {
+        let (surface, menu) = recorded(true);
+        let (req, rx) = request(vec![selectable_item()]);
+        menu.open(req);
+        deliver_layout(&menu);
+        deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
+        menu.window_changed();
+        assert!(rx.try_recv().is_err());
+        *surface.basis.lock() = WindowBasis::FIXED.next();
+        menu.window_changed();
+        assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
+        assert_eq!(*surface.seen.lock(), vec!["create", "destroy"]);
     }
 
     #[test]
@@ -1137,44 +1038,54 @@ mod tests {
         let surface = Arc::new(ReentrantSurface::default());
         let menu = menu_on(Arc::clone(&surface) as Arc<dyn PopupSurface>, true);
         let _ = surface.emitter.set(Arc::clone(&menu.emitter));
-        menu.arm(0, 0, 1);
-        assert_eq!(*surface.seen.lock(), vec!["arm", "destroy"]);
-    }
-
-    #[test]
-    fn an_active_menu_without_pixels_still_dismisses() {
-        let menu = menu_with_thread(true);
-        let (req, rx) = request(vec![selectable_item()]);
+        let (req, _rx) = request(vec![selectable_item()]);
         menu.open(req);
-        force_active(&menu);
-        menu.dismiss();
-        assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
-        assert!(!menu.has_menu());
+        deliver_layout(&menu);
+        assert_eq!(*surface.seen.lock(), vec!["create", "destroy"]);
     }
 
     #[test]
-    fn reopening_a_shown_menu_leaves_it_dismissable() {
-        let menu = menu_with_thread(true);
+    fn reopening_a_shown_menu_replaces_its_surface() {
+        let (surface, menu) = recorded(true);
         let (first, first_rx) = request(vec![selectable_item()]);
         menu.open(first);
-        force_active(&menu);
+        deliver_layout(&menu);
+        deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
         let (second, second_rx) = request(vec![selectable_item()]);
         menu.open(second);
         assert_eq!(first_rx.try_recv(), Ok(MENU_DISMISSED));
         assert!(second_rx.try_recv().is_err());
-        menu.dismiss();
-        assert_eq!(second_rx.try_recv(), Ok(MENU_DISMISSED));
+        deliver_layout(&menu);
+        assert_eq!(*surface.seen.lock(), vec!["create", "destroy", "create"]);
+    }
+
+    #[test]
+    fn input_for_a_retired_surface_does_not_reach_its_successor() {
+        let (_surface, menu) = recorded(true);
+        let (first, _first_rx) = request(vec![selectable_item()]);
+        menu.open(first);
+        deliver_layout(&menu);
+        let retired = menu.emitter.mailbox.peek(|s| s.session.generation());
+        let (second, second_rx) = request(vec![selectable_item()]);
+        menu.open(second);
+        deliver_layout(&menu);
+        deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
+        if let Some(retired) = retired {
+            menu.on_done(retired);
+        }
+        assert!(second_rx.try_recv().is_err());
+        assert!(menu.is_engaged());
     }
 
     #[test]
     fn an_out_of_range_initial_row_highlights_nothing() {
-        let menu = menu_with_thread(true);
+        let (_surface, menu) = recorded(true);
         let (req, _rx) = request_row(vec![selectable_item()], 5);
         menu.open(req);
         assert_eq!(
             menu.emitter
                 .mailbox
-                .peek(|s| s.menu.as_ref().map(|m| m.fsm.active)),
+                .peek(|s| s.session.menu().map(|m| m.fsm.active)),
             Some(MENU_DISMISSED)
         );
     }
@@ -1182,34 +1093,24 @@ mod tests {
     #[test]
     fn a_logical_pointer_maps_through_the_reported_scale_at_every_covered_scale() {
         const AT: (c_int, c_int) = (50, 30);
-        let agrees: Vec<Option<bool>> = jfn_platform_abi::COVERED_SCALES
+        let agrees: Vec<Result<bool, Unrepresentable>> = jfn_platform_abi::COVERED_SCALES
             .into_iter()
             .map(|scale| {
-                let menu = menu_at(
-                    scale,
-                    Some(Layout::for_test(150, 90, Vec::new(), Vec::new())),
-                );
-                let logical = buffer_point(&menu, MenuPoint::Logical { x: AT.0, y: AT.1 });
+                let laid = laid_at(scale);
+                let logical = buffer_point(&laid, MenuPoint::Logical { x: AT.0, y: AT.1 });
                 let physical = buffer_point(
-                    &menu,
+                    &laid,
                     MenuPoint::Physical {
                         x: scale.to_physical(AT.0)?,
                         y: scale.to_physical(AT.1)?,
                     },
                 );
-                Some(logical == physical && logical.is_some())
+                Ok(logical == physical && logical.is_ok())
             })
             .collect();
         assert_eq!(
             agrees,
-            vec![Some(true); jfn_platform_abi::COVERED_SCALES.len()]
-        );
-        assert_eq!(
-            buffer_point(
-                &menu_at(Scale::ONE, None),
-                MenuPoint::Physical { x: 1, y: 1 }
-            ),
-            None
+            vec![Ok(true); jfn_platform_abi::COVERED_SCALES.len()]
         );
     }
 
@@ -1242,12 +1143,12 @@ mod tests {
     }
 
     #[test]
-    fn generations_start_at_one_and_never_hit_zero() {
-        let mut s = MenuState::default();
-        assert_eq!(next_generation(&mut s).get(), 1);
-        assert_eq!(next_generation(&mut s).get(), 2);
-        s.next_generation = u64::MAX;
-        assert_eq!(next_generation(&mut s).get(), Generation::MIN.get());
+    fn identities_start_at_one_and_never_hit_zero() {
+        let mut counter = 0;
+        assert_eq!(next_id(&mut counter).get(), 1);
+        assert_eq!(next_id(&mut counter).get(), 2);
+        counter = u64::MAX;
+        assert_eq!(next_id(&mut counter).get(), NonZeroU64::MIN.get());
     }
 
     #[test]

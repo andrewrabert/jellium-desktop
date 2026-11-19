@@ -305,7 +305,9 @@ define_class!(
         /// no mpv property is involved.
         #[unsafe(method(windowDidChangeBackingProperties:))]
         unsafe fn window_did_change_backing_properties(&self, _n: *mut AnyObject) {
-            jfn_playback::ingest_driver::jfn_playback_rescale_window_extent();
+            if let Err(e) = jfn_playback::ingest_driver::jfn_playback_rescale_window_extent() {
+                tracing::error!(target: LOG_TARGET, "window extent at the new backing scale: {e}; the stored extent stands");
+            }
         }
     }
 

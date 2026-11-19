@@ -4,10 +4,10 @@
 //! slot, the shell overlay fills the shell slot — and an unfilled slot drops
 //! everything routed to it.
 
-use jfn_platform_abi::LogicalPoint;
+use jfn_platform_abi::{WebPoint, WindowPoint};
 use parking_lot::Mutex;
 use std::os::raw::c_int;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 pub trait WebInput: Send + Sync {
     #[allow(clippy::too_many_arguments)] // mirrors CEF's KeyEvent layout 1:1
@@ -23,24 +23,22 @@ pub trait WebInput: Send + Sync {
     );
     fn send_mouse_click(
         &self,
-        x: c_int,
-        y: c_int,
+        p: WebPoint,
         modifiers: u32,
         button: c_int,
         mouse_up: bool,
         click_count: c_int,
     );
-    fn send_mouse_move(&self, x: c_int, y: c_int, modifiers: u32, leave: bool);
-    fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int);
-    /// One event of touch point `id`, in the web overlay's coordinates.
+    fn send_mouse_move(&self, p: WebPoint, modifiers: u32, leave: bool);
+    fn send_mouse_wheel(&self, p: WebPoint, modifiers: u32, delta_x: c_int, delta_y: c_int);
     fn send_touch_event(
         &self,
         id: c_int,
-        x: f32,
-        y: f32,
+        p: WebPoint,
         modifiers: u32,
         phase: crate::touch::TouchPhase,
     );
+    fn capture_lost(&self);
     fn set_focus(&self, focus: bool);
     fn navigate_history(&self, forward: bool);
     fn undo(&self);
@@ -63,7 +61,7 @@ pub trait ShellInput: Send + Sync {
     /// A right-press anywhere the shell owns, modal views included. Raises the
     /// app menu through
     /// `Platform::menu_delivery(MenuKind::ContextMenu)`.
-    fn context_menu(&self, p: LogicalPoint);
+    fn context_menu(&self, p: WindowPoint);
     /// A key press or release, never typed text: a character the user typed
     /// arrives through [`ShellInput::send_text`], so the key identity serves
     /// only the shortcut combinations iced resolves from the key itself.
@@ -71,17 +69,18 @@ pub trait ShellInput: Send + Sync {
     fn send_text(&self, text: &str);
     /// A middle press the shell overlay owns; pastes the primary selection
     /// into the field under `p`.
-    fn primary_paste(&self, p: LogicalPoint);
-    fn send_mouse_move(&self, p: LogicalPoint, modifiers: u32, leave: bool);
+    fn primary_paste(&self, p: WindowPoint);
+    fn send_mouse_move(&self, p: WindowPoint, modifiers: u32, leave: bool);
     fn send_mouse_click(
         &self,
-        p: LogicalPoint,
+        p: WindowPoint,
         modifiers: u32,
         button: c_int,
         mouse_up: bool,
         click_count: c_int,
     );
-    fn send_mouse_wheel(&self, p: LogicalPoint, modifiers: u32, delta_x: c_int, delta_y: c_int);
+    fn send_mouse_wheel(&self, p: WindowPoint, modifiers: u32, delta_x: c_int, delta_y: c_int);
+    fn pointer_cancel(&self);
     fn set_focus(&self, focus: bool);
     fn edit(&self, command: EditCommand);
 }
@@ -128,8 +127,6 @@ pub fn install_web(w: Box<dyn WebInput>) {
 pub fn install_shell(s: Box<dyn ShellInput>) {
     let _ = SHELL.set(s);
 }
-
-type StateListener = Box<dyn Fn(crate::route::ShellState) + Send + Sync>;
 
 static STATE: Mutex<Option<crate::route::ShellState>> = Mutex::new(None);
 
@@ -189,50 +186,17 @@ pub(crate) fn set_window_focused(focused: bool) {
     report_web_focus(|focus| focus.window = focused);
 }
 
-static STATE_LISTENERS: Mutex<Vec<Arc<StateListener>>> = Mutex::new(Vec::new());
-
 /// Publish the shell overlay's routing state. The shell overlay is the only
 /// publisher; a change of `modal_open` moves keyboard focus off or back onto
 /// the web overlay.
 pub fn publish_shell_state(state: crate::route::ShellState) {
     *STATE.lock() = Some(state);
     report_web_focus(|focus| focus.modal_open = state.modal_open);
-    let listeners: Vec<Arc<StateListener>> = STATE_LISTENERS.lock().clone();
-    for f in listeners {
-        f(state);
-    }
 }
 
 /// The shell overlay's routing state, `None` until it has published one.
 pub fn shell_state() -> Option<crate::route::ShellState> {
     *STATE.lock()
-}
-
-/// Subscription ownership. A copied notification can race cancellation;
-/// recipients must gate their own native work before dropping this handle.
-pub struct ShellStateSubscription(Arc<StateListener>);
-impl Drop for ShellStateSubscription {
-    fn drop(&mut self) {
-        STATE_LISTENERS.lock().retain(|f| !Arc::ptr_eq(f, &self.0));
-    }
-}
-pub fn on_shell_state_scoped(f: StateListener) -> ShellStateSubscription {
-    register_shell_state(f)
-}
-fn register_shell_state(f: StateListener) -> ShellStateSubscription {
-    let f = Arc::new(f);
-    let seed = {
-        let mut listeners = STATE_LISTENERS.lock();
-        listeners.push(Arc::clone(&f));
-        *STATE.lock()
-    };
-    // Own registration before delivering the seed: a recipient may panic,
-    // and unwinding must remove the listener and release its captures.
-    let subscription = ShellStateSubscription(f);
-    if let Some(state) = seed {
-        (subscription.0)(state);
-    }
-    subscription
 }
 
 /// The installed web sink while the browser behind it is live; `None` before
@@ -260,38 +224,6 @@ mod tests {
     use crate::route::ShellState;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    #[test]
-    fn dropping_subscription_releases_its_capture() {
-        let _serial = OWNED.lock();
-        let capture = Arc::new(());
-        let observer = Arc::downgrade(&capture);
-        let subscription = on_shell_state_scoped(Box::new(move |_| {
-            let _ = &capture;
-        }));
-        assert!(observer.upgrade().is_some());
-        drop(subscription);
-        assert!(observer.upgrade().is_none());
-    }
-
-    #[test]
-    fn a_panicking_seed_unregisters_and_releases_its_capture() {
-        let _serial = OWNED.lock();
-        let previous = STATE.lock().replace(ShellState::default());
-        let capture = Arc::new(());
-        let observer = Arc::downgrade(&capture);
-        let before = STATE_LISTENERS.lock().len();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _subscription = on_shell_state_scoped(Box::new(move |_| {
-                let _ = &capture;
-                panic!("injected seed failure");
-            }));
-        }));
-        *STATE.lock() = previous;
-        assert!(result.is_err());
-        assert_eq!(STATE_LISTENERS.lock().len(), before);
-        assert!(observer.upgrade().is_none());
-    }
-
     /// Whether the double's browser is live; the test owns it.
     static ALIVE: AtomicBool = AtomicBool::new(false);
     /// Every focus a live double took, oldest first.
@@ -316,8 +248,7 @@ mod tests {
 
         fn send_mouse_click(
             &self,
-            _x: c_int,
-            _y: c_int,
+            _p: WebPoint,
             _modifiers: u32,
             _button: c_int,
             _mouse_up: bool,
@@ -325,12 +256,11 @@ mod tests {
         ) {
         }
 
-        fn send_mouse_move(&self, _x: c_int, _y: c_int, _modifiers: u32, _leave: bool) {}
+        fn send_mouse_move(&self, _p: WebPoint, _modifiers: u32, _leave: bool) {}
 
         fn send_mouse_wheel(
             &self,
-            _x: c_int,
-            _y: c_int,
+            _p: WebPoint,
             _modifiers: u32,
             _delta_x: c_int,
             _delta_y: c_int,
@@ -340,12 +270,13 @@ mod tests {
         fn send_touch_event(
             &self,
             _id: c_int,
-            _x: f32,
-            _y: f32,
+            _p: WebPoint,
             _modifiers: u32,
             _phase: crate::touch::TouchPhase,
         ) {
         }
+
+        fn capture_lost(&self) {}
 
         fn set_focus(&self, focus: bool) {
             TAKEN.lock().push(focus);

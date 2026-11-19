@@ -16,7 +16,7 @@ use x11rb::wrapper::ConnectionExt as X11rbWrapperConnection;
 use jfn_platform_abi::BootGeometry;
 
 use crate::x11_state::{
-    Atoms, HostServices, PaintServices, ParentSnapshot, X11RB_CONN, host, set_host_services,
+    Atoms, HostServices, PaintServices, PublishedParent, X11RB_CONN, host, set_host_services,
     set_paint_services,
 };
 
@@ -310,7 +310,7 @@ pub(crate) fn ensure_host_window() -> bool {
         eprintln!("[x11] host services already initialized");
         return false;
     }
-    let boot_snapshot = ParentSnapshot {
+    let boot_parent = PublishedParent {
         origin_x: parent_x,
         origin_y: parent_y,
         width: pw,
@@ -319,7 +319,7 @@ pub(crate) fn ensure_host_window() -> bool {
         maximized: false,
         scale,
     };
-    crate::x11_state::publish_parent(boot_snapshot);
+    crate::x11_state::publish_parent(boot_parent);
 
     let xfixes_opcode = geo_conn
         .query_extension(x11rb::protocol::xfixes::X11_EXTENSION_NAME.as_bytes())
@@ -335,7 +335,7 @@ pub(crate) fn ensure_host_window() -> bool {
         ph.max(1) as u16,
     );
 
-    crate::geometry::start(geo_conn, toplevel, video_host, root, boot_snapshot);
+    crate::geometry::start(geo_conn, toplevel, video_host, root, boot_parent);
     eprintln!("[x11] host window created (toplevel=0x{toplevel:x} video_host=0x{video_host:x})");
     true
 }

@@ -85,6 +85,14 @@ wrap_context_menu_handler! {
                 callback.cancel();
                 return 1;
             };
+            let reported = jfn_platform_abi::WebPoint::from_view(
+                f64::from(params.xcoord()),
+                f64::from(params.ycoord()),
+            );
+            let Some((anchor, basis)) = jfn_input::web_to_window_point(reported) else {
+                callback.cancel();
+                return 1;
+            };
             let Some(session) = self.inner.menu_open() else {
                 callback.cancel();
                 return 1;
@@ -114,11 +122,8 @@ wrap_context_menu_handler! {
 
             host.open(MenuRequest {
                 items,
-                x: params.xcoord(),
-                // The anchor is in the web overlay's own view space; the app menu
-                // is placed in window space, so the strip the overlay was sized
-                // below is added back.
-                y: params.ycoord() + self.inner.view_top(),
+                anchor,
+                basis,
                 width: 0,
                 initial: MENU_DISMISSED,
                 on_selected: self.inner.menu_selection_callback(session),

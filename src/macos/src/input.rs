@@ -32,7 +32,7 @@ extern_class!(
 
 use jfn_input::buttons::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use jfn_input::scroll::ScrollAccum;
-use jfn_platform_abi::LogicalPoint;
+use jfn_platform_abi::WindowPoint;
 use jfn_platform_abi::cursor::CursorShape;
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_ALT_DOWN, EVENTFLAG_COMMAND_DOWN, EVENTFLAG_CONTROL_DOWN,
@@ -262,8 +262,7 @@ fn flush_scroll_accumulator() {
     let flush = SCROLL.lock().flush();
     if let Some(f) = flush {
         jfn_input_dispatch_scroll_precise(
-            f.x,
-            f.y,
+            WindowPoint::from_window(f64::from(f.x), f64::from(f.y)),
             f.dx,
             f.dy,
             f.mods,
@@ -580,12 +579,10 @@ fn dispatch_mouse_button(view: &InputView, event: &AnyObject, button_code: u32, 
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let _click: isize = unsafe { msg_send![event, clickCount] };
     let mods = ns_to_cef_modifiers(raw_flags) | next;
-    let position = LogicalPoint::from_view(loc.x, loc.y);
     jfn_input_dispatch_mouse_button(
         button_code,
         if pressed { 1 } else { 0 },
-        position.x,
-        position.y,
+        WindowPoint::from_window(loc.x, loc.y),
         mods,
     );
 }
@@ -594,8 +591,11 @@ fn dispatch_mouse_move(view: &InputView, event: &AnyObject, leave: bool) {
     let loc = mouse_loc_in_view(view, event);
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let mods = ns_to_cef_modifiers(raw_flags) | G_MOUSE_BUTTON_MODIFIERS.load(Ordering::SeqCst);
-    let position = LogicalPoint::from_view(loc.x, loc.y);
-    jfn_input_dispatch_mouse_move(position.x, position.y, mods, if leave { 1 } else { 0 });
+    jfn_input_dispatch_mouse_move(
+        WindowPoint::from_window(loc.x, loc.y),
+        mods,
+        if leave { 1 } else { 0 },
+    );
 }
 
 /// AppKit names a function key with a code unit from the private-use block

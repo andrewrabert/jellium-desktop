@@ -416,6 +416,13 @@ impl RootState {
             return;
         };
         let (w, h) = (size.w(), size.h());
+        if let Err(e) = self.rt.window().representable(size) {
+            tracing::error!(
+                target: "Main",
+                "window extent {w}x{h}: {e}; the presented geometry stands"
+            );
+            return;
+        }
 
         let first = self.present.is_none();
         let present = if let Some(p) = self.pending_configure.take() {
@@ -1247,11 +1254,7 @@ mod tests {
     use super::ModeRequest;
     use super::presentation::{Inputs, Step, plan};
     use super::resolve_logical_size;
-    use crate::popup_protocol::popup_place::Placed;
     use crate::window_state::{WindowMode, WindowSize};
-    use jfn_platform_abi::{
-        LogicalPoint, LogicalSize, MenuPlacement, PhysicalSize, Scale, WindowExtent,
-    };
     use std::num::NonZeroI32;
 
     #[test]
@@ -1261,52 +1264,6 @@ mod tests {
             assert!(!ModeRequest::Set(false).resolve(current));
             assert_eq!(ModeRequest::Toggle.resolve(current), !current);
         }
-    }
-
-    fn place(x: i32) -> MenuPlacement {
-        let physical = PhysicalSize { w: 10, h: 10 };
-        let Some(view) = WindowExtent::new(physical, Scale::ONE, LogicalSize { w: 10, h: 10 })
-        else {
-            unreachable!()
-        };
-        MenuPlacement {
-            anchor: LogicalPoint { x, y: 0 },
-            view,
-        }
-    }
-
-    #[test]
-    fn an_unmapped_popup_holds_a_placement_until_the_map() {
-        let mut p = Placed::created(place(0));
-        p.hold(place(1));
-        p.hold(place(2));
-        assert_eq!(p.on_map(), Some(place(2)));
-    }
-
-    #[test]
-    fn a_held_placement_equal_to_the_create_never_reaches_the_wire() {
-        let mut p = Placed::created(place(0));
-        p.hold(place(1));
-        p.hold(place(0));
-        assert_eq!(p.on_map(), None);
-    }
-
-    #[test]
-    fn a_mapped_popup_sends_only_a_changed_placement() {
-        let mut p = Placed::created(place(0));
-        assert_eq!(p.send(place(0)), None);
-        assert_eq!(p.send(place(1)), Some(place(1)));
-        assert_eq!(p.send(place(1)), None);
-    }
-
-    #[test]
-    fn a_consumed_hold_is_not_replayed_by_a_later_map() {
-        let mut p = Placed::created(place(0));
-        p.hold(place(1));
-        assert_eq!(p.on_map(), Some(place(1)));
-        assert_eq!(p.on_map(), None);
-        // The consumed hold is now what the compositor holds.
-        assert_eq!(p.send(place(1)), None);
     }
 
     fn inputs(mapped: bool, pending_configure: bool, size: bool) -> Inputs {

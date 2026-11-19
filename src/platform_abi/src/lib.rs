@@ -41,16 +41,18 @@ pub mod window_source;
 
 pub use cef_host::CefHost;
 pub use geometry::{
-    BootGeometry, COVERED_SCALES, LogicalPoint, LogicalSize, PhysicalPoint, PhysicalSize, Scale,
-    SurfaceSize, WindowExtent, WindowGeometry, WindowPos,
+    BootGeometry, COVERED_SCALES, ExtentError, LogicalPoint, LogicalSize, PhysicalPoint,
+    PhysicalSize, PointsToPixelsError, Scale, SurfacePlacement, SurfaceSize, Unrepresentable,
+    WebPoint, WindowBasis, WindowExtent, WindowGeometry, WindowPoint, WindowPos, points_to_pixels,
+    web_top,
 };
 pub use instance::{Instance, InstanceId};
 pub use jfn_gpu_paint::DamageRect as JfnRect;
 pub use jfn_gpu_paint::WindowTarget;
 pub use media_sink::MediaSink;
 pub use menu::{
-    Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem, MenuKind, MenuMetrics,
-    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface,
+    Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHandle, MenuHost, MenuItem, MenuKind,
+    MenuMetrics, MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface,
     menu_has_selectable, menu_initial_row, menu_scripts,
 };
 pub use mpv_host::{DefaultMpvHost, MpvHost, VoWait};
@@ -61,7 +63,7 @@ pub use stack::Plane;
 pub use visibility::{Ack, Visibility, VisibilityCommit};
 pub use window_owner::{AppCreatedWindow, MpvBootWindow, MpvCreatedWindow, WindowOwner};
 pub use window_source::{
-    WindowSnapshot, WindowSource, WindowSubscription, notify_window_changed,
+    WindowSource, WindowState, WindowStateError, WindowSubscription, notify_window_changed,
     subscribe_window_changed,
 };
 
@@ -472,7 +474,7 @@ pub trait Platform: Send + Sync {
 
     // Per-surface
     /// The surface starts in `initial`; no surface is born at a default.
-    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle;
+    fn alloc_surface(&self, initial: Visibility, placement: SurfacePlacement) -> SurfaceHandle;
     fn free_surface(&self, s: SurfaceHandle);
     /// Presents `frame`, or hands it back undischarged when this surface has no
     /// commit stream for it.
@@ -552,9 +554,7 @@ pub trait Platform: Send + Sync {
     /// or for its own default display when `at` is `None`.
     fn display_scale(&self, at: Option<WindowPos>) -> Scale;
 
-    /// The window's current position in backing pixels, or `None` when this
-    /// backend has no window position to report.
-    fn query_window_position(&self) -> Option<WindowPos>;
+    fn window_position(&self) -> Result<Option<WindowPos>, WindowStateError>;
 
     /// Who creates the app window, and the live geometry authority for it.
     fn window_owner(&self) -> WindowOwner<'_>;
@@ -587,6 +587,7 @@ pub trait Platform: Send + Sync {
     /// The decoration mode currently in effect. Changes are announced via
     /// [`notify_decorations_changed`].
     fn effective_decorations(&self) -> EffectiveDecorations;
+    fn set_titlebar_present(&self, _present: bool) {}
 
     fn shared_texture_supported(&self) -> bool;
 

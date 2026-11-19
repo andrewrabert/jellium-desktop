@@ -78,7 +78,6 @@ impl Inner {
         {
             let mut state = self.browser.lock();
             state.browser = None;
-            state.applied = None;
         }
         self.paint_scheduler.before_close();
         jfn_logging::log(

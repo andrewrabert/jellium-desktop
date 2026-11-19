@@ -2660,6 +2660,7 @@ dependencies = [
  "jfn-platform-abi",
  "jfn-playback",
  "parking_lot",
+ "tracing",
 ]
 
 [[package]]
@@ -2755,6 +2756,7 @@ dependencies = [
  "objc2-metal",
  "objc2-quartz-core",
  "parking_lot",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2825,6 +2827,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "tracing",
  "uuid",
 ]
@@ -2841,6 +2844,7 @@ dependencies = [
  "jfn-wake-event",
  "parking_lot",
  "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -2939,6 +2943,7 @@ dependencies = [
  "jfn-playback",
  "jfn-windows-sink",
  "parking_lot",
+ "thiserror 2.0.21",
  "tracing",
  "windows",
  "windows-core",

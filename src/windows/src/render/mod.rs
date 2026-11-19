@@ -342,13 +342,12 @@ pub(crate) fn present<'a>(
     Ok(frame.present(|_content| Presented::issued()))
 }
 
-/// Offsets the content visual by the reserved top inset and sizes it to match.
-pub(crate) fn resize(h: SurfaceHandle, size: SurfaceSize) {
+pub(crate) fn resize(h: SurfaceHandle, _size: SurfaceSize) {
     let mut st = STATE.lock();
     let Some(entry) = st.find_mut(h) else {
         return;
     };
-    entry.content.set_offset(0.0, size.physical_top as f32);
+    entry.content.set_offset(0.0, 0.0);
     st.commit();
 }
 
@@ -365,9 +364,12 @@ pub(crate) fn window_target(h: SurfaceHandle) -> Option<WindowTarget> {
 /// surface. The popup shows itself with its first frame.
 pub(crate) fn popup_show(h: SurfaceHandle, x: c_int, y: c_int) {
     let scale = crate::platform::win_get_scale();
-    let (Some(px), Some(py)) = (scale.to_physical(x), scale.to_physical(y)) else {
-        tracing::error!(target: "platform", "popup offset {x},{y} is unrepresentable at scale {scale}");
-        return;
+    let (px, py) = match (scale.to_physical(x), scale.to_physical(y)) {
+        (Ok(px), Ok(py)) => (px, py),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::error!(target: "platform", "popup offset: {e}; popup left unplaced");
+            return;
+        }
     };
     let mut st = STATE.lock();
     let Some(entry) = st.find_mut(h) else {

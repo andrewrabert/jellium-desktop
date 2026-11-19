@@ -5,8 +5,6 @@ use parking_lot::Mutex;
 use crate::shell::state::ChromeInputs;
 
 static INPUTS: Mutex<ChromeInputs> = Mutex::new(ChromeInputs {
-    client_side_decorations: false,
-    fullscreen: false,
     video_active: false,
     osd_visible: false,
 });
@@ -32,14 +30,6 @@ pub fn set_osd_visible(visible: bool) {
 /// jellyfin-web is playing video, pushed from `jfn_playback::chrome`.
 pub fn set_video_active(active: bool) {
     update(|i| i.video_active = active);
-}
-
-pub fn set_client_side_decorations(client_side: bool) {
-    update(|i| i.client_side_decorations = client_side);
-}
-
-pub fn set_fullscreen(fullscreen: bool) {
-    update(|i| i.fullscreen = fullscreen);
 }
 
 fn update(f: impl FnOnce(&mut ChromeInputs)) {

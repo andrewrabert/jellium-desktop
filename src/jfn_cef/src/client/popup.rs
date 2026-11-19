@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::platform_ops::{MenuDelivery, MenuItem, MenuRequest, MenuSelection};
 
-use super::{Inner, PopupState};
+use super::{Inner, PopupAt, PopupState};
 
 fn options_as_items(options: &[String]) -> Vec<MenuItem> {
     options
@@ -39,7 +39,19 @@ impl Inner {
         p.options.clear();
         p.selected_idx = -1;
         p.selectable.clear();
+        p.rect = None;
         p.anchor = None;
+        p.requested = false;
+    }
+
+    fn popup_at(&self, x: i32, y: i32) -> Option<PopupAt> {
+        match self.dropdown() {
+            MenuDelivery::Host(_) => jfn_input::web_to_window_point(
+                jfn_platform_abi::WebPoint::from_view(f64::from(x), f64::from(y)),
+            )
+            .map(|(point, basis)| PopupAt::Window(point, basis)),
+            MenuDelivery::Composited | MenuDelivery::Page => Some(PopupAt::View(x, y)),
+        }
     }
 
     pub(crate) fn on_popup_show(&self, show: bool) {
@@ -56,10 +68,13 @@ impl Inner {
     }
 
     pub(crate) fn on_popup_size(self: &Arc<Self>, x: i32, y: i32, w: i32, h: i32) {
+        let at = self.popup_at(x, y);
         {
             let mut p = self.popup.lock();
-            p.x = x;
-            p.y = y;
+            if p.requested {
+                return;
+            }
+            p.rect = at;
             p.w = w;
             p.h = h;
             p.size_received = true;
@@ -74,29 +89,37 @@ impl Inner {
         selectable: Vec<i32>,
         anchor: Option<(i32, i32)>,
     ) {
+        let anchor = anchor.map(|(x, y)| self.popup_at(x, y));
         {
             let mut p = self.popup.lock();
             p.options = opts;
             p.selected_idx = selected;
             p.selectable = selectable;
-            p.anchor = anchor;
+            match anchor {
+                Some(None) => p.rect = None,
+                Some(at) => p.anchor = at,
+                None => {}
+            }
             p.options_received = true;
         }
         self.try_show_popup();
     }
 
     fn try_show_popup(self: &Arc<Self>) {
-        let (x, y, w, h, opts, selected, selectable) = {
-            let p = self.popup.lock();
+        let (at, w, h, opts, selected, selectable) = {
+            let mut p = self.popup.lock();
             if !p.visible || !p.size_received || !p.options_received {
                 return;
             }
-            // Blink's popup rect (p.x/p.y) flips above the element near the
-            // window bottom; the anchor keeps the menu under the box.
-            let (x, y) = p.anchor.unwrap_or((p.x, p.y));
+            p.size_received = false;
+            p.options_received = false;
+            p.requested = true;
+            let rect = p.rect.take();
+            let Some(at) = p.anchor.take().or(rect) else {
+                return;
+            };
             (
-                x,
-                y,
+                at,
                 p.w,
                 p.h,
                 p.options.clone(),
@@ -113,23 +136,33 @@ impl Inner {
                 let _ = post_task(ThreadId::UI, Some(&mut task));
             });
         });
-        match self.dropdown() {
-            MenuDelivery::Host(host) => host.open(MenuRequest {
-                items: options_as_items(&opts),
-                x,
-                y,
-                width: w,
-                initial: selected,
-                on_selected,
-            }),
-            MenuDelivery::Composited => self.surface().popup_show(x, y, w, h),
-            MenuDelivery::Page => {}
+        match (self.dropdown(), at) {
+            (MenuDelivery::Host(host), PopupAt::Window(anchor, basis)) => {
+                let handle = host.open(MenuRequest {
+                    items: options_as_items(&opts),
+                    anchor,
+                    basis,
+                    width: w,
+                    initial: selected,
+                    on_selected,
+                });
+                self.popup.lock().menu = handle;
+            }
+            (MenuDelivery::Composited, PopupAt::View(x, y)) => {
+                self.surface().popup_show(x, y, w, h)
+            }
+            _ => {}
         }
     }
 
     fn hide_dropdown(&self) {
         match self.dropdown() {
-            MenuDelivery::Host(host) => host.hide(),
+            MenuDelivery::Host(host) => {
+                let handle = self.popup.lock().menu.take();
+                if let Some(handle) = handle {
+                    host.hide(handle);
+                }
+            }
             MenuDelivery::Composited => self.surface().popup_hide(),
             MenuDelivery::Page => {}
         }

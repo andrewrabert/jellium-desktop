@@ -60,7 +60,11 @@ impl Platform for X11Platform {
         Ok(())
     }
 
-    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+    fn alloc_surface(
+        &self,
+        initial: Visibility,
+        _placement: jfn_platform_abi::SurfacePlacement,
+    ) -> SurfaceHandle {
         surface::alloc_surface(initial).to_handle()
     }
 
@@ -76,10 +80,8 @@ impl Platform for X11Platform {
         surface::present(SurfaceId::from_handle(s), frame)
     }
 
-    /// X11 owns the overlay's size through parent geometry; the only part of
-    /// the request this backend applies is the reserved top strip.
-    fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
-        surface::surface_set_top_inset(SurfaceId::from_handle(s), size.physical_top);
+    fn surface_resize(&self, s: SurfaceHandle, _size: SurfaceSize) {
+        surface::surface_set_top_inset(SurfaceId::from_handle(s), 0);
     }
 
     fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
@@ -152,11 +154,11 @@ impl Platform for X11Platform {
     }
 
     fn toggle_fullscreen(&self) {
-        let Some(snap) = crate::x11_state::parent_snapshot() else {
+        let Some(parent) = crate::x11_state::published_parent() else {
             tracing::warn!(target: "Platform", "no published geometry; nothing to gate");
             return;
         };
-        crate::geometry::set_parent_fullscreen(!snap.fullscreen);
+        crate::geometry::set_parent_fullscreen(!parent.fullscreen);
     }
 
     fn scale(&self) -> jfn_platform_abi::Scale {
@@ -172,12 +174,11 @@ impl Platform for X11Platform {
         WindowOwner::App(&crate::window_source::X11_WINDOW_SOURCE)
     }
 
-    fn query_window_position(&self) -> Option<WindowPos> {
-        let conn = crate::x11_state::x11rb_conn()?;
-        let host = crate::x11_state::host()?;
-        let (x, y, _, _) =
-            crate::lifecycle::query_parent_geometry_x11rb(&conn, host.toplevel, host.root)?;
-        Some(WindowPos { x, y })
+    fn window_position(&self) -> Result<Option<WindowPos>, jfn_platform_abi::WindowStateError> {
+        use jfn_platform_abi::WindowSource as _;
+        Ok(crate::window_source::X11_WINDOW_SOURCE
+            .window_state()?
+            .position)
     }
 
     /// X11 constrains only the size; position is left to the WM.

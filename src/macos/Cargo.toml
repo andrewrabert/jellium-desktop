@@ -32,6 +32,7 @@ objc2-quartz-core.workspace = true
 [dependencies]
 jfn-platform-abi = { path = "../platform_abi" }
 parking_lot.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 
 [lints]

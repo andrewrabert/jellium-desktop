@@ -7,7 +7,7 @@ use std::os::raw::c_int;
 use std::time::{Duration, Instant};
 
 use iced_core::{Event, mouse};
-use jfn_platform_abi::LogicalPoint;
+use jfn_platform_abi::WindowPoint;
 use jfn_platform_abi::cursor::CursorShape;
 use parking_lot::Mutex;
 
@@ -17,6 +17,8 @@ use crate::shell::actor::{Work, point};
 const DOUBLE_PRESS: Duration = Duration::from_millis(400);
 
 static LAST_DRAG_PRESS: Mutex<Option<Instant>> = Mutex::new(None);
+
+static HELD: Mutex<Vec<mouse::Button>> = Mutex::new(Vec::new());
 
 /// The shape iced's `mouse_interaction` resolved to for the current frame.
 pub(crate) fn set_interaction(interaction: mouse::Interaction) {
@@ -56,7 +58,7 @@ impl jfn_input::ShellInput for ShellSink {
         }
     }
 
-    fn context_menu(&self, p: LogicalPoint) {
+    fn context_menu(&self, p: WindowPoint) {
         crate::shell::post(Work::ContextMenu(p));
     }
 
@@ -82,31 +84,29 @@ impl jfn_input::ShellInput for ShellSink {
         }
     }
 
-    fn primary_paste(&self, p: LogicalPoint) {
+    fn primary_paste(&self, p: WindowPoint) {
         crate::shell::post(Work::PrimaryPaste(p));
     }
 
-    fn send_mouse_move(&self, p: LogicalPoint, _modifiers: u32, leave: bool) {
+    fn send_mouse_move(&self, p: WindowPoint, _modifiers: u32, leave: bool) {
         let event = if leave {
             mouse::Event::CursorLeft
         } else {
-            mouse::Event::CursorMoved {
-                position: point(p.x, p.y),
-            }
+            mouse::Event::CursorMoved { position: point(p) }
         };
         crate::shell::post(Work::Event(Event::Mouse(event)));
     }
 
     fn send_mouse_click(
         &self,
-        p: LogicalPoint,
+        p: WindowPoint,
         _modifiers: u32,
         button: c_int,
         mouse_up: bool,
         _click_count: c_int,
     ) {
         crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorMoved {
-            position: point(p.x, p.y),
+            position: point(p),
         })));
         // CEF mouse buttons: 0 = left, 1 = middle, 2 = right.
         let button = match button {
@@ -114,6 +114,13 @@ impl jfn_input::ShellInput for ShellSink {
             2 => mouse::Button::Right,
             _ => mouse::Button::Left,
         };
+        {
+            let mut held = HELD.lock();
+            held.retain(|b| *b != button);
+            if !mouse_up {
+                held.push(button);
+            }
+        }
         let event = if mouse_up {
             mouse::Event::ButtonReleased(button)
         } else {
@@ -122,9 +129,9 @@ impl jfn_input::ShellInput for ShellSink {
         crate::shell::post(Work::Event(Event::Mouse(event)));
     }
 
-    fn send_mouse_wheel(&self, p: LogicalPoint, _modifiers: u32, delta_x: c_int, delta_y: c_int) {
+    fn send_mouse_wheel(&self, p: WindowPoint, _modifiers: u32, delta_x: c_int, delta_y: c_int) {
         crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorMoved {
-            position: point(p.x, p.y),
+            position: point(p),
         })));
         crate::shell::post(Work::Event(Event::Mouse(mouse::Event::WheelScrolled {
             delta: mouse::ScrollDelta::Pixels {
@@ -132,6 +139,15 @@ impl jfn_input::ShellInput for ShellSink {
                 y: delta_y as f32,
             },
         })));
+    }
+
+    fn pointer_cancel(&self) {
+        crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorLeft)));
+        for button in std::mem::take(&mut *HELD.lock()) {
+            crate::shell::post(Work::Event(Event::Mouse(mouse::Event::ButtonReleased(
+                button,
+            ))));
+        }
     }
 
     fn set_focus(&self, focus: bool) {

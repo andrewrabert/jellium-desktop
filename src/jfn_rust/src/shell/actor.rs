@@ -16,7 +16,8 @@ use iced_runtime::user_interface::{self, UserInterface};
 use iced_widget::Widget as _;
 use jfn_gpu_paint::{Acquired, Presented};
 use jfn_platform_abi::{
-    FrameSource, LogicalPoint, LogicalSize, SurfaceHandle, Visibility, WindowExtent,
+    ExtentError, FrameSource, LogicalSize, SurfaceHandle, Visibility, WindowBasis, WindowExtent,
+    WindowPoint, WindowStateError,
 };
 
 use crate::shell::controls::{self, Direction};
@@ -35,8 +36,10 @@ const TARGET_WAIT: Duration = Duration::from_secs(5);
 
 pub enum Work {
     Event(Event),
-    Resize {
+    Window {
         extent: WindowExtent,
+        web_top: std::ffi::c_int,
+        basis: WindowBasis,
     },
     Redraw,
     OpenAbout,
@@ -50,12 +53,12 @@ pub enum Work {
         text: Option<String>,
     },
     /// A right press the shell overlay owns, in window coordinates.
-    ContextMenu(LogicalPoint),
+    ContextMenu(WindowPoint),
     /// The Menu key or Shift+F10: the edit menu at the focused field's caret.
     /// With no field focused it raises nothing.
     EditMenuAtCaret,
     /// A middle press the shell overlay owns, in window coordinates.
-    PrimaryPaste(LogicalPoint),
+    PrimaryPaste(WindowPoint),
     /// An edit menu's selection, for the field it named.
     EditAt {
         field: Target,
@@ -318,12 +321,14 @@ pub struct Model {
     screen: crate::connection::Screen,
     titlebar: Titlebar,
     inputs: ChromeInputs,
+    web_top: std::ffi::c_int,
+    basis: WindowBasis,
     theme: Theme,
 }
 
 impl Model {
     fn titlebar_shown(&self) -> bool {
-        state::titlebar_shown(self.inputs)
+        state::titlebar_shown(self.web_top, self.inputs)
     }
 
     /// The modal stack's own view, then the titlebar, then nothing.
@@ -574,8 +579,12 @@ pub enum LoopStartError {
     NoTarget,
     #[error("GPU device unavailable")]
     NoGpu,
-    #[error("window extent unavailable")]
-    NoExtent,
+    #[error("platform unavailable")]
+    NoPlatform,
+    #[error("window extent: {0}")]
+    Extent(#[from] ExtentError),
+    #[error("window state: {0}")]
+    WindowState(#[source] WindowStateError),
     #[error("swapchain creation failed: {0}")]
     Painter(#[source] jfn_gpu_paint::SurfaceLost),
 }
@@ -590,7 +599,7 @@ impl Loop {
         actions: crate::shell::ApplicationActions,
     ) -> Result<Loop, LoopStartError> {
         let gpu = jfn_gpu_paint::surfaces().ok_or(LoopStartError::NoGpu)?;
-        let extent = initial_extent().ok_or(LoopStartError::NoExtent)?;
+        let (extent, web_top, basis) = initial_window()?;
         let wake = {
             let tx = wake_tx.clone();
             Arc::new(move || {
@@ -606,6 +615,8 @@ impl Loop {
             connection,
             titlebar: Titlebar::new(),
             inputs: crate::shell::chrome::inputs(),
+            web_top,
+            basis,
             theme: Theme {
                 chrome_background: crate::shell::theme::chrome_background(),
                 ..Theme::default()
@@ -615,7 +626,7 @@ impl Loop {
             let wake = Arc::clone(&wake);
             move || wake()
         });
-        publish(&model, extent);
+        publish(&model);
         apply_visibility(surface, &model);
         Ok(Loop {
             actions,
@@ -718,9 +729,17 @@ impl Loop {
                 }
                 self.events.push(event);
             }
-            Work::Resize { extent } => {
-                self.painter.resize(extent);
-                self.current = extent;
+            Work::Window {
+                extent,
+                web_top,
+                basis,
+            } => {
+                self.model.web_top = web_top;
+                self.model.basis = basis;
+                if extent != self.current {
+                    self.painter.resize(extent);
+                    self.current = extent;
+                }
                 self.discard_cache();
             }
             Work::Redraw => {}
@@ -883,7 +902,7 @@ impl Loop {
             overlay.retain_settings_state(focus, offset);
         }
         if settled {
-            publish(&this.model, this.current);
+            publish(&this.model);
             return;
         }
 
@@ -896,7 +915,7 @@ impl Loop {
             }
         }
         this.immediate = true;
-        publish(&this.model, this.current);
+        publish(&this.model);
         apply_visibility(this.surface, &this.model);
     }
 }
@@ -921,6 +940,7 @@ fn resolve_deferred(
                 menu_anchor = menu_anchor.or(raise_menu(
                     &fields,
                     p,
+                    model.basis,
                     queued,
                     model.stack.identity() == Some(Identity::SettingsOverlay),
                     actions,
@@ -930,7 +950,7 @@ fn resolve_deferred(
                 menu_anchor = menu_anchor.or_else(|| fields.focused().map(caret_anchor));
             }
             Deferred::PrimaryPaste(p) => {
-                if let Some(field) = fields.at(point(p.x, p.y)) {
+                if let Some(field) = fields.at(point(p)) {
                     read_primary(wake_tx.clone(), Reader::Field(field.id.clone()));
                 }
             }
@@ -946,8 +966,13 @@ fn resolve_deferred(
     }
     if let Some(anchor) = menu_anchor {
         let raised = Fields::collect(ui, painter.renderer());
-        if let Some(field) = raised.at(point(anchor.x, anchor.y)) {
-            crate::shell::menu::open_edit(field, anchor, crate::shell::lang::strings());
+        if let Some(field) = raised.at(point(anchor)) {
+            crate::shell::menu::open_edit(
+                field,
+                anchor,
+                model.basis,
+                crate::shell::lang::strings(),
+            );
         }
     }
 }
@@ -1100,9 +1125,9 @@ fn paint(
 /// A request that needs a widget tree to resolve against, held until the pass
 /// has built one.
 enum Deferred {
-    ContextMenu(LogicalPoint),
+    ContextMenu(WindowPoint),
     EditMenuAtCaret,
-    PrimaryPaste(LogicalPoint),
+    PrimaryPaste(WindowPoint),
     Edit(Target, jfn_input::EditCommand),
 }
 
@@ -1241,11 +1266,8 @@ fn publish_primary(fields: &Fields, last: &mut Option<(Id, u64)>) {
 
 /// The window point an edit menu raised from the keyboard anchors at: the
 /// focused field's caret.
-fn caret_anchor(field: &crate::shell::fields::Snapshot) -> LogicalPoint {
-    LogicalPoint {
-        x: field.caret.x as i32,
-        y: field.caret.y as i32,
-    }
+fn caret_anchor(field: &crate::shell::fields::Snapshot) -> WindowPoint {
+    window_point(field.caret)
 }
 
 /// The menu a right press raises: the edit menu over a shell field, with the
@@ -1257,14 +1279,15 @@ fn caret_anchor(field: &crate::shell::fields::Snapshot) -> LogicalPoint {
 /// macOS's own Edit menu resolves [`Target::Focused`] to it.
 fn raise_menu(
     fields: &Fields,
-    p: LogicalPoint,
+    p: WindowPoint,
+    basis: WindowBasis,
     queued: &mut Vec<Apply>,
     restricted: bool,
     actions: crate::shell::ApplicationActions,
-) -> Option<LogicalPoint> {
-    let at = point(p.x, p.y);
+) -> Option<WindowPoint> {
+    let at = point(p);
     let Some(field) = fields.at(at) else {
-        (actions.open_menu)(p, restricted);
+        (actions.open_menu)(p, basis, restricted);
         return None;
     };
     let lease = jfn_platform_abi::try_lease()?;
@@ -1278,10 +1301,8 @@ fn raise_menu(
     Some(p)
 }
 
-/// Publishes the routing state at the extent's exact logical size.
-fn publish(model: &Model, extent: WindowExtent) {
+fn publish(model: &Model) {
     jfn_input::publish_shell_state(crate::shell::state::shell_state(
-        Some(extent),
         model.inputs,
         model.stack.occupied(),
     ));
@@ -1345,22 +1366,31 @@ fn await_target<T>(
     }
 }
 
-/// The extent the overlay starts at: the window source's own when it has one,
-/// else 1280x720 logical at the platform's reported scale.
-fn initial_extent() -> Option<WindowExtent> {
-    let lease = jfn_platform_abi::try_lease()?;
+fn initial_window() -> Result<(WindowExtent, std::ffi::c_int, WindowBasis), LoopStartError> {
+    let lease = jfn_platform_abi::try_lease().ok_or(LoopStartError::NoPlatform)?;
     let plat = lease.platform();
-    if let Some(extent) = plat.window_owner().source().snapshot().extent {
-        return Some(extent);
+    match plat.window_owner().source().window_state() {
+        Ok(window) => Ok((window.extent, window.web_top, window.basis)),
+        Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => {
+            let scale = plat.scale();
+            let logical = LogicalSize { w: 1280, h: 720 };
+            let physical = logical.to_physical(scale).map_err(ExtentError::from)?;
+            Ok((
+                WindowExtent::new(physical, scale, logical)?,
+                0,
+                WindowBasis::FIXED,
+            ))
+        }
+        Err(e) => Err(LoopStartError::WindowState(e)),
     }
-    let scale = plat.scale();
-    let logical = LogicalSize { w: 1280, h: 720 };
-    WindowExtent::new(logical.to_physical(scale)?, scale, logical)
 }
 
-/// The pointer position an iced event carries, for the sink's convenience.
-pub(crate) fn point(x: i32, y: i32) -> Point {
-    Point::new(x as f32, y as f32)
+pub(crate) fn point(p: WindowPoint) -> Point {
+    Point::new(p.x() as f32, p.y() as f32)
+}
+
+pub(crate) fn window_point(p: Point) -> WindowPoint {
+    WindowPoint::from_window(f64::from(p.x), f64::from(p.y))
 }
 
 #[cfg(test)]
@@ -1523,6 +1553,8 @@ mod tests {
             connection: crate::connection::Connection::new(String::new()),
             titlebar: Titlebar::new(),
             inputs: ChromeInputs::default(),
+            web_top: 0,
+            basis: WindowBasis::FIXED,
             theme: Theme::default(),
         };
         model.apply_message_batch(messages);
@@ -1596,6 +1628,8 @@ mod tests {
             connection: crate::connection::Connection::new(String::new()),
             titlebar: Titlebar::new(),
             inputs: ChromeInputs::default(),
+            web_top: 0,
+            basis: WindowBasis::FIXED,
             theme: Theme::default(),
         };
         for message in ordered[..4].iter().cloned() {
@@ -1622,6 +1656,8 @@ mod tests {
             connection: crate::connection::Connection::new(String::new()),
             titlebar: Titlebar::new(),
             inputs: ChromeInputs::default(),
+            web_top: 0,
+            basis: WindowBasis::FIXED,
             theme: Theme::default(),
         };
         let pre_event_focus = Some(crate::shell::settings::DEVICE_NAME_FIELD);
@@ -1736,6 +1772,8 @@ mod tests {
             connection: crate::connection::Connection::new(String::new()),
             titlebar: Titlebar::new(),
             inputs: ChromeInputs::default(),
+            web_top: 0,
+            basis: WindowBasis::FIXED,
             theme: Theme::default(),
         };
 
