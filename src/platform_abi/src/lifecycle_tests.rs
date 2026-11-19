@@ -6,6 +6,7 @@ use super::*;
 enum Outcome {
     Success,
     Failure,
+    DetachFailure,
     Panic,
 }
 
@@ -18,7 +19,7 @@ impl Platform for Backend {
     fn init(&self, _access: &LifecycleAccess, _mpv: *mut c_void) -> Result<(), PlatformInitError> {
         self.events.lock().push("acquired host");
         match self.outcome {
-            Outcome::Success => Ok(()),
+            Outcome::Success | Outcome::DetachFailure => Ok(()),
             Outcome::Failure => Err(PlatformInitError::backend(
                 "after host acquisition",
                 std::io::Error::other("injected"),
@@ -26,8 +27,15 @@ impl Platform for Backend {
             Outcome::Panic => panic!("injected panic after host acquisition"),
         }
     }
-    fn cleanup(&self, _access: &LifecycleAccess) {
+    fn cleanup(&self, _access: &LifecycleAccess) -> Result<(), DetachError> {
         self.events.lock().push("detach backend");
+        match self.outcome {
+            Outcome::DetachFailure => Err(DetachError::new(
+                "backend detach",
+                std::io::Error::other("injected"),
+            )),
+            Outcome::Success | Outcome::Failure | Outcome::Panic => Ok(()),
+        }
     }
     fn post_window_cleanup(&self, _access: &LifecycleAccess) -> Result<(), HostReleaseError> {
         self.events.lock().push("release host");
@@ -71,7 +79,7 @@ impl Platform for Backend {
     fn set_surface_visibility(&self, s: SurfaceHandle, visibility: Visibility) -> VisibilityCommit {
         unreachable!("lifecycle test never calls this platform operation")
     }
-    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) -> Result<(), StackError> {
         unreachable!("lifecycle test never calls this platform operation")
     }
     fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery<'_> {
@@ -98,7 +106,7 @@ impl Platform for Backend {
     fn resize_gate(&self) -> Option<&dyn ResizeGate> {
         unreachable!("lifecycle test never calls this platform operation")
     }
-    fn scale(&self) -> Scale {
+    fn scale(&self) -> Result<Scale, WindowStateError> {
         unreachable!("lifecycle test never calls this platform operation")
     }
     fn display_scale(&self, at: Option<WindowPos>) -> Scale {
@@ -238,6 +246,7 @@ fn busy_cleanup_returns_backend_and_window_owner_for_retry() {
         Err(PlatformCleanupError::Busy { runtime, terminate }) => (runtime, terminate),
         Err(PlatformCleanupError::Termination { .. }) => panic!("termination attempted while busy"),
         Err(PlatformCleanupError::HostRelease(_)) => panic!("host released while busy"),
+        Err(PlatformCleanupError::Detach { .. }) => panic!("backend detached while busy"),
     };
     assert_eq!(*backend.events.lock(), ["acquired host"]);
     assert!(
@@ -353,6 +362,32 @@ fn failed_window_termination_retains_host_and_retry_skips_backend_detachment() {
             .is_ok()
     );
     assert!(observer.upgrade().is_none());
+    assert_eq!(
+        *backend.events.lock(),
+        [
+            "acquired host",
+            "detach backend",
+            "terminate mpv",
+            "release host"
+        ]
+    );
+}
+
+#[test]
+fn failed_backend_detachment_still_terminates_and_releases_the_host() {
+    let _serial = TEST_PLATFORM.lock();
+    let (backend, prepared) = prepared(Outcome::DetachFailure);
+    let runtime = match prepared.initialize(std::ptr::null_mut()) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("successful backend initialization failed"),
+    };
+    match runtime.cleanup(|| {
+        backend.events.lock().push("terminate mpv");
+        Ok::<(), ()>(())
+    }) {
+        Err(PlatformCleanupError::Detach { rest: Ok(()), .. }) => {}
+        _ => panic!("detach failure was not reported with the later phases' outcome"),
+    }
     assert_eq!(
         *backend.events.lock(),
         [

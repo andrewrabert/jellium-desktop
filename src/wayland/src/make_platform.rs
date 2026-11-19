@@ -108,10 +108,12 @@ impl Platform for WaylandPlatform {
         crate::lifecycle::init(self.rt())
     }
 
-    fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
-        if let Err(e) = crate::lifecycle::cleanup(self.rt()) {
-            tracing::error!("platform cleanup: {e}");
-        }
+    fn cleanup(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+    ) -> Result<(), jfn_platform_abi::DetachError> {
+        crate::lifecycle::cleanup(self.rt())
+            .map_err(|e| jfn_platform_abi::DetachError::new("Wayland menu shutdown", e))
     }
 
     fn post_window_cleanup(
@@ -169,7 +171,7 @@ impl Platform for WaylandPlatform {
         )
     }
 
-    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) -> Result<(), jfn_platform_abi::StackError> {
         // SAFETY: a `&[SurfaceHandle]` (i.e. `&[*mut c_void]`) and a
         // `&[*mut PlatformSurface]` have identical layout; each handle was
         // minted by this backend's `alloc_surface`.
@@ -179,9 +181,8 @@ impl Platform for WaylandPlatform {
                 ordered.len(),
             )
         };
-        if let Err(e) = wl_ops::restack(self.rt(), typed) {
-            tracing::error!(target: "Main", "restack: {e}; left unplaced");
-        }
+        wl_ops::restack(self.rt(), typed)
+            .map_err(|e| jfn_platform_abi::StackError::new("Wayland restack", e))
     }
 
     fn menu_delivery(
@@ -244,8 +245,8 @@ impl Platform for WaylandPlatform {
         self.rt().root().toggle_fullscreen();
     }
 
-    fn scale(&self) -> jfn_platform_abi::Scale {
-        self.rt().window().scale()
+    fn scale(&self) -> Result<jfn_platform_abi::Scale, jfn_platform_abi::WindowStateError> {
+        Ok(self.rt().window().scale())
     }
 
     /// The output containing `at`, else the first usable output. When the

@@ -225,10 +225,11 @@ impl Platform for WindowsPlatform {
         win_init(mpv)
     }
 
-    fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
-        if let Err(e) = win_cleanup() {
-            tracing::error!(target: "platform", "Windows cleanup: {e}");
-        }
+    fn cleanup(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+    ) -> Result<(), jfn_platform_abi::DetachError> {
+        win_cleanup().map_err(|e| jfn_platform_abi::DetachError::new("Windows cleanup", e))
     }
 
     // mpv's window is gone by the time this runs and the compositor devices
@@ -301,8 +302,9 @@ impl Platform for WindowsPlatform {
         crate::render::set_visibility(s, visibility)
     }
 
-    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
-        crate::render::apply_stack(ordered);
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) -> Result<(), jfn_platform_abi::StackError> {
+        crate::render::apply_stack(ordered)
+            .map_err(|e| jfn_platform_abi::StackError::new("Windows restack AddVisual", e))
     }
 
     fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery<'_> {
@@ -362,11 +364,8 @@ impl Platform for WindowsPlatform {
         None
     }
 
-    fn scale(&self) -> jfn_platform_abi::Scale {
-        win_get_scale().unwrap_or_else(|e| {
-            tracing::error!(target: "platform", "window scale: {e}; reporting the system scale");
-            crate::platform::win_display_scale()
-        })
+    fn scale(&self) -> Result<jfn_platform_abi::Scale, jfn_platform_abi::WindowStateError> {
+        win_get_scale()
     }
 
     fn display_scale(&self, at: Option<WindowPos>) -> jfn_platform_abi::Scale {

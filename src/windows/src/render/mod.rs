@@ -233,13 +233,13 @@ pub(crate) fn free(h: SurfaceHandle) {
 /// surfaces `ordered` does not name keep their relative order above those it
 /// does, so every live surface stays parented. Video needs no placing: the
 /// composition target is mpv's own HWND, so every visual is above it.
-pub(crate) fn apply_stack(ordered: &[SurfaceHandle]) {
+pub(crate) fn apply_stack(ordered: &[SurfaceHandle]) -> windows::core::Result<()> {
     let mut st = STATE.lock();
     let Registry {
         devices, surfaces, ..
     } = &mut *st;
     let Some(root) = devices.as_ref().map(Devices::root) else {
-        return;
+        return Ok(());
     };
     let rank = |e: &Entry| ordered.iter().position(|h| h.id() == e.id.0);
 
@@ -249,6 +249,7 @@ pub(crate) fn apply_stack(ordered: &[SurfaceHandle]) {
     named.sort_by_key(|e| rank(e).unwrap_or(usize::MAX));
     named.append(&mut unnamed);
 
+    let mut first_failure = None;
     unsafe {
         for entry in &named {
             let _ = root.RemoveVisual(entry.content.visual());
@@ -263,7 +264,7 @@ pub(crate) fn apply_stack(ordered: &[SurfaceHandle]) {
             match placed {
                 Ok(()) => prev = Some(visual),
                 Err(e) => {
-                    tracing::error!(target: "platform", "apply_stack AddVisual failed: {e:?}");
+                    first_failure.get_or_insert(e);
                 }
             }
         }
@@ -271,6 +272,7 @@ pub(crate) fn apply_stack(ordered: &[SurfaceHandle]) {
 
     *surfaces = named;
     st.commit();
+    first_failure.map_or(Ok(()), Err)
 }
 
 /// Set a surface's content visual to `visibility`, publish it, and wait for

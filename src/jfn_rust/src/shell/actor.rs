@@ -1384,7 +1384,7 @@ fn initial_window() -> Result<(WindowExtent, std::ffi::c_int, WindowBasis), Loop
     match plat.window_owner().source().window_state() {
         Ok(window) => Ok((window.extent, window.web_top, window.basis)),
         Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => {
-            let scale = plat.scale();
+            let scale = plat.scale().map_err(LoopStartError::WindowState)?;
             let logical = LogicalSize { w: 1280, h: 720 };
             let physical = logical.to_physical(scale).map_err(ExtentError::from)?;
             Ok((

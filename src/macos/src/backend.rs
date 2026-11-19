@@ -505,8 +505,12 @@ impl Platform for MacosPlatform {
         macos_init(mpv)
     }
 
-    fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
+    fn cleanup(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+    ) -> Result<(), jfn_platform_abi::DetachError> {
         macos_cleanup();
+        Ok(())
     }
 
     // mpv's window is gone by the time this runs and AppKit owns nothing past
@@ -594,10 +598,11 @@ impl Platform for MacosPlatform {
         macos_set_surface_visibility(s.as_ptr(), visibility)
     }
 
-    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) -> Result<(), jfn_platform_abi::StackError> {
         // `SurfaceHandle` is `#[repr(transparent)]` over `*mut c_void`, so the
         // slice pointer reinterprets directly.
         macos_apply_stack(ordered.as_ptr() as *const *mut c_void, ordered.len());
+        Ok(())
     }
 
     fn menu_delivery(&self, _kind: MenuKind) -> MenuDelivery<'_> {
@@ -648,8 +653,8 @@ impl Platform for MacosPlatform {
         None
     }
 
-    fn scale(&self) -> Scale {
-        macos_scale()
+    fn scale(&self) -> Result<Scale, jfn_platform_abi::WindowStateError> {
+        Ok(macos_scale())
     }
 
     fn display_scale(&self, at: Option<WindowPos>) -> Scale {

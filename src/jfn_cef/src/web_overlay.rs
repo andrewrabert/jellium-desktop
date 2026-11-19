@@ -169,7 +169,17 @@ impl WebOverlay {
         let Some(application_menu) = self.inner.application_menu.lock().clone() else {
             return;
         };
-        let surface = WebOverlaySurface::allocate(platform);
+        let surface = match WebOverlaySurface::allocate(platform) {
+            Ok(surface) => surface,
+            Err(e) => {
+                jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("web overlay stacking: {e}"),
+                );
+                return;
+            }
+        };
         let client = Inner::new(
             Arc::clone(&self.inner.session),
             surface,
@@ -373,7 +383,9 @@ impl WebOverlaySurface {
     pub(crate) fn platform(&self) -> &dyn jfn_platform_abi::Platform {
         self.platform.platform()
     }
-    pub(crate) fn allocate(platform: jfn_platform_abi::PlatformLease) -> Arc<WebOverlaySurface> {
+    pub(crate) fn allocate(
+        platform: jfn_platform_abi::PlatformLease,
+    ) -> Result<Arc<WebOverlaySurface>, jfn_platform_abi::StackError> {
         let surface = Arc::new(Self {
             handle: platform.platform().alloc_surface(
                 Visibility::Hidden,
@@ -382,8 +394,8 @@ impl WebOverlaySurface {
             platform,
         });
         let stacker: Arc<dyn jfn_platform_abi::stack::WebOverlayStacker> = surface.clone();
-        jfn_platform_abi::stack::install_web_overlay_stacker(Arc::downgrade(&stacker));
-        surface
+        jfn_platform_abi::stack::install_web_overlay_stacker(Arc::downgrade(&stacker))?;
+        Ok(surface)
     }
 
     pub(crate) fn set_visibility(&self, visibility: Visibility) -> Visibility {
@@ -438,20 +450,26 @@ impl jfn_platform_abi::stack::WebOverlayStacker for WebOverlaySurface {
         &self,
         lower: &[jfn_platform_abi::SurfaceHandle],
         upper: &[jfn_platform_abi::SurfaceHandle],
-    ) {
+    ) -> Result<(), jfn_platform_abi::StackError> {
         let mut ordered = Vec::with_capacity(lower.len() + upper.len() + 1);
         ordered.extend_from_slice(lower);
         if !self.handle.is_none() {
             ordered.push(self.handle);
         }
         ordered.extend_from_slice(upper);
-        self.platform.platform().apply_stack(&ordered);
+        self.platform.platform().apply_stack(&ordered)
     }
 }
 
 impl Drop for WebOverlaySurface {
     fn drop(&mut self) {
-        jfn_platform_abi::stack::remove_web_overlay_stacker();
+        if let Err(e) = jfn_platform_abi::stack::remove_web_overlay_stacker() {
+            jfn_logging::log(
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Error,
+                &format!("web overlay unstacking: {e}"),
+            );
+        }
         if !self.handle.is_none() {
             self.platform.platform().free_surface(self.handle);
         }
