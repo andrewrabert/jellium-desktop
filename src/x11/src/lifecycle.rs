@@ -440,9 +440,7 @@ pub fn init() -> Result<(), jfn_platform_abi::PlatformInitError> {
         Error::backend("X11 control connection installation", "already initialized")
     })?;
     crate::input_lifecycle::start(toplevel);
-    if let Err(e) = crate::menu::start() {
-        tracing::error!("{e}; menus disabled");
-    }
+    crate::menu::start().map_err(|e| Error::backend("X11 menu start", e))?;
     tracing::info!("X11 platform initialized (toplevel=0x{toplevel:x})");
     Ok(())
 }

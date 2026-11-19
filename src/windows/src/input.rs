@@ -361,11 +361,15 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 CursorShape::from_cef(STATE.lock().cursor_type).unwrap_or(CursorShape::Pointer);
             if shape == CursorShape::None {
                 unsafe { SetCursor(None) };
-            } else {
-                let cur = unsafe { LoadCursorW(None, cef_cursor_to_win(shape)).ok() };
-                unsafe { SetCursor(cur) };
+                return LRESULT(1);
             }
-            return LRESULT(1);
+            match unsafe { LoadCursorW(None, cef_cursor_to_win(shape)) } {
+                Ok(cur) => {
+                    unsafe { SetCursor(Some(cur)) };
+                    return LRESULT(1);
+                }
+                Err(e) => tracing::error!(target: "platform", "cursor {shape:?}: {e}"),
+            }
         }
 
         WM_NCCREATE => {
@@ -479,8 +483,9 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 x: get_x_lparam(lp),
                 y: get_y_lparam(lp),
             };
-            unsafe {
-                let _ = ScreenToClient(hwnd, &mut pt);
+            if let Err(e) = unsafe { ScreenToClient(hwnd, &mut pt) }.ok() {
+                tracing::error!(target: "platform", "mouse wheel dropped: ScreenToClient: {e}");
+                return LRESULT(0);
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
             match view_point(pt.x, pt.y) {
@@ -495,8 +500,9 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 x: get_x_lparam(lp),
                 y: get_y_lparam(lp),
             };
-            unsafe {
-                let _ = ScreenToClient(hwnd, &mut pt);
+            if let Err(e) = unsafe { ScreenToClient(hwnd, &mut pt) }.ok() {
+                tracing::error!(target: "platform", "mouse wheel dropped: ScreenToClient: {e}");
+                return LRESULT(0);
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
             match view_point(pt.x, pt.y) {

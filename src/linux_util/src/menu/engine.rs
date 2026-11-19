@@ -40,6 +40,8 @@ pub enum MenuInputEvent {
 pub enum MenuSpawnError {
     #[error("menu render thread spawn: {0}")]
     Thread(#[source] std::io::Error),
+    #[error("menu popup thread spawn: {0}")]
+    PopupThread(#[source] std::io::Error),
 }
 
 pub struct SoftwareMenu {

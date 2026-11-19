@@ -531,7 +531,7 @@ pub trait Platform: Send + Sync {
     /// sink.
     fn media_session(&self) -> &dyn MediaSink;
 
-    fn cef_paths(&self) -> CefPaths;
+    fn cef_paths(&self) -> std::io::Result<CefPaths>;
 
     // Fullscreen
     /// Observed mpv native-window replacement. Hosts with an app-owned window

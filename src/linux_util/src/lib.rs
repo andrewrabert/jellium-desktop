@@ -19,8 +19,8 @@ pub mod xkb;
 
 use jfn_platform_abi::{CefPaths, WindowDecorations};
 
-pub fn cef_paths() -> CefPaths {
-    let exe = std::fs::canonicalize("/proc/self/exe").unwrap_or_default();
+pub fn cef_paths() -> std::io::Result<CefPaths> {
+    let exe = std::fs::canonicalize("/proc/self/exe")?;
     let res_dir = option_env!("CEF_RESOURCES_DIR")
         .map(str::to_string)
         .unwrap_or_else(|| {
@@ -28,12 +28,12 @@ pub fn cef_paths() -> CefPaths {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default()
         });
-    CefPaths {
+    Ok(CefPaths {
         browser_subprocess_path: Some(exe),
         resources_dir_path: Some(std::path::PathBuf::from(&res_dir)),
         locales_dir_path: Some(std::path::PathBuf::from(format!("{res_dir}/locales"))),
         ..Default::default()
-    }
+    })
 }
 
 /// Default *preference*: KDE draws its own server-side decorations and lets

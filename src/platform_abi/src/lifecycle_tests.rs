@@ -91,7 +91,7 @@ impl Platform for Backend {
     fn media_session(&self) -> &dyn MediaSink {
         unreachable!("lifecycle test never calls this platform operation")
     }
-    fn cef_paths(&self) -> CefPaths {
+    fn cef_paths(&self) -> std::io::Result<CefPaths> {
         unreachable!("lifecycle test never calls this platform operation")
     }
     fn set_fullscreen(&self, v: bool) {

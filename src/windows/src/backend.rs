@@ -329,17 +329,18 @@ impl Platform for WindowsPlatform {
         &SmtcSink
     }
 
-    fn cef_paths(&self) -> jfn_platform_abi::CefPaths {
-        let exe = std::env::current_exe()
-            .and_then(std::fs::canonicalize)
-            .unwrap_or_default();
-        let dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        jfn_platform_abi::CefPaths {
+    fn cef_paths(&self) -> std::io::Result<jfn_platform_abi::CefPaths> {
+        let exe = std::env::current_exe().and_then(std::fs::canonicalize)?;
+        let dir = exe
+            .parent()
+            .ok_or_else(|| std::io::Error::other("the executable path has no parent"))?
+            .to_path_buf();
+        Ok(jfn_platform_abi::CefPaths {
             browser_subprocess_path: Some(exe),
             resources_dir_path: Some(dir.clone()),
             locales_dir_path: Some(dir.join("locales")),
             ..Default::default()
-        }
+        })
     }
 
     fn on_window_handle_changed(&self, id: i64) {

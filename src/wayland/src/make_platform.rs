@@ -200,7 +200,7 @@ impl Platform for WaylandPlatform {
         &jfn_mpris::MprisSink
     }
 
-    fn cef_paths(&self) -> jfn_platform_abi::CefPaths {
+    fn cef_paths(&self) -> std::io::Result<jfn_platform_abi::CefPaths> {
         jfn_linux_util::cef_paths()
     }
 
