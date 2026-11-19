@@ -1,27 +1,29 @@
 use std::thread::JoinHandle;
 
 use jfn_platform_abi::{
-    MpvCreatedWindow, PhysicalSize, Scale, WindowExtent, WindowPos, WindowSource, WindowState,
-    WindowStateError, notify_window_changed,
+    MpvCreatedWindow, PhysicalSize, Scale, WindowExtent, WindowPlacement, WindowPos, WindowSource,
+    WindowState, WindowStateError, notify_window_changed,
 };
 use parking_lot::{Condvar, Mutex};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow,
-};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::UI::HiDpi::{
     GetAwarenessFromDpiAwarenessContext, GetDpiForWindow, GetThreadDpiAwarenessContext,
     GetWindowDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsZoomed};
 
+use crate::monitor::Monitor;
 use crate::scale::ClientExtentError;
 
-#[derive(Clone, Copy)]
+struct Sample {
+    state: WindowState,
+    placement: WindowPlacement,
+}
+
 enum Stored {
     Unsampled,
-    Sampled(WindowState),
+    Sampled(Sample),
 }
 
 static WINDOW_STATE: Mutex<Stored> = Mutex::new(Stored::Unsampled);
@@ -111,16 +113,20 @@ pub(crate) fn sample() -> Result<Option<PhysicalSize>, WindowStateError> {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let extent = crate::scale::extent(client, dpi)?;
     let fullscreen = crate::platform::win_is_fullscreen();
+    let placement = window_placement(hwnd)?;
     let state = WindowState {
         extent,
-        position: Some(window_position(hwnd)?),
+        position: Some(placement.position()),
         maximized: !fullscreen && unsafe { IsZoomed(hwnd) }.as_bool(),
         fullscreen,
         web_top: 0,
         basis: jfn_platform_abi::WindowBasis::FIXED,
     };
-    let previous = std::mem::replace(&mut *WINDOW_STATE.lock(), Stored::Sampled(state));
-    if !matches!(previous, Stored::Sampled(p) if p.extent == extent) {
+    let previous = std::mem::replace(
+        &mut *WINDOW_STATE.lock(),
+        Stored::Sampled(Sample { state, placement }),
+    );
+    if !matches!(previous, Stored::Sampled(p) if p.state.extent == extent) {
         log_sample(hwnd, dpi, extent);
     }
     Ok(Some(client))
@@ -129,22 +135,20 @@ pub(crate) fn sample() -> Result<Option<PhysicalSize>, WindowStateError> {
 /// Window position relative to the monitor's working area (excludes the
 /// taskbar), in physical pixels. Matches mpv's `--geometry +X+Y` coordinate
 /// system on Windows (`vo_calc_window_geometry` uses the working area).
-fn window_position(hwnd: HWND) -> Result<WindowPos, WindowStateError> {
+fn window_placement(hwnd: HWND) -> Result<WindowPlacement, WindowStateError> {
     let mut wr = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut wr) }
         .map_err(|e| WindowStateError::WindowRect(e.code().0))?;
-    let mon: HMONITOR = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    let mut mi = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe { GetMonitorInfoW(mon, &mut mi) }
-        .ok()
+    let monitor = Monitor::of(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
         .map_err(|e| WindowStateError::MonitorInfo(e.code().0))?;
-    Ok(WindowPos {
-        x: wr.left - mi.rcWork.left,
-        y: wr.top - mi.rcWork.top,
-    })
+    let work = monitor.work_area();
+    Ok(WindowPlacement::new(
+        monitor.name(),
+        WindowPos {
+            x: wr.left - work.left,
+            y: wr.top - work.top,
+        },
+    ))
 }
 
 /// The client size, the client origin in screen coordinates, the window rect,
@@ -189,13 +193,20 @@ pub(crate) fn publish_deferred() -> Result<Option<PhysicalSize>, WindowStateErro
 }
 
 pub(crate) fn stored_window_state() -> Result<WindowState, WindowStateError> {
-    if let Stored::Sampled(state) = *WINDOW_STATE.lock() {
-        return Ok(state);
+    read_stored(|stored| stored.state)
+}
+
+pub(crate) fn stored_window_placement() -> Result<WindowPlacement, WindowStateError> {
+    read_stored(|stored| stored.placement.clone())
+}
+
+fn read_stored<T>(read: impl Fn(&Sample) -> T) -> Result<T, WindowStateError> {
+    if let Stored::Sampled(stored) = &*WINDOW_STATE.lock() {
+        return Ok(read(stored));
     }
     sample()?;
-    let stored = *WINDOW_STATE.lock();
-    match stored {
-        Stored::Sampled(state) => Ok(state),
+    match &*WINDOW_STATE.lock() {
+        Stored::Sampled(stored) => Ok(read(stored)),
         Stored::Unsampled => Err(WindowStateError::NoWindow),
     }
 }
@@ -219,6 +230,10 @@ pub(crate) static WIN_WINDOW_SOURCE: WinWindowSource = WinWindowSource;
 impl WindowSource for WinWindowSource {
     fn window_state(&self) -> Result<WindowState, WindowStateError> {
         stored_window_state()
+    }
+
+    fn window_placement(&self) -> Result<Option<WindowPlacement>, WindowStateError> {
+        Ok(Some(stored_window_placement()?))
     }
 }
 

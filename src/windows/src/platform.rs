@@ -28,13 +28,16 @@ use jfn_mpv::api::{
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_platform_abi::WindowStateError;
-use jfn_platform_abi::geometry::{Bounds, ClampError, WindowGeometry, clamp_to_bounds};
+use jfn_platform_abi::geometry::{
+    Bounds, ClampError, PlacedGeometry, WindowGeometry, clamp_to_screen,
+};
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 
 use crate::input::{
     jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
     jfn_input_windows_stop_input_thread,
 };
+use crate::monitor::Monitor;
 
 struct WinState {
     mpv_hwnd_raw: usize,
@@ -359,9 +362,11 @@ pub(crate) fn win_cleanup() -> Result<(), crate::window::NotifierPanicked> {
     notifier
 }
 
-pub(crate) fn win_clamp_window_geometry(
-    mut g: WindowGeometry,
-) -> Result<WindowGeometry, ClampError> {
+pub(crate) fn win_clamp_window_geometry(g: &WindowGeometry) -> Result<PlacedGeometry, ClampError> {
+    clamp_to_screen(g, Monitor::find, || primary_work_bounds().map(Some))
+}
+
+fn primary_work_bounds() -> Result<Bounds, ClampError> {
     let mut work = RECT::default();
     unsafe {
         SystemParametersInfoW(
@@ -374,6 +379,5 @@ pub(crate) fn win_clamp_window_geometry(
     .map_err(|e| ClampError::WorkArea(e.code().0))?;
     let vw = work.right - work.left;
     let vh = work.bottom - work.top;
-    clamp_to_bounds(&mut g, Bounds { w: vw, h: vh });
-    Ok(g)
+    Ok(Bounds { w: vw, h: vh })
 }

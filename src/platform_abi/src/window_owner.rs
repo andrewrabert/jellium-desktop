@@ -3,7 +3,7 @@
 //! boot, and which [`WindowSource`] is authoritative.
 
 use crate::geometry::{
-    BootGeometry, LogicalSize, PhysicalSize, Scale, Unrepresentable, mpv_reconcile_size,
+    BootGeometry, LogicalSize, MpvScreen, PhysicalSize, Scale, Unrepresentable, mpv_reconcile_size,
 };
 use crate::window_source::WindowSource;
 
@@ -23,6 +23,7 @@ pub struct MpvBootWindow {
     /// mpv's `--geometry`, physical pixels.
     pub geometry: String,
     pub force_position: bool,
+    pub screen: Option<MpvScreen>,
     pub maximized: bool,
 }
 
@@ -62,6 +63,7 @@ impl<'src> WindowOwner<'src> {
             WindowOwner::Mpv(_) => Some(MpvBootWindow {
                 geometry: g.mpv_geometry_string(),
                 force_position: g.force_position(),
+                screen: g.mpv_screen().cloned(),
                 maximized: g.maximized(),
             }),
         }
@@ -86,7 +88,10 @@ impl<'src> WindowOwner<'src> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{COVERED_SCALES, WindowGeometry, WindowPos};
+    use crate::geometry::{
+        Bounds, COVERED_SCALES, ClampError, ScreenName, TargetScreen, WindowGeometry,
+        WindowPlacement, WindowPos, clamp_to_screen,
+    };
     use crate::window_source::{WindowState, WindowStateError};
     use parking_lot::Mutex;
 
@@ -110,7 +115,7 @@ mod tests {
 
     impl AppCreatedWindow for SeedingWindow {
         fn seed_boot_geometry(&self, g: &BootGeometry) {
-            self.seeded.lock().push(*g);
+            self.seeded.lock().push(g.clone());
         }
     }
 
@@ -137,10 +142,46 @@ mod tests {
             WindowGeometry {
                 w: physical.w,
                 h: physical.h,
-                position,
-            },
+                placement: position.map(|p| WindowPlacement::new(None, p)),
+            }
+            .on_primary(),
             maximized,
         ))
+    }
+
+    #[test]
+    fn an_mpv_owner_hands_mpv_the_screen_the_clamp_named() -> Result<(), ClampError> {
+        let saved = WindowGeometry {
+            w: 1280,
+            h: 720,
+            placement: Some(WindowPlacement::new(
+                ScreenName::new("DISPLAY2".to_owned()),
+                WindowPos { x: 100, y: 50 },
+            )),
+        };
+        let clamped = clamp_to_screen(
+            &saved,
+            |name| {
+                Ok(Some(TargetScreen {
+                    mpv: MpvScreen::Name(name.clone()),
+                    bounds: Bounds { w: 2560, h: 1440 },
+                }))
+            },
+            || Ok(None),
+        )?;
+        let logical = LogicalSize { w: 1280, h: 720 };
+        let g = BootGeometry::from_clamped(logical, Scale::ONE, clamped, false);
+        let handed = WindowOwner::Mpv(&MpvWindow)
+            .apply_boot_geometry(&g)
+            .map(|w| (w.geometry, w.screen));
+        assert_eq!(
+            handed,
+            Some((
+                "1280x720+100+50".to_owned(),
+                ScreenName::new("DISPLAY2".to_owned()).map(MpvScreen::Name)
+            ))
+        );
+        Ok(())
     }
 
     #[test]

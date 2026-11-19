@@ -174,21 +174,21 @@ impl Platform for X11Platform {
         WindowOwner::App(&crate::window_source::X11_WINDOW_SOURCE)
     }
 
-    fn window_position(&self) -> Result<Option<WindowPos>, jfn_platform_abi::WindowStateError> {
+    fn window_position(
+        &self,
+    ) -> Result<Option<jfn_platform_abi::WindowPlacement>, jfn_platform_abi::WindowStateError> {
         use jfn_platform_abi::WindowSource as _;
-        Ok(crate::window_source::X11_WINDOW_SOURCE
-            .window_state()?
-            .position)
+        crate::window_source::X11_WINDOW_SOURCE.window_placement()
     }
 
     /// X11 constrains only the size; position is left to the WM.
     fn clamp_window_geometry(
         &self,
-        g: WindowGeometry,
-    ) -> Result<WindowGeometry, jfn_platform_abi::geometry::ClampError> {
+        g: &WindowGeometry,
+    ) -> Result<jfn_platform_abi::PlacedGeometry, jfn_platform_abi::geometry::ClampError> {
         Ok(match crate::lifecycle::screen_bounds() {
             Some(bounds) => jfn_platform_abi::geometry::clamp_size_to_bounds(g, bounds),
-            None => g,
+            None => g.on_primary(),
         })
     }
 

@@ -221,9 +221,9 @@ impl Platform for WaylandPlatform {
     // constrains saved geometry
     fn clamp_window_geometry(
         &self,
-        g: jfn_platform_abi::WindowGeometry,
-    ) -> Result<jfn_platform_abi::WindowGeometry, jfn_platform_abi::geometry::ClampError> {
-        Ok(g)
+        g: &jfn_platform_abi::WindowGeometry,
+    ) -> Result<jfn_platform_abi::PlacedGeometry, jfn_platform_abi::geometry::ClampError> {
+        Ok(g.on_primary())
     }
 
     // the Wayland event loop runs on its own thread; the app main thread has
@@ -269,7 +269,7 @@ impl Platform for WaylandPlatform {
     // the compositor tells no client where its window is
     fn window_position(
         &self,
-    ) -> Result<Option<jfn_platform_abi::WindowPos>, jfn_platform_abi::WindowStateError> {
+    ) -> Result<Option<jfn_platform_abi::WindowPlacement>, jfn_platform_abi::WindowStateError> {
         Ok(None)
     }
 

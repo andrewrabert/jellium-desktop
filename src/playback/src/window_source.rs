@@ -2,7 +2,9 @@
 //! ingest extent cell that mpv's property observations feed. Windows and X11
 //! have their own sources.
 
-use jfn_platform_abi::{MpvCreatedWindow, WindowSource, WindowState, WindowStateError};
+use jfn_platform_abi::{
+    MpvCreatedWindow, WindowPlacement, WindowSource, WindowState, WindowStateError,
+};
 
 pub struct MpvWindowSource;
 
@@ -16,12 +18,17 @@ impl WindowSource for MpvWindowSource {
         let lease = jfn_platform_abi::try_lease().ok_or(WindowStateError::NoPlatform)?;
         Ok(WindowState {
             extent,
-            position: lease.platform().window_position()?,
+            position: lease.platform().window_position()?.map(|p| p.position()),
             maximized: crate::ingest_driver::jfn_playback_window_maximized(),
             fullscreen: crate::ingest_driver::jfn_playback_fullscreen(),
             web_top: 0,
             basis: jfn_platform_abi::WindowBasis::FIXED,
         })
+    }
+
+    fn window_placement(&self) -> Result<Option<WindowPlacement>, WindowStateError> {
+        let lease = jfn_platform_abi::try_lease().ok_or(WindowStateError::NoPlatform)?;
+        lease.platform().window_position()
     }
 }
 

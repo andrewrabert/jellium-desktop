@@ -1,6 +1,7 @@
 //! macOS `Platform` backend.
 
 pub mod scale;
+pub mod screen;
 
 #[cfg(target_os = "macos")]
 mod backend;

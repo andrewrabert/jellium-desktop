@@ -177,7 +177,8 @@ fn win_open_external_url(url: &str) {
 }
 
 use jfn_platform_abi::{
-    IdleInhibitLevel, MenuDelivery, MenuKind, OnText, SurfaceHandle, WindowGeometry, WindowPos,
+    IdleInhibitLevel, MenuDelivery, MenuKind, OnText, PlacedGeometry, SurfaceHandle,
+    WindowGeometry, WindowPlacement, WindowPos,
 };
 
 /// SMTC-backed [`jfn_platform_abi::MediaSink`].
@@ -377,14 +378,16 @@ impl Platform for WindowsPlatform {
         jfn_platform_abi::WindowOwner::Mpv(&crate::window::WIN_WINDOW_SOURCE)
     }
 
-    fn window_position(&self) -> Result<Option<WindowPos>, jfn_platform_abi::WindowStateError> {
-        Ok(crate::window::stored_window_state()?.position)
+    fn window_position(
+        &self,
+    ) -> Result<Option<WindowPlacement>, jfn_platform_abi::WindowStateError> {
+        Ok(Some(crate::window::stored_window_placement()?))
     }
 
     fn clamp_window_geometry(
         &self,
-        g: WindowGeometry,
-    ) -> Result<WindowGeometry, jfn_platform_abi::geometry::ClampError> {
+        g: &WindowGeometry,
+    ) -> Result<PlacedGeometry, jfn_platform_abi::geometry::ClampError> {
         win_clamp_window_geometry(g)
     }
 

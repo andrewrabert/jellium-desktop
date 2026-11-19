@@ -13,7 +13,9 @@ use jfn_cef::{APP_VERSION_FULL, BrowserCef, InitializedCef, LoadedCef, ProcessDi
 use jfn_instance_ipc::jfn::{Request, Response};
 use jfn_instance_ipc::{Listener, Start, Stream};
 use jfn_logging::{Category, Level};
-use jfn_platform_abi::{IdleInhibitLevel, Instance, Platform, WindowGeometry, WindowStateError};
+use jfn_platform_abi::{
+    IdleInhibitLevel, Instance, MpvScreen, Platform, WindowGeometry, WindowStateError,
+};
 
 use crate::cli;
 
@@ -235,6 +237,7 @@ struct MpvInitOptions<'a> {
     backend_byte: u8,
     boot_geometry: Option<&'a str>,
     boot_force_position: bool,
+    boot_screen: Option<&'a MpvScreen>,
     boot_window_max: bool,
     embed_wid: Option<i64>,
     hwdec: jfn_config::Hwdec,
@@ -246,6 +249,11 @@ struct MpvInitOptions<'a> {
 
 fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
     let geometry_c = opts.boot_geometry.map(cs);
+    let screen = match opts.boot_screen {
+        Some(MpvScreen::Index(index)) => jfn_mpv::boot::BootScreen::Index(*index),
+        Some(MpvScreen::Name(name)) => jfn_mpv::boot::BootScreen::Name(name.as_str().to_owned()),
+        None => jfn_mpv::boot::BootScreen::Default,
+    };
     let hwdec_c = cs(opts.hwdec.as_str());
     let user_agent_c = cs(&format!("JelliumDesktop/{}", APP_VERSION_FULL));
     let passthrough_c = cs(opts.audio_passthrough);
@@ -269,6 +277,7 @@ fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
         geometry: geometry_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
         wid: opts.embed_wid.unwrap_or(0),
         force_window_position: opts.boot_force_position,
+        screen,
         window_maximized_at_boot: opts.boot_window_max,
         mpv_log_level: mpv_log_level_c.as_ptr(),
         client_side_decorations: jfn_config::client_side_decorations(),
@@ -804,10 +813,10 @@ fn boot_mpv_reconcile(hz: f64) -> Result<(), MpvReconcileError> {
             .window_owner()
             .reconcile_mpv_size(plat().scale(), logical, physical, locked)?;
     if let Some(resized) = reconciled {
-        let clamped = plat().clamp_window_geometry(WindowGeometry {
+        let clamped = plat().clamp_window_geometry(&WindowGeometry {
             w: resized.w,
             h: resized.h,
-            position: None,
+            placement: saved.placement,
         })?;
         let (new_pw, new_ph) = (clamped.w, clamped.h);
         let geom_str = format!("{new_pw}x{new_ph}");
@@ -1012,8 +1021,9 @@ fn run_app(
     // hit the real server, not the mpv proxy the prepare may install.
     let boot = match crate::window_geometry::controller().boot() {
         Ok(boot) => boot,
-        Err(e @ crate::window_geometry::BootGeometryError::Clamp { unclamped, .. }) => {
-            tracing::error!(target: "Main", "boot geometry: {e}; the saved geometry stands");
+        Err(crate::window_geometry::BootGeometryError::Clamp { error, unclamped }) => {
+            tracing::error!(target: "Main",
+                "boot geometry: not clamped on-screen: {error}; the saved geometry stands");
             unclamped
         }
         Err(e) => {
@@ -1044,6 +1054,7 @@ fn run_app(
         backend_byte,
         boot_geometry: mpv_boot.as_ref().map(|w| w.geometry.as_str()),
         boot_force_position: mpv_boot.as_ref().is_some_and(|w| w.force_position),
+        boot_screen: mpv_boot.as_ref().and_then(|w| w.screen.as_ref()),
         boot_window_max: mpv_boot.as_ref().is_some_and(|w| w.maximized),
         embed_wid: plat().mpv_host().embed_wid(),
         hwdec: opts.hwdec,

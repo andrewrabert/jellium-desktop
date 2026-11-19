@@ -1,5 +1,7 @@
 use jfn_mailbox::Mailbox;
-use jfn_platform_abi::{LogicalSize, PhysicalSize, WindowDecorations, WindowPos};
+use jfn_platform_abi::{
+    LogicalSize, PhysicalSize, ScreenName, WindowDecorations, WindowPlacement, WindowPos,
+};
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -14,11 +16,11 @@ pub use hardware_decode::{HWDEC_DEFAULT, Hwdec, UnknownHwdec, hwdec_options};
 
 const DEVICE_NAME_MAX: usize = 64;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct JfnWindowGeometry {
     pub logical: Option<LogicalSize>,
     pub physical: Option<PhysicalSize>,
-    pub position: Option<WindowPos>,
+    pub placement: Option<WindowPlacement>,
     pub maximized: bool,
 }
 
@@ -84,6 +86,9 @@ struct SettingsFile {
 
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     window_y: Option<i32>,
+
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    window_screen: Option<String>,
 
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     window_maximized: Option<bool>,
@@ -240,12 +245,19 @@ impl SettingsData {
                 self.window.logical = None;
             }
         }
+        let screen = file.window_screen.and_then(ScreenName::new);
         match (file.window_x, file.window_y) {
-            (None, None) => {}
-            (Some(x), Some(y)) => self.window.position = Some(WindowPos { x, y }),
+            (None, None) => {
+                if screen.is_some() {
+                    eprintln!("[config] windowScreen ignored: no windowX/windowY is saved");
+                }
+            }
+            (Some(x), Some(y)) => {
+                self.window.placement = Some(WindowPlacement::new(screen, WindowPos { x, y }));
+            }
             (Some(_), None) | (None, Some(_)) => {
                 eprintln!("[config] windowX/windowY ignored: only one is saved");
-                self.window.position = None;
+                self.window.placement = None;
             }
         }
         if let Some(v) = file.window_maximized {
@@ -278,8 +290,14 @@ impl SettingsData {
             window_height: self.window.physical.map(|s| s.h),
             window_logical_width: self.window.logical.map(|s| s.w),
             window_logical_height: self.window.logical.map(|s| s.h),
-            window_x: self.window.position.map(|p| p.x),
-            window_y: self.window.position.map(|p| p.y),
+            window_x: self.window.placement.as_ref().map(|p| p.position().x),
+            window_y: self.window.placement.as_ref().map(|p| p.position().y),
+            window_screen: self
+                .window
+                .placement
+                .as_ref()
+                .and_then(WindowPlacement::screen)
+                .map(|s| s.as_str().to_owned()),
             window_maximized: Some(self.window.maximized),
             hwdec: (self.hwdec != Hwdec::default()).then_some(self.hwdec),
             audio_passthrough: (!self.audio_passthrough.is_empty())
@@ -583,7 +601,7 @@ pub fn titlebar_theme_color() -> bool {
 bool_accessors!(hide_scrollbar, set_hide_scrollbar, hide_scrollbar);
 
 pub fn window_geometry() -> JfnWindowGeometry {
-    state().lock().data.window
+    state().lock().data.window.clone()
 }
 
 pub fn set_window_geometry(g: JfnWindowGeometry) {
@@ -625,8 +643,8 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LogicalSize, PhysicalSize, SettingsData, SettingsFile, WindowDecorations, WindowPos,
-        default_device_name, normalize_device_name,
+        LogicalSize, PhysicalSize, ScreenName, SettingsData, SettingsFile, WindowDecorations,
+        WindowPlacement, WindowPos, default_device_name, normalize_device_name,
     };
 
     const PLATFORM: &str = "platform-host";
@@ -689,7 +707,10 @@ mod tests {
             window: super::JfnWindowGeometry {
                 logical: Some(LogicalSize { w: 5, h: 6 }),
                 physical: Some(PhysicalSize { w: 3, h: 4 }),
-                position: Some(WindowPos { x: 1, y: 2 }),
+                placement: Some(WindowPlacement::new(
+                    ScreenName::new("DISPLAY2".into()),
+                    WindowPos { x: 1, y: 2 },
+                )),
                 maximized: true,
             },
             audio_exclusive: true,
@@ -710,6 +731,7 @@ mod tests {
                 "windowLogicalHeight",
                 "windowX",
                 "windowY",
+                "windowScreen",
                 "windowMaximized",
                 "hwdec",
                 "audioPassthrough",
@@ -733,7 +755,7 @@ mod tests {
         assert_eq!(data.server_url, "http://host");
         assert!(data.transparent_titlebar);
         assert!(data.hide_scrollbar);
-        assert_eq!(data.window.position, None);
+        assert_eq!(data.window.placement, None);
     }
 
     #[test]
@@ -793,9 +815,57 @@ mod tests {
     #[test]
     fn a_negative_window_position_round_trips() {
         let data = loaded(r#"{"windowX":-1920,"windowY":-40}"#);
-        assert_eq!(data.window.position, Some(WindowPos { x: -1920, y: -40 }));
+        assert_eq!(
+            data.window.placement,
+            Some(WindowPlacement::new(None, WindowPos { x: -1920, y: -40 }))
+        );
         let text = serde_json::to_string(&data.to_file()).expect("serializes");
         assert!(text.contains(r#""windowX":-1920,"windowY":-40"#));
+        assert!(!text.contains("windowScreen"));
+    }
+
+    #[test]
+    fn a_window_screen_round_trips_with_its_position() {
+        let data = loaded(r#"{"windowX":100,"windowY":50,"windowScreen":"\\\\.\\DISPLAY2"}"#);
+        let expected = Some(WindowPlacement::new(
+            ScreenName::new(r"\\.\DISPLAY2".into()),
+            WindowPos { x: 100, y: 50 },
+        ));
+        assert_eq!(data.window.placement, expected);
+        let text = serde_json::to_string(&data.to_file()).expect("serializes");
+        assert!(text.contains(r#""windowX":100,"windowY":50,"windowScreen":"\\\\.\\DISPLAY2""#));
+        assert_eq!(loaded(&text).window.placement, expected);
+    }
+
+    #[test]
+    fn an_absent_or_empty_window_screen_names_the_primary() {
+        for json in [
+            r#"{"windowX":100,"windowY":50}"#,
+            r#"{"windowX":100,"windowY":50,"windowScreen":""}"#,
+            r#"{"windowX":100,"windowY":50,"windowScreen":7}"#,
+        ] {
+            let data = loaded(json);
+            assert_eq!(
+                data.window.placement,
+                Some(WindowPlacement::new(None, WindowPos { x: 100, y: 50 })),
+                "{json}"
+            );
+            let text = serde_json::to_string(&data.to_file()).expect("serializes");
+            assert!(!text.contains("windowScreen"), "{json}");
+        }
+    }
+
+    #[test]
+    fn a_window_screen_without_a_position_is_ignored() {
+        for json in [
+            r#"{"windowScreen":"DISPLAY2"}"#,
+            r#"{"windowX":100,"windowScreen":"DISPLAY2"}"#,
+        ] {
+            let data = loaded(json);
+            assert_eq!(data.window.placement, None, "{json}");
+            let text = serde_json::to_string(&data.to_file()).expect("serializes");
+            assert!(!text.contains("windowScreen"), "{json}");
+        }
     }
 
     #[test]
