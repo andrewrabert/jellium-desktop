@@ -301,8 +301,10 @@ impl WindowState {
     }
 
     fn published(rt: &'static WlRuntime, fullscreen: bool, changed: bool) {
-        if rt.try_core().is_some() {
-            wl_ops::on_configure(rt, fullscreen);
+        if rt.try_core().is_some()
+            && let Err(e) = wl_ops::on_configure(rt, fullscreen)
+        {
+            tracing::error!(target: "Main", "window state published: {e}; left unplaced");
         }
         jfn_platform_abi::notify_window_changed();
         if changed && let Some(menu) = rt.menu() {

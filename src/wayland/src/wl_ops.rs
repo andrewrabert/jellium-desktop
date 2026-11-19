@@ -74,8 +74,10 @@ pub(crate) fn alloc_surface(
     s.layer_actor = Some(build_actor(rt, &st, &surface, &viewport, s.visibility));
     s.surface = Some(SurfaceRef::new(surface, viewport));
     crate::wl_state::parent_layer(&mut st, ptr);
-    if let Some(extent) = rt.window().window_extent() {
-        place(s, extent);
+    if let Some(extent) = rt.window().window_extent()
+        && let Err(e) = place(s, extent)
+    {
+        tracing::error!(target: "Main", "new surface: {e}; left unplaced");
     }
 
     crate::scene::dispatch(
@@ -130,23 +132,26 @@ pub(crate) fn free_surface(rt: &'static WlRuntime, ptr: *mut PlatformSurface) {
 }
 
 /// Applies the whole order, bottom first, replacing whatever was applied before.
-pub(crate) fn restack(rt: &'static WlRuntime, ordered: &[*mut PlatformSurface]) {
-    let Some(mut st) = core(rt) else { return };
+pub(crate) fn restack(
+    rt: &'static WlRuntime,
+    ordered: &[*mut PlatformSurface],
+) -> Result<(), PlaceError> {
+    let Some(mut st) = core(rt) else {
+        return Ok(());
+    };
     st.stack.clear();
     st.stack.extend_from_slice(ordered);
-    if let Some(extent) = rt.window().window_extent() {
-        for &p in ordered {
-            if !p.is_null() {
-                place(unsafe { surface_mut(p) }, extent);
-            }
-        }
-    }
+    let placed = match rt.window().window_extent() {
+        Some(extent) => place_all(ordered, extent),
+        None => Ok(()),
+    };
     let order: Vec<crate::scene::LayerId> = ordered
         .iter()
         .filter(|p| !p.is_null())
         .map(|p| crate::scene::LayerId(*p as usize))
         .collect();
     crate::scene::dispatch(rt, &mut st, crate::scene::SceneEvent::Order(order));
+    placed
 }
 
 // =====================================================================
@@ -215,14 +220,15 @@ fn covered(
     })
 }
 
-fn place(s: &PlatformSurface, extent: crate::window_state::PublishedWindow) {
-    let c = match covered(s, extent) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(target: "Main", "surface top: {e}; left unplaced");
-            return;
-        }
-    };
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+#[error("surface top: {0}")]
+pub(crate) struct PlaceError(#[from] jfn_platform_abi::Unrepresentable);
+
+fn place(
+    s: &PlatformSurface,
+    extent: crate::window_state::PublishedWindow,
+) -> Result<(), PlaceError> {
+    let c = covered(s, extent)?;
     if let Some(sub) = s.subsurface.as_ref() {
         sub.set_position(0, c.top);
     }
@@ -232,6 +238,21 @@ fn place(s: &PlatformSurface, extent: crate::window_state::PublishedWindow) {
     if let Some(actor) = s.layer_actor.as_ref() {
         actor.resize(c.lw, c.lh, c.pw, c.ph);
     }
+    Ok(())
+}
+
+fn place_all(
+    surfaces: &[*mut PlatformSurface],
+    extent: crate::window_state::PublishedWindow,
+) -> Result<(), PlaceError> {
+    let mut placed = Ok(());
+    for &p in surfaces.iter().filter(|p| !p.is_null()) {
+        let result = place(unsafe { surface_mut(p) }, extent);
+        if placed.is_ok() {
+            placed = result;
+        }
+    }
+    placed
 }
 
 /// Marks the surface external, desynchronizes it, and hands back its swapchain
@@ -394,23 +415,21 @@ pub(crate) fn present<'a>(
     }))
 }
 
-pub(crate) fn on_configure(rt: &'static WlRuntime, fullscreen: bool) {
+pub(crate) fn on_configure(rt: &'static WlRuntime, fullscreen: bool) -> Result<(), PlaceError> {
     let Some(ext) = rt.window().window_extent() else {
-        return;
+        return Ok(());
     };
 
-    let Some(mut st) = core(rt) else { return };
+    let Some(mut st) = core(rt) else {
+        return Ok(());
+    };
 
     st.was_fullscreen = fullscreen;
 
     crate::wl_state::ensure_root_locked(rt, &mut st);
 
-    for &p in &st.stack {
-        if p.is_null() {
-            continue;
-        }
-        place(unsafe { surface_mut(p) }, ext);
-    }
+    let placed = place_all(&st.stack, ext);
 
     st.flush();
+    placed
 }
