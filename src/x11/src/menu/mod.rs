@@ -17,10 +17,11 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::rust_connection::RustConnection;
 
-use jfn_linux_util::menu::{MenuInputEvent, MenuPoint, SoftwareMenu};
+use jfn_linux_util::menu::{MenuInputEvent, MenuPoint, MenuSpawnError, SoftwareMenu};
 use jfn_platform_abi::{
-    Generation, MenuClose, MenuHost, MenuMetrics, MenuPaint, MenuPlacement, PhysicalSize,
-    PopupSurface, Unrepresentable, WindowBasis, WindowPoint,
+    Generation, MENU_DISMISSED, MenuClose, MenuHandle, MenuHost, MenuMetrics, MenuOpenError,
+    MenuPaint, MenuPlacement, MenuRequest, MenuShutdownError, PhysicalSize, PopupSurface,
+    Unrepresentable, WindowBasis, WindowPoint,
 };
 
 use crate::conn_source::X11Source;
@@ -46,18 +47,45 @@ enum BuildError {
     GcId(#[source] ReplyOrIdError),
 }
 
-pub fn warm() {
-    host().warm();
+pub fn start() -> Result<(), MenuSpawnError> {
+    if MENU.get().is_some() {
+        return Ok(());
+    }
+    let surface = Arc::new(X11PopupSurface {
+        tx: Mutex::new(None),
+    });
+    spawn_popup(&surface);
+    let menu = SoftwareMenu::spawn(surface)?;
+    MENU.get_or_init(|| menu).warm();
+    Ok(())
 }
 
-pub fn host() -> &'static SoftwareMenu {
-    MENU.get_or_init(|| {
-        let surface = Arc::new(X11PopupSurface {
-            tx: Mutex::new(None),
-        });
-        spawn_popup(&surface);
-        SoftwareMenu::spawn(surface)
-    })
+fn dismiss(generation: Generation) {
+    if let Some(menu) = MENU.get() {
+        menu.on_done(generation);
+    }
+}
+
+pub(crate) struct X11MenuHost;
+
+impl MenuHost for X11MenuHost {
+    fn open(&self, req: MenuRequest) -> Result<MenuHandle, MenuOpenError> {
+        let Some(menu) = MENU.get() else {
+            req.on_selected.resolve(MENU_DISMISSED);
+            return Err(MenuOpenError::EngineUnavailable);
+        };
+        menu.open(req)
+    }
+
+    fn hide(&self, handle: MenuHandle) {
+        if let Some(menu) = MENU.get() {
+            menu.hide(handle);
+        }
+    }
+
+    fn shutdown(&self) -> Result<(), MenuShutdownError> {
+        MENU.get().map_or(Ok(()), MenuHost::shutdown)
+    }
 }
 
 struct X11PopupSurface {
@@ -90,7 +118,7 @@ impl X11PopupSurface {
                 .collect()
         };
         for generation in doomed {
-            host().on_done(generation);
+            dismiss(generation);
         }
     }
 }
@@ -110,7 +138,7 @@ impl PopupSurface for X11PopupSurface {
     fn create(&self, generation: Generation, place: MenuPlacement) {
         if !self.send(Op::Create { generation, place }) {
             tracing::error!(target: "x11::menu", "popup thread gone; dismissing menu");
-            host().on_done(generation);
+            dismiss(generation);
         }
     }
 
@@ -270,7 +298,7 @@ impl PopupLoop {
             Ok(window) => window,
             Err(e) => {
                 tracing::error!(target: "x11::menu", "build: {e}; dismissing");
-                host().on_done(generation);
+                dismiss(generation);
                 return;
             }
         };
@@ -292,7 +320,7 @@ impl PopupLoop {
                     if matches!(st.phase, Phase::Grabbing(_)) {
                         tracing::error!(target: "x11::menu", "grab: deadline expired; dismissing");
                         st.tear_down();
-                        host().on_done(generation);
+                        dismiss(generation);
                     }
                 }
                 TimeoutAction::Drop
@@ -301,7 +329,7 @@ impl PopupLoop {
             Err(_) => {
                 tracing::error!(target: "x11::menu", "create: grab deadline setup failed; dismissing");
                 self.tear_down();
-                host().on_done(generation);
+                dismiss(generation);
             }
         }
     }
@@ -470,13 +498,15 @@ impl PopupLoop {
                 };
                 self.phase = Phase::Open(window);
                 tracing::debug!(target: "x11::menu", "grab: menu is modal");
-                host().on_ready(generation, logical);
+                if let Some(menu) = MENU.get() {
+                    menu.on_ready(generation, logical);
+                }
             }
             GrabAttempt::Busy => {}
             GrabAttempt::Failed => {
                 tracing::error!(target: "x11::menu", "grab: non-retryable failure; dismissing");
                 self.tear_down();
-                host().on_done(generation);
+                dismiss(generation);
             }
         }
     }
@@ -503,7 +533,9 @@ impl PopupLoop {
             Event::KeyPress(e) => MenuInputEvent::Key(self.keymap.lookup(e.detail)),
             _ => return,
         };
-        host().input(window.generation, event);
+        if let Some(menu) = MENU.get() {
+            menu.input(window.generation, event);
+        }
     }
 
     fn tear_down(&mut self) {

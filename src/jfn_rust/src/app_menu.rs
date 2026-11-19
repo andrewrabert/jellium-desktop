@@ -1,6 +1,8 @@
 //! Application menu policy, composed into the shell and CEF adapters at startup.
 
-use jfn_platform_abi::{MenuDelivery, MenuItem, MenuKind, MenuRequest, MenuSelection, WindowPoint};
+use jfn_platform_abi::{
+    MenuDelivery, MenuItem, MenuKind, MenuOpenError, MenuRequest, MenuSelection, WindowPoint,
+};
 
 // CEF's custom command range. Shell edit menus use their own request-local IDs.
 const TOGGLE_FULLSCREEN: i32 = 26_500;
@@ -45,7 +47,7 @@ fn open_host(anchor: WindowPoint, basis: jfn_platform_abi::WindowBasis, restrict
     let MenuDelivery::Host(host) = platform.menu_delivery(MenuKind::ContextMenu) else {
         return;
     };
-    host.open(MenuRequest {
+    let opened = host.open(MenuRequest {
         items: items(restricted),
         anchor,
         basis,
@@ -55,6 +57,10 @@ fn open_host(anchor: WindowPoint, basis: jfn_platform_abi::WindowBasis, restrict
             dispatch(id);
         }),
     });
+    match opened {
+        Ok(_) | Err(MenuOpenError::NothingSelectable) => {}
+        Err(e) => tracing::error!("app menu: {e}"),
+    }
 }
 
 pub(crate) fn shell_actions() -> crate::shell::ApplicationActions {

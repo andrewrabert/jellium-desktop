@@ -107,7 +107,7 @@ impl Platform for X11Platform {
     ) -> jfn_platform_abi::MenuDelivery<'_> {
         match kind {
             jfn_platform_abi::MenuKind::ContextMenu => {
-                jfn_platform_abi::MenuDelivery::Host(crate::menu::host())
+                jfn_platform_abi::MenuDelivery::Host(&crate::menu::X11MenuHost)
             }
             jfn_platform_abi::MenuKind::Dropdown => jfn_platform_abi::MenuDelivery::Page,
         }

@@ -109,7 +109,9 @@ impl Platform for WaylandPlatform {
     }
 
     fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
-        crate::lifecycle::cleanup(self.rt());
+        if let Err(e) = crate::lifecycle::cleanup(self.rt()) {
+            tracing::error!("platform cleanup: {e}");
+        }
     }
 
     fn post_window_cleanup(

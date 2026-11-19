@@ -305,7 +305,7 @@ impl WindowState {
             wl_ops::on_configure(rt, fullscreen);
         }
         jfn_platform_abi::notify_window_changed();
-        if changed && let Some(menu) = rt.try_menu() {
+        if changed && let Some(menu) = rt.menu() {
             menu.window_changed();
         }
     }

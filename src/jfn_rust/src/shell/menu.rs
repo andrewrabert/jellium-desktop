@@ -2,7 +2,9 @@
 
 use std::os::raw::c_int;
 
-use jfn_platform_abi::{MenuDelivery, MenuItem, MenuKind, MenuRequest, MenuSelection, WindowPoint};
+use jfn_platform_abi::{
+    MenuDelivery, MenuItem, MenuKind, MenuOpenError, MenuRequest, MenuSelection, WindowPoint,
+};
 
 use crate::shell::actor::{Target, Work};
 use crate::shell::fields::Snapshot;
@@ -110,7 +112,7 @@ pub fn open_edit(
         })
         .collect();
     let id = field.id.clone();
-    host.open(MenuRequest {
+    let opened = host.open(MenuRequest {
         items,
         anchor,
         basis,
@@ -126,6 +128,10 @@ pub fn open_edit(
             });
         }),
     });
+    match opened {
+        Ok(_) | Err(MenuOpenError::NothingSelectable) => {}
+        Err(e) => tracing::error!("edit menu: {e}"),
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use cef::rc::Rc;
 use cef::*;
-use jfn_platform_abi::WindowStateError;
+use jfn_platform_abi::{MenuOpenError, WindowStateError};
 use std::os::raw::{c_int, c_void};
 use std::sync::Arc;
 
@@ -136,7 +136,7 @@ wrap_context_menu_handler! {
                 }
             }
 
-            host.open(MenuRequest {
+            let opened = host.open(MenuRequest {
                 items,
                 anchor,
                 basis,
@@ -144,6 +144,14 @@ wrap_context_menu_handler! {
                 initial: MENU_DISMISSED,
                 on_selected: self.inner.menu_selection_callback(session),
             });
+            match opened {
+                Ok(_) | Err(MenuOpenError::NothingSelectable) => {}
+                Err(e) => jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("context menu: {e}"),
+                ),
+            }
             1
         }
     }

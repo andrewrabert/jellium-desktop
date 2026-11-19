@@ -2,7 +2,7 @@ use cef::rc::Rc;
 use cef::{
     ImplBrowserHost, ImplTask, KeyEvent, Task, ThreadId, WrapTask, post_task, sys, wrap_task,
 };
-use jfn_platform_abi::WindowStateError;
+use jfn_platform_abi::{MenuOpenError, WindowStateError};
 use std::sync::Arc;
 
 use crate::platform_ops::{MenuDelivery, MenuItem, MenuRequest, MenuSelection};
@@ -99,7 +99,9 @@ impl Inner {
             p.h = h;
             p.size_received = true;
         }
-        self.try_show_popup();
+        if let Err(e) = self.try_show_popup() {
+            Self::report_menu_open(e);
+        }
     }
 
     pub(crate) fn set_popup_options(
@@ -125,21 +127,33 @@ impl Inner {
             }
             p.options_received = true;
         }
-        self.try_show_popup();
+        if let Err(e) = self.try_show_popup() {
+            Self::report_menu_open(e);
+        }
     }
 
-    fn try_show_popup(self: &Arc<Self>) {
+    fn report_menu_open(e: MenuOpenError) {
+        if e != MenuOpenError::NothingSelectable {
+            jfn_logging::log(
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Error,
+                &format!("dropdown menu: {e}"),
+            );
+        }
+    }
+
+    fn try_show_popup(self: &Arc<Self>) -> Result<(), MenuOpenError> {
         let (at, w, h, opts, selected, selectable) = {
             let mut p = self.popup.lock();
             if !p.visible || !p.size_received || !p.options_received {
-                return;
+                return Ok(());
             }
             p.size_received = false;
             p.options_received = false;
             p.requested = true;
             let rect = p.rect.take();
             let Some(at) = p.anchor.take().or(rect) else {
-                return;
+                return Ok(());
             };
             (
                 at,
@@ -161,7 +175,7 @@ impl Inner {
         });
         match (self.dropdown(), at) {
             (MenuDelivery::Host(host), PopupAt::Window(anchor, basis)) => {
-                let handle = host.open(MenuRequest {
+                let opened = host.open(MenuRequest {
                     items: options_as_items(&opts),
                     anchor,
                     basis,
@@ -169,13 +183,20 @@ impl Inner {
                     initial: selected,
                     on_selected,
                 });
-                self.popup.lock().menu = handle;
+                match opened {
+                    Ok(handle) => self.popup.lock().menu = Some(handle),
+                    Err(e) => {
+                        self.popup.lock().menu = None;
+                        return Err(e);
+                    }
+                }
             }
             (MenuDelivery::Composited, PopupAt::View(x, y)) => {
                 self.surface().popup_show(x, y, w, h)
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn hide_dropdown(&self) {

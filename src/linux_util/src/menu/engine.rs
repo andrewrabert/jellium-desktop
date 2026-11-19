@@ -7,9 +7,9 @@ use std::thread::JoinHandle;
 use jfn_mailbox::Mailbox;
 use jfn_platform_abi::{
     ExtentError, Generation, LogicalSize, MENU_DISMISSED, MenuClose, MenuHandle, MenuHost,
-    MenuItem, MenuMetrics, MenuPaint, MenuPlacement, MenuRequest, MenuSelection, PhysicalSize,
-    PopupSurface, Unrepresentable, WindowBasis, WindowExtent, WindowPoint, menu_has_selectable,
-    menu_initial_row,
+    MenuItem, MenuMetrics, MenuOpenError, MenuPaint, MenuPlacement, MenuRequest, MenuSelection,
+    MenuShutdownError, PhysicalSize, PopupSurface, Unrepresentable, WindowBasis, WindowExtent,
+    WindowPoint, menu_has_selectable, menu_initial_row,
 };
 use parking_lot::Mutex;
 
@@ -36,45 +36,56 @@ pub enum MenuInputEvent {
     Expose,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum MenuSpawnError {
+    #[error("menu render thread spawn: {0}")]
+    Thread(#[source] std::io::Error),
+}
+
 pub struct SoftwareMenu {
     emitter: Arc<Emitter>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SoftwareMenu {
-    pub fn spawn(surface: Arc<dyn PopupSurface>) -> SoftwareMenu {
+    pub fn spawn(surface: Arc<dyn PopupSurface>) -> Result<SoftwareMenu, MenuSpawnError> {
         let emitter = Emitter::new(surface);
         let thread = {
             let emitter = Arc::clone(&emitter);
-            match std::thread::Builder::new()
+            std::thread::Builder::new()
                 .name("jfn-menu".into())
                 .spawn(move || run(&emitter))
-            {
-                Ok(handle) => Some(handle),
-                Err(e) => {
-                    tracing::error!(target: "menu", "render thread spawn failed: {e}; menus disabled");
-                    None
-                }
-            }
+                .map_err(MenuSpawnError::Thread)?
         };
-        SoftwareMenu {
+        Ok(SoftwareMenu {
             emitter,
-            thread: Mutex::new(thread),
-        }
+            thread: Mutex::new(Some(thread)),
+        })
     }
 
-    pub fn open_triggered(&self, req: MenuRequest, serial: u32) -> Option<MenuHandle> {
+    pub fn open_triggered(
+        &self,
+        req: MenuRequest,
+        serial: u32,
+    ) -> Result<MenuHandle, MenuOpenError> {
         self.open_impl(req, serial)
     }
 
-    fn open_impl(&self, req: MenuRequest, serial: u32) -> Option<MenuHandle> {
-        if !self.render_thread_alive() || !menu_has_selectable(&req.items) {
+    fn open_impl(&self, req: MenuRequest, serial: u32) -> Result<MenuHandle, MenuOpenError> {
+        let refusal = if !self.render_thread_alive() {
+            Some(MenuOpenError::EngineUnavailable)
+        } else if !menu_has_selectable(&req.items) {
+            Some(MenuOpenError::NothingSelectable)
+        } else {
+            None
+        };
+        if let Some(e) = refusal {
             req.on_selected.resolve(MENU_DISMISSED);
-            return None;
+            return Err(e);
         }
         let surface = &self.emitter.surface;
         let mut refused = None;
-        let mut handle = None;
+        let mut handle = Err(MenuOpenError::StaleBasis);
         self.emitter.update(|s| {
             if surface.window_basis() != req.basis {
                 refused = Some(req.on_selected);
@@ -82,7 +93,7 @@ impl SoftwareMenu {
             }
             let resolve = close_current(s, MenuClose::Finished);
             let id = next_id(&mut s.next_session);
-            handle = Some(MenuHandle::new(id));
+            handle = Ok(MenuHandle::new(id));
             s.session = Session::Laying(Menu {
                 id,
                 fsm: FsmState {
@@ -225,7 +236,7 @@ impl SoftwareMenu {
 impl MenuHost for SoftwareMenu {
     fn warm(&self) {}
 
-    fn open(&self, req: MenuRequest) -> Option<MenuHandle> {
+    fn open(&self, req: MenuRequest) -> Result<MenuHandle, MenuOpenError> {
         self.open_impl(req, 0)
     }
 
@@ -238,14 +249,26 @@ impl MenuHost for SoftwareMenu {
         });
     }
 
-    fn shutdown(&self) {
+    fn shutdown(&self) -> Result<(), MenuShutdownError> {
         self.emitter.update(|s| {
             s.shutdown = true;
             close_current(s, MenuClose::Finished)
         });
-        if let Some(handle) = self.thread.lock().take() {
-            let _ = handle.join();
+        let thread = self.thread.lock().take();
+        match thread.map(JoinHandle::join) {
+            Some(Err(payload)) => Err(MenuShutdownError::ThreadPanicked(panic_message(&*payload))),
+            Some(Ok(())) | None => Ok(()),
         }
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_owned()
     }
 }
 
@@ -877,7 +900,7 @@ mod tests {
     fn a_menu_creates_its_surface_once_and_only_after_its_layout() {
         let (surface, menu) = recorded(true);
         let (req, _rx) = request(vec![selectable_item()]);
-        assert!(menu.open(req).is_some());
+        assert!(menu.open(req).is_ok());
         assert!(surface.seen.lock().is_empty());
         deliver_layout(&menu);
         assert_eq!(*surface.seen.lock(), vec!["create"]);
@@ -890,7 +913,7 @@ mod tests {
     fn a_menu_whose_size_names_no_extent_closes_without_a_surface() {
         let (surface, menu) = recorded(true);
         let (req, rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_ok());
         deliver_layout_sized(&menu, 1, 1);
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
         assert!(!menu.is_engaged());
@@ -901,7 +924,7 @@ mod tests {
     fn a_configured_size_equal_to_the_request_leaves_the_height_untouched() {
         let (_surface, menu) = recorded(true);
         let (req, _rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_ok());
         deliver_layout(&menu);
         deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
         assert_eq!(view_ph_of(&menu), Some(40));
@@ -911,7 +934,7 @@ mod tests {
     fn a_configured_size_never_raises_the_visible_height() {
         let (_surface, menu) = recorded(true);
         let (req, _rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_ok());
         deliver_layout(&menu);
         deliver_ready(&menu, LogicalSize { w: 100, h: 90 });
         assert_eq!(view_ph_of(&menu), Some(40));
@@ -921,7 +944,7 @@ mod tests {
     fn a_smaller_configured_size_lowers_the_visible_height() {
         let (_surface, menu) = recorded(true);
         let (req, _rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_ok());
         deliver_layout(&menu);
         deliver_ready(&menu, LogicalSize { w: 100, h: 30 });
         assert_eq!(view_ph_of(&menu), Some(30));
@@ -933,7 +956,7 @@ mod tests {
         let (req, rx) = request(vec![selectable_item()]);
         let handle = menu.open(req);
         assert!(rx.try_recv().is_err());
-        if let Some(handle) = handle {
+        if let Ok(handle) = handle {
             menu.hide(handle);
         }
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
@@ -945,9 +968,9 @@ mod tests {
         let (first, first_rx) = request(vec![selectable_item()]);
         let stale = menu.open(first);
         let (second, second_rx) = request(vec![selectable_item()]);
-        menu.open(second);
+        assert!(menu.open(second).is_ok());
         assert_eq!(first_rx.try_recv(), Ok(MENU_DISMISSED));
-        if let Some(stale) = stale {
+        if let Ok(stale) = stale {
             menu.hide(stale);
         }
         assert!(second_rx.try_recv().is_err());
@@ -958,14 +981,14 @@ mod tests {
     fn a_refused_request_resolves_itself_and_leaves_the_live_menu_open() {
         let (_surface, menu) = recorded(true);
         let (live, live_rx) = request(vec![selectable_item()]);
-        menu.open(live);
+        assert!(menu.open(live).is_ok());
         let (req, rx) = request(vec![MenuItem {
             id: 0,
             label: String::new(),
             enabled: false,
             separator: true,
         }]);
-        assert!(menu.open(req).is_none());
+        assert_eq!(menu.open(req), Err(MenuOpenError::NothingSelectable));
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
         assert!(live_rx.try_recv().is_err());
         assert!(menu.is_engaged());
@@ -975,7 +998,7 @@ mod tests {
     fn open_without_a_render_thread_resolves_and_leaves_the_state_idle() {
         let (_surface, menu) = recorded(false);
         let (req, rx) = request(vec![selectable_item()]);
-        assert!(menu.open(req).is_none());
+        assert_eq!(menu.open(req), Err(MenuOpenError::EngineUnavailable));
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
         assert!(!menu.is_engaged());
     }
@@ -985,7 +1008,7 @@ mod tests {
         let (surface, menu) = recorded(true);
         *surface.basis.lock() = WindowBasis::FIXED.next();
         let (req, rx) = request(vec![selectable_item()]);
-        assert!(menu.open(req).is_none());
+        assert_eq!(menu.open(req), Err(MenuOpenError::StaleBasis));
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
         assert!(!menu.is_engaged());
     }
@@ -994,7 +1017,7 @@ mod tests {
     fn a_window_change_before_the_layout_arrives_closes_the_menu() {
         let (surface, menu) = recorded(true);
         let (req, rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_ok());
         *surface.basis.lock() = WindowBasis::FIXED.next();
         deliver_layout(&menu);
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
@@ -1005,7 +1028,7 @@ mod tests {
     fn a_layout_error_for_the_current_session_dismisses_the_request() {
         let (surface, menu) = recorded(true);
         let (req, rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_ok());
         deliver_layout_result(
             &menu,
             Err(Unrepresentable {
@@ -1022,7 +1045,7 @@ mod tests {
     fn a_window_change_closes_a_menu_that_is_sitting_open() {
         let (surface, menu) = recorded(true);
         let (req, rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_ok());
         deliver_layout(&menu);
         deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
         menu.window_changed();
@@ -1039,7 +1062,7 @@ mod tests {
         let menu = menu_on(Arc::clone(&surface) as Arc<dyn PopupSurface>, true);
         let _ = surface.emitter.set(Arc::clone(&menu.emitter));
         let (req, _rx) = request(vec![selectable_item()]);
-        menu.open(req);
+        assert!(menu.open(req).is_ok());
         deliver_layout(&menu);
         assert_eq!(*surface.seen.lock(), vec!["create", "destroy"]);
     }
@@ -1048,11 +1071,11 @@ mod tests {
     fn reopening_a_shown_menu_replaces_its_surface() {
         let (surface, menu) = recorded(true);
         let (first, first_rx) = request(vec![selectable_item()]);
-        menu.open(first);
+        assert!(menu.open(first).is_ok());
         deliver_layout(&menu);
         deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
         let (second, second_rx) = request(vec![selectable_item()]);
-        menu.open(second);
+        assert!(menu.open(second).is_ok());
         assert_eq!(first_rx.try_recv(), Ok(MENU_DISMISSED));
         assert!(second_rx.try_recv().is_err());
         deliver_layout(&menu);
@@ -1063,11 +1086,11 @@ mod tests {
     fn input_for_a_retired_surface_does_not_reach_its_successor() {
         let (_surface, menu) = recorded(true);
         let (first, _first_rx) = request(vec![selectable_item()]);
-        menu.open(first);
+        assert!(menu.open(first).is_ok());
         deliver_layout(&menu);
         let retired = menu.emitter.mailbox.peek(|s| s.session.generation());
         let (second, second_rx) = request(vec![selectable_item()]);
-        menu.open(second);
+        assert!(menu.open(second).is_ok());
         deliver_layout(&menu);
         deliver_ready(&menu, LogicalSize { w: 100, h: 40 });
         if let Some(retired) = retired {
@@ -1081,7 +1104,7 @@ mod tests {
     fn an_out_of_range_initial_row_highlights_nothing() {
         let (_surface, menu) = recorded(true);
         let (req, _rx) = request_row(vec![selectable_item()], 5);
-        menu.open(req);
+        assert!(menu.open(req).is_ok());
         assert_eq!(
             menu.emitter
                 .mailbox

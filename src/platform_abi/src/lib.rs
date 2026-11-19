@@ -52,8 +52,8 @@ pub use jfn_gpu_paint::WindowTarget;
 pub use media_sink::MediaSink;
 pub use menu::{
     Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHandle, MenuHost, MenuItem, MenuKind,
-    MenuMetrics, MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface,
-    menu_has_selectable, menu_initial_row, menu_scripts,
+    MenuMetrics, MenuOpenError, MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection,
+    MenuShutdownError, PopupSurface, menu_has_selectable, menu_initial_row, menu_scripts,
 };
 pub use mpv_host::{DefaultMpvHost, MpvHost, VoWait};
 pub use osr_popup::{NoOsrPopup, OsrPopupSurface};

@@ -155,12 +155,17 @@ pub(crate) fn init(
     #[cfg(feature = "kde-palette")]
     crate::kde_palette::init(rt);
 
-    jfn_platform_abi::MenuHost::warm(rt.menu());
+    match rt.start_menu() {
+        Ok(menu) => jfn_platform_abi::MenuHost::warm(menu),
+        Err(e) => tracing::error!("{e}; menus disabled"),
+    }
 
     Ok(())
 }
 
-pub(crate) fn cleanup(rt: &'static crate::runtime::WlRuntime) {
+pub(crate) fn cleanup(
+    rt: &'static crate::runtime::WlRuntime,
+) -> Result<(), jfn_platform_abi::MenuShutdownError> {
     // KDE palette: KWin atomically drops the palette object with the
     // window. The scheme file is unlinked separately via
     // kde_palette::post_window_cleanup after mpv tears down the surface.
@@ -168,13 +173,14 @@ pub(crate) fn cleanup(rt: &'static crate::runtime::WlRuntime) {
     rt.selections().cleanup();
     // Must precede root_window::cleanup: the menu's teardown ops go through
     // the root thread's queue.
-    if let Some(menu) = rt.try_menu() {
-        jfn_platform_abi::MenuHost::shutdown(menu);
-    }
+    let menu = rt
+        .menu()
+        .map_or(Ok(()), jfn_platform_abi::MenuHost::shutdown);
     // Stop the app-owned toplevel thread before mpv's VO-teardown roundtrip;
     // otherwise it holds a wl_display read barrier and the roundtrip hangs when
     // no video ever played (a quiet display never wakes its poll).
     crate::root_window::cleanup(rt);
     crate::input_lifecycle::lifecycle_cleanup(rt);
     // Rust-side WlState lives until process exit (mirrors C++ globals).
+    menu
 }

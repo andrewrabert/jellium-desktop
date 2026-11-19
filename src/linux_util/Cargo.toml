@@ -24,6 +24,7 @@ jfn-platform-abi = { path = "../platform_abi" }
 khronos-egl = { version = "6", features = ["dynamic"] }
 libloading = "0.9"
 nix.workspace = true
+thiserror.workspace = true
 tiny-skia = "0.12"
 tracing.workspace = true
 xkbcommon = "0.9"
