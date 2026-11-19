@@ -95,6 +95,12 @@ impl Inner {
         host.send_mouse_move_event(Some(&me), if leave { 1 } else { 0 });
     }
 
+    pub(crate) fn send_capture_lost(&self) {
+        if let Some(host) = self.host() {
+            host.send_capture_lost_event();
+        }
+    }
+
     pub(crate) fn send_mouse_wheel(
         &self,
         x: c_int,

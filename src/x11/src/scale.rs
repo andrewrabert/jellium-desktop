@@ -10,7 +10,9 @@
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use jfn_platform_abi::{LogicalPoint, PhysicalPoint, PhysicalSize, Scale, WindowExtent, WindowPos};
+use jfn_platform_abi::{
+    ExtentError, LogicalPoint, PhysicalPoint, PhysicalSize, Scale, WindowExtent, WindowPos,
+};
 use x11rb::connection::Connection;
 use x11rb::resource_manager::new_from_resource_manager;
 use x11rb::rust_connection::RustConnection;
@@ -57,7 +59,7 @@ fn probe() -> Option<Scale> {
 /// The scale X11 reports for the app window: the geometry thread's published
 /// scale once it has published one, else [`query_display_scale`].
 pub(crate) fn window_scale() -> Scale {
-    crate::x11_state::parent_snapshot()
+    crate::x11_state::published_parent()
         .map(|s| s.scale)
         .unwrap_or_else(query_display_scale)
 }
@@ -140,10 +142,7 @@ pub(crate) fn screen_dpi_scale(
 ///
 /// X11 publishes no logical size, so this backend divides the physical size
 /// by the scale it reports to name one.
-///
-/// `None` when the division does not name a logical size, or when either
-/// axis is below two pixels.
-pub(crate) fn extent(physical: PhysicalSize, scale: Scale) -> Option<WindowExtent> {
+pub(crate) fn extent(physical: PhysicalSize, scale: Scale) -> Result<WindowExtent, ExtentError> {
     WindowExtent::new(physical, scale, physical.to_logical(scale)?)
 }
 
@@ -238,16 +237,16 @@ mod tests {
 
     #[test]
     fn the_extent_carries_the_reported_scale_at_every_covered_scale() {
-        let scales: Vec<Option<Scale>> = COVERED_SCALES
+        let scales: Vec<Result<Scale, ExtentError>> = COVERED_SCALES
             .into_iter()
-            .map(|s| Some(extent(LOGICAL.to_physical(s)?, s)?.scale()))
+            .map(|s| Ok(extent(LOGICAL.to_physical(s)?, s)?.scale()))
             .collect();
-        assert_eq!(scales, COVERED_SCALES.map(Some).to_vec());
+        assert_eq!(scales, COVERED_SCALES.map(Ok).to_vec());
     }
 
     #[test]
     fn the_last_physical_pixel_maps_to_the_last_logical_pixel_at_every_covered_scale() {
-        let agrees: Vec<Option<bool>> = COVERED_SCALES
+        let agrees: Vec<Result<bool, ExtentError>> = COVERED_SCALES
             .into_iter()
             .map(|s| {
                 let physical = LOGICAL.to_physical(s)?;
@@ -260,15 +259,14 @@ mod tests {
                         y: physical.h - 1,
                     },
                 );
-                Some(
-                    last == LogicalPoint {
+                Ok(last
+                    == LogicalPoint {
                         x: logical.w - 1,
                         y: logical.h - 1,
-                    },
-                )
+                    })
             })
             .collect();
-        assert_eq!(agrees, vec![Some(true); COVERED_SCALES.len()]);
+        assert_eq!(agrees, vec![Ok(true); COVERED_SCALES.len()]);
     }
 
     #[test]
@@ -277,7 +275,14 @@ mod tests {
             view_point(None, PhysicalPoint { x: 42, y: 7 }),
             LogicalPoint { x: 42, y: 7 }
         );
-        assert_eq!(extent(PhysicalSize { w: 0, h: 720 }, Scale::ONE), None);
+        let physical = PhysicalSize { w: 0, h: 720 };
+        assert_eq!(
+            extent(physical, Scale::ONE),
+            Err(ExtentError::BelowTwoPixels {
+                physical,
+                logical: jfn_platform_abi::LogicalSize { w: 0, h: 720 },
+            })
+        );
     }
 
     #[test]

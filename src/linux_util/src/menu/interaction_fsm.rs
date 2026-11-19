@@ -26,7 +26,6 @@ pub enum MenuEvent {
     Motion { x: i32, y: i32 },
     Press { x: i32, y: i32 },
     Key(u32),
-    Dismiss,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -35,7 +34,6 @@ pub enum MenuEffect {
     Close(i32),
 }
 
-/// Without a layout only `Dismiss`, Escape and Tab have an effect.
 pub fn step(
     s: &mut MenuState,
     ev: &MenuEvent,
@@ -43,7 +41,6 @@ pub fn step(
     items: &[MenuItem],
 ) -> Vec<MenuEffect> {
     match *ev {
-        MenuEvent::Dismiss => vec![MenuEffect::Close(-1)],
         MenuEvent::Motion { x, y } => {
             let Some(layout) = layout else {
                 return vec![];
@@ -206,12 +203,6 @@ mod tests {
     }
 
     #[test]
-    fn dismiss_closes_cancelled() {
-        let (_, e) = run(1, MenuEvent::Dismiss);
-        assert_eq!(e, vec![MenuEffect::Close(-1)]);
-    }
-
-    #[test]
     fn press_on_row_closes_with_id() {
         let (_, e) = run(-1, MenuEvent::Press { x: 50, y: 25 });
         assert_eq!(e, vec![MenuEffect::Close(20)]);
@@ -325,8 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_and_dismiss_close_without_a_layout() {
-        assert_eq!(bare(0, MenuEvent::Dismiss).1, vec![MenuEffect::Close(-1)]);
+    fn escape_closes_without_a_layout() {
         assert_eq!(
             bare(0, MenuEvent::Key(XK_ESCAPE)).1,
             vec![MenuEffect::Close(-1)]

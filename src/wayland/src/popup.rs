@@ -1,11 +1,14 @@
-use jfn_linux_util::menu::{MenuInputEvent, MenuPoint};
+use jfn_linux_util::menu::MenuInputEvent;
 use jfn_platform_abi::{
-    Generation, LogicalPoint, MenuClose, MenuMetrics, MenuPaint, MenuPlacement, PopupSurface,
+    Generation, LogicalSize, MenuClose, MenuHandle, MenuMetrics, MenuPaint, MenuPlacement,
+    PopupSurface, WindowBasis,
 };
 
 use crate::popup_protocol::{PopupCommand, PopupParent};
+use crate::protocol::SurfacePoint;
 use crate::runtime::WlRuntime;
 use smithay_client_toolkit::shell::{WaylandSurface, xdg::XdgSurface as _};
+use wayland_client::protocol::wl_surface::WlSurface;
 
 pub(crate) struct WlPopupSurface {
     pub(crate) rt: &'static WlRuntime,
@@ -20,22 +23,20 @@ impl PopupSurface for WlPopupSurface {
         }
     }
 
-    fn arm(&self, generation: Generation, anchor: LogicalPoint, serial: u32) {
+    fn window_basis(&self) -> WindowBasis {
+        self.rt.window().basis()
+    }
+
+    fn create(&self, generation: Generation, place: MenuPlacement) {
         let Some(window) = self.rt.root().window() else {
             self.rt.menu().on_done(generation);
             return;
-        };
-        let serial = if serial != 0 {
-            serial
-        } else {
-            self.rt.seat().last_input_serial()
         };
         send(
             self.rt,
             PopupCommand::Create {
                 generation,
-                anchor,
-                serial,
+                place,
                 parent: PopupParent {
                     surface: window.wl_surface().clone(),
                     xdg_surface: window.xdg_surface().clone(),
@@ -43,17 +44,10 @@ impl PopupSurface for WlPopupSurface {
                 input: std::sync::Arc::new(MenuInput {
                     rt: self.rt,
                     generation,
+                    popup: std::sync::OnceLock::new(),
                 }),
             },
         );
-    }
-
-    fn map_armed(&self, generation: Generation) {
-        send(self.rt, PopupCommand::Map { generation });
-    }
-
-    fn reposition(&self, generation: Generation, place: MenuPlacement) {
-        send(self.rt, PopupCommand::Reposition { generation, place });
     }
 
     fn present(&self, paint: MenuPaint) {
@@ -71,19 +65,17 @@ fn send(rt: &WlRuntime, command: PopupCommand) {
     }
 }
 
-/// Captures the trigger when content requests a popup, before layout work.
-/// Ordinary button presses never create speculative protocol objects.
 pub(crate) struct WlMenuHost {
     pub(crate) rt: &'static WlRuntime,
 }
 impl jfn_platform_abi::MenuHost for WlMenuHost {
-    fn open(&self, request: jfn_platform_abi::MenuRequest) {
+    fn open(&self, request: jfn_platform_abi::MenuRequest) -> Option<MenuHandle> {
         self.rt
             .menu()
-            .open_triggered(request, self.rt.seat().last_input_serial());
+            .open_triggered(request, self.rt.seat().last_input_serial())
     }
-    fn hide(&self) {
-        self.rt.menu().hide();
+    fn hide(&self, handle: MenuHandle) {
+        self.rt.menu().hide(handle);
     }
     fn shutdown(&self) {
         self.rt.menu().shutdown();
@@ -95,25 +87,29 @@ impl jfn_platform_abi::MenuHost for WlMenuHost {
 pub(crate) struct MenuInput {
     rt: &'static WlRuntime,
     generation: Generation,
+    popup: std::sync::OnceLock<WlSurface>,
 }
 impl crate::protocol::InputTarget for MenuInput {
-    fn configured(&self) {
-        self.rt.menu().on_ready(self.generation);
+    fn registered(&self, surface: &WlSurface) {
+        let _ = self.popup.set(surface.clone());
+    }
+    fn configured(&self, size: LogicalSize) {
+        self.rt.menu().on_ready(self.generation, size);
     }
     fn dismissed(&self) {
         self.rt.menu().on_done(self.generation);
     }
-    fn motion(&self, position: (f64, f64), _: u32, leave: bool) {
+    fn motion(&self, at: &SurfacePoint, _: u32, leave: bool) {
         if !leave {
-            self.pointer(position, false);
+            self.pointer(at, false);
         }
     }
-    fn button(&self, _: u32, pressed: bool, position: (f64, f64), _: u32) {
+    fn button(&self, _: u32, pressed: bool, at: &SurfacePoint, _: u32) {
         if pressed {
-            self.pointer(position, true);
+            self.pointer(at, true);
         }
     }
-    fn scroll(&self, _: (f64, f64), _: i32, dy: i32, _: u32) {
+    fn scroll(&self, _: &SurfacePoint, _: i32, dy: i32, _: u32) {
         self.rt
             .menu()
             .input(self.generation, MenuInputEvent::Scroll(dy));
@@ -127,16 +123,12 @@ impl crate::protocol::InputTarget for MenuInput {
     }
 }
 impl MenuInput {
-    fn pointer(&self, position: (f64, f64), press: bool) {
-        self.rt.menu().input(
-            self.generation,
-            MenuInputEvent::Pointer {
-                at: MenuPoint::Logical {
-                    x: position.0 as i32,
-                    y: position.1 as i32,
-                },
-                press,
-            },
-        );
+    fn pointer(&self, at: &SurfacePoint, press: bool) {
+        let Some(at) = self.popup.get().and_then(|popup| at.menu_point(popup)) else {
+            return;
+        };
+        self.rt
+            .menu()
+            .input(self.generation, MenuInputEvent::Pointer { at, press });
     }
 }

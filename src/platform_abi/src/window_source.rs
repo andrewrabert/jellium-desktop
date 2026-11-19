@@ -1,24 +1,39 @@
-//! Live window geometry, sourced from whichever component owns the window,
-//! plus the payload-free change wakeup. Producers update their source and
-//! call [`notify_window_changed`]; consumers subscribe and pull a
-//! [`WindowSnapshot`].
-
 use crate::subscriptions::Subscribers;
 pub use crate::subscriptions::Subscription as WindowSubscription;
 use std::sync::LazyLock;
 
-use crate::geometry::{WindowExtent, WindowPos};
+use crate::geometry::{ExtentError, PointsToPixelsError, WindowBasis, WindowExtent, WindowPos};
 
-#[derive(Clone, Copy)]
-pub struct WindowSnapshot {
-    pub extent: Option<WindowExtent>,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowState {
+    pub extent: WindowExtent,
     pub position: Option<WindowPos>,
     pub maximized: bool,
     pub fullscreen: bool,
+    pub web_top: std::ffi::c_int,
+    pub basis: WindowBasis,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+pub enum WindowStateError {
+    #[error("the window does not exist yet")]
+    NoWindow,
+    #[error("the window has stated no web offset yet")]
+    WebOffsetUnstated,
+    #[error(transparent)]
+    Extent(#[from] ExtentError),
+    #[error("the window DPI is zero")]
+    ZeroDpi,
+    #[error("the window's client rect could not be read (HRESULT {0:#010x})")]
+    ClientRect(i32),
+    #[error("window position: {0}")]
+    Position(#[from] PointsToPixelsError),
+    #[error("the platform is gone")]
+    NoPlatform,
 }
 
 pub trait WindowSource: Send + Sync {
-    fn snapshot(&self) -> WindowSnapshot;
+    fn window_state(&self) -> Result<WindowState, WindowStateError>;
 }
 
 static WINDOW_SUBSCRIBERS: LazyLock<Subscribers> = LazyLock::new(Subscribers::new);
@@ -29,7 +44,6 @@ pub fn subscribe_window_changed(f: fn()) -> WindowSubscription {
     WINDOW_SUBSCRIBERS.subscribe(f)
 }
 
-/// Wake subscribers after committing the snapshot they will read.
 pub fn notify_window_changed() {
     WINDOW_SUBSCRIBERS.notify();
 }

@@ -69,12 +69,6 @@ pub(crate) fn win_hwnd() -> Option<HWND> {
     (raw != 0).then(|| hwnd_from_raw(raw))
 }
 
-/// The stored HWND, taken from mpv's observed `window-id` on first use. The
-/// boot wait pulls the window snapshot before `win_init` runs, so resolution
-/// cannot wait for init. `None` until mpv's VO has a window.
-///
-/// Reads a cached atomic — no mpv property read, so no thread that pulls the
-/// snapshot can serialize against the mpv core or mpv's VO GUI thread.
 pub(crate) fn win_ensure_hwnd() -> Option<HWND> {
     if let Some(hwnd) = win_hwnd() {
         return Some(hwnd);
@@ -182,7 +176,7 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                     }
                 }
                 WM_MOVE => {
-                    crate::window::sample();
+                    crate::window::sample_from_window_message();
                 }
                 WM_DPICHANGED | WM_STYLECHANGED => {
                     crate::window::publish_deferred();

@@ -45,7 +45,11 @@ impl Platform for Backend {
     fn early_init(&self) {
         unreachable!("lifecycle test never calls this platform operation")
     }
-    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+    fn alloc_surface(
+        &self,
+        initial: Visibility,
+        _placement: crate::SurfacePlacement,
+    ) -> SurfaceHandle {
         unreachable!("lifecycle test never calls this platform operation")
     }
     fn free_surface(&self, s: SurfaceHandle) {
@@ -100,7 +104,7 @@ impl Platform for Backend {
     fn display_scale(&self, at: Option<WindowPos>) -> Scale {
         unreachable!("lifecycle test never calls this platform operation")
     }
-    fn query_window_position(&self) -> Option<WindowPos> {
+    fn window_position(&self) -> Result<Option<WindowPos>, crate::WindowStateError> {
         unreachable!("lifecycle test never calls this platform operation")
     }
     fn window_owner(&self) -> WindowOwner<'_> {

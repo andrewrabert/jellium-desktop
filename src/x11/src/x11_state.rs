@@ -1,18 +1,3 @@
-//! Shared X11 state, split by ownership so every mutable resource has exactly
-//! one writer:
-//!
-//! - [`HostServices`] / [`PaintServices`] — immutable, process-lifetime facts
-//!   set once (host-window creation, then platform init) and read lock-free
-//!   thereafter.
-//! - [`ParentSnapshot`] — the app top-level's live geometry, published by the
-//!   geometry thread through an [`ArcSwap`] so all other readers are lock-free.
-//! - [`crate::registry`] — the owned surface arena and the geometry-command
-//!   queue; the geometry thread is the sole structure writer.
-//! - [`GATE`] — the resize transition gate (its own small lock).
-//!
-//! The xcb/x11rb connections still live behind `Arc`s so the input and content
-//! threads can hold references independent of any lock.
-
 use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -136,11 +121,8 @@ pub struct PaintServices {
     pub colormap: u32,
 }
 
-/// The app top-level's live geometry, published by the geometry thread. An
-/// immutable snapshot swapped wholesale so every other reader is lock-free and
-/// never tears placement mid-update.
 #[derive(Copy, Clone, Debug)]
-pub struct ParentSnapshot {
+pub struct PublishedParent {
     pub origin_x: i32,
     pub origin_y: i32,
     pub width: i32,
@@ -152,7 +134,7 @@ pub struct ParentSnapshot {
 
 static HOST: OnceLock<HostServices> = OnceLock::new();
 static PAINT: OnceLock<PaintServices> = OnceLock::new();
-static PARENT: OnceLock<ArcSwapOption<ParentSnapshot>> = OnceLock::new();
+static PARENT: OnceLock<ArcSwapOption<PublishedParent>> = OnceLock::new();
 /// Bottom-to-top live overlay window ids, republished by the geometry thread on
 /// every create/destroy so the cursor thread can target them lock-free.
 static OVERLAY_WINDOWS: OnceLock<ArcSwap<Vec<u32>>> = OnceLock::new();
@@ -171,11 +153,11 @@ pub(crate) static X11_RESIZE_GATE: X11ResizeGate = X11ResizeGate;
 
 impl jfn_platform_abi::ResizeGate for X11ResizeGate {
     fn begin(&self) {
-        let Some(snap) = parent_snapshot() else {
+        let Some(parent) = published_parent() else {
             tracing::warn!(target: "Platform", "no published geometry; nothing to gate");
             return;
         };
-        GATE.lock().begin_capturing((snap.width, snap.height));
+        GATE.lock().begin_capturing((parent.width, parent.height));
     }
 
     /// Ends the gate only; the geometry thread is the sole owner of overlay
@@ -212,18 +194,17 @@ pub(crate) fn paint() -> Option<&'static PaintServices> {
     PAINT.get()
 }
 
-fn parent_cell() -> &'static ArcSwapOption<ParentSnapshot> {
+fn parent_cell() -> &'static ArcSwapOption<PublishedParent> {
     PARENT.get_or_init(ArcSwapOption::empty)
 }
 
-/// Publish a fresh parent snapshot. Called only by the geometry thread.
-pub(crate) fn publish_parent(snap: ParentSnapshot) {
-    parent_cell().store(Some(Arc::new(snap)));
+pub(crate) fn publish_parent(parent: PublishedParent) {
+    parent_cell().store(Some(Arc::new(parent)));
 }
 
 /// Lock-free read of the latest published parent geometry. `None` until the
 /// geometry thread has published one.
-pub fn parent_snapshot() -> Option<Arc<ParentSnapshot>> {
+pub fn published_parent() -> Option<Arc<PublishedParent>> {
     parent_cell().load_full()
 }
 

@@ -17,6 +17,7 @@ jfn-platform-abi = { path = "../platform_abi" }
 jfn-wake-event = { path = "../wake_event" }
 jfn-js-json = { path = "../js_json" }
 serde.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

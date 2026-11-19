@@ -5,7 +5,9 @@ use std::num::NonZeroU64;
 
 #[cfg(target_os = "windows")]
 use jfn_platform_abi::WindowPos;
-use jfn_platform_abi::{LogicalPoint, PhysicalPoint, PhysicalSize, Scale, WindowExtent};
+use jfn_platform_abi::{
+    ExtentError, LogicalPoint, PhysicalPoint, PhysicalSize, Scale, WindowExtent,
+};
 
 /// The DPI every Windows scale is expressed against.
 pub const BASE_DPI: NonZeroU64 = match NonZeroU64::new(96) {
@@ -51,12 +53,30 @@ pub fn display_scale(at: Option<WindowPos>) -> Scale {
 ///
 /// Windows publishes no logical size, so this backend divides the client
 /// size by the scale that DPI names.
-///
-/// `None` when the DPI is zero, when the division names no logical size, or
-/// when either axis is below two pixels.
-pub fn extent(client: PhysicalSize, dpi: u32) -> Option<WindowExtent> {
-    let scale = scale_from_dpi(dpi)?;
-    WindowExtent::new(client, scale, client.to_logical(scale)?)
+pub fn extent(client: PhysicalSize, dpi: u32) -> Result<WindowExtent, ClientExtentError> {
+    let scale = scale_from_dpi(dpi).ok_or(ClientExtentError::ZeroDpi)?;
+    let logical = client.to_logical(scale).map_err(ExtentError::from)?;
+    Ok(WindowExtent::new(client, scale, logical)?)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, thiserror::Error)]
+pub enum ClientExtentError {
+    #[error("the window DPI is zero")]
+    ZeroDpi,
+    #[error("the window's client rect could not be read (HRESULT {0:#010x})")]
+    ClientRect(i32),
+    #[error(transparent)]
+    Extent(#[from] ExtentError),
+}
+
+impl From<ClientExtentError> for jfn_platform_abi::WindowStateError {
+    fn from(e: ClientExtentError) -> Self {
+        match e {
+            ClientExtentError::ZeroDpi => Self::ZeroDpi,
+            ClientExtentError::ClientRect(hresult) => Self::ClientRect(hresult),
+            ClientExtentError::Extent(e) => Self::Extent(e),
+        }
+    }
 }
 
 /// The pointer position in the space `extent`'s logical size names.
@@ -87,16 +107,16 @@ mod tests {
 
     #[test]
     fn the_extent_carries_the_reported_scale_at_every_covered_scale() {
-        let scales: Vec<Option<Scale>> = COVERED_DPI
+        let scales: Vec<Result<Scale, ClientExtentError>> = COVERED_DPI
             .into_iter()
-            .map(|dpi| Some(extent(CLIENT, dpi)?.scale()))
+            .map(|dpi| Ok(extent(CLIENT, dpi)?.scale()))
             .collect();
-        assert_eq!(scales, COVERED_SCALES.map(Some).to_vec());
+        assert_eq!(scales, COVERED_SCALES.map(Ok).to_vec());
     }
 
     #[test]
     fn the_last_physical_pixel_maps_to_the_last_logical_pixel_at_every_covered_scale() {
-        let corners: Vec<Option<(LogicalPoint, LogicalPoint)>> = COVERED_DPI
+        let corners: Vec<Result<(LogicalPoint, LogicalPoint), ClientExtentError>> = COVERED_DPI
             .into_iter()
             .map(|dpi| {
                 let e = extent(CLIENT, dpi)?;
@@ -108,7 +128,7 @@ mod tests {
                         y: CLIENT.h - 1,
                     },
                 );
-                Some((
+                Ok((
                     last,
                     LogicalPoint {
                         x: logical.w - 1,
@@ -117,19 +137,26 @@ mod tests {
                 ))
             })
             .collect();
-        let agrees: Vec<Option<bool>> = corners
+        let agrees: Vec<Result<bool, ClientExtentError>> = corners
             .into_iter()
             .map(|pair| pair.map(|(got, want)| got == want))
             .collect();
-        assert_eq!(agrees, vec![Some(true); COVERED_DPI.len()]);
+        assert_eq!(agrees, vec![Ok(true); COVERED_DPI.len()]);
     }
 
     #[test]
     fn a_zero_dpi_reports_one() {
         assert_eq!(scale_from_dpi(0), None);
         assert_eq!(report_dpi("test", 0), Scale::ONE);
-        assert_eq!(extent(CLIENT, 0), None);
-        assert_eq!(extent(PhysicalSize { w: 0, h: 720 }, 96), None);
+        assert_eq!(extent(CLIENT, 0), Err(ClientExtentError::ZeroDpi));
+        let physical = PhysicalSize { w: 0, h: 720 };
+        assert_eq!(
+            extent(physical, 96),
+            Err(ClientExtentError::Extent(ExtentError::BelowTwoPixels {
+                physical,
+                logical: jfn_platform_abi::LogicalSize { w: 0, h: 720 },
+            }))
+        );
     }
 
     #[test]

@@ -1,29 +1,3 @@
-//! Fullscreen/resize transition gate.
-//!
-//! The compositor detaches the main surface's content while the window is
-//! resizing (so a stale-size frame isn't stretched), then re-presents once
-//! the new size lands. This is a pure value type: it holds no atomics or
-//! locks. The OS-bound compositor keeps its own `Mutex`/`AtomicBool` and
-//! stores a [`TransitionGate`] inside it — which keeps a backend's own
-//! locking intact and lets the gating logic be tested on any host.
-//!
-//! The two backends drive the gate through different (faithful) entry
-//! points:
-//! - **macOS** (`G_IN_TRANSITION` + `G_EXPECTED_SIZE`): [`begin`], [`end`],
-//!   [`in_transition`], [`set_expected`], [`note_present_size`]. It never
-//!   captures a pre-resize size.
-//! - **X11** (parent-snapshot capture + expected size):
-//!   [`begin_capturing`], [`end`], [`in_transition`], [`set_expected`],
-//!   [`main_present_decision`].
-//!
-//! [`begin`]: TransitionGate::begin
-//! [`begin_capturing`]: TransitionGate::begin_capturing
-//! [`end`]: TransitionGate::end
-//! [`in_transition`]: TransitionGate::in_transition
-//! [`set_expected`]: TransitionGate::set_expected
-//! [`note_present_size`]: TransitionGate::note_present_size
-//! [`main_present_decision`]: TransitionGate::main_present_decision
-
 /// What the main-surface present path should do with an incoming
 /// frame. See [`TransitionGate::main_present_decision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

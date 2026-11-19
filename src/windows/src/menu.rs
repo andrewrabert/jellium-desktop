@@ -9,7 +9,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use jfn_platform_abi::{
-    MENU_DISMISSED, MenuHost, MenuItem, MenuRequest, MenuSelection, menu_has_selectable,
+    MENU_DISMISSED, MenuHandle, MenuHost, MenuItem, MenuRequest, MenuSelection, menu_has_selectable,
 };
 use parking_lot::Mutex;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
@@ -44,27 +44,43 @@ static TRACKING: AtomicBool = AtomicBool::new(false);
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
+static CURRENT: Mutex<Option<MenuHandle>> = Mutex::new(None);
+
+static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_handle() -> MenuHandle {
+    let id = NEXT_HANDLE.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    MenuHandle::new(std::num::NonZeroU64::new(id).unwrap_or(std::num::NonZeroU64::MIN))
+}
+
 pub(crate) struct WinMenuHost;
 
 impl MenuHost for WinMenuHost {
-    fn open(&self, req: MenuRequest) {
+    fn open(&self, req: MenuRequest) -> Option<MenuHandle> {
         let (Some(hwnd), true) = (input_hwnd(), menu_has_selectable(&req.items)) else {
             req.on_selected.resolve(MENU_DISMISSED);
-            return;
+            return None;
         };
+        let handle = next_handle();
+        *CURRENT.lock() = Some(handle);
+        let (x, y) = req.anchor.floor();
         let displaced = PENDING.lock().replace(Pending {
             items: req.items,
-            x: req.x,
-            y: req.y,
+            x,
+            y,
             on_selected: req.on_selected,
         });
         if let Some(prev) = displaced {
             prev.on_selected.resolve(MENU_DISMISSED);
         }
         let _ = unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_TRACK, WPARAM(0), LPARAM(0)) };
+        Some(handle)
     }
 
-    fn hide(&self) {
+    fn hide(&self, handle: MenuHandle) {
+        if *CURRENT.lock() != Some(handle) {
+            return;
+        }
         CANCELLED.store(true, Ordering::Release);
         let pending = PENDING.lock().take();
         if let Some(pending) = pending {
@@ -142,10 +158,13 @@ pub(crate) fn on_input_message(hwnd: HWND, msg: u32) {
     }
 
     let scale = win_get_scale();
-    let (Some(x), Some(y)) = (scale.to_physical(pending.x), scale.to_physical(pending.y)) else {
-        tracing::error!(target: "platform", "menu anchor {},{} is unrepresentable at scale {scale}", pending.x, pending.y);
-        pending.on_selected.resolve(MENU_DISMISSED);
-        return;
+    let (x, y) = match (scale.to_physical(pending.x), scale.to_physical(pending.y)) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::error!(target: "platform", "menu anchor: {e}; dismissing");
+            pending.on_selected.resolve(MENU_DISMISSED);
+            return;
+        }
     };
     let mut pt = POINT { x, y };
     unsafe {

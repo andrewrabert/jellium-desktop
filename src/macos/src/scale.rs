@@ -1,8 +1,6 @@
 //! The macOS scale rule: the `backingScaleFactor` AppKit reports, turned into
 //! an exact [`Scale`], and this backend's own decision when it cannot be.
 
-use std::ffi::c_int;
-
 use jfn_platform_abi::Scale;
 #[cfg(target_os = "macos")]
 use jfn_platform_abi::WindowPos;
@@ -34,23 +32,6 @@ pub fn report_backing(source: &str, factor: Option<f64>) -> Scale {
         ),
     }
     reported
-}
-
-/// `points * scale`, integer round-half-up: the backing-pixel value a
-/// `CGFloat` measured in points names.
-///
-/// `None` when `points` is not finite, or when the result does not fit
-/// `c_int`.
-pub fn to_backing(scale: Scale, points: f64) -> Option<c_int> {
-    if !points.is_finite() {
-        return None;
-    }
-    let exact = points * scale.as_f64();
-    let rounded = (exact + 0.5).floor();
-    if !rounded.is_finite() || rounded < f64::from(c_int::MIN) || rounded > f64::from(c_int::MAX) {
-        return None;
-    }
-    Some(rounded as c_int)
 }
 
 /// The scale macOS reports for `at`.
@@ -92,26 +73,5 @@ mod tests {
     fn a_silent_source_reports_one() {
         assert_eq!(report_backing("test", None), Scale::ONE);
         assert_eq!(report_backing("test", Some(0.0)), Scale::ONE);
-    }
-
-    #[test]
-    fn a_point_value_converts_by_round_half_up_at_every_covered_scale() {
-        const POINTS: f64 = 337.5;
-        let converted: Vec<Option<c_int>> = COVERED_SCALES
-            .into_iter()
-            .map(|s| to_backing(s, POINTS))
-            .collect();
-        let oracle: Vec<Option<c_int>> = COVERED_SCALES
-            .into_iter()
-            .map(|s| Some((POINTS * s.as_f64() + 0.5).floor() as c_int))
-            .collect();
-        assert_eq!(converted, oracle);
-    }
-
-    #[test]
-    fn a_non_finite_point_value_names_no_backing_pixel() {
-        assert_eq!(to_backing(Scale::ONE, f64::NAN), None);
-        assert_eq!(to_backing(Scale::ONE, f64::INFINITY), None);
-        assert_eq!(to_backing(Scale::ONE, f64::from(c_int::MAX) * 2.0), None);
     }
 }

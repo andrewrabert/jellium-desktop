@@ -13,7 +13,7 @@ use jfn_cef::{APP_VERSION_FULL, BrowserCef, InitializedCef, LoadedCef, ProcessDi
 use jfn_instance_ipc::jfn::{Request, Response};
 use jfn_instance_ipc::{Listener, Start, Stream};
 use jfn_logging::{Category, Level};
-use jfn_platform_abi::{IdleInhibitLevel, Instance, Platform, WindowGeometry};
+use jfn_platform_abi::{IdleInhibitLevel, Instance, Platform, WindowGeometry, WindowStateError};
 
 use crate::cli;
 
@@ -772,21 +772,37 @@ fn boot_mpv_reconcile() -> Option<jfn_gpu_paint::RefreshRate> {
         jfn_gpu_paint::report_refresh(jfn_gpu_paint::RefreshSource::MpvDisplayFps, rate);
     }
     let saved = jfn_config::window_geometry();
-    let snap = crate::window_geometry::controller().source().snapshot();
+    let window = match crate::window_geometry::controller().source().window_state() {
+        Ok(window) => window,
+        Err(e) => {
+            tracing::error!(target: "Main", "[FLOW] mpv size reconcile: window state: {e}; mpv keeps its size");
+            return rate;
+        }
+    };
     tracing::info!(target: "Main",
         "[FLOW] scale={} fullscreen={} display-hz={hz}",
-        plat().scale(), snap.fullscreen
+        plat().scale(), window.fullscreen
     );
 
     // Saved intent, not an observation: the OS may still be applying the
     // maximize, and a set_geometry landing mid-flight leaves mpv's stored
     // window size disagreeing with the visible window.
-    let locked = saved.maximized || snap.fullscreen || snap.maximized;
-    let reconciled = crate::window_geometry::saved_sizes(&saved).and_then(|(logical, physical)| {
-        plat()
-            .window_owner()
-            .reconcile_mpv_size(plat().scale(), logical, physical, locked)
-    });
+    let locked = saved.maximized || window.fullscreen || window.maximized;
+    let reconciled = match crate::window_geometry::saved_sizes(&saved) {
+        Some((logical, physical)) => {
+            plat()
+                .window_owner()
+                .reconcile_mpv_size(plat().scale(), logical, physical, locked)
+        }
+        None => Ok(None),
+    };
+    let reconciled = match reconciled {
+        Ok(reconciled) => reconciled,
+        Err(e) => {
+            tracing::error!(target: "Main", "[FLOW] mpv size reconcile: {e}; mpv keeps its size");
+            None
+        }
+    };
     if let Some(physical) = reconciled {
         let clamped = plat().clamp_window_geometry(WindowGeometry {
             w: physical.w,
@@ -826,8 +842,6 @@ fn start_web_overlay(
     }
     jfn_color::theme::jfn_theme_color_set_video_bg(user_video_bg);
 
-    // The overlay creates its browser itself, at the first size the window
-    // snapshot and the shell overlay's reserved strip yield.
     let manager = crate::manager::jfn_manager_prepare()?;
     let overlay = jfn_cef::WebOverlay::start(
         &cef.runtime,
@@ -997,9 +1011,12 @@ fn run_app(
 
     // Boot geometry resolves before the host prepare so its display probes
     // hit the real server, not the mpv proxy the prepare may install.
-    let Some(boot) = crate::window_geometry::controller().boot() else {
-        tracing::error!(target: "Main", "boot geometry unrepresentable at the reported scale");
-        return 1;
+    let boot = match crate::window_geometry::controller().boot() {
+        Ok(boot) => boot,
+        Err(e) => {
+            tracing::error!(target: "Main", "boot geometry: {e}");
+            return 1;
+        }
     };
     let mpv_boot = plat().window_owner().apply_boot_geometry(&boot);
 
@@ -1217,10 +1234,14 @@ fn boot_progress(boot: &BackgroundCapture) -> Option<ReadyBoot> {
     let BackgroundCapture::Applied { user_video_bg } = boot else {
         return None;
     };
-    crate::window_geometry::controller()
-        .source()
-        .snapshot()
-        .extent?;
+    match crate::window_geometry::controller().source().window_state() {
+        Ok(_) => {}
+        Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => return None,
+        Err(e) => {
+            tracing::error!(target: "Main", "boot: window state: {e}");
+            return None;
+        }
+    }
     if !plat().mpv_host().host_ready() {
         return None;
     }

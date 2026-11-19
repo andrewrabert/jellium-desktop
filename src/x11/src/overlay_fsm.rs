@@ -1,13 +1,3 @@
-//! Pure placement state machine for one CEF overlay tracking the mpv parent.
-//!
-//! No x11rb / FFI / OS calls — plain values, so it unit-tests on any host like
-//! [`jfn_compositor_core::transition`]. The geometry thread is the executor: it
-//! snapshots parent truth, calls [`step`] per overlay, and applies the effects.
-//!
-//! Fullscreen escape works by flipping the overlay to `override_redirect` (an
-//! unmanaged window the WM won't strut-clamp), positioned by us at the parent's
-//! fullscreen rect. Windowed overlays stay WM-managed transients.
-
 /// Absolute screen rect: `(x, y, w, h)`.
 pub type Geom = (i32, i32, i32, i32);
 
@@ -27,7 +17,6 @@ impl OverlayState {
     }
 }
 
-/// Parent truth + this overlay's wants, snapshotted once per handler pass.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Inputs {
     /// Absolute parent geometry; in fullscreen this is the monitor rect.

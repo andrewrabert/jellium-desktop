@@ -1,15 +1,3 @@
-//! X11 geometry thread: the sole writer of ALL overlay + video-host structure.
-//!
-//! It owns every [`StructureSurface`], consumes the [`GeometryCommand`] queue
-//! (create/destroy/visibility/restack), and is the sole sizer of the overlays
-//! and the video host. It publishes the parent's live geometry as an immutable
-//! [`ParentSnapshot`] so all other readers are lock-free.
-//!
-//! Structure (create/size/place/map/restack) runs on the geometry connection;
-//! content (pixel upload) runs on the content connection inside each surface's
-//! [`crate::overlay_actor::OverlayActor`]. No overlay window ever has two
-//! writers.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -39,7 +27,7 @@ use crate::registry::{
     GeometryCommand, StructureSurface, SurfaceId, drain_commands, publish_applied, registry,
     split_capabilities,
 };
-use crate::x11_state::{HostServices, PaintServices, ParentSnapshot};
+use crate::x11_state::{HostServices, PaintServices, PublishedParent};
 
 pub struct Handle {
     join: Option<std::thread::JoinHandle<()>>,
@@ -149,7 +137,7 @@ pub fn start(
     parent: u32,
     video_host: u32,
     root: u32,
-    boot: ParentSnapshot,
+    boot: PublishedParent,
 ) {
     *CONN_HOLD.lock() = Some(conn.clone());
     crate::registry::install_command_channel();
@@ -199,14 +187,14 @@ struct GeoWork {
 }
 
 impl GeoWork {
-    fn new(scale: jfn_platform_abi::Scale, snap: &ParentSnapshot) -> Self {
+    fn new(scale: jfn_platform_abi::Scale, boot: &PublishedParent) -> Self {
         Self {
-            parent_x: snap.origin_x,
-            parent_y: snap.origin_y,
-            pw: snap.width,
-            ph: snap.height,
-            fullscreen: snap.fullscreen,
-            maximized: snap.maximized,
+            parent_x: boot.origin_x,
+            parent_y: boot.origin_y,
+            pw: boot.width,
+            ph: boot.height,
+            fullscreen: boot.fullscreen,
+            maximized: boot.maximized,
             scale,
             structures: HashMap::new(),
             fsm: HashMap::new(),
@@ -240,7 +228,7 @@ impl GeoWork {
     }
 
     fn publish(&self) {
-        crate::x11_state::publish_parent(ParentSnapshot {
+        crate::x11_state::publish_parent(PublishedParent {
             origin_x: self.parent_x,
             origin_y: self.parent_y,
             width: self.pw,
@@ -681,9 +669,6 @@ fn activate_parent(conn: &RustConnection, root: Window, parent: Window) {
 // ===================================================================
 
 impl GeoLoop {
-    /// Snapshot parent truth once, size the video host + every overlay from it
-    /// in one flushed batch. A pending of `Restack` or above re-raises an
-    /// unmanaged overlay over mpv after events that can restack the parent.
     fn reconcile(&mut self, pending: Pending) {
         let reassert_stack = pending >= Pending::Restack;
         let conn = &*self.conn;
@@ -845,7 +830,7 @@ impl GeoLoop {
         video_host: Window,
         root: Window,
         signal: LoopSignal,
-        boot: ParentSnapshot,
+        boot: PublishedParent,
     ) -> GeoLoop {
         let watch_mask = EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE;
         watch_window(&conn, parent, watch_mask);
@@ -1063,7 +1048,7 @@ fn geometry_thread_body(
     parent: Window,
     video_host: Window,
     root: Window,
-    boot: ParentSnapshot,
+    boot: PublishedParent,
 ) {
     let mut event_loop: EventLoop<'_, GeoLoop> = match EventLoop::try_new() {
         Ok(el) => el,

@@ -2,7 +2,8 @@
 //! geometry comes from the geometry thread's state, not mpv ingest.
 
 use jfn_platform_abi::{
-    AppCreatedWindow, BootGeometry, PhysicalSize, WindowPos, WindowSnapshot, WindowSource,
+    AppCreatedWindow, BootGeometry, PhysicalSize, WindowPos, WindowSource, WindowState,
+    WindowStateError,
 };
 
 pub struct X11WindowSource;
@@ -10,38 +11,31 @@ pub struct X11WindowSource;
 pub static X11_WINDOW_SOURCE: X11WindowSource = X11WindowSource;
 
 impl WindowSource for X11WindowSource {
-    fn snapshot(&self) -> WindowSnapshot {
+    fn window_state(&self) -> Result<WindowState, WindowStateError> {
         if crate::x11_state::host().is_none() {
-            return WindowSnapshot {
-                extent: None,
-                position: None,
-                maximized: false,
-                fullscreen: false,
-            };
+            return Err(WindowStateError::NoWindow);
         }
-        let Some(m) = crate::x11_state::parent_snapshot() else {
-            return WindowSnapshot {
-                extent: None,
-                position: None,
-                maximized: false,
-                fullscreen: false,
-            };
+        let Some(parent) = crate::x11_state::published_parent() else {
+            return Err(WindowStateError::NoWindow);
         };
-        WindowSnapshot {
-            extent: crate::scale::extent(
-                PhysicalSize {
-                    w: m.width,
-                    h: m.height,
-                },
-                m.scale,
-            ),
+        let extent = crate::scale::extent(
+            PhysicalSize {
+                w: parent.width,
+                h: parent.height,
+            },
+            parent.scale,
+        )?;
+        Ok(WindowState {
+            extent,
             position: Some(WindowPos {
-                x: m.origin_x,
-                y: m.origin_y,
+                x: parent.origin_x,
+                y: parent.origin_y,
             }),
-            maximized: m.maximized,
-            fullscreen: m.fullscreen,
-        }
+            maximized: parent.maximized,
+            fullscreen: parent.fullscreen,
+            web_top: 0,
+            basis: jfn_platform_abi::WindowBasis::FIXED,
+        })
     }
 }
 

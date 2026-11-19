@@ -110,19 +110,66 @@ impl Scale {
         self.numerator.get() as f64 / self.denominator.get() as f64
     }
 
-    /// `logical * scale`, integer round-half-up. `None` when the result does
-    /// not fit `c_int`.
-    pub fn to_physical(self, logical: c_int) -> Option<c_int> {
+    pub fn to_physical(self, logical: c_int) -> Result<c_int, Unrepresentable> {
         let num = i128::from(logical) * i128::from(self.numerator.get());
-        c_int::try_from(div_round_half_up(num, i128::from(self.denominator.get()))).ok()
+        c_int::try_from(div_round_half_up(num, i128::from(self.denominator.get()))).map_err(|_| {
+            Unrepresentable {
+                value: logical,
+                scale: self,
+            }
+        })
     }
 
-    /// `physical / scale`, integer round-half-up. `None` when the result does
-    /// not fit `c_int`.
-    pub fn to_logical(self, physical: c_int) -> Option<c_int> {
+    pub fn to_logical(self, physical: c_int) -> Result<c_int, Unrepresentable> {
         let num = i128::from(physical) * i128::from(self.denominator.get());
-        c_int::try_from(div_round_half_up(num, i128::from(self.numerator.get()))).ok()
+        c_int::try_from(div_round_half_up(num, i128::from(self.numerator.get()))).map_err(|_| {
+            Unrepresentable {
+                value: physical,
+                scale: self,
+            }
+        })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+pub enum PointsToPixelsError {
+    #[error("{points} points is not a finite length (scale {scale})")]
+    NonFinite { points: f64, scale: Scale },
+    #[error("{points} points at scale {scale} does not fit a pixel count")]
+    DoesNotFit { points: f64, scale: Scale },
+}
+
+pub fn points_to_pixels(scale: Scale, points: f64) -> Result<c_int, PointsToPixelsError> {
+    if !points.is_finite() {
+        return Err(PointsToPixelsError::NonFinite { points, scale });
+    }
+    let exact = points * scale.as_f64();
+    let rounded = (exact + 0.5).floor();
+    if !rounded.is_finite() || rounded < f64::from(c_int::MIN) || rounded > f64::from(c_int::MAX) {
+        return Err(PointsToPixelsError::DoesNotFit { points, scale });
+    }
+    Ok(rounded as c_int)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, thiserror::Error)]
+#[error("{value} px does not convert at scale {scale}")]
+pub struct Unrepresentable {
+    pub value: c_int,
+    pub scale: Scale,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, thiserror::Error)]
+pub enum ExtentError {
+    #[error(transparent)]
+    Unrepresentable(#[from] Unrepresentable),
+    #[error(
+        "physical {}x{} or logical {}x{} has an axis below two pixels",
+        physical.w, physical.h, logical.w, logical.h
+    )]
+    BelowTwoPixels {
+        physical: PhysicalSize,
+        logical: LogicalSize,
+    },
 }
 
 /// `value`, which is not zero.
@@ -182,9 +229,8 @@ pub struct PhysicalSize {
 }
 
 impl LogicalSize {
-    /// `None` when either axis of the result does not fit `c_int`.
-    pub fn to_physical(self, scale: Scale) -> Option<PhysicalSize> {
-        Some(PhysicalSize {
+    pub fn to_physical(self, scale: Scale) -> Result<PhysicalSize, Unrepresentable> {
+        Ok(PhysicalSize {
             w: scale.to_physical(self.w)?,
             h: scale.to_physical(self.h)?,
         })
@@ -192,9 +238,8 @@ impl LogicalSize {
 }
 
 impl PhysicalSize {
-    /// `None` when either axis of the result does not fit `c_int`.
-    pub fn to_logical(self, scale: Scale) -> Option<LogicalSize> {
-        Some(LogicalSize {
+    pub fn to_logical(self, scale: Scale) -> Result<LogicalSize, Unrepresentable> {
+        Ok(LogicalSize {
             w: scale.to_logical(self.w)?,
             h: scale.to_logical(self.h)?,
         })
@@ -230,6 +275,81 @@ impl LogicalPoint {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct WindowPoint {
+    x: f64,
+    y: f64,
+}
+
+impl WindowPoint {
+    pub fn from_window(x: f64, y: f64) -> WindowPoint {
+        WindowPoint { x, y }
+    }
+
+    pub fn x(self) -> f64 {
+        self.x
+    }
+
+    pub fn y(self) -> f64 {
+        self.y
+    }
+
+    pub fn floor(self) -> (c_int, c_int) {
+        (floor_axis(self.x), floor_axis(self.y))
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct WebPoint {
+    x: f64,
+    y: f64,
+}
+
+impl WebPoint {
+    pub fn from_view(x: f64, y: f64) -> WebPoint {
+        WebPoint { x, y }
+    }
+
+    pub fn x(self) -> f64 {
+        self.x
+    }
+
+    pub fn y(self) -> f64 {
+        self.y
+    }
+
+    pub fn floor(self) -> (c_int, c_int) {
+        (floor_axis(self.x), floor_axis(self.y))
+    }
+}
+
+fn floor_axis(v: f64) -> c_int {
+    view_axis(v.floor())
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct WindowBasis(u64);
+
+impl WindowBasis {
+    pub const FIXED: WindowBasis = WindowBasis(0);
+
+    pub fn next(self) -> WindowBasis {
+        WindowBasis(self.0.wrapping_add(1))
+    }
+}
+
+pub fn web_top(
+    decorations: crate::EffectiveDecorations,
+    fullscreen: bool,
+    titlebar_present: bool,
+) -> c_int {
+    if titlebar_present && decorations == crate::EffectiveDecorations::ClientSide && !fullscreen {
+        crate::TITLEBAR_LOGICAL_HEIGHT
+    } else {
+        0
+    }
+}
+
 /// `v` truncated toward zero, saturating at the [`c_int`] bounds. A
 /// non-finite `v` names zero.
 fn view_axis(v: f64) -> c_int {
@@ -255,19 +375,15 @@ pub struct WindowExtent {
 }
 
 impl WindowExtent {
-    /// The extent `physical`, `scale` and `logical` name.
-    ///
-    /// `logical` is the size its producer supplied; nothing here re-derives
-    /// it.
-    ///
-    /// `None` when either axis of either size is below two pixels: a
-    /// one-pixel axis has no second endpoint for
-    /// [`WindowExtent::to_logical_point`] to map onto.
-    pub fn new(physical: PhysicalSize, scale: Scale, logical: LogicalSize) -> Option<Self> {
+    pub fn new(
+        physical: PhysicalSize,
+        scale: Scale,
+        logical: LogicalSize,
+    ) -> Result<Self, ExtentError> {
         if physical.w < 2 || physical.h < 2 || logical.w < 2 || logical.h < 2 {
-            return None;
+            return Err(ExtentError::BelowTwoPixels { physical, logical });
         }
-        Some(Self {
+        Ok(Self {
             logical,
             physical,
             scale,
@@ -417,41 +533,34 @@ impl WindowGeometry {
     }
 }
 
-/// A window's top-left position, in the coordinate space the backend
-/// reports (backing pixels relative to the working area). Returned by
-/// `Platform::query_window_position`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WindowPos {
     pub x: c_int,
     pub y: c_int,
 }
 
-/// A surface's own coherent size, the scale it is presented at, and the strip
-/// of the window above it.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SurfaceSize {
     pub extent: WindowExtent,
-    /// Offset of the surface's top edge from the window's top edge.
-    pub logical_top: c_int,
-    pub physical_top: c_int,
 }
 
-/// The physical size mpv's window is resized to at boot.
-///
-/// `None` when `locked`, when the saved logical size does not map to a
-/// representable physical one, and when the size it maps to is the one the
-/// saved geometry already records.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SurfacePlacement {
+    Window,
+    BelowTitlebar,
+}
+
 pub(crate) fn mpv_reconcile_size(
     reported: Scale,
     saved_logical: LogicalSize,
     saved_physical: PhysicalSize,
     locked: bool,
-) -> Option<PhysicalSize> {
+) -> Result<Option<PhysicalSize>, Unrepresentable> {
     if locked {
-        return None;
+        return Ok(None);
     }
     let physical = saved_logical.to_physical(reported)?;
-    (physical != saved_physical).then_some(physical)
+    Ok((physical != saved_physical).then_some(physical))
 }
 
 /// `g`'s size shrunk to fit `bounds`; its position is untouched.
@@ -533,7 +642,7 @@ mod tests {
             let physical = logical.to_physical(scale);
             assert_eq!(
                 physical.and_then(|p| p.to_logical(scale)),
-                Some(logical),
+                Ok(logical),
                 "at {scale}"
             );
         }
@@ -542,19 +651,19 @@ mod tests {
     #[test]
     fn covered_scales_map_to_their_known_physical_sizes() {
         let logical = LogicalSize { w: 1280, h: 720 };
-        let sizes: Vec<Option<PhysicalSize>> = covered()
+        let sizes: Vec<Result<PhysicalSize, Unrepresentable>> = covered()
             .into_iter()
             .map(|s| logical.to_physical(s))
             .collect();
         assert_eq!(
             sizes,
             vec![
-                Some(PhysicalSize { w: 640, h: 360 }),
-                Some(PhysicalSize { w: 960, h: 540 }),
-                Some(PhysicalSize { w: 1280, h: 720 }),
-                Some(PhysicalSize { w: 1600, h: 900 }),
-                Some(PhysicalSize { w: 1920, h: 1080 }),
-                Some(PhysicalSize { w: 2560, h: 1440 }),
+                Ok(PhysicalSize { w: 640, h: 360 }),
+                Ok(PhysicalSize { w: 960, h: 540 }),
+                Ok(PhysicalSize { w: 1280, h: 720 }),
+                Ok(PhysicalSize { w: 1600, h: 900 }),
+                Ok(PhysicalSize { w: 1920, h: 1080 }),
+                Ok(PhysicalSize { w: 2560, h: 1440 }),
             ]
         );
     }
@@ -582,26 +691,30 @@ mod tests {
     fn an_axis_below_two_pixels_names_no_extent() {
         let one = PhysicalSize { w: 1, h: 720 };
         let ok = LogicalSize { w: 1280, h: 720 };
-        assert_eq!(WindowExtent::new(one, Scale::ONE, ok), None);
         assert_eq!(
-            WindowExtent::new(
-                PhysicalSize { w: 1280, h: 720 },
-                Scale::ONE,
-                LogicalSize { w: 1280, h: 1 },
-            ),
-            None
+            WindowExtent::new(one, Scale::ONE, ok),
+            Err(ExtentError::BelowTwoPixels {
+                physical: one,
+                logical: ok,
+            })
+        );
+        let physical = PhysicalSize { w: 1280, h: 720 };
+        let logical = LogicalSize { w: 1280, h: 1 };
+        assert_eq!(
+            WindowExtent::new(physical, Scale::ONE, logical),
+            Err(ExtentError::BelowTwoPixels { physical, logical })
         );
     }
 
     #[test]
     fn the_last_physical_pixel_maps_to_the_last_logical_pixel_at_every_covered_scale() {
         let logical = LogicalSize { w: 1280, h: 720 };
-        let corners: Vec<Option<(LogicalPoint, LogicalPoint)>> = covered()
+        let corners: Vec<Result<(LogicalPoint, LogicalPoint), ExtentError>> = covered()
             .into_iter()
             .map(|scale| {
                 let extent = WindowExtent::new(logical.to_physical(scale)?, scale, logical)?;
                 let physical = extent.physical();
-                Some((
+                Ok((
                     extent.to_logical_point(PhysicalPoint { x: 0, y: 0 }),
                     extent.to_logical_point(PhysicalPoint {
                         x: physical.w - 1,
@@ -610,7 +723,7 @@ mod tests {
                 ))
             })
             .collect();
-        let expected = Some((
+        let expected = Ok((
             LogicalPoint { x: 0, y: 0 },
             LogicalPoint {
                 x: logical.w - 1,
@@ -623,7 +736,7 @@ mod tests {
     #[test]
     fn pointer_map_stays_monotone_past_the_client_origin() {
         let logical = LogicalSize { w: 1280, h: 720 };
-        let monotone: Vec<Option<bool>> = covered()
+        let monotone: Vec<Result<bool, ExtentError>> = covered()
             .into_iter()
             .map(|scale| {
                 let extent = WindowExtent::new(logical.to_physical(scale)?, scale, logical)?;
@@ -634,10 +747,10 @@ mod tests {
                     ok &= mapped >= previous;
                     previous = mapped;
                 }
-                Some(ok)
+                Ok(ok)
             })
             .collect();
-        assert_eq!(monotone, vec![Some(true); COVERED_SCALES.len()]);
+        assert_eq!(monotone, vec![Ok(true); COVERED_SCALES.len()]);
     }
 
     #[test]
@@ -646,11 +759,11 @@ mod tests {
         let physical = PhysicalSize { w: 1280, h: 720 };
         assert_eq!(
             mpv_reconcile_size(Scale::ONE, logical, physical, false),
-            None
+            Ok(None)
         );
         assert_eq!(
-            ratio(5, 4).and_then(|s| mpv_reconcile_size(s, logical, physical, true)),
-            None
+            ratio(5, 4).map(|s| mpv_reconcile_size(s, logical, physical, true)),
+            Some(Ok(None))
         );
     }
 
@@ -659,8 +772,8 @@ mod tests {
         let logical = LogicalSize { w: 1280, h: 720 };
         let physical = PhysicalSize { w: 1280, h: 720 };
         assert_eq!(
-            ratio(5, 4).and_then(|s| mpv_reconcile_size(s, logical, physical, false)),
-            Some(PhysicalSize { w: 1600, h: 900 })
+            ratio(5, 4).map(|s| mpv_reconcile_size(s, logical, physical, false)),
+            Some(Ok(Some(PhysicalSize { w: 1600, h: 900 })))
         );
     }
 
@@ -777,5 +890,53 @@ mod tests {
         let mut g = WindowGeometry::from_raw(3000, 2000, -1, -1);
         clamp_to_bounds(&mut g, SCREEN);
         assert_eq!(g, WindowGeometry::from_raw(1920, 1080, 0, 0));
+    }
+
+    #[test]
+    fn a_point_value_converts_by_round_half_up_at_every_covered_scale() {
+        const POINTS: f64 = 337.5;
+        let converted: Vec<Result<c_int, PointsToPixelsError>> = COVERED_SCALES
+            .into_iter()
+            .map(|s| points_to_pixels(s, POINTS))
+            .collect();
+        let oracle: Vec<Result<c_int, PointsToPixelsError>> = COVERED_SCALES
+            .into_iter()
+            .map(|s| Ok((POINTS * s.as_f64() + 0.5).floor() as c_int))
+            .collect();
+        assert_eq!(converted, oracle);
+    }
+
+    #[test]
+    fn a_non_finite_point_value_is_non_finite() {
+        assert!(matches!(
+            points_to_pixels(Scale::ONE, f64::NAN),
+            Err(PointsToPixelsError::NonFinite { points, scale: Scale::ONE }) if points.is_nan()
+        ));
+        assert_eq!(
+            points_to_pixels(Scale::ONE, f64::INFINITY),
+            Err(PointsToPixelsError::NonFinite {
+                points: f64::INFINITY,
+                scale: Scale::ONE
+            })
+        );
+    }
+
+    #[test]
+    fn a_point_value_beyond_c_int_does_not_fit() {
+        let points = f64::from(c_int::MAX) * 2.0;
+        assert_eq!(
+            points_to_pixels(Scale::ONE, points),
+            Err(PointsToPixelsError::DoesNotFit {
+                points,
+                scale: Scale::ONE
+            })
+        );
+        assert_eq!(
+            points_to_pixels(Scale::ONE, -points),
+            Err(PointsToPixelsError::DoesNotFit {
+                points: -points,
+                scale: Scale::ONE
+            })
+        );
     }
 }

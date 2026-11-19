@@ -6,7 +6,7 @@
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
-use jfn_platform_abi::{LogicalSize, PhysicalSize, Scale, WindowExtent};
+use jfn_platform_abi::{ExtentError, LogicalSize, PhysicalSize, Scale, WindowExtent};
 
 use crate::window_state::WindowSize;
 
@@ -79,17 +79,11 @@ pub(crate) fn unstated(log: &mut UnstatedLog) -> Scale120 {
     REPORTED
 }
 
-/// The extent a compositor's own sizes and the scale it reported name.
-///
-/// The logical size is carried through verbatim.
-///
-/// `None` when the physical size and scale do not map to a logical one, or
-/// when either axis is below two pixels.
 pub(crate) fn extent(
     logical: WindowSize,
     physical: WindowSize,
     scale: Scale,
-) -> Option<WindowExtent> {
+) -> Result<WindowExtent, ExtentError> {
     let physical = PhysicalSize {
         w: physical.w(),
         h: physical.h(),
@@ -185,19 +179,24 @@ mod tests {
     #[test]
     fn the_extent_carries_the_reported_scale_at_every_covered_scale() {
         let logical = LogicalSize { w: 1280, h: 720 };
-        let scales: Vec<Option<Scale>> = jfn_platform_abi::COVERED_SCALES
+        let scales: Vec<Result<Option<Scale>, ExtentError>> = jfn_platform_abi::COVERED_SCALES
             .into_iter()
             .map(|s| {
                 let physical = logical.to_physical(s)?;
-                let e = extent(
-                    sizes(logical.w, logical.h)?,
-                    sizes(physical.w, physical.h)?,
-                    s,
-                )?;
-                Some(e.scale())
+                let (Some(logical), Some(physical)) =
+                    (sizes(logical.w, logical.h), sizes(physical.w, physical.h))
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(extent(logical, physical, s)?.scale()))
             })
             .collect();
-        assert_eq!(scales, jfn_platform_abi::COVERED_SCALES.map(Some).to_vec());
+        assert_eq!(
+            scales,
+            jfn_platform_abi::COVERED_SCALES
+                .map(|s| Ok(Some(s)))
+                .to_vec()
+        );
     }
 
     #[test]
@@ -209,12 +208,11 @@ mod tests {
         assert_eq!(
             sizes(598, 337)
                 .zip(sizes(1497, 843))
-                .and_then(|(l, p)| extent(l, p, scale))
-                .map(|e| (e.logical(), e.physical())),
-            Some((
+                .map(|(l, p)| extent(l, p, scale).map(|e| (e.logical(), e.physical()))),
+            Some(Ok((
                 LogicalSize { w: 598, h: 337 },
                 PhysicalSize { w: 1497, h: 843 }
-            ))
+            )))
         );
     }
 
@@ -254,10 +252,13 @@ mod tests {
                 return;
             };
             let oracle = (i128::from(logical) * i128::from(raw) + 60) / 120;
-            let physical = scale.scale().to_physical(logical);
+            let expected = i32::try_from(oracle).map_err(|_| jfn_platform_abi::Unrepresentable {
+                value: logical,
+                scale: scale.scale(),
+            });
             assert_eq!(
-                physical.map(i128::from),
-                i32::try_from(oracle).ok().map(i128::from),
+                scale.scale().to_physical(logical),
+                expected,
                 "raw={raw} logical={logical}"
             );
         };
@@ -318,7 +319,7 @@ mod tests {
             else {
                 continue;
             };
-            let Some(physical) = scale.scale().to_physical(w) else {
+            let Ok(physical) = scale.scale().to_physical(w) else {
                 continue;
             };
             let Ok(physical_u32) = u32::try_from(physical) else {

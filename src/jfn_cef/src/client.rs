@@ -182,11 +182,8 @@ impl Painting {
     }
 }
 
-/// The browser handle and the size last applied to it, under one lock: a size
-/// derived while no browser exists is never recorded as applied.
 pub(crate) struct BrowserState {
     pub(crate) browser: Option<Browser>,
-    pub(crate) applied: Option<jfn_platform_abi::SurfaceSize>,
 }
 
 pub(crate) struct Inner {
@@ -255,10 +252,15 @@ pub type CreatedFn = dyn Fn() + Send + Sync;
 pub type ContextBuilderFn = dyn Fn(*mut c_void) + Send + Sync;
 pub type ContextDispatcherFn = dyn Fn(c_int) -> bool + Send + Sync;
 
+#[derive(Clone, Copy)]
+enum PopupAt {
+    Window(jfn_platform_abi::WindowPoint, jfn_platform_abi::WindowBasis),
+    View(i32, i32),
+}
+
 #[derive(Default)]
 struct PopupState {
-    x: i32,
-    y: i32,
+    rect: Option<PopupAt>,
     w: i32,
     h: i32,
     visible: bool,
@@ -267,8 +269,9 @@ struct PopupState {
     // Option indices an arrow key can land on (disabled/optgroup-disabled
     // excluded). Used to drive CEF's own popup to the chosen row.
     selectable: Vec<i32>,
-    // Bottom-left corner of the <select> element in view coordinates.
-    anchor: Option<(i32, i32)>,
+    anchor: Option<PopupAt>,
+    requested: bool,
+    menu: Option<jfn_platform_abi::MenuHandle>,
     size_received: bool,
     options_received: bool,
 }
@@ -316,10 +319,7 @@ impl Inner {
             _owner_connected: owner_connected,
             owner_disconnected,
             painting: Mutex::new(Painting::None),
-            browser: Mutex::new(BrowserState {
-                browser: None,
-                applied: None,
-            }),
+            browser: Mutex::new(BrowserState { browser: None }),
             pending_menu_callback: Mutex::new(None),
             menu: Mutex::new(MenuOwnership::default()),
             surface,
@@ -359,29 +359,7 @@ impl Inner {
         &self.surface
     }
 
-    /// The strip this browser's view was sized below, logical pixels. Zero
-    /// until a size has been applied to a live browser.
-    pub(crate) fn view_top(&self) -> c_int {
-        self.browser
-            .lock()
-            .applied
-            .map_or(0, |size| size.logical_top)
-    }
-
-    /// Hand `size` to the platform surface and, when a browser exists, to CEF.
-    /// A size derived before the browser exists is applied but never recorded,
-    /// so the next reconcile applies it again once the browser is there.
     pub(crate) fn apply_view_size(self: &Arc<Self>, size: jfn_platform_abi::SurfaceSize) {
-        {
-            let mut state = self.browser.lock();
-            if state.browser.is_none() {
-                state.applied = None;
-            } else if state.applied == Some(size) {
-                return;
-            } else {
-                state.applied = Some(size);
-            }
-        }
         self.resize(size);
     }
 

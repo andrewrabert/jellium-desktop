@@ -134,12 +134,12 @@ fn hint_scale(renderer: &mut Renderer, extent: WindowExtent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jfn_platform_abi::{COVERED_SCALES, LogicalSize, Scale};
+    use jfn_platform_abi::{COVERED_SCALES, ExtentError, LogicalSize, Scale};
 
     const LOGICAL: LogicalSize = LogicalSize { w: 1280, h: 720 };
 
     /// One extent per covered scale, each carrying that scale verbatim.
-    fn extents() -> Vec<Option<WindowExtent>> {
+    fn extents() -> Vec<Result<WindowExtent, ExtentError>> {
         COVERED_SCALES
             .into_iter()
             .map(|s| WindowExtent::new(LOGICAL.to_physical(s)?, s, LOGICAL))
@@ -148,32 +148,30 @@ mod tests {
 
     #[test]
     fn the_viewport_carries_the_reported_scale_at_every_covered_scale() {
-        let reported: Vec<Option<f32>> = extents()
+        let reported: Vec<Result<f32, ExtentError>> = extents()
             .into_iter()
-            .map(|e| Some(viewport(e?).scale().window))
+            .map(|e| Ok(viewport(e?).scale().window))
             .collect();
-        let expected: Vec<Option<f32>> = COVERED_SCALES
-            .into_iter()
-            .map(|s| Some(s.as_f32()))
-            .collect();
+        let expected: Vec<Result<f32, ExtentError>> =
+            COVERED_SCALES.into_iter().map(|s| Ok(s.as_f32())).collect();
         assert_eq!(reported, expected);
     }
 
     #[test]
     fn the_viewport_is_the_extent_s_physical_size_at_every_covered_scale() {
-        let sizes: Vec<Option<(u32, u32)>> = extents()
+        let sizes: Vec<Result<(u32, u32), ExtentError>> = extents()
             .into_iter()
             .map(|e| {
                 let e = e?;
                 let size = viewport(e).physical_size();
-                Some((size.width, size.height))
+                Ok((size.width, size.height))
             })
             .collect();
-        let expected: Vec<Option<(u32, u32)>> = COVERED_SCALES
+        let expected: Vec<Result<(u32, u32), ExtentError>> = COVERED_SCALES
             .into_iter()
             .map(|s| {
                 let p = LOGICAL.to_physical(s)?;
-                Some((p.w as u32, p.h as u32))
+                Ok((p.w as u32, p.h as u32))
             })
             .collect();
         assert_eq!(sizes, expected);
@@ -181,15 +179,13 @@ mod tests {
 
     #[test]
     fn the_swapchain_size_is_the_extent_s_physical_size_at_every_covered_scale() {
-        let sizes: Vec<Option<FrameSize>> = extents()
-            .into_iter()
-            .map(|e| Some(frame_size(e?)))
-            .collect();
-        let expected: Vec<Option<FrameSize>> = COVERED_SCALES
+        let sizes: Vec<Result<FrameSize, ExtentError>> =
+            extents().into_iter().map(|e| Ok(frame_size(e?))).collect();
+        let expected: Vec<Result<FrameSize, ExtentError>> = COVERED_SCALES
             .into_iter()
             .map(|s| {
                 let p = LOGICAL.to_physical(s)?;
-                Some(FrameSize { w: p.w, h: p.h })
+                Ok(FrameSize { w: p.w, h: p.h })
             })
             .collect();
         assert_eq!(sizes, expected);
@@ -197,11 +193,11 @@ mod tests {
 
     #[test]
     fn the_application_scale_is_one_at_every_covered_scale() {
-        let applications: Vec<Option<f32>> = extents()
+        let applications: Vec<Result<f32, ExtentError>> = extents()
             .into_iter()
-            .map(|e| Some(viewport(e?).scale().application))
+            .map(|e| Ok(viewport(e?).scale().application))
             .collect();
-        assert_eq!(applications, vec![Some(1.0); COVERED_SCALES.len()]);
+        assert_eq!(applications, vec![Ok(1.0); COVERED_SCALES.len()]);
         assert_eq!(Scale::ONE.as_f32(), 1.0);
     }
 }

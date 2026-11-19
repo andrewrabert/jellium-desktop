@@ -5,7 +5,7 @@
 //! register their own adapter on the same queue.
 
 use crate::popup_protocol::{PopupCommand, Popups};
-use crate::protocol::{InputTarget, SeatInput};
+use crate::protocol::{InputTarget, SeatInput, SurfacePoint};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, LoopHandle, LoopSignal, ping::PingSource};
 use calloop_wayland_source::WaylandSource;
@@ -41,6 +41,7 @@ use xkbcommon::xkb;
 
 use jfn_input::TouchPhase;
 use jfn_input::buttons::{BTN_BACK, BTN_EXTRA, BTN_FORWARD, BTN_SIDE};
+use jfn_platform_abi::WindowPoint;
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_ALT_DOWN, EVENTFLAG_CONTROL_DOWN, EVENTFLAG_SHIFT_DOWN,
 };
@@ -77,19 +78,21 @@ impl SeatShared {
     }
 }
 
-pub type MouseMoveFn = fn(x: i32, y: i32, mods: u32, leave: c_int);
-pub type MouseButtonFn = fn(button: u32, pressed: c_int, x: i32, y: i32, mods: u32);
-pub type ScrollFn = fn(x: i32, y: i32, dx: i32, dy: i32, mods: u32);
+pub type MouseMoveFn = fn(p: WindowPoint, mods: u32, leave: c_int);
+pub type MouseButtonFn = fn(button: u32, pressed: c_int, p: WindowPoint, mods: u32);
+pub type PointerCancelFn = fn();
+pub type ScrollFn = fn(p: WindowPoint, dx: i32, dy: i32, mods: u32);
 pub type HistoryNavFn = fn(forward: c_int);
 pub type KbFocusFn = fn(gained: c_int);
 pub type KeyFn = fn(keysym: u32, native_code: u32, mods: u32, pressed: c_int);
 pub type CharFn = fn(codepoint: u32, mods: u32, native_code: u32);
-pub type TouchFn = fn(id: i32, phase: TouchPhase, x: f64, y: f64, mods: u32);
+pub type TouchFn = fn(id: i32, phase: TouchPhase, p: WindowPoint, mods: u32);
 
 #[derive(Clone, Copy)]
 pub struct Callbacks {
     pub mouse_move: Option<MouseMoveFn>,
     pub mouse_button: Option<MouseButtonFn>,
+    pub pointer_cancel: Option<PointerCancelFn>,
     pub scroll: Option<ScrollFn>,
     pub history_nav: Option<HistoryNavFn>,
     pub kb_focus: Option<KbFocusFn>,
@@ -312,7 +315,7 @@ impl SeatHandler for State {
         }
         match capability {
             Capability::Pointer => {
-                self.protocol.cancel_pointer(self.modifiers);
+                self.protocol.cancel_pointer();
                 if let Some(themed) = self.pointer.take()
                     && themed.pointer().version() >= 3
                 {
@@ -345,7 +348,7 @@ impl SeatHandler for State {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         if seat == self.seat {
             self.disarm_repeat();
-            self.protocol.cancel_pointer(self.modifiers);
+            self.protocol.cancel_pointer();
             self.protocol.cancel_keyboard(self.modifiers);
             self.protocol.cancel_touch(self.modifiers);
             self.reconcile_keyboard_focus();
@@ -418,39 +421,42 @@ impl PointerHandler for State {
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
+        let mut axis_at: Option<SurfacePoint> = None;
         for event in events {
             // Axis groups belong to the focus under which they arrived.
-            if matches!(
-                event.kind,
-                PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. }
-            ) {
-                self.flush_scroll();
-                self.scroll_dx = 0.0;
-                self.scroll_dy = 0.0;
+            match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. } => {
+                    self.flush_scroll(axis_at.take());
+                    self.scroll_dx = 0.0;
+                    self.scroll_dy = 0.0;
+                }
+                PointerEventKind::Axis { .. } => {
+                    axis_at = Some(SurfacePoint::from_event(&event.surface, event.position));
+                }
+                _ => {}
             }
             self.pointer_event(conn, event);
             self.drain_popup_commands();
         }
-        self.flush_scroll();
+        self.flush_scroll(axis_at);
     }
 }
 
 impl State {
     fn pointer_event(&mut self, conn: &Connection, event: &PointerEvent) {
         let modifiers = self.modifiers;
+        let at = SurfacePoint::from_event(&event.surface, event.position);
         match event.kind {
             PointerEventKind::Enter { serial } => {
                 self.pointer_serial = serial;
-                self.protocol
-                    .enter(&event.surface, event.position, modifiers);
+                self.protocol.motion(&at, modifiers);
                 self.apply_cursor(conn);
             }
             PointerEventKind::Leave { .. } => {
-                self.protocol.leave(&event.surface, modifiers);
+                self.protocol.leave(&at, modifiers);
             }
             PointerEventKind::Motion { .. } => {
-                self.protocol
-                    .motion(&event.surface, event.position, modifiers);
+                self.protocol.motion(&at, modifiers);
             }
             PointerEventKind::Press { button, serial, .. }
             | PointerEventKind::Release { button, serial, .. } => {
@@ -475,7 +481,7 @@ impl State {
                     self.dismiss_popup(generation);
                 }
                 self.protocol
-                    .button(&event.surface, button, pressed, consumed, self.modifiers);
+                    .button(&at, button, pressed, consumed, self.modifiers);
             }
             PointerEventKind::Axis {
                 horizontal,
@@ -501,7 +507,7 @@ impl State {
         }
     }
 
-    fn flush_scroll(&mut self) {
+    fn flush_scroll(&mut self, at: Option<SurfacePoint>) {
         let (mut dx, mut dy) = (0i32, 0i32);
         if self.scroll_have_v120 {
             dx = -self.scroll_v120_x;
@@ -527,7 +533,9 @@ impl State {
         if dx == 0 && dy == 0 {
             return;
         }
-        self.protocol.scroll(dx, dy, self.modifiers);
+        if let Some(at) = at {
+            self.protocol.scroll(&at, dx, dy, self.modifiers);
+        }
     }
 }
 
@@ -556,8 +564,12 @@ impl TouchHandler for State {
         for generation in dismiss {
             self.dismiss_popup(generation);
         }
-        self.protocol
-            .touch_down(&surface, id, position, consumed, self.modifiers);
+        self.protocol.touch_down(
+            SurfacePoint::from_event(&surface, position),
+            id,
+            consumed,
+            self.modifiers,
+        );
         self.drain_popup_commands();
     }
 
@@ -829,7 +841,7 @@ fn run_input_loop(
     if let Err(e) = event_loop.run(None, &mut state, |_| {}) {
         tracing::error!(target: "Main", "input: event loop: {e}");
     }
-    state.protocol.cancel_pointer(state.modifiers);
+    state.protocol.cancel_pointer();
     state.protocol.cancel_keyboard(state.modifiers);
     state.protocol.cancel_touch(state.modifiers);
     state.drain_selection_reads();
@@ -865,7 +877,13 @@ fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Opt
     let pool = smithay_client_toolkit::shm::slot::SlotPool::new(4 * 1024 * 1024, &shm).ok();
     let mut protocol = SeatInput::default();
     let window = rt.root().window()?;
-    protocol.register(window.wl_surface().clone(), Arc::new(ContentInput { cb }));
+    protocol.register(
+        window.wl_surface().clone(),
+        Arc::new(ContentInput {
+            cb,
+            root: std::sync::OnceLock::new(),
+        }),
+    );
 
     let state = State {
         rt,
@@ -948,43 +966,46 @@ impl InputThread {
 /// Application encoding lives at the registered content endpoint.
 struct ContentInput {
     cb: Callbacks,
+    root: std::sync::OnceLock<wl_surface::WlSurface>,
+}
+impl ContentInput {
+    fn window_point(&self, at: &SurfacePoint) -> Option<WindowPoint> {
+        at.window_point(self.root.get()?)
+    }
 }
 impl InputTarget for ContentInput {
-    fn motion(&self, position: (f64, f64), modifiers: u32, leave: bool) {
-        if let Some(f) = self.cb.mouse_move {
-            f(
-                position.0 as i32,
-                position.1 as i32,
-                modifiers,
-                i32::from(leave),
-            );
+    fn registered(&self, surface: &wl_surface::WlSurface) {
+        let _ = self.root.set(surface.clone());
+    }
+    fn motion(&self, at: &SurfacePoint, modifiers: u32, leave: bool) {
+        if let (Some(f), Some(p)) = (self.cb.mouse_move, self.window_point(at)) {
+            f(p, modifiers, i32::from(leave));
         }
     }
-    fn button(&self, button: u32, pressed: bool, position: (f64, f64), modifiers: u32) {
+    fn button(&self, button: u32, pressed: bool, at: &SurfacePoint, modifiers: u32) {
         if matches!(button, BTN_SIDE | BTN_EXTRA | BTN_BACK | BTN_FORWARD) {
             if pressed && let Some(f) = self.cb.history_nav {
                 f(i32::from(matches!(button, BTN_EXTRA | BTN_FORWARD)));
             }
             return;
         }
-        if let Some(f) = self.cb.mouse_button {
-            f(
-                button,
-                i32::from(pressed),
-                position.0 as i32,
-                position.1 as i32,
-                modifiers,
-            );
+        if let (Some(f), Some(p)) = (self.cb.mouse_button, self.window_point(at)) {
+            f(button, i32::from(pressed), p, modifiers);
         }
     }
-    fn scroll(&self, position: (f64, f64), dx: i32, dy: i32, modifiers: u32) {
-        if let Some(f) = self.cb.scroll {
-            f(position.0 as i32, position.1 as i32, dx, dy, modifiers);
+    fn pointer_cancel(&self) {
+        if let Some(f) = self.cb.pointer_cancel {
+            f();
         }
     }
-    fn touch(&self, id: i32, phase: TouchPhase, position: (f64, f64), modifiers: u32) {
-        if let Some(f) = self.cb.touch {
-            f(id, phase, position.0, position.1, modifiers);
+    fn scroll(&self, at: &SurfacePoint, dx: i32, dy: i32, modifiers: u32) {
+        if let (Some(f), Some(p)) = (self.cb.scroll, self.window_point(at)) {
+            f(p, dx, dy, modifiers);
+        }
+    }
+    fn touch(&self, id: i32, phase: TouchPhase, at: &SurfacePoint, modifiers: u32) {
+        if let (Some(f), Some(p)) = (self.cb.touch, self.window_point(at)) {
+            f(id, phase, p, modifiers);
         }
     }
     fn key(&self, event: &KeyEvent, pressed: bool, modifiers: u32) {
@@ -1048,15 +1069,10 @@ impl State {
             match command {
                 PopupCommand::Create {
                     generation,
-                    anchor,
-                    serial,
+                    place,
                     input,
                     parent,
-                } => self.create_popup(generation, anchor, serial, input, parent),
-                PopupCommand::Map { generation } => self.map_popup(generation),
-                PopupCommand::Reposition { generation, place } => {
-                    self.reposition_popup(generation, place)
-                }
+                } => self.create_popup(generation, place, input, parent),
                 PopupCommand::Paint(paint) => self.paint_popup(paint),
                 PopupCommand::Destroy { generation } => self.destroy_popup(generation),
             }

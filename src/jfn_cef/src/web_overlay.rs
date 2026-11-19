@@ -1,11 +1,3 @@
-//! The process's one web overlay: jellyfin-web's browser, the platform
-//! surface it paints into, and the size it is driven at.
-//!
-//! It owns its surface and its browser handle; every caller that drives it
-//! holds a [`WebOverlay`] clone. Its size is a pure function of the window
-//! snapshot and the strip the shell overlay publishes, and the browser is
-//! created as soon as that function yields one.
-
 pub mod size;
 
 use std::ffi::c_int;
@@ -22,7 +14,7 @@ use jfn_platform_abi::Visibility;
 use crate::client::{DeferredNavigation, Inner, post_close_and_wait, post_set_hidden};
 use crate::frame_rate::FrameRate;
 use crate::paint_scheduler::PaintMode;
-use jfn_platform_abi::{PaintFrame, Presented, SurfaceSize, WindowTarget};
+use jfn_platform_abi::{PaintFrame, Presented, SurfaceSize, WindowStateError, WindowTarget};
 use size::view_size;
 
 pub struct WebOverlayConfig {
@@ -36,7 +28,6 @@ struct Overlay {
     application_menu: Mutex<Option<crate::ApplicationMenu>>,
     session: Arc<crate::runtime::Session>,
     platform: Mutex<Option<jfn_platform_abi::PlatformLease>>,
-    subscription: Mutex<Option<jfn_input::ShellStateSubscription>>,
     close: Mutex<()>,
     window_subscription: Mutex<Option<jfn_platform_abi::WindowSubscription>>,
     /// CEF is the sole strong authority after a creation request is accepted.
@@ -77,10 +68,6 @@ pub struct OverlayStartError;
 static STARTED: Mutex<Weak<Overlay>> = Mutex::new(Weak::new());
 
 impl WebOverlay {
-    /// Allocates the platform surface, installs the jfn-input web sink and
-    /// jellyfin-web's message handlers, subscribes to the window snapshot and
-    /// to [`jfn_input::on_shell_state_scoped`], and creates the browser as soon as
-    /// both yield a size with a positive width and height.
     pub fn start(
         runtime: &crate::InitializedCef,
         config: WebOverlayConfig,
@@ -93,7 +80,6 @@ impl WebOverlay {
                 application_menu: Mutex::new(Some(config.application_menu)),
                 session: Arc::clone(&runtime.session),
                 platform: Mutex::new(Some(runtime.platform_lease())),
-                subscription: Mutex::new(None),
                 close: Mutex::new(()),
                 window_subscription: Mutex::new(None),
                 client: OnceLock::new(),
@@ -113,15 +99,6 @@ impl WebOverlay {
         *STARTED.lock() = Arc::downgrade(&overlay.inner);
         *overlay.inner.window_subscription.lock() =
             Some(jfn_platform_abi::subscribe_window_changed(sync_started));
-        let subscription = jfn_input::on_shell_state_scoped(Box::new({
-            let weak = Arc::downgrade(&overlay.inner);
-            move |_| {
-                if let Some(inner) = weak.upgrade() {
-                    WebOverlay { inner }.sync();
-                }
-            }
-        }));
-        *overlay.inner.subscription.lock() = Some(subscription);
 
         overlay.sync();
         Ok(overlay)
@@ -131,9 +108,6 @@ impl WebOverlay {
         self.inner.client.get().and_then(Weak::upgrade)
     }
 
-    /// Posts [`WebOverlay::sync_on_ui`] onto TID_UI. Its callers include the
-    /// window-snapshot listener, which the compositor's own dispatch loop runs
-    /// inline.
     fn sync(&self) {
         self.inner.session.dispatch(|| {
             let mut task = SyncTask::new(self.clone());
@@ -148,15 +122,32 @@ impl WebOverlay {
         if !self.inner.session.is_active() {
             return;
         }
-        let Some(state) = jfn_input::shell_state() else {
-            return;
-        };
         let Some(platform) = self.inner.platform.lock().clone() else {
             return;
         };
-        let snapshot = platform.platform().window_owner().source().snapshot();
-        let Some(size) = view_size(&snapshot, state.reserved_strip) else {
-            return;
+        let window = match platform.platform().window_owner().source().window_state() {
+            Ok(window) => window,
+            Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => return,
+            Err(e) => {
+                jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("web overlay window state: {e}"),
+                );
+                return;
+            }
+        };
+        let size = match view_size(&window) {
+            Ok(Some(size)) => size,
+            Ok(None) => return,
+            Err(e) => {
+                jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("web overlay size: {e}"),
+                );
+                return;
+            }
         };
         self.ensure_browser(size);
     }
@@ -194,13 +185,11 @@ impl WebOverlay {
             jfn_logging::Category::Cef,
             jfn_logging::Level::Info,
             &format!(
-                "CreateBrowser(web) logical={}x{}+{} physical={}x{}+{} scale={}",
+                "CreateBrowser(web) logical={}x{} physical={}x{} scale={}",
                 size.extent.logical().w,
                 size.extent.logical().h,
-                size.logical_top,
                 size.extent.physical().w,
                 size.extent.physical().h,
-                size.physical_top,
                 size.extent.scale(),
             ),
         );
@@ -328,7 +317,6 @@ impl WebOverlay {
         drain_and_release(&self.inner.session, &self.inner.platform, || {
             crate::ready::stop();
             self.inner.window_subscription.lock().take();
-            self.inner.subscription.lock().take();
             // This barrier runs after every accepted UI task, including browser
             // creation. Looking up the client before it would miss queued creation.
             let (tx, rx) = std::sync::mpsc::channel();
@@ -387,7 +375,10 @@ impl WebOverlaySurface {
     }
     pub(crate) fn allocate(platform: jfn_platform_abi::PlatformLease) -> Arc<WebOverlaySurface> {
         let surface = Arc::new(Self {
-            handle: platform.platform().alloc_surface(Visibility::Hidden),
+            handle: platform.platform().alloc_surface(
+                Visibility::Hidden,
+                jfn_platform_abi::SurfacePlacement::BelowTitlebar,
+            ),
             platform,
         });
         let stacker: Arc<dyn jfn_platform_abi::stack::WebOverlayStacker> = surface.clone();
@@ -481,9 +472,6 @@ pub(crate) fn with_current_client<R>(f: impl FnOnce(&Inner) -> R) -> Option<R> {
         .flatten()
 }
 
-/// Subscribed into the window snapshot at [`WebOverlay::start`]; posts the
-/// overlay's sync and returns, so the thread that publishes the change waits
-/// for nothing.
 fn sync_started() {
     if let Some(inner) = STARTED.lock().upgrade() {
         WebOverlay { inner }.sync();

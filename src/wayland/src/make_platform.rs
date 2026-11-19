@@ -123,8 +123,12 @@ impl Platform for WaylandPlatform {
         stopped.map_err(|e| jfn_platform_abi::HostReleaseError::new("mpv proxy socket removal", e))
     }
 
-    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
-        SurfaceHandle::from_ptr(wl_ops::alloc_surface(self.rt(), initial) as *mut c_void)
+    fn alloc_surface(
+        &self,
+        initial: Visibility,
+        placement: jfn_platform_abi::SurfacePlacement,
+    ) -> SurfaceHandle {
+        SurfaceHandle::from_ptr(wl_ops::alloc_surface(self.rt(), initial, placement) as *mut c_void)
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
@@ -146,13 +150,7 @@ impl Platform for WaylandPlatform {
         )
     }
 
-    fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
-        wl_ops::surface_resize(
-            self.rt(),
-            s.as_ptr() as *mut crate::wl_state::PlatformSurface,
-            size,
-        );
-    }
+    fn surface_resize(&self, _s: SurfaceHandle, _size: SurfaceSize) {}
 
     fn surface_window_target(&self, s: SurfaceHandle) -> Option<jfn_platform_abi::WindowTarget> {
         wl_ops::window_target(
@@ -265,8 +263,10 @@ impl Platform for WaylandPlatform {
     }
 
     // the compositor tells no client where its window is
-    fn query_window_position(&self) -> Option<jfn_platform_abi::WindowPos> {
-        None
+    fn window_position(
+        &self,
+    ) -> Result<Option<jfn_platform_abi::WindowPos>, jfn_platform_abi::WindowStateError> {
+        Ok(None)
     }
 
     fn set_cursor(&self, shape: CursorShape) {
@@ -309,6 +309,10 @@ impl Platform for WaylandPlatform {
 
     fn effective_decorations(&self) -> jfn_platform_abi::EffectiveDecorations {
         self.rt().root().effective_decorations()
+    }
+
+    fn set_titlebar_present(&self, present: bool) {
+        self.rt().window().set_titlebar_present(self.rt(), present);
     }
 
     fn shared_texture_supported(&self) -> bool {

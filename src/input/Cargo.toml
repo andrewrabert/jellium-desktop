@@ -12,6 +12,7 @@ path = "src/lib.rs"
 jfn-platform-abi = { path = "../platform_abi" }
 jfn-playback = { path = "../playback" }
 parking_lot.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

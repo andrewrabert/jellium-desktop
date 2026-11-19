@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use crossbeam_utils::atomic::AtomicCell;
 use jfn_mpv::{Event, ObserveId, PropertyValue};
-use jfn_platform_abi::{LogicalSize, PhysicalSize, Scale, WindowExtent};
+use jfn_platform_abi::{ExtentError, LogicalSize, PhysicalSize, Scale, WindowExtent};
 
 use crate::coordinator::Input;
 use crate::types::{EndReason, PlaybackBufferedRange};
@@ -267,8 +267,12 @@ fn digest_osd_dims<C: IngestCtx>(
         Some(logical) => extent_at(scale, logical),
         None => extent_of(scale, physical),
     };
-    let Some(extent) = extent else {
-        return Vec::new();
+    let extent = match extent {
+        Ok(extent) => extent,
+        Err(e) => {
+            tracing::error!(target: "mpv", "osd-dimensions {w}x{h}: {e}; the stored extent stands");
+            return Vec::new();
+        }
     };
     state.set_window_extent(extent);
     vec![IngestOut::WindowExtentChanged]
@@ -276,7 +280,7 @@ fn digest_osd_dims<C: IngestCtx>(
 
 /// The extent a reported scale and an exact logical content size name; the
 /// physical size is the single conversion of the logical one.
-pub(crate) fn extent_at(scale: Scale, logical: LogicalSize) -> Option<WindowExtent> {
+pub(crate) fn extent_at(scale: Scale, logical: LogicalSize) -> Result<WindowExtent, ExtentError> {
     WindowExtent::new(logical.to_physical(scale)?, scale, logical)
 }
 
@@ -284,10 +288,7 @@ pub(crate) fn extent_at(scale: Scale, logical: LogicalSize) -> Option<WindowExte
 ///
 /// mpv's pixel size is carried through verbatim; the logical size is the
 /// single conversion of it.
-///
-/// `None` when the division names no logical size, or when either axis is
-/// below two pixels.
-pub(crate) fn extent_of(scale: Scale, physical: PhysicalSize) -> Option<WindowExtent> {
+pub(crate) fn extent_of(scale: Scale, physical: PhysicalSize) -> Result<WindowExtent, ExtentError> {
     WindowExtent::new(physical, scale, physical.to_logical(scale)?)
 }
 
@@ -341,7 +342,7 @@ fn as_double(v: &PropertyValue) -> Option<f64> {
 mod tests {
     use super::*;
     use jfn_mpv::Node;
-    use jfn_platform_abi::COVERED_SCALES;
+    use jfn_platform_abi::{COVERED_SCALES, Unrepresentable};
 
     struct TestCtx {
         scale: Scale,
@@ -548,29 +549,29 @@ mod tests {
     #[test]
     fn the_extent_carries_the_reported_scale_at_every_covered_scale() {
         let logical = LogicalSize { w: 1280, h: 720 };
-        let observed: Vec<Option<(Scale, LogicalSize)>> = COVERED_SCALES
+        let observed: Vec<Result<Option<(Scale, LogicalSize)>, Unrepresentable>> = COVERED_SCALES
             .into_iter()
             .map(|scale| {
                 let physical = logical.to_physical(scale)?;
                 let state = IngestState::new();
                 digest_dims(&state, i64::from(physical.w), i64::from(physical.h), scale);
-                state.window_extent().map(|e| (e.scale(), e.logical()))
+                Ok(state.window_extent().map(|e| (e.scale(), e.logical())))
             })
             .collect();
         assert_eq!(
             observed,
-            COVERED_SCALES.map(|s| Some((s, logical))).to_vec()
+            COVERED_SCALES.map(|s| Ok(Some((s, logical)))).to_vec()
         );
     }
 
     #[test]
     fn the_extent_carries_the_host_s_logical_size_verbatim() {
         let logical = LogicalSize { w: 1281, h: 721 };
-        let observed: Vec<Option<LogicalSize>> = COVERED_SCALES
+        let observed: Vec<Result<LogicalSize, ExtentError>> = COVERED_SCALES
             .into_iter()
             .map(|scale| extent_at(scale, logical).map(|e| e.logical()))
             .collect();
-        assert_eq!(observed, vec![Some(logical); COVERED_SCALES.len()]);
+        assert_eq!(observed, vec![Ok(logical); COVERED_SCALES.len()]);
     }
 
     #[test]

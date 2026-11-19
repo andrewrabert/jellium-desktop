@@ -12,34 +12,71 @@ use jfn_platform_abi::event_flags::{
 use smithay_client_toolkit::seat::keyboard::KeyEvent;
 use wayland_client::{Proxy, backend::ObjectId, protocol::wl_surface::WlSurface};
 
+#[derive(Clone, Debug)]
+pub(crate) struct SurfacePoint {
+    surface: WlSurface,
+    x: f64,
+    y: f64,
+}
+
+impl SurfacePoint {
+    pub(crate) fn from_event(surface: &WlSurface, position: (f64, f64)) -> Self {
+        Self {
+            surface: surface.clone(),
+            x: position.0,
+            y: position.1,
+        }
+    }
+
+    pub(crate) fn surface(&self) -> &WlSurface {
+        &self.surface
+    }
+
+    fn moved(&self, position: (f64, f64)) -> Self {
+        Self {
+            surface: self.surface.clone(),
+            x: position.0,
+            y: position.1,
+        }
+    }
+
+    pub(crate) fn window_point(&self, root: &WlSurface) -> Option<jfn_platform_abi::WindowPoint> {
+        (&self.surface == root).then(|| jfn_platform_abi::WindowPoint::from_window(self.x, self.y))
+    }
+
+    pub(crate) fn menu_point(&self, popup: &WlSurface) -> Option<jfn_linux_util::menu::MenuPoint> {
+        (&self.surface == popup).then(|| jfn_linux_util::menu::MenuPoint::Logical {
+            x: self.x.floor() as i32,
+            y: self.y.floor() as i32,
+        })
+    }
+}
+
 pub(crate) trait InputTarget: Send + Sync {
-    fn configured(&self) {}
+    fn registered(&self, _surface: &WlSurface) {}
+    fn configured(&self, _size: jfn_platform_abi::LogicalSize) {}
     fn dismissed(&self) {}
-    fn motion(&self, _position: (f64, f64), _modifiers: u32, _leave: bool) {}
-    fn button(&self, _button: u32, _pressed: bool, _position: (f64, f64), _modifiers: u32) {}
-    fn scroll(&self, _position: (f64, f64), _dx: i32, _dy: i32, _modifiers: u32) {}
+    fn motion(&self, _at: &SurfacePoint, _modifiers: u32, _leave: bool) {}
+    fn button(&self, _button: u32, _pressed: bool, _at: &SurfacePoint, _modifiers: u32) {}
+    fn pointer_cancel(&self) {}
+    fn scroll(&self, _at: &SurfacePoint, _dx: i32, _dy: i32, _modifiers: u32) {}
     fn key(&self, _event: &KeyEvent, _pressed: bool, _modifiers: u32) {}
     /// A touch point. A destination without touch input takes it as its left
     /// button.
-    fn touch(&self, _id: i32, phase: TouchPhase, position: (f64, f64), modifiers: u32) {
+    fn touch(&self, _id: i32, phase: TouchPhase, at: &SurfacePoint, modifiers: u32) {
         match phase {
             TouchPhase::Pressed => {
-                self.motion(position, modifiers, false);
-                self.button(
-                    BTN_LEFT,
-                    true,
-                    position,
-                    modifiers | EVENTFLAG_LEFT_MOUSE_BUTTON,
-                );
+                self.motion(at, modifiers, false);
+                self.button(BTN_LEFT, true, at, modifiers | EVENTFLAG_LEFT_MOUSE_BUTTON);
             }
             TouchPhase::Moved => {
-                self.motion(position, modifiers | EVENTFLAG_LEFT_MOUSE_BUTTON, false);
+                self.motion(at, modifiers | EVENTFLAG_LEFT_MOUSE_BUTTON, false);
             }
             TouchPhase::Released => {
-                self.button(BTN_LEFT, false, position, modifiers);
-                self.motion(position, modifiers, true);
+                self.button(BTN_LEFT, false, at, modifiers);
+                self.motion(at, modifiers, true);
             }
-            TouchPhase::Cancelled => self.motion(position, modifiers, true),
+            TouchPhase::Cancelled => self.motion(at, modifiers, true),
         }
     }
 }
@@ -49,19 +86,15 @@ struct Destination {
     surface: WlSurface,
     parent: Option<ObjectId>,
     target: Arc<dyn InputTarget>,
-    position: (f64, f64),
 }
 
 #[derive(Default)]
 pub(crate) struct SeatInput {
     destinations: HashMap<ObjectId, Destination>,
-    pointer: Option<ObjectId>,
     keyboard: Option<ObjectId>,
     buttons: HashMap<u32, Option<ObjectId>>,
     keys: HashMap<u32, (ObjectId, KeyEvent)>,
-    /// Each live touch point's owner, `None` when its press was consumed, and
-    /// its last position: a release reports none of its own.
-    touches: HashMap<i32, (Option<ObjectId>, (f64, f64))>,
+    touches: HashMap<i32, (Option<ObjectId>, SurfacePoint)>,
     grabs: Vec<(ObjectId, Generation)>,
     pub(crate) focus_epoch: u64,
     pub(crate) focused: bool,
@@ -69,13 +102,13 @@ pub(crate) struct SeatInput {
 
 impl SeatInput {
     pub(crate) fn register(&mut self, surface: WlSurface, target: Arc<dyn InputTarget>) {
+        target.registered(&surface);
         self.destinations.insert(
             surface.id(),
             Destination {
                 surface,
                 parent: None,
                 target,
-                position: (0.0, 0.0),
             },
         );
     }
@@ -88,13 +121,13 @@ impl SeatInput {
         target: Arc<dyn InputTarget>,
     ) {
         let id = surface.id();
+        target.registered(&surface);
         self.destinations.insert(
             id.clone(),
             Destination {
                 surface,
                 parent: Some(parent),
                 target,
-                position: (0.0, 0.0),
             },
         );
         self.grabs.push((id, generation));
@@ -107,13 +140,8 @@ impl SeatInput {
         // receives nothing, and its release cannot fall through to a new one.
     }
 
-    pub(crate) fn enter(&mut self, surface: &WlSurface, position: (f64, f64), modifiers: u32) {
-        self.pointer = Some(surface.id());
-        self.motion(surface, position, modifiers);
-    }
-
-    pub(crate) fn leave(&mut self, surface: &WlSurface, modifiers: u32) {
-        let id = surface.id();
+    pub(crate) fn leave(&mut self, at: &SurfacePoint, modifiers: u32) {
+        let id = at.surface().id();
         let buttons: Vec<_> = self
             .buttons
             .iter()
@@ -126,26 +154,21 @@ impl SeatInput {
                 destination.target.button(
                     button,
                     false,
-                    destination.position,
+                    at,
                     modifiers | self.button_modifiers(&id),
                 );
             }
         }
         if let Some(destination) = self.destinations.get(&id) {
-            destination
-                .target
-                .motion(destination.position, modifiers, true);
-        }
-        if self.pointer.as_ref() == Some(&id) {
-            self.pointer = None;
+            destination.target.motion(at, modifiers, true);
         }
     }
 
-    pub(crate) fn motion(&mut self, surface: &WlSurface, position: (f64, f64), modifiers: u32) {
-        let modifiers = modifiers | self.button_modifiers(&surface.id());
-        if let Some(destination) = self.destinations.get_mut(&surface.id()) {
-            destination.position = position;
-            destination.target.motion(position, modifiers, false);
+    pub(crate) fn motion(&self, at: &SurfacePoint, modifiers: u32) {
+        let id = at.surface().id();
+        let modifiers = modifiers | self.button_modifiers(&id);
+        if let Some(destination) = self.destinations.get(&id) {
+            destination.target.motion(at, modifiers, false);
         }
     }
 
@@ -174,14 +197,15 @@ impl SeatInput {
 
     pub(crate) fn button(
         &mut self,
-        surface: &WlSurface,
+        at: &SurfacePoint,
         button: u32,
         pressed: bool,
         consumed: bool,
         modifiers: u32,
     ) {
+        let event = at.surface().id();
         let owner = if pressed {
-            let owner = (!consumed).then(|| surface.id());
+            let owner = (!consumed).then(|| event.clone());
             // A fresh press starts a new sequence even if the compositor ended
             // an earlier grab without delivering its release.
             self.buttons.insert(button, owner.clone());
@@ -189,30 +213,25 @@ impl SeatInput {
         } else {
             self.buttons.remove(&button).flatten()
         };
-        if let Some(id) = owner
-            && let Some(destination) = self.destinations.get(&id)
-        {
-            destination.target.button(
-                button,
-                pressed,
-                destination.position,
-                modifiers | self.button_modifiers(&id),
-            );
+        let Some(id) = owner else { return };
+        let Some(destination) = self.destinations.get(&id) else {
+            return;
+        };
+        if id == event {
+            destination
+                .target
+                .button(button, pressed, at, modifiers | self.button_modifiers(&id));
+        } else {
+            destination.target.pointer_cancel();
         }
     }
 
-    pub(crate) fn scroll(&self, dx: i32, dy: i32, modifiers: u32) {
-        if let Some(destination) = self
-            .pointer
-            .as_ref()
-            .and_then(|id| self.destinations.get(id))
-        {
-            destination.target.scroll(
-                destination.position,
-                dx,
-                dy,
-                modifiers | self.button_modifiers(&destination.surface.id()),
-            );
+    pub(crate) fn scroll(&self, at: &SurfacePoint, dx: i32, dy: i32, modifiers: u32) {
+        let id = at.surface().id();
+        if let Some(destination) = self.destinations.get(&id) {
+            destination
+                .target
+                .scroll(at, dx, dy, modifiers | self.button_modifiers(&id));
         }
     }
 
@@ -231,29 +250,22 @@ impl SeatInput {
             })
     }
 
-    pub(crate) fn touch_down(
-        &mut self,
-        surface: &WlSurface,
-        id: i32,
-        position: (f64, f64),
-        consumed: bool,
-        modifiers: u32,
-    ) {
+    pub(crate) fn touch_down(&mut self, at: SurfacePoint, id: i32, consumed: bool, modifiers: u32) {
         // A down under a live id means the compositor ended the old sequence
         // without an up; its owner is told it was cancelled.
         self.touch_end(id, TouchPhase::Cancelled, modifiers);
-        let owner = (!consumed).then(|| surface.id());
-        self.touches.insert(id, (owner.clone(), position));
-        self.touch_deliver(owner.as_ref(), id, TouchPhase::Pressed, position, modifiers);
+        let owner = (!consumed).then(|| at.surface().id());
+        self.touch_deliver(owner.as_ref(), id, TouchPhase::Pressed, &at, modifiers);
+        self.touches.insert(id, (owner, at));
     }
 
     pub(crate) fn touch_motion(&mut self, id: i32, position: (f64, f64), modifiers: u32) {
         let Some((owner, last)) = self.touches.get_mut(&id) else {
             return;
         };
-        *last = position;
-        let owner = owner.clone();
-        self.touch_deliver(owner.as_ref(), id, TouchPhase::Moved, position, modifiers);
+        *last = last.moved(position);
+        let (owner, at) = (owner.clone(), last.clone());
+        self.touch_deliver(owner.as_ref(), id, TouchPhase::Moved, &at, modifiers);
     }
 
     pub(crate) fn touch_up(&mut self, id: i32, modifiers: u32) {
@@ -261,8 +273,8 @@ impl SeatInput {
     }
 
     fn touch_end(&mut self, id: i32, phase: TouchPhase, modifiers: u32) {
-        if let Some((owner, position)) = self.touches.remove(&id) {
-            self.touch_deliver(owner.as_ref(), id, phase, position, modifiers);
+        if let Some((owner, at)) = self.touches.remove(&id) {
+            self.touch_deliver(owner.as_ref(), id, phase, &at, modifiers);
         }
     }
 
@@ -271,11 +283,11 @@ impl SeatInput {
         owner: Option<&ObjectId>,
         id: i32,
         phase: TouchPhase,
-        position: (f64, f64),
+        at: &SurfacePoint,
         modifiers: u32,
     ) {
         if let Some(destination) = owner.and_then(|owner| self.destinations.get(owner)) {
-            destination.target.touch(id, phase, position, modifiers);
+            destination.target.touch(id, phase, at, modifiers);
         }
     }
 
@@ -336,14 +348,9 @@ impl SeatInput {
         }
     }
 
-    pub(crate) fn cancel_pointer(&mut self, modifiers: u32) {
-        let surfaces: Vec<_> = self
-            .destinations
-            .values()
-            .map(|d| d.surface.clone())
-            .collect();
-        for surface in surfaces {
-            self.leave(&surface, modifiers);
+    pub(crate) fn cancel_pointer(&mut self) {
+        for destination in self.destinations.values() {
+            destination.target.pointer_cancel();
         }
         self.buttons.clear();
     }

@@ -61,11 +61,19 @@ pub fn menu_initial_row(items: &[MenuItem], initial: c_int) -> c_int {
         .map_or(MENU_DISMISSED, |_| initial)
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct MenuHandle(NonZeroU64);
+
+impl MenuHandle {
+    pub fn new(id: NonZeroU64) -> MenuHandle {
+        MenuHandle(id)
+    }
+}
+
 pub struct MenuRequest {
     pub items: Vec<MenuItem>,
-    /// Anchor in logical (view) coordinates.
-    pub x: c_int,
-    pub y: c_int,
+    pub anchor: crate::geometry::WindowPoint,
+    pub basis: crate::geometry::WindowBasis,
     /// Desired logical width; `<= 0` is content-sized.
     pub width: c_int,
     /// Row highlighted at open; `-1` for none.
@@ -111,13 +119,9 @@ pub enum MenuDelivery<'a> {
 pub trait MenuHost: Send + Sync {
     fn warm(&self) {}
 
-    /// Replaces any menu already open, and returns before the menu is drawn.
-    /// A request that fails [`menu_has_selectable`] resolves with
-    /// [`MENU_DISMISSED`] and puts nothing on screen.
-    fn open(&self, req: MenuRequest);
+    fn open(&self, req: MenuRequest) -> Option<MenuHandle>;
 
-    /// Tears the menu down, resolving its selection with [`MENU_DISMISSED`].
-    fn hide(&self) {}
+    fn hide(&self, _handle: MenuHandle) {}
 
     /// Resolves any pending selection with [`MENU_DISMISSED`].
     fn shutdown(&self) {}
@@ -125,10 +129,11 @@ pub trait MenuHost: Send + Sync {
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct MenuPlacement {
-    /// Anchor in logical (view) coordinates.
-    pub anchor: crate::geometry::LogicalPoint,
+    pub anchor: crate::geometry::WindowPoint,
     /// The visible menu's own size in both spaces.
     pub view: crate::geometry::WindowExtent,
+    pub serial: u32,
+    pub basis: crate::geometry::WindowBasis,
 }
 
 pub struct MenuPaint {
@@ -141,6 +146,7 @@ pub struct MenuPaint {
     pub scroll: c_int,
     /// The visible crop's own size in both spaces.
     pub view: crate::geometry::WindowExtent,
+    pub basis: crate::geometry::WindowBasis,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -155,7 +161,6 @@ pub struct MenuMetrics {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MenuClose {
     Finished,
-    Speculative,
     External,
 }
 
@@ -164,23 +169,9 @@ pub enum MenuClose {
 pub trait PopupSurface: Send + Sync {
     fn metrics(&self) -> MenuMetrics;
 
-    /// Puts up the surface that holds the grab, anchored at `anchor`, with
-    /// no menu on it.
-    ///
-    /// That surface has no menu, so it has no logical size, no physical size
-    /// and no scale: each backend maps it at the smallest size its own
-    /// protocol admits, and no caller supplies one.
-    ///
-    /// `serial` is the input serial a grab must cite; backends that do not
-    /// grab on a serial ignore it.
-    fn arm(&self, generation: Generation, anchor: crate::geometry::LogicalPoint, serial: u32);
+    fn window_basis(&self) -> crate::geometry::WindowBasis;
 
-    /// Maps the armed surface, so the grab takes effect before the menu has
-    /// pixels. A backend whose armed surface maps at [`PopupSurface::arm`]
-    /// states that here and does nothing else.
-    fn map_armed(&self, generation: Generation);
-
-    fn reposition(&self, generation: Generation, place: MenuPlacement);
+    fn create(&self, generation: Generation, place: MenuPlacement);
 
     fn present(&self, paint: MenuPaint);
 

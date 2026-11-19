@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::Receiver;
 use jfn_mpv::{Event, PropertyValue};
-use jfn_platform_abi::{LogicalSize, Scale};
+use jfn_platform_abi::{ExtentError, LogicalSize, Scale, WindowStateError};
 
 use crate::ffi::post as post_input;
 use crate::ingest::{
@@ -89,25 +89,20 @@ pub fn jfn_playback_ingest_mpv_event_owned(
     dispatch(outs)
 }
 
-/// Reconcile the playback window mode from the current window snapshot.
-/// Idempotent — the state machine dedupes, so an unchanged mode emits
-/// nothing.
 pub fn jfn_playback_reconcile_window_mode() {
     let Some(lease) = jfn_platform_abi::try_lease() else {
         return;
     };
-    let snap = lease.platform().window_owner().source().snapshot();
-    post_window_state(snap.fullscreen, snap.maximized);
+    match lease.platform().window_owner().source().window_state() {
+        Ok(window) => post_window_mode(window.fullscreen, window.maximized),
+        Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => {}
+        Err(e) => {
+            tracing::error!(target: "mpv", "window mode reconcile: window state: {e}");
+        }
+    }
 }
 
-/// Push the window mode through the same digest path the `fullscreen` /
-/// `window-maximized` property observations drive.
-///
-/// `FULLSCREEN` must digest first: entering fullscreen reads the *stored*
-/// maximized flag for `was_maximized`, and a fullscreen snapshot carries
-/// `maximized == false` (the modes are mutually exclusive), which must not
-/// clobber that flag before it is read.
-fn post_window_state(fullscreen: bool, maximized: bool) {
+fn post_window_mode(fullscreen: bool, maximized: bool) {
     use crate::ingest::observe_id::{FULLSCREEN, WINDOW_MAX};
     let Some(lease) = jfn_platform_abi::try_lease() else {
         return;
@@ -135,24 +130,22 @@ pub fn jfn_playback_window_maximized() -> bool {
 /// the host's current logical content size, then wakes the window-changed
 /// subscribers. `false` when neither a logical content size nor a stored
 /// extent is available.
-pub fn jfn_playback_rescale_window_extent() -> bool {
+pub fn jfn_playback_rescale_window_extent() -> Result<bool, ExtentError> {
     let Some(lease) = jfn_platform_abi::try_lease() else {
-        return false;
+        return Ok(false);
     };
     let plat = lease.platform();
     let logical = match plat.mpv_host().logical_content_size() {
         Some(logical) => logical,
         None => match state().window_extent() {
             Some(extent) => extent.logical(),
-            None => return false,
+            None => return Ok(false),
         },
     };
-    let Some(extent) = extent_at(plat.scale(), logical) else {
-        return false;
-    };
+    let extent = extent_at(plat.scale(), logical)?;
     state().set_window_extent(extent);
     jfn_platform_abi::notify_window_changed();
-    true
+    Ok(true)
 }
 
 pub fn jfn_playback_display_hz() -> f64 {

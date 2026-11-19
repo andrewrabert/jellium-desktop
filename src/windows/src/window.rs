@@ -1,17 +1,8 @@
-//! The mpv window's client rect, DPI, position, and mode, and the
-//! [`WindowSource`] that publishes them.
-//!
-//! One sample pass is the whole window state: CEF's render size, the
-//! persisted geometry and position, the scale the context menu and the OSR
-//! popup are placed with, and the mode playback reconciles against all read
-//! the stored snapshot. No pull issues an mpv call, and a pull with a stored
-//! snapshot issues no Win32 query either.
-
 use std::thread::JoinHandle;
 
 use jfn_platform_abi::{
-    MpvCreatedWindow, PhysicalSize, Scale, WindowExtent, WindowPos, WindowSnapshot, WindowSource,
-    notify_window_changed,
+    MpvCreatedWindow, PhysicalSize, Scale, WindowExtent, WindowPos, WindowSource, WindowState,
+    WindowStateError, notify_window_changed,
 };
 use parking_lot::{Condvar, Mutex};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
@@ -25,7 +16,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsZoomed};
 
-static SNAPSHOT: Mutex<Option<WindowSnapshot>> = Mutex::new(None);
+use crate::scale::ClientExtentError;
+
+static WINDOW_STATE: Mutex<Option<WindowState>> = Mutex::new(None);
 
 struct NotifyState {
     dirty: bool,
@@ -79,35 +72,49 @@ pub(crate) fn stop_notifier() {
     let _ = handle.join();
 }
 
-/// Re-read mpv's window in one pass — client rect, DPI, position, maximized,
-/// fullscreen — and store it as the window's snapshot. Returns the client
-/// size just stored; `None` when there is no window or its client rect is
-/// empty, which leaves the stored snapshot untouched.
-pub(crate) fn sample() -> Option<PhysicalSize> {
-    let hwnd = crate::platform::win_ensure_hwnd()?;
+pub(crate) fn sample() -> Result<Option<PhysicalSize>, ClientExtentError> {
+    let Some(hwnd) = crate::platform::win_ensure_hwnd() else {
+        return Ok(None);
+    };
     let mut rc = RECT::default();
-    unsafe { GetClientRect(hwnd, &mut rc) }.ok()?;
+    unsafe { GetClientRect(hwnd, &mut rc) }
+        .map_err(|e| ClientExtentError::ClientRect(e.code().0))?;
     let client = PhysicalSize {
         w: rc.right - rc.left,
         h: rc.bottom - rc.top,
     };
     if client.w <= 0 || client.h <= 0 {
-        return None;
+        return Ok(None);
     }
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let extent = crate::scale::extent(client, dpi)?;
     let fullscreen = crate::platform::win_is_fullscreen();
-    let snap = WindowSnapshot {
-        extent: Some(extent),
+    let state = WindowState {
+        extent,
         position: window_position(hwnd),
         maximized: !fullscreen && unsafe { IsZoomed(hwnd) }.as_bool(),
         fullscreen,
+        web_top: 0,
+        basis: jfn_platform_abi::WindowBasis::FIXED,
     };
-    let previous = SNAPSHOT.lock().replace(snap);
-    if previous.and_then(|p| p.extent) != Some(extent) {
+    let previous = WINDOW_STATE.lock().replace(state);
+    if previous.map(|p| p.extent) != Some(extent) {
         log_sample(hwnd, dpi, extent);
     }
-    Some(client)
+    Ok(Some(client))
+}
+
+pub(crate) fn sample_from_window_message() -> Option<PhysicalSize> {
+    match sample() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(
+                target: "platform",
+                "window sample: {e}; the stored window state stands"
+            );
+            None
+        }
+    }
 }
 
 /// Window position relative to the monitor's working area (excludes the
@@ -154,36 +161,42 @@ fn log_sample(hwnd: HWND, dpi: u32, extent: WindowExtent) {
     );
 }
 
-/// [`sample`], then wake every window-changed consumer synchronously.
-/// For init-time publishing on the app main thread; the WndProc hook uses
-/// [`publish_deferred`].
 pub(crate) fn republish() -> Option<PhysicalSize> {
-    let client = sample()?;
+    let client = sample_from_window_message()?;
     notify_window_changed();
     Some(client)
 }
 
-/// [`sample`], then hand the wakeup to the notifier thread.
 pub(crate) fn publish_deferred() -> Option<PhysicalSize> {
-    let client = sample()?;
+    let client = sample_from_window_message()?;
     NOTIFY.lock().dirty = true;
     NOTIFY_WAKE.notify_one();
     Some(client)
 }
 
-/// The stored snapshot, seeded by one [`sample`] when nothing is stored yet —
-/// the boot wait pulls it before `win_init` runs.
-pub(crate) fn snapshot() -> Option<WindowSnapshot> {
-    if let Some(snap) = *SNAPSHOT.lock() {
-        return Some(snap);
+pub(crate) fn stored_window_state() -> Result<WindowState, WindowStateError> {
+    if let Some(state) = *WINDOW_STATE.lock() {
+        return Ok(state);
     }
     sample()?;
-    *SNAPSHOT.lock()
+    let stored = *WINDOW_STATE.lock();
+    stored.ok_or(WindowStateError::NoWindow)
+}
+
+pub(crate) fn stored_window_state_or_log() -> Option<WindowState> {
+    match stored_window_state() {
+        Ok(state) => Some(state),
+        Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => None,
+        Err(e) => {
+            tracing::error!(target: "platform", "window state: {e}");
+            None
+        }
+    }
 }
 
 /// Client size and scale as of the last sample.
 pub(crate) fn client_extent() -> Option<WindowExtent> {
-    snapshot()?.extent
+    Some(stored_window_state_or_log()?.extent)
 }
 
 /// The scale the client window's DPI named at the last sample, or `None`
@@ -195,9 +208,8 @@ pub(crate) fn client_scale() -> Option<Scale> {
     Some(client_extent()?.scale())
 }
 
-/// Forget the stored snapshot.
 pub(crate) fn clear() {
-    *SNAPSHOT.lock() = None;
+    *WINDOW_STATE.lock() = None;
 }
 
 pub(crate) struct WinWindowSource;
@@ -205,13 +217,8 @@ pub(crate) struct WinWindowSource;
 pub(crate) static WIN_WINDOW_SOURCE: WinWindowSource = WinWindowSource;
 
 impl WindowSource for WinWindowSource {
-    fn snapshot(&self) -> WindowSnapshot {
-        crate::window::snapshot().unwrap_or(WindowSnapshot {
-            extent: None,
-            position: None,
-            maximized: false,
-            fullscreen: false,
-        })
+    fn window_state(&self) -> Result<WindowState, WindowStateError> {
+        stored_window_state()
     }
 }
 

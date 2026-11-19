@@ -252,6 +252,10 @@ fn update_keymap(conn: &xcb::Connection, st: &mut State) {
     st.xkb_st = Some(new_state);
 }
 
+fn window_point(x: i32, y: i32) -> jfn_platform_abi::WindowPoint {
+    jfn_platform_abi::WindowPoint::from_window(f64::from(x), f64::from(y))
+}
+
 fn cef_modifiers(st: &State) -> u32 {
     st.modifiers | st.mouse_button_modifiers
 }
@@ -259,14 +263,20 @@ fn cef_modifiers(st: &State) -> u32 {
 /// The pointer position in the space the window's logical size names; the
 /// identity before the geometry thread has published an extent.
 fn view_point(x: i32, y: i32) -> jfn_platform_abi::LogicalPoint {
-    let extent = crate::x11_state::parent_snapshot().and_then(|s| {
-        crate::scale::extent(
+    let extent = crate::x11_state::published_parent().and_then(|s| {
+        match crate::scale::extent(
             jfn_platform_abi::PhysicalSize {
                 w: s.width,
                 h: s.height,
             },
             s.scale,
-        )
+        ) {
+            Ok(extent) => Some(extent),
+            Err(e) => {
+                tracing::error!(target: "Main", "pointer extent: {e}; mapping by the identity");
+                None
+            }
+        }
     });
     crate::scale::view_point(extent, jfn_platform_abi::PhysicalPoint { x, y })
 }
@@ -671,20 +681,20 @@ fn dispatch_input_event(ev: QueuedInputEvent) {
             x,
             y,
             modifiers,
-        } => jfn_input_dispatch_mouse_button(code, pressed, x, y, modifiers),
+        } => jfn_input_dispatch_mouse_button(code, pressed, window_point(x, y), modifiers),
         QueuedInputEvent::MouseMove {
             x,
             y,
             modifiers,
             leave,
-        } => jfn_input_dispatch_mouse_move(x, y, modifiers, leave),
+        } => jfn_input_dispatch_mouse_move(window_point(x, y), modifiers, leave),
         QueuedInputEvent::Scroll {
             x,
             y,
             dx,
             dy,
             modifiers,
-        } => jfn_input_dispatch_scroll(x, y, dx, dy, modifiers),
+        } => jfn_input_dispatch_scroll(window_point(x, y), dx, dy, modifiers),
     }
 }
 

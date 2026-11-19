@@ -264,7 +264,11 @@ impl Platform for WindowsPlatform {
         true
     }
 
-    fn alloc_surface(&self, initial: Visibility) -> SurfaceHandle {
+    fn alloc_surface(
+        &self,
+        initial: Visibility,
+        _placement: jfn_platform_abi::SurfacePlacement,
+    ) -> SurfaceHandle {
         let s = crate::render::alloc();
         crate::render::set_visibility(s, initial).acknowledged();
         s
@@ -368,8 +372,8 @@ impl Platform for WindowsPlatform {
         jfn_platform_abi::WindowOwner::Mpv(&crate::window::WIN_WINDOW_SOURCE)
     }
 
-    fn query_window_position(&self) -> Option<WindowPos> {
-        crate::window::snapshot()?.position
+    fn window_position(&self) -> Result<Option<WindowPos>, jfn_platform_abi::WindowStateError> {
+        Ok(crate::window::stored_window_state()?.position)
     }
 
     fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry {

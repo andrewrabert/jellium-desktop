@@ -6,6 +6,7 @@
 use std::os::raw::c_int;
 
 use jfn_input::{TouchPhase, WebInput};
+use jfn_platform_abi::WebPoint;
 
 struct WebSink;
 
@@ -35,33 +36,41 @@ impl WebInput for WebSink {
 
     fn send_mouse_click(
         &self,
-        x: c_int,
-        y: c_int,
+        p: WebPoint,
         modifiers: u32,
         button: c_int,
         mouse_up: bool,
         click_count: c_int,
     ) {
+        let (x, y) = p.floor();
         crate::web_overlay::with_current_client(|client| {
             client.send_mouse_click(x, y, modifiers, button, mouse_up, click_count);
         });
     }
 
-    fn send_mouse_move(&self, x: c_int, y: c_int, modifiers: u32, leave: bool) {
+    fn send_mouse_move(&self, p: WebPoint, modifiers: u32, leave: bool) {
+        let (x, y) = p.floor();
         crate::web_overlay::with_current_client(|client| {
             client.send_mouse_move(x, y, modifiers, leave);
         });
     }
 
-    fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int) {
+    fn send_mouse_wheel(&self, p: WebPoint, modifiers: u32, delta_x: c_int, delta_y: c_int) {
+        let (x, y) = p.floor();
         crate::web_overlay::with_current_client(|client| {
             client.send_mouse_wheel(x, y, modifiers, delta_x, delta_y);
         });
     }
 
-    fn send_touch_event(&self, id: c_int, x: f32, y: f32, modifiers: u32, phase: TouchPhase) {
+    fn send_touch_event(&self, id: c_int, p: WebPoint, modifiers: u32, phase: TouchPhase) {
         crate::web_overlay::with_current_client(|client| {
-            client.send_touch_event(id, x, y, modifiers, phase);
+            client.send_touch_event(id, p.x() as f32, p.y() as f32, modifiers, phase);
+        });
+    }
+
+    fn capture_lost(&self) {
+        crate::web_overlay::with_current_client(|client| {
+            client.send_capture_lost();
         });
     }
 
