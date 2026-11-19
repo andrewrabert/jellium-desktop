@@ -762,23 +762,29 @@ impl RunningRuntime {
     }
 }
 
-/// Boot-time mpv size reconcile (saved scale vs the scale the platform
-/// reports); seeds the display-hz cache and returns it for browser init.
-fn boot_mpv_reconcile() -> Option<jfn_gpu_paint::RefreshRate> {
+fn boot_display_hz() -> (f64, Option<jfn_gpu_paint::RefreshRate>) {
     jfn_playback::ingest_driver::jfn_playback_seed_display_hz_sync();
     let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
     let rate = jfn_gpu_paint::RefreshRate::from_hz(hz);
     if let Some(rate) = rate {
         jfn_gpu_paint::report_refresh(jfn_gpu_paint::RefreshSource::MpvDisplayFps, rate);
     }
+    (hz, rate)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum MpvReconcileError {
+    #[error("window state: {0}")]
+    WindowState(#[from] WindowStateError),
+    #[error(transparent)]
+    Size(#[from] jfn_platform_abi::Unrepresentable),
+}
+
+fn boot_mpv_reconcile(hz: f64) -> Result<(), MpvReconcileError> {
     let saved = jfn_config::window_geometry();
-    let window = match crate::window_geometry::controller().source().window_state() {
-        Ok(window) => window,
-        Err(e) => {
-            tracing::error!(target: "Main", "[FLOW] mpv size reconcile: window state: {e}; mpv keeps its size");
-            return rate;
-        }
-    };
+    let window = crate::window_geometry::controller()
+        .source()
+        .window_state()?;
     tracing::info!(target: "Main",
         "[FLOW] scale={} fullscreen={} display-hz={hz}",
         plat().scale(), window.fullscreen
@@ -795,14 +801,7 @@ fn boot_mpv_reconcile() -> Option<jfn_gpu_paint::RefreshRate> {
                 .reconcile_mpv_size(plat().scale(), logical, physical, locked)
         }
         None => Ok(None),
-    };
-    let reconciled = match reconciled {
-        Ok(reconciled) => reconciled,
-        Err(e) => {
-            tracing::error!(target: "Main", "[FLOW] mpv size reconcile: {e}; mpv keeps its size");
-            None
-        }
-    };
+    }?;
     if let Some(physical) = reconciled {
         let clamped = plat().clamp_window_geometry(WindowGeometry {
             w: physical.w,
@@ -818,8 +817,7 @@ fn boot_mpv_reconcile() -> Option<jfn_gpu_paint::RefreshRate> {
         let g_c = cs(&geom_str);
         unsafe { jfn_mpv::api::jfn_mpv_set_geometry(g_c.as_ptr()) };
     }
-
-    rate
+    Ok(())
 }
 
 fn start_web_overlay(
@@ -1210,7 +1208,11 @@ fn consume_boot_event(boot: &mut BackgroundCapture, event: jfn_mpv::api::WaitEve
             BootEvent::Consumed
         }
         jfn_mpv::api::WaitEvent::Event(event) => {
-            jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(&event, plat());
+            if let Err(e) =
+                jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(&event, plat())
+            {
+                tracing::error!(target: "mpv", "{e}");
+            }
             BootEvent::Consumed
         }
     }
@@ -1332,7 +1334,10 @@ fn run_with_cef(
             }
         }
     }
-    let rate = boot_mpv_reconcile();
+    let (hz, rate) = boot_display_hz();
+    if let Err(e) = boot_mpv_reconcile(hz) {
+        tracing::error!(target: "Main", "[FLOW] mpv size reconcile: {e}; mpv keeps its size");
+    }
     resources.services.playback = Some(initialize_playback_coordination());
     let Some(cef) = resources.services.cef.as_ref() else {
         tracing::error!(target: "Main", "startup invariant violated: overlay acquisition requires initialized CEF");

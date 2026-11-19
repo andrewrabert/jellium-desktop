@@ -38,6 +38,24 @@ pub mod observe_id {
 
 const MAX_BUFFERED_RANGES: usize = 8;
 
+#[derive(Debug, thiserror::Error)]
+pub enum IngestError {
+    #[error("osd-dimensions {w}x{h} do not fit a pixel count: {source}")]
+    OsdDimsRange {
+        w: i64,
+        h: i64,
+        #[source]
+        source: std::num::TryFromIntError,
+    },
+    #[error("osd-dimensions {w}x{h}: {source}")]
+    OsdDimsExtent {
+        w: i32,
+        h: i32,
+        #[source]
+        source: ExtentError,
+    },
+}
+
 /// Caller-provided platform hooks. Implementations stay outside this crate so
 /// jfn-playback doesn't grow a platform dep.
 pub trait IngestCtx {
@@ -121,7 +139,7 @@ pub(crate) fn ingest_event_for_ffi<C: IngestCtx>(
     event: &Event,
     state: &IngestState,
     ctx: &C,
-) -> Vec<IngestOut> {
+) -> Result<Vec<IngestOut>, IngestError> {
     ingest(event, state, ctx)
 }
 
@@ -132,21 +150,25 @@ pub(crate) fn ingest_property_for_ffi<C: IngestCtx>(
     value: &PropertyValue,
     state: &IngestState,
     ctx: &C,
-) -> Vec<IngestOut> {
+) -> Result<Vec<IngestOut>, IngestError> {
     digest_property(id, value, state, ctx)
 }
 
-pub(crate) fn ingest<C: IngestCtx>(event: &Event, state: &IngestState, ctx: &C) -> Vec<IngestOut> {
-    match event {
+pub(crate) fn ingest<C: IngestCtx>(
+    event: &Event,
+    state: &IngestState,
+    ctx: &C,
+) -> Result<Vec<IngestOut>, IngestError> {
+    Ok(match event {
         Event::Shutdown => vec![IngestOut::Shutdown],
         Event::FileLoaded => vec![IngestOut::Input(Input::FileLoaded)],
         Event::EndFile(reason) => Some(end_file_input(reason))
             .into_iter()
             .map(IngestOut::Input)
             .collect(),
-        Event::PropertyChange { id, value, .. } => digest_property(*id, value, state, ctx),
+        Event::PropertyChange { id, value, .. } => digest_property(*id, value, state, ctx)?,
         _ => Vec::new(),
-    }
+    })
 }
 
 fn end_file_input(reason: &jfn_mpv::EndFileReason) -> Input {
@@ -176,10 +198,10 @@ fn digest_property<C: IngestCtx>(
     value: &PropertyValue,
     state: &IngestState,
     ctx: &C,
-) -> Vec<IngestOut> {
+) -> Result<Vec<IngestOut>, IngestError> {
     use observe_id::*;
-    match id {
-        OSD_DIMS => digest_osd_dims(value, state, ctx).into_iter().collect(),
+    Ok(match id {
+        OSD_DIMS => digest_osd_dims(value, state, ctx)?,
         PAUSE => as_flag(value)
             .map(|f| vec![IngestOut::Input(Input::PauseChanged(f))])
             .unwrap_or_default(),
@@ -219,7 +241,7 @@ fn digest_property<C: IngestCtx>(
             if let Some(id) = as_int(value) {
                 let previous = state.window_id.swap(id, Ordering::Relaxed);
                 if id != previous {
-                    return vec![IngestOut::WindowHandleChanged(id)];
+                    return Ok(vec![IngestOut::WindowHandleChanged(id)]);
                 }
             }
             Vec::new()
@@ -232,50 +254,46 @@ fn digest_property<C: IngestCtx>(
         }
         DISPLAY_FPS => {
             let Some(fps) = as_double(value) else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
             if fps == state.display_hz() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             state.display_hz.store(fps);
             vec![IngestOut::Input(Input::DisplayHz(fps))]
         }
         CACHE_STATE => digest_cache_state(value),
         _ => Vec::new(),
-    }
+    })
 }
 
 fn digest_osd_dims<C: IngestCtx>(
     value: &PropertyValue,
     state: &IngestState,
     ctx: &C,
-) -> Vec<IngestOut> {
+) -> Result<Vec<IngestOut>, IngestError> {
     let PropertyValue::Node(node) = value else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let w = node.get("w").and_then(|v| v.as_int()).unwrap_or(0);
     let h = node.get("h").and_then(|v| v.as_int()).unwrap_or(0);
     if w <= 0 || h <= 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let (Ok(w), Ok(h)) = (i32::try_from(w), i32::try_from(h)) else {
-        return Vec::new();
-    };
+    let range = |source| IngestError::OsdDimsRange { w, h, source };
+    let (w, h) = (
+        i32::try_from(w).map_err(range)?,
+        i32::try_from(h).map_err(range)?,
+    );
     let physical = PhysicalSize { w, h };
     let scale = ctx.scale();
     let extent = match ctx.os_logical_size().filter(|l| l.w > 0 && l.h > 0) {
         Some(logical) => extent_at(scale, logical),
         None => extent_of(scale, physical),
     };
-    let extent = match extent {
-        Ok(extent) => extent,
-        Err(e) => {
-            tracing::error!(target: "mpv", "osd-dimensions {w}x{h}: {e}; the stored extent stands");
-            return Vec::new();
-        }
-    };
+    let extent = extent.map_err(|source| IngestError::OsdDimsExtent { w, h, source })?;
     state.set_window_extent(extent);
-    vec![IngestOut::WindowExtentChanged]
+    Ok(vec![IngestOut::WindowExtentChanged])
 }
 
 /// The extent a reported scale and an exact logical content size name; the
@@ -365,6 +383,10 @@ mod tests {
         TestCtx { scale, mac: None }
     }
 
+    fn ingest_ok(event: &Event, state: &IngestState, ctx: &TestCtx) -> Vec<IngestOut> {
+        ingest(event, state, ctx).unwrap()
+    }
+
     fn prop(id: u64, value: PropertyValue) -> Event {
         Event::PropertyChange {
             id,
@@ -376,7 +398,7 @@ mod tests {
     #[test]
     fn pause_flag_round_trips() {
         let state = IngestState::new();
-        let out = ingest(
+        let out = ingest_ok(
             &prop(observe_id::PAUSE, PropertyValue::Flag(true)),
             &state,
             &ctx(Scale::ONE),
@@ -388,7 +410,7 @@ mod tests {
     #[test]
     fn time_pos_scales_to_microseconds() {
         let state = IngestState::new();
-        let out = ingest(
+        let out = ingest_ok(
             &prop(observe_id::TIME_POS, PropertyValue::Double(1.5)),
             &state,
             &ctx(Scale::ONE),
@@ -403,7 +425,7 @@ mod tests {
     fn window_replacement_is_observed_without_rebinding_repeated_handles() {
         let state = IngestState::new();
         for id in [101, 202] {
-            let out = ingest(
+            let out = ingest_ok(
                 &prop(observe_id::WINDOW_ID, PropertyValue::Int(id)),
                 &state,
                 &ctx(Scale::ONE),
@@ -411,7 +433,7 @@ mod tests {
             assert!(matches!(out.as_slice(), [IngestOut::WindowHandleChanged(got)] if *got == id));
             assert_eq!(state.window_id(), Some(id));
             assert!(
-                ingest(
+                ingest_ok(
                     &prop(observe_id::WINDOW_ID, PropertyValue::Int(id)),
                     &state,
                     &ctx(Scale::ONE)
@@ -425,12 +447,12 @@ mod tests {
     fn fullscreen_carries_maximized_when_entering() {
         let state = IngestState::new();
         // Window first reports maximized true.
-        let _ = ingest(
+        let _ = ingest_ok(
             &prop(observe_id::WINDOW_MAX, PropertyValue::Flag(true)),
             &state,
             &ctx(Scale::ONE),
         );
-        let out = ingest(
+        let out = ingest_ok(
             &prop(observe_id::FULLSCREEN, PropertyValue::Flag(true)),
             &state,
             &ctx(Scale::ONE),
@@ -446,7 +468,7 @@ mod tests {
         assert!(was_maximized);
 
         // Leaving fullscreen always reports was_maximized = false.
-        let out = ingest(
+        let out = ingest_ok(
             &prop(observe_id::FULLSCREEN, PropertyValue::Flag(false)),
             &state,
             &ctx(Scale::ONE),
@@ -465,7 +487,7 @@ mod tests {
 
     fn digest_dims(state: &IngestState, w: i64, h: i64, scale: Scale) {
         let node = Node::Map(vec![("w".into(), Node::Int(w)), ("h".into(), Node::Int(h))]);
-        let _ = ingest(
+        let _ = ingest_ok(
             &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
             state,
             &ctx(scale),
@@ -476,14 +498,14 @@ mod tests {
     fn display_fps_suppresses_duplicates() {
         let state = IngestState::new();
         let v = PropertyValue::Double(60.0);
-        let out = ingest(
+        let out = ingest_ok(
             &prop(observe_id::DISPLAY_FPS, v.clone()),
             &state,
             &ctx(Scale::ONE),
         );
         matches!(out[0], IngestOut::Input(Input::DisplayHz(_)));
         assert_eq!(state.display_hz(), 60.0);
-        let out = ingest(&prop(observe_id::DISPLAY_FPS, v), &state, &ctx(Scale::ONE));
+        let out = ingest_ok(&prop(observe_id::DISPLAY_FPS, v), &state, &ctx(Scale::ONE));
         assert!(out.is_empty());
     }
 
@@ -495,7 +517,7 @@ mod tests {
             ("h".into(), Node::Int(2160)),
         ]);
         let observed = ratio(2, 1).map(|two| {
-            let out = ingest(
+            let out = ingest_ok(
                 &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
                 &state,
                 &ctx(two),
@@ -530,7 +552,7 @@ mod tests {
         let observed = ratio(2, 1).map(|two| {
             let mut c = ctx(two);
             c.mac = Some(LogicalSize { w: 1280, h: 720 });
-            let _ = ingest(
+            let _ = ingest_ok(
                 &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
                 &state,
                 &c,
@@ -610,12 +632,32 @@ mod tests {
             ("w".into(), Node::Int(0)),
             ("h".into(), Node::Int(1080)),
         ]);
-        let out = ingest(
+        let out = ingest_ok(
             &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
             &state,
             &ctx(Scale::ONE),
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn osd_dims_out_of_range_is_an_error_and_keeps_the_extent() {
+        let state = IngestState::new();
+        digest_dims(&state, 1600, 900, Scale::ONE);
+        let node = Node::Map(vec![
+            ("w".into(), Node::Int(i64::from(i32::MAX) + 1)),
+            ("h".into(), Node::Int(1080)),
+        ]);
+        let out = ingest(
+            &prop(observe_id::OSD_DIMS, PropertyValue::Node(node)),
+            &state,
+            &ctx(Scale::ONE),
+        );
+        assert!(matches!(out, Err(IngestError::OsdDimsRange { .. })));
+        assert_eq!(
+            state.window_extent().map(|e| e.physical()),
+            Some(PhysicalSize { w: 1600, h: 900 })
+        );
     }
 
     #[test]
@@ -629,7 +671,7 @@ mod tests {
             "seekable-ranges".into(),
             Node::Array(vec![range.clone(), range]),
         )]);
-        let out = ingest(
+        let out = ingest_ok(
             &prop(observe_id::CACHE_STATE, PropertyValue::Node(root)),
             &state,
             &ctx(Scale::ONE),
@@ -645,14 +687,14 @@ mod tests {
     #[test]
     fn shutdown_event_returns_terminal() {
         let state = IngestState::new();
-        let out = ingest(&Event::Shutdown, &state, &ctx(Scale::ONE));
+        let out = ingest_ok(&Event::Shutdown, &state, &ctx(Scale::ONE));
         assert!(matches!(out[0], IngestOut::Shutdown));
     }
 
     #[test]
     fn end_file_maps_reason() {
         let state = IngestState::new();
-        let out = ingest(
+        let out = ingest_ok(
             &Event::EndFile(jfn_mpv::EndFileReason::Eof),
             &state,
             &ctx(Scale::ONE),
@@ -666,7 +708,7 @@ mod tests {
     #[test]
     fn file_loaded_emits_input() {
         let state = IngestState::new();
-        let out = ingest(&Event::FileLoaded, &state, &ctx(Scale::ONE));
+        let out = ingest_ok(&Event::FileLoaded, &state, &ctx(Scale::ONE));
         assert!(matches!(out[0], IngestOut::Input(Input::FileLoaded)));
     }
 }

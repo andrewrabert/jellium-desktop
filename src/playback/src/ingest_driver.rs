@@ -15,6 +15,16 @@ use crate::ingest::{
     IngestCtx, IngestOut, IngestState, extent_at, ingest_event_for_ffi, ingest_property_for_ffi,
 };
 
+pub use crate::ingest::IngestError;
+
+#[derive(Debug, thiserror::Error)]
+pub enum WindowModeError {
+    #[error("window state: {0}")]
+    WindowState(#[source] WindowStateError),
+    #[error(transparent)]
+    Ingest(#[from] IngestError),
+}
+
 // ---------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------
@@ -80,38 +90,50 @@ pub fn jfn_playback_window_id() -> Option<i64> {
     state().window_id()
 }
 
-/// Returns flag bits — see [`INGEST_FLAG_SHUTDOWN`].
 pub fn jfn_playback_ingest_mpv_event_owned(
     event: &Event,
     platform: &dyn jfn_platform_abi::Platform,
-) -> u8 {
-    let outs = ingest_event_for_ffi(event, state(), &PlatformCtx(platform));
-    dispatch(outs)
+) -> Result<u8, IngestError> {
+    let outs = ingest_event_for_ffi(event, state(), &PlatformCtx(platform))?;
+    Ok(dispatch(outs))
 }
 
 pub fn jfn_playback_reconcile_window_mode() {
-    let Some(lease) = jfn_platform_abi::try_lease() else {
-        return;
-    };
-    match lease.platform().window_owner().source().window_state() {
-        Ok(window) => post_window_mode(window.fullscreen, window.maximized),
-        Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => {}
-        Err(e) => {
-            tracing::error!(target: "mpv", "window mode reconcile: window state: {e}");
-        }
+    match reconcile_window_mode() {
+        Ok(())
+        | Err(WindowModeError::WindowState(
+            WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated,
+        )) => {}
+        Err(e) => tracing::error!(target: "mpv", "window mode reconcile: {e}"),
     }
 }
 
-fn post_window_mode(fullscreen: bool, maximized: bool) {
+fn reconcile_window_mode() -> Result<(), WindowModeError> {
+    let Some(lease) = jfn_platform_abi::try_lease() else {
+        return Ok(());
+    };
+    let window = lease
+        .platform()
+        .window_owner()
+        .source()
+        .window_state()
+        .map_err(WindowModeError::WindowState)?;
+    post_window_mode(window.fullscreen, window.maximized)?;
+    Ok(())
+}
+
+fn post_window_mode(fullscreen: bool, maximized: bool) -> Result<(), IngestError> {
     use crate::ingest::observe_id::{FULLSCREEN, WINDOW_MAX};
     let Some(lease) = jfn_platform_abi::try_lease() else {
-        return;
+        return Ok(());
     };
     let ctx = PlatformCtx(lease.platform());
-    let outs = ingest_property_for_ffi(FULLSCREEN, &PropertyValue::Flag(fullscreen), state(), &ctx);
+    let outs =
+        ingest_property_for_ffi(FULLSCREEN, &PropertyValue::Flag(fullscreen), state(), &ctx)?;
     dispatch(outs);
-    let outs = ingest_property_for_ffi(WINDOW_MAX, &PropertyValue::Flag(maximized), state(), &ctx);
+    let outs = ingest_property_for_ffi(WINDOW_MAX, &PropertyValue::Flag(maximized), state(), &ctx)?;
     dispatch(outs);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -360,10 +382,14 @@ fn ingest_events(rx: Receiver<Event>) {
         let Some(lease) = jfn_platform_abi::try_lease() else {
             return;
         };
-        let outs = ingest_event_for_ffi(&event, state(), &PlatformCtx(lease.platform()));
-        if dispatch(outs) & INGEST_FLAG_SHUTDOWN != 0 {
-            invoke_shutdown_handler();
-            return;
+        match ingest_event_for_ffi(&event, state(), &PlatformCtx(lease.platform())) {
+            Ok(outs) => {
+                if dispatch(outs) & INGEST_FLAG_SHUTDOWN != 0 {
+                    invoke_shutdown_handler();
+                    return;
+                }
+            }
+            Err(e) => tracing::error!(target: "mpv", "{e}"),
         }
     }
 }
