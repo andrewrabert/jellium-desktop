@@ -7,7 +7,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, LoopHandle, LoopSignal, RegistrationToken};
 use parking_lot::Mutex;
 use x11rb::connection::Connection;
-use x11rb::errors::{ConnectionError, ReplyOrIdError};
+use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::Event;
 use x11rb::protocol::shm::ConnectionExt as ShmConnectionExt;
 use x11rb::protocol::xinput::{self, ConnectionExt as _, XIEventMask};
@@ -45,6 +45,38 @@ enum BuildError {
     CreateWindow(#[source] ConnectionError),
     #[error("graphics context id: {0}")]
     GcId(#[source] ReplyOrIdError),
+    #[error("create_gc: {0}")]
+    CreateGc(#[source] ReplyError),
+    #[error("map_window: {0}")]
+    MapWindow(#[source] ReplyError),
+    #[error("raise window: {0}")]
+    Raise(#[source] ReplyError),
+    #[error("get_geometry: {0}")]
+    Geometry(#[source] ReplyError),
+    #[error("{cause}; releasing the window failed: {cleanup}")]
+    Unwind {
+        #[source]
+        cause: Box<BuildError>,
+        cleanup: ConnectionError,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PresentError {
+    #[error("no shared memory buffer for {w}x{h}")]
+    Shm { w: i32, h: i32 },
+    #[error("shm_put_image: {0}")]
+    PutImage(#[source] ConnectionError),
+    #[error("flush: {0}")]
+    Flush(#[source] ConnectionError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum QueueError {
+    #[error("popup thread not running")]
+    NotRunning,
+    #[error("popup thread gone")]
+    Gone,
 }
 
 pub fn start() -> Result<(), MenuSpawnError> {
@@ -93,13 +125,10 @@ struct X11PopupSurface {
 }
 
 impl X11PopupSurface {
-    /// False when the op could not be queued for the popup thread.
-    fn send(&self, op: Op) -> bool {
+    fn send(&self, op: Op) -> Result<(), QueueError> {
         let slot = self.tx.lock();
-        let Some(tx) = slot.as_ref() else {
-            return false;
-        };
-        tx.send(op).is_ok()
+        let tx = slot.as_ref().ok_or(QueueError::NotRunning)?;
+        tx.send(op).map_err(|_| QueueError::Gone)
     }
 
     /// Stops accepting ops, then dismisses every menu left in the queue. `rx` is
@@ -136,18 +165,22 @@ impl PopupSurface for X11PopupSurface {
     }
 
     fn create(&self, generation: Generation, place: MenuPlacement) {
-        if !self.send(Op::Create { generation, place }) {
-            tracing::error!(target: "x11::menu", "popup thread gone; dismissing menu");
+        if let Err(e) = self.send(Op::Create { generation, place }) {
+            tracing::error!(target: "x11::menu", "create: {e}; dismissing menu");
             dismiss(generation);
         }
     }
 
     fn present(&self, paint: MenuPaint) {
-        self.send(Op::Present(paint));
+        if let Err(e) = self.send(Op::Present(paint)) {
+            tracing::error!(target: "x11::menu", "present: {e}");
+        }
     }
 
     fn destroy(&self, generation: Generation, _reason: MenuClose) {
-        self.send(Op::Destroy { generation });
+        if let Err(e) = self.send(Op::Destroy { generation }) {
+            tracing::error!(target: "x11::menu", "destroy: {e}");
+        }
     }
 }
 
@@ -277,7 +310,12 @@ impl PopupLoop {
     fn on_op(&mut self, op: Op) {
         match op {
             Op::Create { generation, place } => self.create(generation, place),
-            Op::Present(paint) => self.present(paint),
+            Op::Present(paint) => {
+                let generation = paint.generation;
+                if let Err(e) = self.present(paint) {
+                    tracing::error!(target: "x11::menu", "present {generation}: {e}");
+                }
+            }
             Op::Destroy { generation } => {
                 if self.owns(generation) {
                     self.tear_down();
@@ -396,23 +434,11 @@ impl PopupLoop {
             .map_err(BuildError::CreateWindow)?;
         let gc = match self.conn.generate_id() {
             Ok(gc) => gc,
-            Err(e) => {
-                let _ = self.conn.destroy_window(win);
-                return Err(BuildError::GcId(e));
-            }
+            Err(e) => return Err(self.unwind(BuildError::GcId(e), win, None)),
         };
-        let _ = self.conn.create_gc(gc, win, &CreateGCAux::new());
-        let _ = self.conn.map_window(win);
-        let _ = self
-            .conn
-            .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
-        // Round-trip on the grabbing connection before grabbing — the window
-        // must be realized server-side or the grab races into a BadWindow.
-        let _ = self
-            .conn
-            .get_geometry(win)
-            .ok()
-            .and_then(|c| c.reply().ok());
+        if let Err(e) = self.realize(win, gc) {
+            return Err(self.unwind(e, win, Some(gc)));
+        }
         tracing::debug!(target: "x11::menu", "build: window 0x{win:x} created+mapped");
         Ok(Window {
             generation,
@@ -421,6 +447,40 @@ impl PopupLoop {
             gc,
             buf: ShmBuffer::empty(),
         })
+    }
+
+    fn unwind(&self, cause: BuildError, win: u32, gc: Option<u32>) -> BuildError {
+        let released = gc
+            .map_or(Ok(()), |gc| self.conn.free_gc(gc).map(drop))
+            .and_then(|()| self.conn.destroy_window(win).map(drop));
+        match released {
+            Ok(()) => cause,
+            Err(cleanup) => BuildError::Unwind {
+                cause: Box::new(cause),
+                cleanup,
+            },
+        }
+    }
+
+    fn realize(&self, win: u32, gc: u32) -> Result<(), BuildError> {
+        let conn = &*self.conn;
+        let create_gc = conn
+            .create_gc(gc, win, &CreateGCAux::new())
+            .map_err(|e| BuildError::CreateGc(e.into()))?;
+        let map = conn
+            .map_window(win)
+            .map_err(|e| BuildError::MapWindow(e.into()))?;
+        let raise = conn
+            .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
+            .map_err(|e| BuildError::Raise(e.into()))?;
+        conn.get_geometry(win)
+            .map_err(ReplyError::from)
+            .and_then(|cookie| cookie.reply())
+            .map_err(BuildError::Geometry)?;
+        create_gc.check().map_err(BuildError::CreateGc)?;
+        map.check().map_err(BuildError::MapWindow)?;
+        raise.check().map_err(BuildError::Raise)?;
+        Ok(())
     }
 
     /// The root-relative top-left of a window of `size` whose anchor is
@@ -449,22 +509,22 @@ impl PopupLoop {
         Ok((x.max(0), y.max(0)))
     }
 
-    fn present(&mut self, paint: MenuPaint) {
+    fn present(&mut self, paint: MenuPaint) -> Result<(), PresentError> {
         if !self.owns(paint.generation) {
-            return;
+            return Ok(());
         }
         let conn = Arc::clone(&self.conn);
         let Some(window) = self.phase.window() else {
-            return;
+            return Ok(());
         };
         let (w, h) = (paint.buffer.w.max(1), paint.buffer.h.max(1));
         if !shm_alloc(&mut window.buf, &conn, w, h) {
-            return;
+            return Err(PresentError::Shm { w, h });
         }
         let pixels = window.buf.pixels_mut();
         let len = pixels.len().min(paint.pixels.len());
         pixels[..len].copy_from_slice(&paint.pixels[..len]);
-        let _ = conn.shm_put_image(
+        conn.shm_put_image(
             window.win,
             window.gc,
             w as u16,
@@ -480,8 +540,9 @@ impl PopupLoop {
             false,
             window.buf.seg(),
             0,
-        );
-        let _ = conn.flush();
+        )
+        .map_err(PresentError::PutImage)?;
+        conn.flush().map_err(PresentError::Flush)
     }
 
     fn try_grab(&mut self) {
