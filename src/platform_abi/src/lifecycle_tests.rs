@@ -104,7 +104,7 @@ impl Platform for Backend {
     fn display_scale(&self, at: Option<WindowPos>) -> Scale {
         unreachable!("lifecycle test never calls this platform operation")
     }
-    fn window_position(&self) -> Result<Option<WindowPos>, crate::WindowStateError> {
+    fn window_position(&self) -> Result<Option<WindowPlacement>, crate::WindowStateError> {
         unreachable!("lifecycle test never calls this platform operation")
     }
     fn window_owner(&self) -> WindowOwner<'_> {
@@ -112,8 +112,8 @@ impl Platform for Backend {
     }
     fn clamp_window_geometry(
         &self,
-        g: WindowGeometry,
-    ) -> Result<WindowGeometry, geometry::ClampError> {
+        g: &WindowGeometry,
+    ) -> Result<PlacedGeometry, geometry::ClampError> {
         unreachable!("lifecycle test never calls this platform operation")
     }
     fn pump(&self) {

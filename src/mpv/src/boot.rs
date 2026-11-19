@@ -55,6 +55,7 @@ pub struct JfnMpvBoot {
     /// own window.
     pub wid: i64,
     pub force_window_position: bool,
+    pub screen: BootScreen,
     pub window_maximized_at_boot: bool,
     /// libmpv log-message subscription level (`"no"`, `"error"`,
     /// `"warn"`, `"info"`, `"v"`, `"debug"`, `"trace"`).
@@ -63,6 +64,12 @@ pub struct JfnMpvBoot {
     /// the app's own client-side decorations don't stack under a compositor
     /// titlebar (e.g. KDE). No effect on X11 (WM draws decorations).
     pub client_side_decorations: bool,
+}
+
+pub enum BootScreen {
+    Default,
+    Index(usize),
+    Name(String),
 }
 
 /// Owns the Handle for the rest of the process. `mpv_terminate_destroy`
@@ -289,6 +296,11 @@ fn apply_boot_options(handle: &Handle, boot: &JfnMpvBoot) -> crate::error::Resul
     }
     if boot.force_window_position {
         set("force-window-position", "yes")?;
+    }
+    match &boot.screen {
+        BootScreen::Default => {}
+        BootScreen::Index(index) => set("screen", &index.to_string())?,
+        BootScreen::Name(name) => set("screen-name", name.as_str())?,
     }
     if boot.window_maximized_at_boot {
         set("window-maximized", "yes")?;

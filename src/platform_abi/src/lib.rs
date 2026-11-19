@@ -41,9 +41,10 @@ pub mod window_source;
 
 pub use cef_host::CefHost;
 pub use geometry::{
-    BootGeometry, COVERED_SCALES, ExtentError, LogicalPoint, LogicalSize, PhysicalPoint,
-    PhysicalSize, PointsToPixelsError, Scale, SurfacePlacement, SurfaceSize, Unrepresentable,
-    WebPoint, WindowBasis, WindowExtent, WindowGeometry, WindowPoint, WindowPos, points_to_pixels,
+    BootGeometry, COVERED_SCALES, ExtentError, LogicalPoint, LogicalSize, MpvPlacement, MpvScreen,
+    PhysicalPoint, PhysicalSize, PlacedGeometry, PointsToPixelsError, Scale, ScreenName,
+    SurfacePlacement, SurfaceSize, TargetScreen, Unrepresentable, WebPoint, WindowBasis,
+    WindowExtent, WindowGeometry, WindowPlacement, WindowPoint, WindowPos, points_to_pixels,
     web_top,
 };
 pub use instance::{Instance, InstanceId};
@@ -554,15 +555,15 @@ pub trait Platform: Send + Sync {
     /// or for its own default display when `at` is `None`.
     fn display_scale(&self, at: Option<WindowPos>) -> Scale;
 
-    fn window_position(&self) -> Result<Option<WindowPos>, WindowStateError>;
+    fn window_position(&self) -> Result<Option<WindowPlacement>, WindowStateError>;
 
     /// Who creates the app window, and the live geometry authority for it.
     fn window_owner(&self) -> WindowOwner<'_>;
 
     fn clamp_window_geometry(
         &self,
-        g: WindowGeometry,
-    ) -> Result<WindowGeometry, geometry::ClampError>;
+        g: &WindowGeometry,
+    ) -> Result<PlacedGeometry, geometry::ClampError>;
 
     fn pump(&self);
     /// Block the process main thread until [`wake_main_loop`] is called.

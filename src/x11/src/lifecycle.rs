@@ -184,7 +184,7 @@ pub(crate) fn ensure_host_window() -> bool {
     if host().is_some() {
         return true;
     }
-    let Some(boot) = *BOOT_GEOMETRY.lock() else {
+    let Some(boot) = BOOT_GEOMETRY.lock().clone() else {
         tracing::error!(
             target: "Main",
             "x11: no boot geometry; WindowOwner::apply_boot_geometry must seed it before the host window is created"

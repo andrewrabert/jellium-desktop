@@ -2,7 +2,9 @@ use crate::subscriptions::Subscribers;
 pub use crate::subscriptions::Subscription as WindowSubscription;
 use std::sync::LazyLock;
 
-use crate::geometry::{ExtentError, PointsToPixelsError, WindowBasis, WindowExtent, WindowPos};
+use crate::geometry::{
+    ExtentError, PointsToPixelsError, WindowBasis, WindowExtent, WindowPlacement, WindowPos,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowState {
@@ -38,6 +40,13 @@ pub enum WindowStateError {
 
 pub trait WindowSource: Send + Sync {
     fn window_state(&self) -> Result<WindowState, WindowStateError>;
+
+    fn window_placement(&self) -> Result<Option<WindowPlacement>, WindowStateError> {
+        Ok(self
+            .window_state()?
+            .position
+            .map(|position| WindowPlacement::new(None, position)))
+    }
 }
 
 static WINDOW_SUBSCRIBERS: LazyLock<Subscribers> = LazyLock::new(Subscribers::new);

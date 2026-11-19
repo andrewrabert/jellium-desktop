@@ -43,6 +43,6 @@ impl AppCreatedWindow for X11WindowSource {
     /// `ensure_host_window` creates the WM toplevel at this geometry, so the
     /// seed must land before it runs.
     fn seed_boot_geometry(&self, g: &BootGeometry) {
-        crate::lifecycle::set_boot_geometry(*g);
+        crate::lifecycle::set_boot_geometry(g.clone());
     }
 }

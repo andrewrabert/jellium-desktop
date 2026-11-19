@@ -6,8 +6,8 @@
 use std::sync::OnceLock;
 
 use jfn_platform_abi::{
-    BootGeometry, LogicalSize, PhysicalSize, Platform, Scale, Unrepresentable, WindowGeometry,
-    WindowSource, WindowStateError, geometry::ClampError,
+    BootGeometry, LogicalSize, PhysicalSize, PlacedGeometry, Platform, Scale, Unrepresentable,
+    WindowGeometry, WindowPlacement, WindowSource, WindowStateError, geometry::ClampError,
 };
 
 use jfn_config::JfnWindowGeometry;
@@ -39,7 +39,7 @@ impl WindowGeometryController {
     /// scale + clamp from the platform.
     pub fn boot(&self) -> Result<BootGeometry, BootGeometryError> {
         let g = jfn_config::window_geometry();
-        let scale = plat().display_scale(g.position);
+        let scale = plat().display_scale(g.placement.as_ref().map(WindowPlacement::position));
         resolve_boot(g, scale, |w| plat().clamp_window_geometry(w))
     }
 
@@ -67,7 +67,7 @@ impl WindowGeometryController {
 fn resolve_boot(
     g: JfnWindowGeometry,
     scale: Scale,
-    clamp: impl Fn(WindowGeometry) -> Result<WindowGeometry, ClampError>,
+    clamp: impl Fn(&WindowGeometry) -> Result<PlacedGeometry, ClampError>,
 ) -> Result<BootGeometry, BootGeometryError> {
     let (logical, physical) = match (g.logical, g.physical) {
         (Some(logical), _) => (logical, logical.to_physical(scale)?),
@@ -76,22 +76,23 @@ fn resolve_boot(
     };
     // clamp operates on physical backing pixels; on Wayland it's the identity,
     // so the logical size we seed the toplevel with is unaffected.
+    let maximized = g.maximized;
     let saved = WindowGeometry {
         w: physical.w,
         h: physical.h,
-        position: g.position,
+        placement: g.placement,
     };
-    let boot = |geometry| BootGeometry::from_clamped(logical, scale, geometry, g.maximized);
-    match clamp(saved) {
+    let boot = |geometry| BootGeometry::from_clamped(logical, scale, geometry, maximized);
+    match clamp(&saved) {
         Ok(clamped) => Ok(boot(clamped)),
         Err(error) => Err(BootGeometryError::Clamp {
             error,
-            unclamped: boot(saved),
+            unclamped: boot(saved.on_primary()),
         }),
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum BootGeometryError {
     #[error(transparent)]
     Size(#[from] Unrepresentable),
@@ -137,7 +138,7 @@ fn geometry_to_persist(
     Ok(Some(JfnWindowGeometry {
         logical: Some(window.extent.logical()),
         physical: Some(window.extent.physical()),
-        position: window.position,
+        placement: ws.window_placement()?,
         maximized: false,
     }))
 }
@@ -145,13 +146,16 @@ fn geometry_to_persist(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jfn_platform_abi::{WindowExtent, WindowPos, WindowState};
+    use jfn_platform_abi::geometry::{Bounds, clamp_to_screen};
+    use jfn_platform_abi::{
+        MpvScreen, ScreenName, TargetScreen, WindowExtent, WindowPos, WindowState,
+    };
 
     struct FakeWindowSource {
         size: Option<PhysicalSize>,
         maximized: bool,
         fullscreen: bool,
-        position: Option<WindowPos>,
+        placement: Option<WindowPlacement>,
         scale: Scale,
     }
 
@@ -163,12 +167,16 @@ mod tests {
                 .map_err(jfn_platform_abi::ExtentError::from)?;
             Ok(WindowState {
                 extent: WindowExtent::new(physical, self.scale, logical)?,
-                position: self.position,
+                position: self.placement.as_ref().map(WindowPlacement::position),
                 maximized: self.maximized,
                 fullscreen: self.fullscreen,
                 web_top: 0,
                 basis: jfn_platform_abi::WindowBasis::FIXED,
             })
+        }
+
+        fn window_placement(&self) -> Result<Option<WindowPlacement>, WindowStateError> {
+            Ok(self.placement.clone())
         }
     }
 
@@ -177,9 +185,20 @@ mod tests {
             size,
             maximized: false,
             fullscreen: false,
-            position: None,
+            placement: None,
             scale,
         }
+    }
+
+    fn at(x: i32, y: i32) -> Option<WindowPlacement> {
+        Some(WindowPlacement::new(None, WindowPos { x, y }))
+    }
+
+    fn on(screen: &str, x: i32, y: i32) -> Option<WindowPlacement> {
+        Some(WindowPlacement::new(
+            ScreenName::new(screen.to_owned()),
+            WindowPos { x, y },
+        ))
     }
 
     const LOGICAL_720: LogicalSize = LogicalSize { w: 1280, h: 720 };
@@ -195,7 +214,7 @@ mod tests {
         let g = geometry_to_persist(&ws, JfnWindowGeometry::default(), false)
             .unwrap()
             .unwrap();
-        assert_eq!(g.position, None);
+        assert_eq!(g.placement, None);
         assert_eq!(g.physical, Some(PhysicalSize { w: 2400, h: 1350 }));
         assert_eq!(g.logical, Some(LogicalSize { w: 1600, h: 900 }));
         assert!(!g.maximized);
@@ -204,26 +223,54 @@ mod tests {
     #[test]
     fn mpv_shaped_with_position() {
         let ws = FakeWindowSource {
-            position: Some(WindowPos { x: 100, y: 50 }),
+            placement: at(100, 50),
             ..fake(Some(PHYSICAL_720), Scale::ONE)
         };
         let g = geometry_to_persist(&ws, JfnWindowGeometry::default(), false)
             .unwrap()
             .unwrap();
-        assert_eq!(g.position, Some(WindowPos { x: 100, y: 50 }));
+        assert_eq!(g.placement, at(100, 50));
         assert_eq!(g.logical, Some(LOGICAL_720));
     }
 
     #[test]
     fn a_negative_position_persists() {
         let ws = FakeWindowSource {
-            position: Some(WindowPos { x: -1920, y: -40 }),
+            placement: at(-1920, -40),
             ..fake(Some(PHYSICAL_720), Scale::ONE)
         };
         let g = geometry_to_persist(&ws, JfnWindowGeometry::default(), false)
             .unwrap()
             .unwrap();
-        assert_eq!(g.position, Some(WindowPos { x: -1920, y: -40 }));
+        assert_eq!(g.placement, at(-1920, -40));
+    }
+
+    #[test]
+    fn the_screen_persists_with_its_position() {
+        let ws = FakeWindowSource {
+            placement: on(r"\\.\DISPLAY2", 100, 50),
+            ..fake(Some(PHYSICAL_720), Scale::ONE)
+        };
+        let g = geometry_to_persist(&ws, JfnWindowGeometry::default(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.placement, on(r"\\.\DISPLAY2", 100, 50));
+    }
+
+    #[test]
+    fn maximized_keeps_the_saved_screen() {
+        let saved = JfnWindowGeometry {
+            physical: Some(PHYSICAL_720),
+            placement: on(r"\\.\DISPLAY2", 100, 50),
+            ..Default::default()
+        };
+        let ws = FakeWindowSource {
+            maximized: true,
+            placement: on(r"\\.\DISPLAY1", 0, 0),
+            ..fake(Some(PhysicalSize { w: 3840, h: 2160 }), Scale::ONE)
+        };
+        let g = geometry_to_persist(&ws, saved, false).unwrap().unwrap();
+        assert_eq!(g.placement, on(r"\\.\DISPLAY2", 100, 50));
     }
 
     #[test]
@@ -308,8 +355,8 @@ mod tests {
         );
     }
 
-    fn identity_clamp(w: WindowGeometry) -> Result<WindowGeometry, ClampError> {
-        Ok(w)
+    fn identity_clamp(w: &WindowGeometry) -> Result<PlacedGeometry, ClampError> {
+        Ok(w.on_primary())
     }
 
     #[test]
@@ -373,19 +420,62 @@ mod tests {
     fn a_negative_saved_position_reaches_the_clamp_and_the_boot_geometry() {
         let saved = JfnWindowGeometry {
             logical: Some(LOGICAL_720),
-            position: Some(WindowPos { x: -1920, y: -40 }),
+            placement: at(-1920, -40),
             ..Default::default()
         };
         let seen = std::cell::Cell::new(None);
-        let clamp = |w: WindowGeometry| {
-            seen.set(w.position);
-            Ok::<_, ClampError>(w)
+        let clamp = |w: &WindowGeometry| {
+            seen.set(w.placement.as_ref().map(WindowPlacement::position));
+            Ok::<_, ClampError>(w.on_primary())
         };
         assert_eq!(
             resolve_boot(saved, Scale::ONE, clamp).map(|boot| boot.position()),
             Ok(Some(WindowPos { x: -1920, y: -40 }))
         );
         assert_eq!(seen.get(), Some(WindowPos { x: -1920, y: -40 }));
+    }
+
+    #[test]
+    fn the_saved_screen_reaches_the_clamp_and_its_answer_reaches_mpv() {
+        let saved = JfnWindowGeometry {
+            logical: Some(LOGICAL_720),
+            placement: on(r"\\.\DISPLAY2", 100, 50),
+            ..Default::default()
+        };
+        let clamp = |w: &WindowGeometry| clamp_to_screen(w, second_screen, || Ok(None));
+        assert_eq!(
+            resolve_boot(saved, Scale::ONE, clamp)
+                .map(|boot| (boot.position(), boot.mpv_screen().cloned())),
+            Ok((Some(WindowPos { x: 100, y: 50 }), Some(MpvScreen::Index(1))))
+        );
+    }
+
+    fn second_screen(name: &ScreenName) -> Result<Option<TargetScreen>, ClampError> {
+        Ok((name.as_str() == r"\\.\DISPLAY2").then_some(TargetScreen {
+            mpv: MpvScreen::Index(1),
+            bounds: Bounds { w: 2560, h: 1440 },
+        }))
+    }
+
+    fn failing_clamp(_: &WindowGeometry) -> Result<PlacedGeometry, ClampError> {
+        Err(ClampError::Monitors(0))
+    }
+
+    #[test]
+    fn an_unclamped_boot_names_no_mpv_screen() {
+        let saved = JfnWindowGeometry {
+            logical: Some(LOGICAL_720),
+            placement: on(r"\\.\DISPLAY2", 100, 50),
+            ..Default::default()
+        };
+        let unclamped = match resolve_boot(saved, Scale::ONE, failing_clamp) {
+            Err(BootGeometryError::Clamp { unclamped, .. }) => Some(unclamped),
+            Ok(_) | Err(BootGeometryError::Size(_)) => None,
+        };
+        assert_eq!(
+            unclamped.map(|boot| (boot.position(), boot.mpv_screen().cloned())),
+            Some((Some(WindowPos { x: 100, y: 50 }), None))
+        );
     }
 
     #[test]
