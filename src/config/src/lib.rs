@@ -1,13 +1,5 @@
-//! Settings store. Owns the in-memory state, JSON persistence, and the
-//! singleton accessor that the rest of the workspace calls into.
-//!
-//! On-disk schema is [`SettingsFile`]. Missing, unknown, and malformed keys
-//! keep their defaults on load; save suppresses fields that are at their
-//! default (empty strings, sentinel values, zero geometry) so existing config
-//! files round-trip unchanged.
-
 use jfn_mailbox::Mailbox;
-use jfn_platform_abi::{WindowDecorations, WindowPos};
+use jfn_platform_abi::{LogicalSize, PhysicalSize, WindowDecorations, WindowPos};
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -22,33 +14,12 @@ pub use hardware_decode::{HWDEC_DEFAULT, Hwdec, UnknownHwdec, hwdec_options};
 
 const DEVICE_NAME_MAX: usize = 64;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct JfnWindowGeometry {
+    pub logical: Option<LogicalSize>,
+    pub physical: Option<PhysicalSize>,
     pub position: Option<WindowPos>,
-    pub width: i32,
-    pub height: i32,
-    pub logical_width: i32,
-    pub logical_height: i32,
     pub maximized: bool,
-}
-
-impl Default for JfnWindowGeometry {
-    fn default() -> Self {
-        Self {
-            position: None,
-            width: 0,
-            height: 0,
-            logical_width: 0,
-            logical_height: 0,
-            maximized: false,
-        }
-    }
-}
-
-impl JfnWindowGeometry {
-    pub fn saved_position(x: i32, y: i32) -> Option<WindowPos> {
-        (x >= 0 && y >= 0).then_some(WindowPos { x, y })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -249,20 +220,33 @@ impl SettingsData {
             truncate_device_name(&mut v);
             self.device_name = v;
         }
-        if let Some(v) = file.window_width {
-            self.window.width = v;
+        match (file.window_width, file.window_height) {
+            (None, None) => {}
+            (Some(w), Some(h)) if w > 0 && h > 0 => {
+                self.window.physical = Some(PhysicalSize { w, h });
+            }
+            _ => {
+                eprintln!("[config] windowWidth/windowHeight ignored");
+                self.window.physical = None;
+            }
         }
-        if let Some(v) = file.window_height {
-            self.window.height = v;
+        match (file.window_logical_width, file.window_logical_height) {
+            (None, None) => {}
+            (Some(w), Some(h)) if w > 0 && h > 0 => {
+                self.window.logical = Some(LogicalSize { w, h });
+            }
+            _ => {
+                eprintln!("[config] windowLogicalWidth/windowLogicalHeight ignored");
+                self.window.logical = None;
+            }
         }
-        if let Some(v) = file.window_logical_width {
-            self.window.logical_width = v;
-        }
-        if let Some(v) = file.window_logical_height {
-            self.window.logical_height = v;
-        }
-        if let (Some(x), Some(y)) = (file.window_x, file.window_y) {
-            self.window.position = JfnWindowGeometry::saved_position(x, y);
+        match (file.window_x, file.window_y) {
+            (None, None) => {}
+            (Some(x), Some(y)) => self.window.position = Some(WindowPos { x, y }),
+            (Some(_), None) | (None, Some(_)) => {
+                eprintln!("[config] windowX/windowY ignored: only one is saved");
+                self.window.position = None;
+            }
         }
         if let Some(v) = file.window_maximized {
             self.window.maximized = v;
@@ -288,14 +272,12 @@ impl SettingsData {
     }
 
     fn to_file(&self) -> SettingsFile {
-        let size = self.window.width > 0 && self.window.height > 0;
-        let logical = self.window.logical_width > 0 && self.window.logical_height > 0;
         SettingsFile {
             server_url: Some(self.server_url.clone()),
-            window_width: size.then_some(self.window.width),
-            window_height: size.then_some(self.window.height),
-            window_logical_width: logical.then_some(self.window.logical_width),
-            window_logical_height: logical.then_some(self.window.logical_height),
+            window_width: self.window.physical.map(|s| s.w),
+            window_height: self.window.physical.map(|s| s.h),
+            window_logical_width: self.window.logical.map(|s| s.w),
+            window_logical_height: self.window.logical.map(|s| s.h),
             window_x: self.window.position.map(|p| p.x),
             window_y: self.window.position.map(|p| p.y),
             window_maximized: Some(self.window.maximized),
@@ -643,8 +625,8 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SettingsData, SettingsFile, WindowDecorations, WindowPos, default_device_name,
-        normalize_device_name,
+        LogicalSize, PhysicalSize, SettingsData, SettingsFile, WindowDecorations, WindowPos,
+        default_device_name, normalize_device_name,
     };
 
     const PLATFORM: &str = "platform-host";
@@ -705,11 +687,9 @@ mod tests {
             log_level: "debug".into(),
             device_name: "box".into(),
             window: super::JfnWindowGeometry {
+                logical: Some(LogicalSize { w: 5, h: 6 }),
+                physical: Some(PhysicalSize { w: 3, h: 4 }),
                 position: Some(WindowPos { x: 1, y: 2 }),
-                width: 3,
-                height: 4,
-                logical_width: 5,
-                logical_height: 6,
                 maximized: true,
             },
             audio_exclusive: true,
@@ -772,10 +752,50 @@ mod tests {
 
     #[test]
     fn wrong_typed_key_is_ignored_and_rest_of_file_loads() {
-        let data = loaded(r#"{"windowWidth":"wide","serverUrl":"http://host","hideScrollbar":7}"#);
-        assert_eq!(data.window.width, 0);
+        let data = loaded(concat!(
+            r#"{"windowWidth":"wide","windowHeight":900,"#,
+            r#""serverUrl":"http://host","hideScrollbar":7}"#,
+        ));
+        assert_eq!(data.window.physical, None);
         assert!(data.hide_scrollbar);
         assert_eq!(data.server_url, "http://host");
+    }
+
+    #[test]
+    fn window_sizes_load_only_with_both_axes_positive() {
+        let data = loaded(concat!(
+            r#"{"windowWidth":1600,"windowHeight":900,"#,
+            r#""windowLogicalWidth":1280,"windowLogicalHeight":720}"#,
+        ));
+        assert_eq!(data.window.physical, Some(PhysicalSize { w: 1600, h: 900 }));
+        assert_eq!(data.window.logical, Some(LogicalSize { w: 1280, h: 720 }));
+
+        for json in [
+            r#"{"windowWidth":1600,"windowLogicalWidth":1280}"#,
+            concat!(
+                r#"{"windowWidth":0,"windowHeight":900,"#,
+                r#""windowLogicalWidth":1280,"windowLogicalHeight":0}"#,
+            ),
+            concat!(
+                r#"{"windowWidth":-1600,"windowHeight":900,"#,
+                r#""windowLogicalWidth":1280,"windowLogicalHeight":-720}"#,
+            ),
+        ] {
+            let data = loaded(json);
+            assert_eq!(data.window.physical, None, "{json}");
+            assert_eq!(data.window.logical, None, "{json}");
+            let text = serde_json::to_string(&data.to_file()).expect("serializes");
+            assert!(!text.contains("windowWidth"), "{json}");
+            assert!(!text.contains("windowLogicalWidth"), "{json}");
+        }
+    }
+
+    #[test]
+    fn a_negative_window_position_round_trips() {
+        let data = loaded(r#"{"windowX":-1920,"windowY":-40}"#);
+        assert_eq!(data.window.position, Some(WindowPos { x: -1920, y: -40 }));
+        let text = serde_json::to_string(&data.to_file()).expect("serializes");
+        assert!(text.contains(r#""windowX":-1920,"windowY":-40"#));
     }
 
     #[test]

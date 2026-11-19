@@ -138,28 +138,19 @@ pub fn macos_display_scale() -> Scale {
 }
 
 pub fn macos_clamp_window_geometry(
-    w: &mut c_int,
-    h: &mut c_int,
-    x: &mut c_int,
-    y: &mut c_int,
-) -> Result<(), PointsToPixelsError> {
+    mut g: WindowGeometry,
+) -> Result<WindowGeometry, PointsToPixelsError> {
     // SAFETY: this entry point runs on the AppKit main thread.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let Some(screen) = NSScreen::mainScreen(mtm) else {
-        return Ok(());
+        return Ok(g);
     };
     let visible = screen.visibleFrame();
     let scale = crate::scale::report_backing("main screen", Some(screen.backingScaleFactor()));
     let vw = points_to_pixels(scale, visible.size.width)?;
     let vh = points_to_pixels(scale, visible.size.height)?;
-    let mut g = WindowGeometry::from_raw(*w, *h, *x, *y);
     clamp_to_bounds(&mut g, Bounds { w: vw, h: vh });
-    *w = g.w;
-    *h = g.h;
-    let (nx, ny) = g.raw_position();
-    *x = nx;
-    *y = ny;
-    Ok(())
+    Ok(g)
 }
 
 // macos_early_init / macos_init / macos_cleanup + jfn_macos_get_input_view
@@ -634,10 +625,7 @@ impl Platform for MacosPlatform {
         &self,
         g: WindowGeometry,
     ) -> Result<WindowGeometry, jfn_platform_abi::geometry::ClampError> {
-        let (mut w, mut h) = (g.w, g.h);
-        let (mut x, mut y) = g.raw_position();
-        macos_clamp_window_geometry(&mut w, &mut h, &mut x, &mut y)?;
-        Ok(WindowGeometry::from_raw(w, h, x, y))
+        Ok(macos_clamp_window_geometry(g)?)
     }
 
     fn pump(&self) {

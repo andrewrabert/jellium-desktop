@@ -524,23 +524,6 @@ pub struct WindowGeometry {
     pub position: Option<WindowPos>,
 }
 
-impl WindowGeometry {
-    /// Build from raw coordinates where a negative `x` or `y` means "unset".
-    /// The single home for that OS/config-facing sentinel convention.
-    pub fn from_raw(w: c_int, h: c_int, x: c_int, y: c_int) -> Self {
-        Self {
-            w,
-            h,
-            position: (x >= 0 && y >= 0).then_some(WindowPos { x, y }),
-        }
-    }
-
-    /// Raw coordinates for OS APIs that take a sentinel; `(-1, -1)` when unset.
-    pub fn raw_position(&self) -> (c_int, c_int) {
-        self.position.map_or((-1, -1), |p| (p.x, p.y))
-    }
-}
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WindowPos {
     pub x: c_int,
@@ -582,10 +565,6 @@ pub fn clamp_size_to_bounds(g: WindowGeometry, bounds: Bounds) -> WindowGeometry
     }
 }
 
-/// Clamp `g` so the window stays fully within `bounds`: shrink oversized
-/// dimensions, center any unset (negative) axis, pull a past-the-edge window
-/// back in-bounds, then floor at the origin. Byte-for-byte the former
-/// per-platform clamp.
 pub fn clamp_to_bounds(g: &mut WindowGeometry, bounds: Bounds) {
     let vw = bounds.w;
     let vh = bounds.h;
@@ -785,25 +764,39 @@ mod tests {
         );
     }
 
+    fn placed(w: c_int, h: c_int, x: c_int, y: c_int) -> WindowGeometry {
+        WindowGeometry {
+            w,
+            h,
+            position: Some(WindowPos { x, y }),
+        }
+    }
+
+    fn unplaced(w: c_int, h: c_int) -> WindowGeometry {
+        WindowGeometry {
+            w,
+            h,
+            position: None,
+        }
+    }
+
     #[test]
     fn mpv_geometry_string_with_and_without_position() {
         let logical = LogicalSize { w: 1280, h: 720 };
         let scale = Scale::from_f64(1.25);
         assert_eq!(scale, ratio(5, 4));
-        let describe = |x: c_int, y: c_int| {
+        let describe = |clamped: WindowGeometry| {
             scale.map(|s| {
-                let g = BootGeometry::from_clamped(
-                    logical,
-                    s,
-                    WindowGeometry::from_raw(1600, 900, x, y),
-                    false,
-                );
+                let g = BootGeometry::from_clamped(logical, s, clamped, false);
                 (g.mpv_geometry_string(), g.force_position())
             })
         };
-        assert_eq!(describe(-1, -1), Some(("1600x900".to_owned(), false)));
         assert_eq!(
-            describe(100, 50),
+            describe(unplaced(1600, 900)),
+            Some(("1600x900".to_owned(), false))
+        );
+        assert_eq!(
+            describe(placed(1600, 900, 100, 50)),
             Some(("1600x900+100+50".to_owned(), true))
         );
     }
@@ -841,63 +834,80 @@ mod tests {
 
     #[test]
     fn the_size_clamp_shrinks_without_moving_the_window() {
-        let g = WindowGeometry::from_raw(3000, 2000, 1500, 900);
+        let g = placed(3000, 2000, 1500, 900);
         assert_eq!(
             clamp_size_to_bounds(g, Bounds { w: 1920, h: 1080 }),
-            WindowGeometry::from_raw(1920, 1080, 1500, 900)
+            placed(1920, 1080, 1500, 900)
+        );
+    }
+
+    #[test]
+    fn the_size_clamp_keeps_a_negative_position() {
+        let g = placed(3000, 2000, -1920, -40);
+        assert_eq!(
+            clamp_size_to_bounds(g, Bounds { w: 1920, h: 1080 }),
+            placed(1920, 1080, -1920, -40)
         );
     }
 
     #[test]
     fn a_non_positive_bound_leaves_its_axis_alone() {
-        let g = WindowGeometry::from_raw(3000, 2000, -1, -1);
+        let g = unplaced(3000, 2000);
         assert_eq!(clamp_size_to_bounds(g, Bounds { w: 0, h: -5 }), g);
         assert_eq!(
             clamp_size_to_bounds(g, Bounds { w: 1920, h: 0 }),
-            WindowGeometry::from_raw(1920, 2000, -1, -1)
+            unplaced(1920, 2000)
         );
     }
 
     const SCREEN: Bounds = Bounds { w: 1920, h: 1080 };
 
-    fn pos(g: &WindowGeometry) -> (c_int, c_int) {
-        g.raw_position()
-    }
-
     #[test]
     fn fits_unchanged() {
-        let mut g = WindowGeometry::from_raw(800, 600, 100, 50);
+        let mut g = placed(800, 600, 100, 50);
         clamp_to_bounds(&mut g, SCREEN);
-        assert_eq!(g, WindowGeometry::from_raw(800, 600, 100, 50));
+        assert_eq!(g, placed(800, 600, 100, 50));
     }
 
     #[test]
     fn oversized_shrinks_to_bounds() {
-        let mut g = WindowGeometry::from_raw(3000, 2000, 0, 0);
+        let mut g = placed(3000, 2000, 0, 0);
         clamp_to_bounds(&mut g, SCREEN);
         assert_eq!(g.w, 1920);
         assert_eq!(g.h, 1080);
     }
 
     #[test]
-    fn unset_axes_center() {
-        let mut g = WindowGeometry::from_raw(800, 600, -1, -1);
+    fn an_unset_position_centers() {
+        let mut g = unplaced(800, 600);
         clamp_to_bounds(&mut g, SCREEN);
-        assert_eq!(pos(&g), ((1920 - 800) / 2, (1080 - 600) / 2));
+        assert_eq!(
+            g.position,
+            Some(WindowPos {
+                x: (1920 - 800) / 2,
+                y: (1080 - 600) / 2
+            })
+        );
     }
 
     #[test]
     fn past_edge_pulls_back() {
-        let mut g = WindowGeometry::from_raw(800, 600, 1500, 900);
+        let mut g = placed(800, 600, 1500, 900);
         clamp_to_bounds(&mut g, SCREEN);
-        assert_eq!(pos(&g), (1920 - 800, 1080 - 600));
+        assert_eq!(
+            g.position,
+            Some(WindowPos {
+                x: 1920 - 800,
+                y: 1080 - 600
+            })
+        );
     }
 
     #[test]
     fn oversized_then_floored_at_origin() {
-        let mut g = WindowGeometry::from_raw(3000, 2000, -1, -1);
+        let mut g = unplaced(3000, 2000);
         clamp_to_bounds(&mut g, SCREEN);
-        assert_eq!(g, WindowGeometry::from_raw(1920, 1080, 0, 0));
+        assert_eq!(g, placed(1920, 1080, 0, 0));
     }
 
     #[test]
