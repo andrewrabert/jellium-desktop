@@ -327,27 +327,16 @@ fn window_point(p: LogicalPoint) -> jfn_platform_abi::WindowPoint {
 
 #[derive(Debug, thiserror::Error)]
 enum LeavePointError {
-    #[error("{operation}: {source}")]
-    Win32 {
-        operation: &'static str,
-        source: windows::core::Error,
-    },
-    #[error("leave point scale: {0}")]
+    #[error(transparent)]
+    Win32(#[from] windows::core::Error),
+    #[error(transparent)]
     Scale(#[from] WindowStateError),
-}
-
-impl LeavePointError {
-    fn win32(operation: &'static str) -> impl FnOnce(windows::core::Error) -> Self {
-        move |source| Self::Win32 { operation, source }
-    }
 }
 
 fn leave_point(hwnd: HWND) -> Result<LogicalPoint, LeavePointError> {
     let mut pt = POINT::default();
-    unsafe { GetCursorPos(&mut pt) }.map_err(LeavePointError::win32("GetCursorPos"))?;
-    unsafe { ScreenToClient(hwnd, &mut pt) }
-        .ok()
-        .map_err(LeavePointError::win32("ScreenToClient"))?;
+    unsafe { GetCursorPos(&mut pt) }?;
+    unsafe { ScreenToClient(hwnd, &mut pt) }.ok()?;
     Ok(view_point(pt.x, pt.y)?)
 }
 

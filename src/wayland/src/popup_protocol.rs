@@ -136,8 +136,8 @@ impl PopupMapping {
 enum PopupPaintError {
     #[error("no shm pool")]
     NoPool,
-    #[error("no {w}x{h} buffer drawn from the menu's pixels")]
-    Draw { w: i32, h: i32 },
+    #[error("no buffer drawn from the menu's pixels")]
+    Draw,
 }
 
 /// The positioner for a surface of `size` logical px whose top-left sits at
@@ -270,7 +270,7 @@ impl State {
         let pool = self.popups.pool.as_mut().ok_or(PopupPaintError::NoPool)?;
         let (w, h) = (paint.buffer.w, paint.buffer.h);
         let buffer = crate::wl_state::draw_from_pixels(pool, &paint.pixels, w, h)
-            .ok_or(PopupPaintError::Draw { w, h })?;
+            .ok_or(PopupPaintError::Draw)?;
         self.popups
             .current
             .paint(crate::wl_state::AttachedBuffer::Shm(buffer), paint);

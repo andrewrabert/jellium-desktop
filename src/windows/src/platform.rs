@@ -376,7 +376,7 @@ fn primary_work_bounds() -> Result<Bounds, ClampError> {
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         )
     }
-    .map_err(|e| ClampError::WorkArea(e.code().0))?;
+    .map_err(|_| ClampError::WorkArea)?;
     let vw = work.right - work.left;
     let vh = work.bottom - work.top;
     Ok(Bounds { w: vw, h: vh })

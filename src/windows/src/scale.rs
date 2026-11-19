@@ -63,8 +63,8 @@ pub fn extent(client: PhysicalSize, dpi: u32) -> Result<WindowExtent, ClientExte
 pub enum ClientExtentError {
     #[error("the window DPI is zero")]
     ZeroDpi,
-    #[error("the window's client rect could not be read (HRESULT {0:#010x})")]
-    ClientRect(i32),
+    #[error("the window's client rect could not be read")]
+    ClientRect,
     #[error(transparent)]
     Extent(#[from] ExtentError),
 }
@@ -73,7 +73,7 @@ impl From<ClientExtentError> for jfn_platform_abi::WindowStateError {
     fn from(e: ClientExtentError) -> Self {
         match e {
             ClientExtentError::ZeroDpi => Self::ZeroDpi,
-            ClientExtentError::ClientRect(hresult) => Self::ClientRect(hresult),
+            ClientExtentError::ClientRect => Self::ClientRect,
             ClientExtentError::Extent(e) => Self::Extent(e),
         }
     }

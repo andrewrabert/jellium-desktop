@@ -40,20 +40,10 @@ const MAX_BUFFERED_RANGES: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
-    #[error("osd-dimensions {w}x{h} do not fit a pixel count: {source}")]
-    OsdDimsRange {
-        w: i64,
-        h: i64,
-        #[source]
-        source: std::num::TryFromIntError,
-    },
-    #[error("osd-dimensions {w}x{h}: {source}")]
-    OsdDimsExtent {
-        w: i32,
-        h: i32,
-        #[source]
-        source: ExtentError,
-    },
+    #[error(transparent)]
+    OsdDimsRange(#[from] std::num::TryFromIntError),
+    #[error(transparent)]
+    OsdDimsExtent(#[from] ExtentError),
 }
 
 /// Caller-provided platform hooks. Implementations stay outside this crate so
@@ -280,18 +270,14 @@ fn digest_osd_dims<C: IngestCtx>(
     if w <= 0 || h <= 0 {
         return Ok(Vec::new());
     }
-    let range = |source| IngestError::OsdDimsRange { w, h, source };
-    let (w, h) = (
-        i32::try_from(w).map_err(range)?,
-        i32::try_from(h).map_err(range)?,
-    );
+    let (w, h) = (i32::try_from(w)?, i32::try_from(h)?);
     let physical = PhysicalSize { w, h };
     let scale = ctx.scale();
     let extent = match ctx.os_logical_size().filter(|l| l.w > 0 && l.h > 0) {
         Some(logical) => extent_at(scale, logical),
         None => extent_of(scale, physical),
     };
-    let extent = extent.map_err(|source| IngestError::OsdDimsExtent { w, h, source })?;
+    let extent = extent?;
     state.set_window_extent(extent);
     Ok(vec![IngestOut::WindowExtentChanged])
 }
@@ -653,7 +639,7 @@ mod tests {
             &state,
             &ctx(Scale::ONE),
         );
-        assert!(matches!(out, Err(IngestError::OsdDimsRange { .. })));
+        assert!(matches!(out, Err(IngestError::OsdDimsRange(_))));
         assert_eq!(
             state.window_extent().map(|e| e.physical()),
             Some(PhysicalSize { w: 1600, h: 900 })

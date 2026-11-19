@@ -26,12 +26,12 @@ pub enum WindowStateError {
     Extent(#[from] ExtentError),
     #[error("the window DPI is zero")]
     ZeroDpi,
-    #[error("the window's client rect could not be read (HRESULT {0:#010x})")]
-    ClientRect(i32),
-    #[error("the window rect could not be read (HRESULT {0:#010x})")]
-    WindowRect(i32),
-    #[error("the window's monitor info could not be read (HRESULT {0:#010x})")]
-    MonitorInfo(i32),
+    #[error("the window's client rect could not be read")]
+    ClientRect,
+    #[error("the window rect could not be read")]
+    WindowRect,
+    #[error("the window's monitor info could not be read")]
+    MonitorInfo,
     #[error("window position: {0}")]
     Position(#[from] PointsToPixelsError),
     #[error("the platform is gone")]

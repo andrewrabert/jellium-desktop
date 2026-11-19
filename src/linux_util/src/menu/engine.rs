@@ -256,19 +256,9 @@ impl MenuHost for SoftwareMenu {
         });
         let thread = self.thread.lock().take();
         match thread.map(JoinHandle::join) {
-            Some(Err(payload)) => Err(MenuShutdownError::ThreadPanicked(panic_message(&*payload))),
+            Some(Err(_)) => Err(MenuShutdownError::ThreadPanicked),
             Some(Ok(())) | None => Ok(()),
         }
-    }
-}
-
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_owned()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "non-string panic payload".to_owned()
     }
 }
 
