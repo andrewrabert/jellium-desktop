@@ -57,7 +57,7 @@ use jfn_platform_abi::event_flags::{
     EVENTFLAG_MIDDLE_MOUSE_BUTTON, EVENTFLAG_NUM_LOCK_ON, EVENTFLAG_RIGHT_MOUSE_BUTTON,
     EVENTFLAG_SHIFT_DOWN,
 };
-use jfn_platform_abi::{LogicalPoint, PhysicalPoint};
+use jfn_platform_abi::{LogicalPoint, PhysicalPoint, WindowExtent, WindowStateError};
 
 use jfn_input::key::{KeyReport, PhysicalKey};
 use jfn_input::{
@@ -297,8 +297,9 @@ fn is_button_down(msg: u32) -> bool {
 /// The pointer position in the space CEF's view was sized in, mapped through
 /// the extent `crate::window` last sampled. The identity before the first
 /// sample exists.
-fn view_point(x: i32, y: i32) -> LogicalPoint {
-    crate::scale::view_point(crate::window::client_extent(), PhysicalPoint { x, y })
+fn view_point(x: i32, y: i32) -> Result<LogicalPoint, WindowStateError> {
+    let extent = crate::window::client_extent()?;
+    Ok(crate::scale::view_point(extent, PhysicalPoint { x, y }))
 }
 
 fn window_point(p: LogicalPoint) -> jfn_platform_abi::WindowPoint {
@@ -306,8 +307,13 @@ fn window_point(p: LogicalPoint) -> jfn_platform_abi::WindowPoint {
 }
 
 /// One debug line per press.
-fn log_press(msg: u32, physical: PhysicalPoint, logical: LogicalPoint) {
-    let Some(extent) = crate::window::client_extent() else {
+fn log_press(
+    msg: u32,
+    physical: PhysicalPoint,
+    logical: LogicalPoint,
+    extent: Option<WindowExtent>,
+) {
+    let Some(extent) = extent else {
         return;
     };
     let logical_size = extent.logical();
@@ -337,8 +343,10 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_MOUSEMOVE => {
-            let p = view_point(get_x_lparam(lp), get_y_lparam(lp));
-            jfn_input_dispatch_mouse_move(window_point(p), mouse_modifiers(wp), 0);
+            match view_point(get_x_lparam(lp), get_y_lparam(lp)) {
+                Ok(p) => jfn_input_dispatch_mouse_move(window_point(p), mouse_modifiers(wp), 0),
+                Err(e) => tracing::error!(target: "platform", "mouse move dropped: {e}"),
+            }
             return LRESULT(0);
         }
 
@@ -361,9 +369,16 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 x: get_x_lparam(lp),
                 y: get_y_lparam(lp),
             };
-            let p = view_point(physical.x, physical.y);
+            let extent = match crate::window::client_extent() {
+                Ok(extent) => extent,
+                Err(e) => {
+                    tracing::error!(target: "platform", "mouse button dropped: {e}");
+                    return LRESULT(0);
+                }
+            };
+            let p = crate::scale::view_point(extent, physical);
             if down {
-                log_press(msg, physical, p);
+                log_press(msg, physical, p, extent);
             }
             jfn_input_dispatch_mouse_button(
                 msg_to_button_code(msg),
@@ -404,8 +419,10 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
-            let p = view_point(pt.x, pt.y);
-            jfn_input_dispatch_scroll(window_point(p), 0, delta, mouse_modifiers(wp));
+            match view_point(pt.x, pt.y) {
+                Ok(p) => jfn_input_dispatch_scroll(window_point(p), 0, delta, mouse_modifiers(wp)),
+                Err(e) => tracing::error!(target: "platform", "mouse wheel dropped: {e}"),
+            }
             return LRESULT(0);
         }
 
@@ -418,8 +435,10 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
-            let p = view_point(pt.x, pt.y);
-            jfn_input_dispatch_scroll(window_point(p), delta, 0, mouse_modifiers(wp));
+            match view_point(pt.x, pt.y) {
+                Ok(p) => jfn_input_dispatch_scroll(window_point(p), delta, 0, mouse_modifiers(wp)),
+                Err(e) => tracing::error!(target: "platform", "mouse wheel dropped: {e}"),
+            }
             return LRESULT(0);
         }
 
@@ -463,7 +482,9 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_JFN_MENU_TRACK | WM_JFN_MENU_END => {
-            crate::menu::on_input_message(hwnd, msg);
+            if let Err(e) = crate::menu::on_input_message(hwnd, msg) {
+                tracing::error!(target: "platform", "context menu: {e}");
+            }
             return LRESULT(0);
         }
 

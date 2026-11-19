@@ -225,7 +225,9 @@ impl Platform for WindowsPlatform {
     }
 
     fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
-        win_cleanup();
+        if let Err(e) = win_cleanup() {
+            tracing::error!(target: "platform", "Windows cleanup: {e}");
+        }
     }
 
     // mpv's window is gone by the time this runs and the compositor devices
@@ -360,7 +362,10 @@ impl Platform for WindowsPlatform {
     }
 
     fn scale(&self) -> jfn_platform_abi::Scale {
-        win_get_scale()
+        win_get_scale().unwrap_or_else(|e| {
+            tracing::error!(target: "platform", "window scale: {e}; reporting the system scale");
+            crate::platform::win_display_scale()
+        })
     }
 
     fn display_scale(&self, at: Option<WindowPos>) -> jfn_platform_abi::Scale {

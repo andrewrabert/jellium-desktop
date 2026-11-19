@@ -8,7 +8,9 @@ pub(crate) struct WinOsrPopup;
 
 impl OsrPopupSurface for WinOsrPopup {
     fn show(&self, s: SurfaceHandle, x: c_int, y: c_int, _lw: c_int, _lh: c_int) {
-        crate::render::popup_show(s, x, y);
+        if let Err(e) = crate::render::popup_show(s, x, y) {
+            tracing::error!(target: "platform", "{e}; popup left unplaced");
+        }
     }
 
     fn hide(&self, s: SurfaceHandle) {

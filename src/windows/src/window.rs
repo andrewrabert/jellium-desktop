@@ -60,16 +60,32 @@ pub(crate) fn start_notifier() {
     }));
 }
 
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+#[error("the window-changed notifier thread panicked: {0}")]
+pub(crate) struct NotifierPanicked(String);
+
 /// Stop and join the notifier thread. Pending dirtiness is dropped; the
 /// process is tearing down.
-pub(crate) fn stop_notifier() {
+pub(crate) fn stop_notifier() -> Result<(), NotifierPanicked> {
     let handle = NOTIFIER.lock().take();
     let Some(handle) = handle else {
-        return;
+        return Ok(());
     };
     NOTIFY.lock().stop = true;
     NOTIFY_WAKE.notify_one();
-    let _ = handle.join();
+    handle
+        .join()
+        .map_err(|payload| NotifierPanicked(panic_message(&*payload)))
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
 }
 
 pub(crate) fn sample() -> Result<Option<PhysicalSize>, ClientExtentError> {
@@ -102,19 +118,6 @@ pub(crate) fn sample() -> Result<Option<PhysicalSize>, ClientExtentError> {
         log_sample(hwnd, dpi, extent);
     }
     Ok(Some(client))
-}
-
-pub(crate) fn sample_from_window_message() -> Option<PhysicalSize> {
-    match sample() {
-        Ok(client) => client,
-        Err(e) => {
-            tracing::error!(
-                target: "platform",
-                "window sample: {e}; the stored window state stands"
-            );
-            None
-        }
-    }
 }
 
 /// Window position relative to the monitor's working area (excludes the
@@ -161,17 +164,21 @@ fn log_sample(hwnd: HWND, dpi: u32, extent: WindowExtent) {
     );
 }
 
-pub(crate) fn republish() -> Option<PhysicalSize> {
-    let client = sample_from_window_message()?;
+pub(crate) fn republish() -> Result<Option<PhysicalSize>, ClientExtentError> {
+    let Some(client) = sample()? else {
+        return Ok(None);
+    };
     notify_window_changed();
-    Some(client)
+    Ok(Some(client))
 }
 
-pub(crate) fn publish_deferred() -> Option<PhysicalSize> {
-    let client = sample_from_window_message()?;
+pub(crate) fn publish_deferred() -> Result<Option<PhysicalSize>, ClientExtentError> {
+    let Some(client) = sample()? else {
+        return Ok(None);
+    };
     NOTIFY.lock().dirty = true;
     NOTIFY_WAKE.notify_one();
-    Some(client)
+    Ok(Some(client))
 }
 
 pub(crate) fn stored_window_state() -> Result<WindowState, WindowStateError> {
@@ -183,29 +190,20 @@ pub(crate) fn stored_window_state() -> Result<WindowState, WindowStateError> {
     stored.ok_or(WindowStateError::NoWindow)
 }
 
-pub(crate) fn stored_window_state_or_log() -> Option<WindowState> {
+pub(crate) fn existing_window_state() -> Result<Option<WindowState>, WindowStateError> {
     match stored_window_state() {
-        Ok(state) => Some(state),
-        Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => None,
-        Err(e) => {
-            tracing::error!(target: "platform", "window state: {e}");
-            None
-        }
+        Ok(state) => Ok(Some(state)),
+        Err(WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
-/// Client size and scale as of the last sample.
-pub(crate) fn client_extent() -> Option<WindowExtent> {
-    Some(stored_window_state_or_log()?.extent)
+pub(crate) fn client_extent() -> Result<Option<WindowExtent>, WindowStateError> {
+    Ok(existing_window_state()?.map(|state| state.extent))
 }
 
-/// The scale the client window's DPI named at the last sample, or `None`
-/// before the window exists.
-///
-/// One sample names the extent and the scale together, so a menu anchor and
-/// the extent the pointer maps through can never come from two DPIs.
-pub(crate) fn client_scale() -> Option<Scale> {
-    Some(client_extent()?.scale())
+pub(crate) fn client_scale() -> Result<Option<Scale>, WindowStateError> {
+    Ok(client_extent()?.as_ref().map(WindowExtent::scale))
 }
 
 pub(crate) fn clear() {

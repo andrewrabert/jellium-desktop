@@ -31,7 +31,8 @@ use std::ffi::c_int;
 
 use jfn_gpu_paint::{FrameSize, Pixels, WindowTarget};
 use jfn_platform_abi::{
-    Ack, Content, PaintFrame, Presented, SurfaceHandle, SurfaceSize, Visibility, VisibilityCommit,
+    Ack, Content, PaintFrame, Presented, SurfaceHandle, SurfaceSize, Unrepresentable, Visibility,
+    VisibilityCommit, WindowStateError,
 };
 use parking_lot::Mutex;
 use windows::Win32::Foundation::HWND;
@@ -360,23 +361,27 @@ pub(crate) fn window_target(h: SurfaceHandle) -> Option<WindowTarget> {
     st.find_mut(h)?.content.window_target()
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, thiserror::Error)]
+pub(crate) enum PopupPlaceError {
+    #[error("popup scale: {0}")]
+    Scale(#[from] WindowStateError),
+    #[error("popup offset: {0}")]
+    Offset(#[from] Unrepresentable),
+}
+
 /// Place the popup visual at `x`, `y` — logical pixels inside the owning
 /// surface. The popup shows itself with its first frame.
-pub(crate) fn popup_show(h: SurfaceHandle, x: c_int, y: c_int) {
-    let scale = crate::platform::win_get_scale();
-    let (px, py) = match (scale.to_physical(x), scale.to_physical(y)) {
-        (Ok(px), Ok(py)) => (px, py),
-        (Err(e), _) | (_, Err(e)) => {
-            tracing::error!(target: "platform", "popup offset: {e}; popup left unplaced");
-            return;
-        }
-    };
+pub(crate) fn popup_show(h: SurfaceHandle, x: c_int, y: c_int) -> Result<(), PopupPlaceError> {
+    let scale = crate::platform::win_get_scale()?;
+    let px = scale.to_physical(x)?;
+    let py = scale.to_physical(y)?;
     let mut st = STATE.lock();
     let Some(entry) = st.find_mut(h) else {
-        return;
+        return Ok(());
     };
     entry.popup.set_offset(px as f32, py as f32);
     st.commit();
+    Ok(())
 }
 
 /// Detach the popup visual's content, so reopening it cannot flash the frame
