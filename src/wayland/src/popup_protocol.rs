@@ -131,6 +131,14 @@ impl PopupMapping {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+enum PopupPaintError {
+    #[error("no shm pool")]
+    NoPool,
+    #[error("no {w}x{h} buffer drawn from the menu's pixels")]
+    Draw { w: i32, h: i32 },
+}
+
 /// The positioner for a surface of `size` logical px whose top-left sits at
 /// `anchor`. The anchor rect is one pixel because the anchor is a point.
 fn positioner(
@@ -241,35 +249,31 @@ impl State {
         }
         let first = matches!(self.popups.current, PopupMapping::Created { .. });
         let rt = self.rt;
-        let attached = rt.window().with_basis(paint.basis, || {
-            let Some(buffer) = self
-                .popups
-                .pool
-                .as_mut()
-                .and_then(|pool| {
-                    crate::wl_state::draw_from_pixels(
-                        pool,
-                        &paint.pixels,
-                        paint.buffer.w,
-                        paint.buffer.h,
-                    )
-                })
-                .map(crate::wl_state::AttachedBuffer::Shm)
-            else {
-                return false;
-            };
-            self.popups.current.paint(buffer, &paint);
-            true
-        });
+        let attached = rt
+            .window()
+            .with_basis(paint.basis, || self.attach_popup(&paint));
         match attached {
-            Some(true) => {}
-            Some(false) if !first => {}
-            Some(false) => {
-                tracing::error!(target: "Main", "popup: no buffer for the first frame");
+            Some(Ok(())) => {}
+            Some(Err(e)) if !first => {
+                tracing::debug!(target: "Main", "popup frame: {e}; the frame on screen stands");
+            }
+            Some(Err(e)) => {
+                tracing::error!(target: "Main", "popup first frame: {e}; dismissed");
                 self.dismiss_popup(generation);
             }
             None => self.dismiss_popup(generation),
         }
+    }
+
+    fn attach_popup(&mut self, paint: &MenuPaint) -> Result<(), PopupPaintError> {
+        let pool = self.popups.pool.as_mut().ok_or(PopupPaintError::NoPool)?;
+        let (w, h) = (paint.buffer.w, paint.buffer.h);
+        let buffer = crate::wl_state::draw_from_pixels(pool, &paint.pixels, w, h)
+            .ok_or(PopupPaintError::Draw { w, h })?;
+        self.popups
+            .current
+            .paint(crate::wl_state::AttachedBuffer::Shm(buffer), paint);
+        Ok(())
     }
 
     /// Tear the popup down, but only if `generation` still owns it — a newer

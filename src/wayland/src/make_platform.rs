@@ -179,7 +179,9 @@ impl Platform for WaylandPlatform {
                 ordered.len(),
             )
         };
-        wl_ops::restack(self.rt(), typed);
+        if let Err(e) = wl_ops::restack(self.rt(), typed) {
+            tracing::error!(target: "Main", "restack: {e}; left unplaced");
+        }
     }
 
     fn menu_delivery(
