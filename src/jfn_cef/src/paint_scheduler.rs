@@ -3,13 +3,11 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 
-use cef::{
-    CefString, Frame, ImplFrame, ImplTask, Task, ThreadId, WrapTask, post_delayed_task, post_task,
-    wrap_task,
-};
+use cef::{CefString, Frame, ImplFrame, ImplTask, Task, WrapTask, wrap_task};
 
 use crate::client::{Inner, now_ns};
 use crate::frame_rate::FrameRate;
+use crate::ui_task::{UiTaskRejected, post_ui, post_ui_delayed};
 use crossbeam_utils::atomic::AtomicCell;
 
 const BOOST_MULTIPLIER: NonZeroU32 = match NonZeroU32::new(2) {
@@ -129,7 +127,13 @@ pub(crate) struct PaintScheduler {
 
 trait PaintSchedulerMode: Send + Sync {
     fn before_resize(&self) {}
-    fn after_resize(&self, _scheduler: PaintScheduler, _inner: &Arc<Inner>) {}
+    fn after_resize(
+        &self,
+        _scheduler: PaintScheduler,
+        _inner: &Arc<Inner>,
+    ) -> Result<(), UiTaskRejected> {
+        Ok(())
+    }
     fn before_close(&self) {}
     fn refresh_rate_changed(&self, _target: FrameRate) -> bool {
         false
@@ -137,8 +141,20 @@ trait PaintSchedulerMode: Send + Sync {
     fn verdict(&self, _inner: &Inner) -> Verdict {
         Verdict::Present
     }
-    fn kick_task(&self, _scheduler: PaintScheduler, _inner: &Arc<Inner>) {}
-    fn tick_task(&self, _scheduler: PaintScheduler, _inner: &Arc<Inner>) {}
+    fn kick_task(
+        &self,
+        _scheduler: PaintScheduler,
+        _inner: &Arc<Inner>,
+    ) -> Result<(), UiTaskRejected> {
+        Ok(())
+    }
+    fn tick_task(
+        &self,
+        _scheduler: PaintScheduler,
+        _inner: &Arc<Inner>,
+    ) -> Result<(), UiTaskRejected> {
+        Ok(())
+    }
 }
 
 impl PaintScheduler {
@@ -163,11 +179,15 @@ impl PaintScheduler {
         frame.execute_java_script(Some(&code), Some(&url), 0);
     }
 
-    pub(crate) fn during_resize<R>(&self, inner: &Arc<Inner>, resize: impl FnOnce() -> R) -> R {
+    pub(crate) fn during_resize<R>(
+        &self,
+        inner: &Arc<Inner>,
+        resize: impl FnOnce() -> R,
+    ) -> Result<R, UiTaskRejected> {
         self.mode.before_resize();
         let result = resize();
-        self.mode.after_resize(self.clone(), inner);
-        result
+        self.mode.after_resize(self.clone(), inner)?;
+        Ok(result)
     }
 
     pub(crate) fn before_close(&self) {
@@ -184,12 +204,12 @@ impl PaintScheduler {
         self.mode.verdict(inner)
     }
 
-    fn kick_task(&self, inner: &Arc<Inner>) {
-        self.mode.kick_task(self.clone(), inner);
+    fn kick_task(&self, inner: &Arc<Inner>) -> Result<(), UiTaskRejected> {
+        self.mode.kick_task(self.clone(), inner)
     }
 
-    fn tick_task(&self, inner: &Arc<Inner>) {
-        self.mode.tick_task(self.clone(), inner);
+    fn tick_task(&self, inner: &Arc<Inner>) -> Result<(), UiTaskRejected> {
+        self.mode.tick_task(self.clone(), inner)
     }
 }
 
@@ -206,9 +226,13 @@ impl PaintSchedulerMode for ActivePaintScheduler {
         self.state.begin_resize();
     }
 
-    fn after_resize(&self, scheduler: PaintScheduler, inner: &Arc<Inner>) {
+    fn after_resize(
+        &self,
+        scheduler: PaintScheduler,
+        inner: &Arc<Inner>,
+    ) -> Result<(), UiTaskRejected> {
         inner.invalidate_view();
-        start_invalidate_loop(scheduler, &self.state, inner);
+        start_invalidate_loop(scheduler, &self.state, inner)
     }
 
     fn before_close(&self) {
@@ -223,27 +247,47 @@ impl PaintSchedulerMode for ActivePaintScheduler {
         active_verdict(&self.state, inner)
     }
 
-    fn kick_task(&self, scheduler: PaintScheduler, inner: &Arc<Inner>) {
-        active_kick_apply(scheduler, &self.state, inner);
+    fn kick_task(
+        &self,
+        scheduler: PaintScheduler,
+        inner: &Arc<Inner>,
+    ) -> Result<(), UiTaskRejected> {
+        active_kick_apply(scheduler, &self.state, inner)
     }
 
-    fn tick_task(&self, scheduler: PaintScheduler, inner: &Arc<Inner>) {
-        active_invalidate_tick(scheduler, &self.state, inner);
+    fn tick_task(
+        &self,
+        scheduler: PaintScheduler,
+        inner: &Arc<Inner>,
+    ) -> Result<(), UiTaskRejected> {
+        active_invalidate_tick(scheduler, &self.state, inner)
     }
 }
 
-fn start_invalidate_loop(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<Inner>) {
+fn start_invalidate_loop(
+    scheduler: PaintScheduler,
+    state: &PaintState,
+    inner: &Arc<Inner>,
+) -> Result<(), UiTaskRejected> {
     if !state.start_invalidate_loop() {
-        return;
+        return Ok(());
     }
     let next = Arc::clone(inner);
-    inner.session.dispatch(|| {
-        let mut task = KickTask::new(scheduler, next);
-        let _ = post_task(ThreadId::UI, Some(&mut task));
-    });
+    let posted = inner
+        .session
+        .dispatch(|| post_ui(&mut KickTask::new(scheduler, next)))
+        .unwrap_or(Ok(()));
+    if posted.is_err() {
+        stop_invalidate(state, inner);
+    }
+    posted
 }
 
-fn active_kick_apply(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<Inner>) {
+fn active_kick_apply(
+    scheduler: PaintScheduler,
+    state: &PaintState,
+    inner: &Arc<Inner>,
+) -> Result<(), UiTaskRejected> {
     // Boost CEF compositor rate while the loop is live — JS rAF ties to
     // compositor rate, so this speeds up convergence to post-resize dims.
     if let Some(fps) = inner.frame_rate.load()
@@ -253,7 +297,7 @@ fn active_kick_apply(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<
         state.saved_frame_rate.store(Some(fps));
         inner.set_frame_rate(fps.times(BOOST_MULTIPLIER));
     }
-    active_invalidate_tick(scheduler, state, inner);
+    active_invalidate_tick(scheduler, state, inner)
 }
 
 /// Ends the invalidate loop: restores the frame rate it boosted and clears the
@@ -268,13 +312,17 @@ fn stop_invalidate(state: &PaintState, inner: &Arc<Inner>) {
     state.invalidate_running.store(false, Ordering::Release);
 }
 
-fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<Inner>) {
+fn active_invalidate_tick(
+    scheduler: PaintScheduler,
+    state: &PaintState,
+    inner: &Arc<Inner>,
+) -> Result<(), UiTaskRejected> {
     if state.invalidate_tick_count.fetch_add(1, Ordering::AcqRel) + 1 > INVALIDATE_TICK_LIMIT {
         state.invalidate_stop.store(true, Ordering::Release);
     }
     if state.invalidate_stop.load(Ordering::Acquire) {
         stop_invalidate(state, inner);
-        return;
+        return Ok(());
     }
     if inner.browser_alive() {
         inner.invalidate_view();
@@ -289,14 +337,18 @@ fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: 
     // invented.
     let Some(period) = jfn_gpu_paint::refresh_interval() else {
         stop_invalidate(state, inner);
-        return;
+        return Ok(());
     };
     let delay_ms = (period.as_millis() as i64).max(1);
     let next = Arc::clone(inner);
-    inner.session.dispatch(|| {
-        let mut task = TickTask::new(scheduler, next);
-        let _ = post_delayed_task(ThreadId::UI, Some(&mut task), delay_ms);
-    });
+    let posted = inner
+        .session
+        .dispatch(|| post_ui_delayed(&mut TickTask::new(scheduler, next), delay_ms))
+        .unwrap_or(Ok(()));
+    if posted.is_err() {
+        stop_invalidate(state, inner);
+    }
+    posted
 }
 
 /// What the scheduler decided about one produced frame.
@@ -353,7 +405,13 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.inner.session.dispatch(|| self.scheduler.kick_task(&self.inner));
+            if let Some(Err(e)) = self.inner.session.dispatch(|| self.scheduler.kick_task(&self.inner)) {
+                jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("invalidate loop kick: {e}"),
+                );
+            }
         }
     }
 }
@@ -365,7 +423,13 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            self.inner.session.dispatch(|| self.scheduler.tick_task(&self.inner));
+            if let Some(Err(e)) = self.inner.session.dispatch(|| self.scheduler.tick_task(&self.inner)) {
+                jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("invalidate loop tick: {e}"),
+                );
+            }
         }
     }
 }

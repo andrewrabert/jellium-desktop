@@ -9,8 +9,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use jfn_platform_abi::{
-    MENU_DISMISSED, MenuHandle, MenuHost, MenuItem, MenuOpenError, MenuRequest, MenuSelection,
-    MenuShutdownError, Unrepresentable, WindowStateError, menu_has_selectable,
+    MENU_DISMISSED, MenuHandle, MenuHideError, MenuHost, MenuItem, MenuOpenError, MenuRequest,
+    MenuSelection, MenuShutdownError, Unrepresentable, WindowStateError, menu_has_selectable,
 };
 use parking_lot::Mutex;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
@@ -95,18 +95,16 @@ impl MenuHost for WinMenuHost {
         Ok(handle)
     }
 
-    fn hide(&self, handle: MenuHandle) {
+    fn hide(&self, handle: MenuHandle) -> Result<(), MenuHideError> {
         if *CURRENT.lock() != Some(handle) {
-            return;
+            return Ok(());
         }
         CANCELLED.store(true, Ordering::Release);
         let pending = PENDING.lock().take();
         if let Some(pending) = pending {
             pending.on_selected.resolve(MENU_DISMISSED);
         }
-        if post_end().is_err() {
-            tracing::error!(target: "platform", "menu hide: end request undeliverable");
-        }
+        post_end().map_err(|_| MenuHideError::Undeliverable)
     }
 
     fn shutdown(&self) -> Result<(), MenuShutdownError> {
@@ -114,16 +112,15 @@ impl MenuHost for WinMenuHost {
         if let Some(pending) = pending {
             pending.on_selected.resolve(MENU_DISMISSED);
         }
-        post_end()
+        post_end().map_err(|_| MenuShutdownError::Undeliverable)
     }
 }
 
-fn post_end() -> Result<(), MenuShutdownError> {
+fn post_end() -> windows::core::Result<()> {
     let Some(hwnd) = input_hwnd() else {
         return Ok(());
     };
     unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_END, WPARAM(0), LPARAM(0)) }
-        .map_err(|_| MenuShutdownError::Undeliverable)
 }
 
 fn wide(s: &str) -> Vec<u16> {

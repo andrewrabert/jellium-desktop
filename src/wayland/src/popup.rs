@@ -78,10 +78,8 @@ impl MenuHost for WlMenuHost {
         };
         menu.open_triggered(request, self.rt.seat().last_input_serial())
     }
-    fn hide(&self, handle: MenuHandle) {
-        if let Some(menu) = self.rt.menu() {
-            menu.hide(handle);
-        }
+    fn hide(&self, handle: MenuHandle) -> Result<(), jfn_platform_abi::MenuHideError> {
+        self.rt.menu().map_or(Ok(()), |menu| menu.hide(handle))
     }
     fn shutdown(&self) -> Result<(), MenuShutdownError> {
         self.rt.menu().map_or(Ok(()), MenuHost::shutdown)

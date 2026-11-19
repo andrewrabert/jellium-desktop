@@ -96,7 +96,13 @@ impl Inner {
             let Some(text) = text.filter(|t| !t.is_empty()) else {
                 return;
             };
-            tasks::post_paste_js(Arc::clone(&inner), text.to_owned());
+            if let Err(e) = tasks::post_paste_js(Arc::clone(&inner), text.to_owned()) {
+                jfn_logging::log(
+                    jfn_logging::Category::Cef,
+                    jfn_logging::Level::Error,
+                    &format!("paste: {e}"),
+                );
+            }
         }));
         true
     }

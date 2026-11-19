@@ -3,7 +3,7 @@
 //! stop they are dropped. No callback is invoked while holding the state lock.
 
 use cef::rc::Rc;
-use cef::{ImplTask, Task, ThreadId, WrapTask, post_task, wrap_task};
+use cef::{ImplTask, Task, WrapTask, wrap_task};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -60,7 +60,7 @@ pub(crate) fn on_cef_ready(
                 return Ok(());
             };
             let mut task = ReadyCallbackTask::new(Arc::new(Mutex::new(Some(callback))));
-            let accepted = post_task(ThreadId::UI, Some(&mut task)) == 1;
+            let accepted = crate::ui_task::post_ui(&mut task).is_ok();
             // Callback destructors are user code too; release the lock before a rejected
             // task drops its callback. Posting stays serialized with stop().
             drop(state);
@@ -75,7 +75,7 @@ pub(crate) fn on_cef_ready(
 
 pub(crate) fn post_cef_ready() -> Result<(), ReadinessError> {
     let mut task = MarkReadyTask::new();
-    if post_task(ThreadId::UI, Some(&mut task)) != 1 {
+    if crate::ui_task::post_ui(&mut task).is_err() {
         stop();
         return Err(ReadinessError::PostRejected);
     }

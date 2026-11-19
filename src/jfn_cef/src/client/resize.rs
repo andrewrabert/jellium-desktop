@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 
 use super::{Inner, now_ns, tasks};
 use crate::frame_rate::FrameRate;
+use crate::ui_task::UiTaskRejected;
 
 impl Inner {
     pub(crate) fn set_frame_rate(&self, rate: FrameRate) {
@@ -12,20 +13,23 @@ impl Inner {
         self.cef_set_windowless_frame_rate(rate.get());
     }
 
-    pub(super) fn apply_pending_resize(self: &Arc<Self>) {
+    pub(super) fn apply_pending_resize(self: &Arc<Self>) -> Result<(), UiTaskRejected> {
         self.resize_scheduled.store(false, Ordering::Release);
         if !self.browser_alive() {
-            return;
+            return Ok(());
         }
         let now = now_ns();
         self.last_was_resized_ns.store(now, Ordering::Release);
         self.paint_scheduler.during_resize(self, || {
             self.notify_screen_info_changed();
             self.cef_was_resized();
-        });
+        })
     }
 
-    pub(crate) fn resize(self: &Arc<Self>, size: jfn_platform_abi::SurfaceSize) {
+    pub(crate) fn resize(
+        self: &Arc<Self>,
+        size: jfn_platform_abi::SurfaceSize,
+    ) -> Result<(), UiTaskRejected> {
         let logical = size.extent.logical();
         self.width.store(logical.w, Ordering::Release);
         self.height.store(logical.h, Ordering::Release);
@@ -36,7 +40,7 @@ impl Inner {
         self.surface().resize(size);
 
         if !self.browser_alive() {
-            return;
+            return Ok(());
         }
 
         let now = now_ns();
@@ -50,7 +54,7 @@ impl Inner {
                 self.last_was_resized_ns.store(now, Ordering::Release);
                 self.notify_screen_info_changed();
                 self.cef_was_resized();
-                return;
+                return Ok(());
             }
             if self
                 .resize_scheduled
@@ -58,13 +62,21 @@ impl Inner {
                 .is_ok()
             {
                 let delay_ms = ((period_ns - (now - last)) / 1_000_000).max(1);
-                tasks::post_apply_resize(Arc::clone(self), delay_ms);
+                let posted = tasks::post_apply_resize(Arc::clone(self), delay_ms);
+                if posted.is_err() {
+                    self.resize_scheduled.store(false, Ordering::Release);
+                }
+                return posted;
             }
-        });
+            Ok(())
+        })?
     }
 
-    pub(crate) fn set_refresh_rate(self: &Arc<Self>, target: FrameRate) {
-        tasks::post_set_refresh(Arc::clone(self), target);
+    pub(crate) fn set_refresh_rate(
+        self: &Arc<Self>,
+        target: FrameRate,
+    ) -> Result<(), UiTaskRejected> {
+        tasks::post_set_refresh(Arc::clone(self), target)
     }
 
     pub(super) fn apply_set_refresh(&self, target: FrameRate) {

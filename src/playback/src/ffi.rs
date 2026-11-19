@@ -43,22 +43,17 @@ fn coord_handle() -> Option<CoordinatorHandle> {
 }
 
 pub fn jfn_playback_init() {
-    {
-        let mut guard = coord_slot().lock();
-        if guard.is_some() {
-            return;
-        }
-        let mut c = PlaybackCoordinator::new();
-        register_builtin_sinks(&c);
-        c.start();
-        c.window_subscription = Some(jfn_platform_abi::subscribe_window_changed(
-            reconcile_window_mode,
-        ));
-        *guard = Some(c);
+    let mut guard = coord_slot().lock();
+    if guard.is_some() {
+        return;
     }
-    // The immediate reconcile is load-bearing: mode posts made before the
-    // coordinator existed were dropped by `post`, and no wakeup replays them.
-    reconcile_window_mode();
+    let mut c = PlaybackCoordinator::new();
+    register_builtin_sinks(&c);
+    c.start();
+    c.window_subscription = Some(jfn_platform_abi::subscribe_window_changed(
+        reconcile_window_mode,
+    ));
+    *guard = Some(c);
 }
 
 fn reconcile_window_mode() {

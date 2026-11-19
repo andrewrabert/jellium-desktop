@@ -76,7 +76,10 @@ pub fn start() -> Result<(), MenuSpawnError> {
     let surface = Arc::new(X11PopupSurface {
         tx: Mutex::new(None),
     });
-    spawn_popup(&surface).map_err(MenuSpawnError::PopupThread)?;
+    spawn_popup(&surface).map_err(|source| MenuSpawnError::Thread {
+        thread: "menu popup",
+        source,
+    })?;
     let menu = SoftwareMenu::spawn(surface)?;
     MENU.get_or_init(|| menu).warm();
     Ok(())
@@ -99,10 +102,8 @@ impl MenuHost for X11MenuHost {
         menu.open(req)
     }
 
-    fn hide(&self, handle: MenuHandle) {
-        if let Some(menu) = MENU.get() {
-            menu.hide(handle);
-        }
+    fn hide(&self, handle: MenuHandle) -> Result<(), jfn_platform_abi::MenuHideError> {
+        MENU.get().map_or(Ok(()), |menu| menu.hide(handle))
     }
 
     fn shutdown(&self) -> Result<(), MenuShutdownError> {
@@ -337,7 +338,7 @@ impl PopupLoop {
         if let Err(e) = self.watch_releases(true) {
             tracing::warn!(target: "x11::menu", "raw release subscription: {e}; the grab deadline still applies");
         }
-        self.try_grab();
+        self.report_grab();
         if !matches!(self.phase, Phase::Grabbing(_)) {
             return;
         }
@@ -349,7 +350,7 @@ impl PopupLoop {
                     // One final attempt covers owners releasing an explicit grab
                     // without a button/key event. This is a failure deadline, not
                     // a recurring poll.
-                    st.try_grab();
+                    st.report_grab();
                     if matches!(st.phase, Phase::Grabbing(_)) {
                         tracing::error!(target: "x11::menu", "grab: deadline expired; dismissing");
                         st.tear_down_reporting("grab deadline");
@@ -524,38 +525,46 @@ impl PopupLoop {
         Ok(conn.flush()?)
     }
 
-    fn try_grab(&mut self) {
+    fn try_grab(&mut self) -> Result<(), GrabError> {
         let Phase::Grabbing(window) = &self.phase else {
-            return;
+            return Ok(());
         };
         let (generation, logical) = (window.generation, window.logical);
         match grab_modal(&self.conn, window.win) {
             GrabAttempt::Ready => {
-                if let Err(e) = self.finish_grab_wait() {
-                    tracing::warn!(target: "x11::menu", "raw release unsubscription: {e}");
-                }
+                let unwatched = self.finish_grab_wait();
                 let Phase::Grabbing(window) = std::mem::replace(&mut self.phase, Phase::Idle)
                 else {
-                    return;
+                    return unwatched.map_err(GrabError::Unwatch);
                 };
                 self.phase = Phase::Open(window);
                 tracing::debug!(target: "x11::menu", "grab: menu is modal");
                 if let Some(menu) = MENU.get() {
                     menu.on_ready(generation, logical);
                 }
+                unwatched.map_err(GrabError::Unwatch)
             }
-            GrabAttempt::Busy => {}
+            GrabAttempt::Busy => Ok(()),
             GrabAttempt::Failed => {
-                tracing::error!(target: "x11::menu", "grab: non-retryable failure; dismissing");
-                self.tear_down_reporting("grab failure");
+                let torn_down = self.tear_down();
                 dismiss(generation);
+                match torn_down {
+                    Ok(()) => Err(GrabError::Refused),
+                    Err(e) => Err(GrabError::RefusedTearDown(e)),
+                }
             }
+        }
+    }
+
+    fn report_grab(&mut self) {
+        if let Err(e) = self.try_grab() {
+            tracing::error!(target: "x11::menu", "grab: {e}");
         }
     }
 
     fn on_event(&mut self, ev: Event) {
         if matches!(self.phase, Phase::Grabbing(_)) && grab_wakeup(&ev) {
-            self.try_grab();
+            self.report_grab();
             return;
         }
         let Phase::Open(window) = &self.phase else {
@@ -646,6 +655,16 @@ fn grab_wakeup(event: &Event) -> bool {
         event,
         Event::XinputRawButtonRelease(_) | Event::XinputRawKeyRelease(_)
     )
+}
+
+#[derive(Debug, thiserror::Error)]
+enum GrabError {
+    #[error("non-retryable failure; dismissed")]
+    Refused,
+    #[error("non-retryable failure; dismissed, teardown: {0}")]
+    RefusedTearDown(#[source] ReplyError),
+    #[error("modal, but raw release unsubscription: {0}")]
+    Unwatch(#[source] ReplyError),
 }
 
 #[derive(Debug, PartialEq, Eq)]

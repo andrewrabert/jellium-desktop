@@ -57,12 +57,18 @@ impl Inner {
             }
             return;
         }
-        self.paint_scheduler.during_resize(self, || {
+        if let Err(e) = self.paint_scheduler.during_resize(self, || {
             if let Some(host) = browser.host() {
                 host.notify_screen_info_changed();
                 host.was_resized();
             }
-        });
+        }) {
+            jfn_logging::log(
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Error,
+                &format!("first resize: {e}"),
+            );
+        }
 
         // Cloned out before invoking: the callback runs under no lock of this
         // client and remains available to consecutive CEF-owned browsers.

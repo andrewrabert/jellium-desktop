@@ -96,7 +96,7 @@ unsafe fn input_window_state<'a>(hwnd: HWND) -> Option<&'a InputWindowState> {
 
 fn destroy_input_window(hwnd: HWND, state: *const InputWindowState) {
     if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == state as isize {
-        let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+        let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, NO_USER_DATA) };
     }
     let _ = unsafe { DestroyWindow(hwnd) };
 }
@@ -354,6 +354,10 @@ fn log_press(msg: u32, physical: PhysicalPoint, logical: LogicalPoint, extent: W
     );
 }
 
+const PROCESSED: LRESULT = LRESULT(0);
+const PROCESSED_TRUE: LRESULT = LRESULT(1);
+const NO_USER_DATA: isize = 0;
+
 unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_SETCURSOR if u32::from(loword_u32(lp.0 as u32)) == HTCLIENT => {
@@ -361,12 +365,12 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 CursorShape::from_cef(STATE.lock().cursor_type).unwrap_or(CursorShape::Pointer);
             if shape == CursorShape::None {
                 unsafe { SetCursor(None) };
-                return LRESULT(1);
+                return PROCESSED_TRUE;
             }
             match unsafe { LoadCursorW(None, cef_cursor_to_win(shape)) } {
                 Ok(cur) => {
                     unsafe { SetCursor(Some(cur)) };
-                    return LRESULT(1);
+                    return PROCESSED_TRUE;
                 }
                 Err(e) => tracing::error!(target: "platform", "cursor {shape:?}: {e}"),
             }
@@ -382,12 +386,12 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_NCDESTROY => {
-            let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+            let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, NO_USER_DATA) };
         }
 
         WM_MOUSEMOVE => {
             let Some(state) = (unsafe { input_window_state(hwnd) }) else {
-                return LRESULT(0);
+                return PROCESSED;
             };
             match view_point(get_x_lparam(lp), get_y_lparam(lp)) {
                 Ok(p) => match state.pointer.try_borrow_mut() {
@@ -402,12 +406,12 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 },
                 Err(e) => tracing::error!(target: "platform", "mouse move dropped: {e}"),
             }
-            return LRESULT(0);
+            return PROCESSED;
         }
 
         WM_MOUSELEAVE => {
             let Some(state) = (unsafe { input_window_state(hwnd) }) else {
-                return LRESULT(0);
+                return PROCESSED;
             };
             match leave_point(hwnd) {
                 Ok(p) => match state.pointer.try_borrow_mut() {
@@ -422,7 +426,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 },
                 Err(e) => tracing::error!(target: "platform", "mouse leave dropped: {e}"),
             }
-            return LRESULT(0);
+            return PROCESSED;
         }
 
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP
@@ -440,7 +444,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(target: "platform", "mouse button dropped: {e}");
-                    return LRESULT(0);
+                    return PROCESSED;
                 }
             };
             if down && let Ok(extent) = sampled {
@@ -452,7 +456,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 window_point(p),
                 mouse_modifiers(wp),
             );
-            return LRESULT(0);
+            return PROCESSED;
         }
 
         WM_XBUTTONDOWN | WM_XBUTTONUP => {
@@ -463,18 +467,18 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     _ => HistoryDirection::Back,
                 });
             }
-            return LRESULT(1);
+            return PROCESSED_TRUE;
         }
 
         WM_APPCOMMAND => {
             let cmd = get_appcommand_lparam(lp) as u32;
             if cmd == APPCOMMAND_BROWSER_BACKWARD.0 {
                 jfn_input_dispatch_history_nav(HistoryDirection::Back);
-                return LRESULT(1);
+                return PROCESSED_TRUE;
             }
             if cmd == APPCOMMAND_BROWSER_FORWARD.0 {
                 jfn_input_dispatch_history_nav(HistoryDirection::Forward);
-                return LRESULT(1);
+                return PROCESSED_TRUE;
             }
         }
 
@@ -485,14 +489,14 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             };
             if let Err(e) = unsafe { ScreenToClient(hwnd, &mut pt) }.ok() {
                 tracing::error!(target: "platform", "mouse wheel dropped: ScreenToClient: {e}");
-                return LRESULT(0);
+                return PROCESSED;
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
             match view_point(pt.x, pt.y) {
                 Ok(p) => jfn_input_dispatch_scroll(window_point(p), 0, delta, mouse_modifiers(wp)),
                 Err(e) => tracing::error!(target: "platform", "mouse wheel dropped: {e}"),
             }
-            return LRESULT(0);
+            return PROCESSED;
         }
 
         WM_MOUSEHWHEEL => {
@@ -502,21 +506,21 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             };
             if let Err(e) = unsafe { ScreenToClient(hwnd, &mut pt) }.ok() {
                 tracing::error!(target: "platform", "mouse wheel dropped: ScreenToClient: {e}");
-                return LRESULT(0);
+                return PROCESSED;
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
             match view_point(pt.x, pt.y) {
                 Ok(p) => jfn_input_dispatch_scroll(window_point(p), delta, 0, mouse_modifiers(wp)),
                 Err(e) => tracing::error!(target: "platform", "mouse wheel dropped: {e}"),
             }
-            return LRESULT(0);
+            return PROCESSED;
         }
 
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let vk = wp.0 as u16;
             if vk == VK_F4.0 && msg == WM_SYSKEYDOWN && is_key_down(VK_MENU.0) {
                 jfn_shutdown_initiate();
-                return LRESULT(0);
+                return PROCESSED;
             }
             if vk == VK_BROWSER_BACK.0 || vk == VK_BROWSER_FORWARD.0 {
                 if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
@@ -525,7 +529,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         _ => HistoryDirection::Back,
                     });
                 }
-                return LRESULT(0);
+                return PROCESSED;
             }
             let pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             let is_sys = msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP;
@@ -540,7 +544,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 logical: logical_char(vk),
                 physical: physical_key(lp),
             });
-            return LRESULT(0);
+            return PROCESSED;
         }
 
         WM_CHAR | WM_SYSCHAR => {
@@ -550,19 +554,19 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 lp.0 as u32,
                 msg == WM_SYSCHAR,
             );
-            return LRESULT(0);
+            return PROCESSED;
         }
 
         WM_JFN_MENU_TRACK | WM_JFN_MENU_END => {
             if let Err(e) = crate::menu::on_input_message(hwnd, msg) {
                 tracing::error!(target: "platform", "context menu: {e}");
             }
-            return LRESULT(0);
+            return PROCESSED;
         }
 
         WM_SETFOCUS | WM_KILLFOCUS => {
             jfn_input_dispatch_keyboard_focus(c_int::from(toplevel_active(hwnd)));
-            return LRESULT(0);
+            return PROCESSED;
         }
 
         _ => {}

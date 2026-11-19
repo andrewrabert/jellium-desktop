@@ -38,10 +38,12 @@ pub enum MenuInputEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MenuSpawnError {
-    #[error("menu render thread spawn: {0}")]
-    Thread(#[source] std::io::Error),
-    #[error("menu popup thread spawn: {0}")]
-    PopupThread(#[source] std::io::Error),
+    #[error("{thread} thread spawn: {source}")]
+    Thread {
+        thread: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub struct SoftwareMenu {
@@ -57,7 +59,10 @@ impl SoftwareMenu {
             std::thread::Builder::new()
                 .name("jfn-menu".into())
                 .spawn(move || run(&emitter))
-                .map_err(MenuSpawnError::Thread)?
+                .map_err(|source| MenuSpawnError::Thread {
+                    thread: "menu render",
+                    source,
+                })?
         };
         Ok(SoftwareMenu {
             emitter,
@@ -246,13 +251,14 @@ impl MenuHost for SoftwareMenu {
         self.open_impl(req, 0)
     }
 
-    fn hide(&self, handle: MenuHandle) {
+    fn hide(&self, handle: MenuHandle) -> Result<(), jfn_platform_abi::MenuHideError> {
         self.emitter.update(|s| {
             if s.session.menu().map(|m| MenuHandle::new(m.id)) != Some(handle) {
                 return None;
             }
             close_current(s, MenuClose::Finished)
         });
+        Ok(())
     }
 
     fn shutdown(&self) -> Result<(), MenuShutdownError> {
@@ -953,7 +959,7 @@ mod tests {
         let handle = menu.open(req);
         assert!(rx.try_recv().is_err());
         if let Ok(handle) = handle {
-            menu.hide(handle);
+            menu.hide(handle).unwrap();
         }
         assert_eq!(rx.try_recv(), Ok(MENU_DISMISSED));
     }
@@ -967,7 +973,7 @@ mod tests {
         assert!(menu.open(second).is_ok());
         assert_eq!(first_rx.try_recv(), Ok(MENU_DISMISSED));
         if let Ok(stale) = stale {
-            menu.hide(stale);
+            menu.hide(stale).unwrap();
         }
         assert!(second_rx.try_recv().is_err());
         assert!(menu.is_engaged());

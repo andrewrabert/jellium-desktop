@@ -222,6 +222,9 @@ pub fn jfn_mpv_wait_event(timeout: f64) -> *mut sys::mpv_event {
     unsafe { sys::mpv_wait_event(h, timeout) }
 }
 
+pub const NO_WAIT: f64 = 0.0;
+pub const WAIT_FOREVER: f64 = -1.0;
+
 /// A missing handle and `MPV_EVENT_NONE` both collapse to [`WaitEvent::None`].
 pub fn wait_event_owned(timeout: f64) -> WaitEvent {
     let ev = jfn_mpv_wait_event(timeout);
