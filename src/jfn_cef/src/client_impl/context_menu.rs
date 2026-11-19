@@ -1,5 +1,6 @@
 use cef::rc::Rc;
 use cef::*;
+use jfn_platform_abi::WindowStateError;
 use std::os::raw::{c_int, c_void};
 use std::sync::Arc;
 
@@ -89,9 +90,24 @@ wrap_context_menu_handler! {
                 f64::from(params.xcoord()),
                 f64::from(params.ycoord()),
             );
-            let Some((anchor, basis)) = jfn_input::web_to_window_point(reported) else {
-                callback.cancel();
-                return 1;
+            let (anchor, basis) = match jfn_input::web_to_window_point(reported) {
+                Ok(at) => at,
+                Err(e) => {
+                    if !matches!(
+                        e,
+                        WindowStateError::NoWindow
+                            | WindowStateError::WebOffsetUnstated
+                            | WindowStateError::NoPlatform
+                    ) {
+                        jfn_logging::log(
+                            jfn_logging::Category::Cef,
+                            jfn_logging::Level::Error,
+                            &format!("context menu anchor: window state: {e}"),
+                        );
+                    }
+                    callback.cancel();
+                    return 1;
+                }
             };
             let Some(session) = self.inner.menu_open() else {
                 callback.cancel();

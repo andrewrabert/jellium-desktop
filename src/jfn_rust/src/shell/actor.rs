@@ -554,10 +554,13 @@ fn run(
     on_ready: std::sync::mpsc::SyncSender<Result<(), LoopStartError>>,
 ) {
     let mut pending = Vec::new();
-    let Some(target) = wait_for_target(surface, rx, wake_tx, &mut pending) else {
-        crate::shell::publish_no_overlay();
-        drop(on_ready.send(Err(LoopStartError::NoTarget)));
-        return;
+    let target = match wait_for_target(surface, rx, wake_tx, &mut pending) {
+        Ok(target) => target,
+        Err(error) => {
+            crate::shell::publish_no_overlay();
+            drop(on_ready.send(Err(LoopStartError::NoTarget(error))));
+            return;
+        }
     };
     let mut state = match Loop::start(surface, wake_tx, target, metadata, actions) {
         Ok(state) => state,
@@ -573,10 +576,22 @@ fn run(
     state.run(rx);
 }
 
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum TargetWaitError {
+    #[error("platform unavailable")]
+    NoPlatform,
+    #[error("startup canceled by shutdown")]
+    Shutdown,
+    #[error("work channel disconnected")]
+    Disconnected,
+    #[error("no window target for the overlay surface before the deadline")]
+    Timeout,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoopStartError {
-    #[error("window target unavailable or startup canceled")]
-    NoTarget,
+    #[error("window target: {0}")]
+    NoTarget(#[source] TargetWaitError),
     #[error("GPU device unavailable")]
     NoGpu,
     #[error("platform unavailable")]
@@ -1326,8 +1341,8 @@ fn wait_for_target(
     rx: &Receiver<Work>,
     wake_tx: &Sender<Work>,
     pending: &mut Vec<Work>,
-) -> Option<jfn_gpu_paint::WindowTarget> {
-    let lease = jfn_platform_abi::try_lease()?;
+) -> Result<jfn_gpu_paint::WindowTarget, TargetWaitError> {
+    let lease = jfn_platform_abi::try_lease().ok_or(TargetWaitError::NoPlatform)?;
     let plat = lease.platform();
     let tx = wake_tx.clone();
     plat.on_surface_target_ready(
@@ -1346,22 +1361,19 @@ fn await_target<T>(
     pending: &mut Vec<Work>,
     deadline: Instant,
     mut query: impl FnMut() -> Option<T>,
-) -> Option<T> {
+) -> Result<T, TargetWaitError> {
     loop {
         if let Some(target) = query() {
-            return Some(target);
+            return Ok(target);
         }
         if Instant::now() >= deadline {
-            tracing::error!("shell: no window target for the overlay surface");
-            return None;
+            return Err(TargetWaitError::Timeout);
         }
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Work::Shutdown) | Err(RecvTimeoutError::Disconnected) => return None,
+            Ok(Work::Shutdown) => return Err(TargetWaitError::Shutdown),
             Ok(work) => pending.push(work),
-            Err(RecvTimeoutError::Timeout) => {
-                tracing::error!("shell: no window target for the overlay surface");
-                return None;
-            }
+            Err(RecvTimeoutError::Disconnected) => return Err(TargetWaitError::Disconnected),
+            Err(RecvTimeoutError::Timeout) => return Err(TargetWaitError::Timeout),
         }
     }
 }
@@ -1439,7 +1451,7 @@ mod tests {
                 (queries == 2).then_some(42)
             },
         );
-        assert_eq!(target, Some(42));
+        assert_eq!(target, Ok(42));
         assert!(matches!(pending.as_slice(), [super::Work::OpenAbout]));
     }
 
@@ -1455,13 +1467,13 @@ mod tests {
                 super::Instant::now() + super::TARGET_WAIT,
                 || None::<()>
             ),
-            None
+            Err(super::TargetWaitError::Shutdown)
         );
         // A continuous work stream must not extend the deadline.
         tx.send(super::Work::Redraw).unwrap();
         assert_eq!(
             super::await_target(&rx, &mut pending, super::Instant::now(), || None::<()>),
-            None
+            Err(super::TargetWaitError::Timeout)
         );
         assert!(pending.is_empty());
     }

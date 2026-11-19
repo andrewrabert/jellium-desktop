@@ -2,6 +2,7 @@ use cef::rc::Rc;
 use cef::{
     ImplBrowserHost, ImplTask, KeyEvent, Task, ThreadId, WrapTask, post_task, sys, wrap_task,
 };
+use jfn_platform_abi::WindowStateError;
 use std::sync::Arc;
 
 use crate::platform_ops::{MenuDelivery, MenuItem, MenuRequest, MenuSelection};
@@ -44,13 +45,26 @@ impl Inner {
         p.requested = false;
     }
 
-    fn popup_at(&self, x: i32, y: i32) -> Option<PopupAt> {
+    fn popup_at(&self, x: i32, y: i32) -> Result<PopupAt, WindowStateError> {
         match self.dropdown() {
             MenuDelivery::Host(_) => jfn_input::web_to_window_point(
                 jfn_platform_abi::WebPoint::from_view(f64::from(x), f64::from(y)),
             )
             .map(|(point, basis)| PopupAt::Window(point, basis)),
-            MenuDelivery::Composited | MenuDelivery::Page => Some(PopupAt::View(x, y)),
+            MenuDelivery::Composited | MenuDelivery::Page => Ok(PopupAt::View(x, y)),
+        }
+    }
+
+    fn report_popup_at(e: &WindowStateError) {
+        match e {
+            WindowStateError::NoWindow
+            | WindowStateError::WebOffsetUnstated
+            | WindowStateError::NoPlatform => {}
+            e => jfn_logging::log(
+                jfn_logging::Category::Cef,
+                jfn_logging::Level::Error,
+                &format!("popup position: window state: {e}"),
+            ),
         }
     }
 
@@ -68,7 +82,13 @@ impl Inner {
     }
 
     pub(crate) fn on_popup_size(self: &Arc<Self>, x: i32, y: i32, w: i32, h: i32) {
-        let at = self.popup_at(x, y);
+        let at = match self.popup_at(x, y) {
+            Ok(at) => Some(at),
+            Err(e) => {
+                Self::report_popup_at(&e);
+                None
+            }
+        };
         {
             let mut p = self.popup.lock();
             if p.requested {
@@ -90,14 +110,17 @@ impl Inner {
         anchor: Option<(i32, i32)>,
     ) {
         let anchor = anchor.map(|(x, y)| self.popup_at(x, y));
+        if let Some(Err(e)) = &anchor {
+            Self::report_popup_at(e);
+        }
         {
             let mut p = self.popup.lock();
             p.options = opts;
             p.selected_idx = selected;
             p.selectable = selectable;
             match anchor {
-                Some(None) => p.rect = None,
-                Some(at) => p.anchor = at,
+                Some(Err(_)) => p.rect = None,
+                Some(Ok(at)) => p.anchor = Some(at),
                 None => {}
             }
             p.options_received = true;
