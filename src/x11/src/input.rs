@@ -30,6 +30,7 @@ use crate::conn_source::XcbSource;
 
 use jfn_input::buttons;
 use jfn_linux_util::xkb::to_cef_mods;
+use jfn_platform_abi::ExtentError;
 use jfn_platform_abi::cursor::CursorShape;
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_LEFT_MOUSE_BUTTON, EVENTFLAG_MIDDLE_MOUSE_BUTTON, EVENTFLAG_RIGHT_MOUSE_BUTTON,
@@ -151,6 +152,28 @@ enum QueuedInputEvent {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+enum KeymapError {
+    #[error("no keymap for xkb device {0}")]
+    Keymap(i32),
+    #[error("no keyboard state for xkb device {0}")]
+    State(i32),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum InputError {
+    #[error("keymap update: {0}")]
+    Keymap(#[from] KeymapError),
+    #[error("pointer extent: {0}")]
+    Extent(#[from] ExtentError),
+    #[error("input dispatch thread gone")]
+    DispatchClosed,
+}
+
+fn queue(dispatch: &Sender<QueuedInputEvent>, ev: QueuedInputEvent) -> Result<(), InputError> {
+    dispatch.send(ev).map_err(|_| InputError::DispatchClosed)
+}
+
 struct State {
     conn: Arc<xcb::Connection>,
     window: u32,
@@ -234,7 +257,7 @@ fn setup_xkb(conn: &xcb::Connection, st: &mut State) -> bool {
     true
 }
 
-fn update_keymap(conn: &xcb::Connection, st: &mut State) {
+fn update_keymap(conn: &xcb::Connection, st: &mut State) -> Result<(), KeymapError> {
     let kmap = xkb_x11::keymap_new_from_device(
         &st.xkb_ctx,
         conn,
@@ -242,14 +265,15 @@ fn update_keymap(conn: &xcb::Connection, st: &mut State) {
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     );
     if kmap.get_raw_ptr().is_null() {
-        return;
+        return Err(KeymapError::Keymap(st.xkb_device_id));
     }
     let new_state = xkb_x11::state_new_from_device(&kmap, conn, st.xkb_device_id);
     if new_state.get_raw_ptr().is_null() {
-        return;
+        return Err(KeymapError::State(st.xkb_device_id));
     }
     st.xkb_kmap = Some(kmap);
     st.xkb_st = Some(new_state);
+    Ok(())
 }
 
 fn window_point(x: i32, y: i32) -> jfn_platform_abi::WindowPoint {
@@ -262,39 +286,43 @@ fn cef_modifiers(st: &State) -> u32 {
 
 /// The pointer position in the space the window's logical size names; the
 /// identity before the geometry thread has published an extent.
-fn view_point(x: i32, y: i32) -> jfn_platform_abi::LogicalPoint {
-    let extent = crate::x11_state::published_parent().and_then(|s| {
-        match crate::scale::extent(
-            jfn_platform_abi::PhysicalSize {
-                w: s.width,
-                h: s.height,
-            },
-            s.scale,
-        ) {
-            Ok(extent) => Some(extent),
-            Err(e) => {
-                tracing::error!(target: "Main", "pointer extent: {e}; mapping by the identity");
-                None
-            }
-        }
-    });
-    crate::scale::view_point(extent, jfn_platform_abi::PhysicalPoint { x, y })
+fn view_point(x: i32, y: i32) -> Result<jfn_platform_abi::LogicalPoint, ExtentError> {
+    let extent = crate::x11_state::published_parent()
+        .map(|s| {
+            crate::scale::extent(
+                jfn_platform_abi::PhysicalSize {
+                    w: s.width,
+                    h: s.height,
+                },
+                s.scale,
+            )
+        })
+        .transpose()?;
+    Ok(crate::scale::view_point(
+        extent,
+        jfn_platform_abi::PhysicalPoint { x, y },
+    ))
 }
 
-fn handle_key(st: &mut State, detail: u8, pressed: bool) {
+fn handle_key(st: &mut State, detail: u8, pressed: bool) -> Result<(), InputError> {
     let Some(xst) = st.xkb_st.as_mut() else {
-        return;
+        return Ok(());
     };
     let kc_raw = detail as u32;
     let kc = xkb::Keycode::new(kc_raw);
     let sym: u32 = xst.key_get_one_sym(kc).raw();
 
     if sym == XKB_KEY_XF86BACK || sym == XKB_KEY_XF86FORWARD {
-        if pressed {
-            let _ = st.dispatch.send(QueuedInputEvent::HistoryNav {
-                forward: (sym == XKB_KEY_XF86FORWARD) as c_int,
-            });
-        }
+        let queued = if pressed {
+            queue(
+                &st.dispatch,
+                QueuedInputEvent::HistoryNav {
+                    forward: (sym == XKB_KEY_XF86FORWARD) as c_int,
+                },
+            )
+        } else {
+            Ok(())
+        };
         xst.update_key(
             kc,
             if pressed {
@@ -303,31 +331,40 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
                 xkb::KeyDirection::Up
             },
         );
-        return;
+        return queued;
     }
 
     let native = (kc_raw as i32) - 8; // X keycode → linux input code
-    let _ = st.dispatch.send(QueuedInputEvent::KeyRaw {
-        sym,
-        native: native as u32,
-        modifiers: st.modifiers,
-        pressed: pressed as c_int,
-    });
+    let mut queued = queue(
+        &st.dispatch,
+        QueuedInputEvent::KeyRaw {
+            sym,
+            native: native as u32,
+            modifiers: st.modifiers,
+            pressed: pressed as c_int,
+        },
+    );
 
-    if pressed {
+    if pressed && queued.is_ok() {
         if let Some(text) = compose_feed(sym) {
-            let _ = st.dispatch.send(QueuedInputEvent::Text {
-                text,
-                modifiers: st.modifiers,
-            });
+            queued = queue(
+                &st.dispatch,
+                QueuedInputEvent::Text {
+                    text,
+                    modifiers: st.modifiers,
+                },
+            );
         } else if !compose_pending() {
             let cp = xst.key_get_utf32(kc);
             if cp > 0 {
-                let _ = st.dispatch.send(QueuedInputEvent::Char {
-                    cp,
-                    modifiers: st.modifiers,
-                    native: native as u32,
-                });
+                queued = queue(
+                    &st.dispatch,
+                    QueuedInputEvent::Char {
+                        cp,
+                        modifiers: st.modifiers,
+                        native: native as u32,
+                    },
+                );
             }
         }
     }
@@ -341,17 +378,24 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) {
         },
     );
     st.modifiers = to_cef_mods(xst);
+    queued
 }
 
-fn handle_button(st: &mut State, detail: u8, event_x: i16, event_y: i16, pressed: bool) {
+fn handle_button(
+    st: &mut State,
+    detail: u8,
+    event_x: i16,
+    event_y: i16,
+    pressed: bool,
+) -> Result<(), InputError> {
     let button = detail as u32;
     let point = view_point(event_x as i32, event_y as i32);
-    let (x, y) = (point.x, point.y);
 
     if (4..=7).contains(&button) {
         if !pressed {
-            return;
+            return Ok(());
         }
+        let point = point?;
         let (dx, dy) = match button {
             4 => (0, 120),
             5 => (0, -120),
@@ -359,30 +403,35 @@ fn handle_button(st: &mut State, detail: u8, event_x: i16, event_y: i16, pressed
             7 => (-120, 0),
             _ => (0, 0),
         };
-        let _ = st.dispatch.send(QueuedInputEvent::Scroll {
-            x,
-            y,
-            dx,
-            dy,
-            modifiers: cef_modifiers(st),
-        });
-        return;
+        return queue(
+            &st.dispatch,
+            QueuedInputEvent::Scroll {
+                x: point.x,
+                y: point.y,
+                dx,
+                dy,
+                modifiers: cef_modifiers(st),
+            },
+        );
     }
 
     if button == 8 || button == 9 {
         if pressed {
-            let _ = st.dispatch.send(QueuedInputEvent::HistoryNav {
-                forward: (button == 9) as c_int,
-            });
+            return queue(
+                &st.dispatch,
+                QueuedInputEvent::HistoryNav {
+                    forward: (button == 9) as c_int,
+                },
+            );
         }
-        return;
+        return Ok(());
     }
 
     let flag = match button {
         1 => EVENTFLAG_LEFT_MOUSE_BUTTON,
         2 => EVENTFLAG_MIDDLE_MOUSE_BUTTON,
         3 => EVENTFLAG_RIGHT_MOUSE_BUTTON,
-        _ => return,
+        _ => return Ok(()),
     };
     if pressed {
         st.mouse_button_modifiers |= flag;
@@ -395,18 +444,22 @@ fn handle_button(st: &mut State, detail: u8, event_x: i16, event_y: i16, pressed
         1 => buttons::BTN_LEFT,
         2 => buttons::BTN_MIDDLE,
         3 => buttons::BTN_RIGHT,
-        _ => return,
+        _ => return Ok(()),
     };
+    let point = point?;
     if pressed {
         activate_parent(st);
     }
-    let _ = st.dispatch.send(QueuedInputEvent::MouseButton {
-        code,
-        pressed: pressed as c_int,
-        x,
-        y,
-        modifiers: cef_modifiers(st),
-    });
+    queue(
+        &st.dispatch,
+        QueuedInputEvent::MouseButton {
+            code,
+            pressed: pressed as c_int,
+            x: point.x,
+            y: point.y,
+            modifiers: cef_modifiers(st),
+        },
+    )
 }
 
 fn activate_parent(st: &State) {
@@ -427,38 +480,47 @@ fn activate_parent(st: &State) {
     let _ = st.conn.flush();
 }
 
-fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) {
-    let point = view_point(ev.event_x() as i32, ev.event_y() as i32);
+fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) -> Result<(), InputError> {
+    let point = view_point(ev.event_x() as i32, ev.event_y() as i32)?;
     st.ptr_x = point.x;
     st.ptr_y = point.y;
-    let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
-        x: st.ptr_x,
-        y: st.ptr_y,
-        modifiers: cef_modifiers(st),
-        leave: 0,
-    });
+    queue(
+        &st.dispatch,
+        QueuedInputEvent::MouseMove {
+            x: st.ptr_x,
+            y: st.ptr_y,
+            modifiers: cef_modifiers(st),
+            leave: 0,
+        },
+    )
 }
 
-fn handle_enter(st: &mut State, ev: &xcb::x::EnterNotifyEvent) {
-    let point = view_point(ev.event_x() as i32, ev.event_y() as i32);
-    st.ptr_x = point.x;
-    st.ptr_y = point.y;
+fn handle_enter(st: &mut State, ev: &xcb::x::EnterNotifyEvent) -> Result<(), InputError> {
     st.cursor.resend_latest();
-    let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
-        x: st.ptr_x,
-        y: st.ptr_y,
-        modifiers: cef_modifiers(st),
-        leave: 0,
-    });
+    let point = view_point(ev.event_x() as i32, ev.event_y() as i32)?;
+    st.ptr_x = point.x;
+    st.ptr_y = point.y;
+    queue(
+        &st.dispatch,
+        QueuedInputEvent::MouseMove {
+            x: st.ptr_x,
+            y: st.ptr_y,
+            modifiers: cef_modifiers(st),
+            leave: 0,
+        },
+    )
 }
 
-fn handle_leave(st: &State, _ev: &xcb::x::LeaveNotifyEvent) {
-    let _ = st.dispatch.send(QueuedInputEvent::MouseMove {
-        x: st.ptr_x,
-        y: st.ptr_y,
-        modifiers: cef_modifiers(st),
-        leave: 1,
-    });
+fn handle_leave(st: &State, _ev: &xcb::x::LeaveNotifyEvent) -> Result<(), InputError> {
+    queue(
+        &st.dispatch,
+        QueuedInputEvent::MouseMove {
+            x: st.ptr_x,
+            y: st.ptr_y,
+            modifiers: cef_modifiers(st),
+            leave: 1,
+        },
+    )
 }
 
 fn handle_xkb_state_notify(st: &mut State, ev: &xcb::xkb::StateNotifyEvent) {
@@ -587,7 +649,9 @@ fn input_thread_body(mut st: State) {
 
     if let Err(e) =
         handle.insert_source(XcbSource::new(st.conn.clone()), |ev, (), st: &mut State| {
-            handle_event(st, ev);
+            if let Err(e) = handle_event(st, ev) {
+                tracing::error!(target: "x11::input", "input event: {e}");
+            }
         })
     {
         eprintln!("[x11] failed to register xcb event source: {e}");
@@ -726,20 +790,25 @@ fn input_dispatch_thread_body(events: Channel<QueuedInputEvent>) {
 /// A focus change the window itself took or lost. A `NotifyGrab` or
 /// `NotifyUngrab` mode is the menu's keyboard grab and changes nothing, and so
 /// is a `NotifyPointer`, `NotifyPointerRoot` or `NotifyInferior` detail.
-fn handle_focus(st: &State, mode: x::NotifyMode, detail: x::NotifyDetail, gained: bool) {
+fn handle_focus(
+    st: &State,
+    mode: x::NotifyMode,
+    detail: x::NotifyDetail,
+    gained: bool,
+) -> Result<(), InputError> {
     if matches!(mode, x::NotifyMode::Grab | x::NotifyMode::Ungrab) {
-        return;
+        return Ok(());
     }
     if matches!(
         detail,
         x::NotifyDetail::Pointer | x::NotifyDetail::PointerRoot | x::NotifyDetail::Inferior
     ) {
-        return;
+        return Ok(());
     }
-    let _ = st.dispatch.send(QueuedInputEvent::KeyboardFocus { gained });
+    queue(&st.dispatch, QueuedInputEvent::KeyboardFocus { gained })
 }
 
-fn handle_event(st: &mut State, ev: xcb::Event) {
+fn handle_event(st: &mut State, ev: xcb::Event) -> Result<(), InputError> {
     use xcb::Event;
     match ev {
         Event::X(x::Event::KeyPress(e)) => handle_key(st, e.detail(), true),
@@ -757,31 +826,37 @@ fn handle_event(st: &mut State, ev: xcb::Event) {
             if let Some(selections) = crate::selection::selections() {
                 selections.on_selection_request(&e);
             }
+            Ok(())
         }
         Event::X(x::Event::SelectionNotify(e)) => {
             if let Some(selections) = crate::selection::selections() {
                 selections.on_selection_notify(&e);
             }
+            Ok(())
         }
         Event::X(x::Event::SelectionClear(e)) => {
             if let Some(selections) = crate::selection::selections() {
                 selections.on_selection_clear(&e);
             }
+            Ok(())
         }
         Event::X(x::Event::EnterNotify(e)) => handle_enter(st, &e),
         Event::X(x::Event::LeaveNotify(e)) => handle_leave(st, &e),
         Event::Xkb(xkb_ev) => {
             use xcb::xkb;
             match xkb_ev {
-                xkb::Event::StateNotify(e) => handle_xkb_state_notify(st, &e),
+                xkb::Event::StateNotify(e) => {
+                    handle_xkb_state_notify(st, &e);
+                    Ok(())
+                }
                 xkb::Event::MapNotify(_) | xkb::Event::NewKeyboardNotify(_) => {
                     let conn = st.conn.clone();
-                    update_keymap(&conn, st);
+                    Ok(update_keymap(&conn, st)?)
                 }
-                _ => {}
+                _ => Ok(()),
             }
         }
-        _ => {}
+        _ => Ok(()),
     }
 }
 
