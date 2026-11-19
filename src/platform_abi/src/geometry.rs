@@ -506,6 +506,14 @@ pub struct Bounds {
     pub h: c_int,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, thiserror::Error)]
+pub enum ClampError {
+    #[error("the visible frame names no pixel bounds: {0}")]
+    VisibleFrame(#[from] PointsToPixelsError),
+    #[error("the working area could not be read (HRESULT {0:#010x})")]
+    WorkArea(i32),
+}
+
 /// Saved window geometry: size plus an optional top-left position. `None`
 /// position asks [`clamp_to_bounds`] to center the window (mpv's own centering
 /// misbehaves when only the width/height are overridden).

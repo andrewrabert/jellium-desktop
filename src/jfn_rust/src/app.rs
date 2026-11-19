@@ -778,6 +778,8 @@ enum MpvReconcileError {
     WindowState(#[from] WindowStateError),
     #[error(transparent)]
     Size(#[from] jfn_platform_abi::Unrepresentable),
+    #[error("clamp: {0}")]
+    Clamp(#[from] jfn_platform_abi::geometry::ClampError),
 }
 
 fn boot_mpv_reconcile(hz: f64) -> Result<(), MpvReconcileError> {
@@ -807,7 +809,7 @@ fn boot_mpv_reconcile(hz: f64) -> Result<(), MpvReconcileError> {
             w: physical.w,
             h: physical.h,
             position: None,
-        });
+        })?;
         let (new_pw, new_ph) = (clamped.w, clamped.h);
         let geom_str = format!("{new_pw}x{new_ph}");
         tracing::info!(target: "Main",
@@ -1011,6 +1013,10 @@ fn run_app(
     // hit the real server, not the mpv proxy the prepare may install.
     let boot = match crate::window_geometry::controller().boot() {
         Ok(boot) => boot,
+        Err(e @ crate::window_geometry::BootGeometryError::Clamp { unclamped, .. }) => {
+            tracing::error!(target: "Main", "boot geometry: {e}; the saved geometry stands");
+            unclamped
+        }
         Err(e) => {
             tracing::error!(target: "Main", "boot geometry: {e}");
             return 1;

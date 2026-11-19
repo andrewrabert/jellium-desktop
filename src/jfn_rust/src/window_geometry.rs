@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use jfn_platform_abi::{
     BootGeometry, LogicalSize, PhysicalSize, Platform, Scale, Unrepresentable, WindowGeometry,
-    WindowSource, WindowStateError,
+    WindowSource, WindowStateError, geometry::ClampError,
 };
 
 use jfn_config::JfnWindowGeometry;
@@ -37,7 +37,7 @@ impl WindowGeometryController {
 
     /// Resolve saved config into typed boot geometry, sourcing the display
     /// scale + clamp from the platform.
-    pub fn boot(&self) -> Result<BootGeometry, Unrepresentable> {
+    pub fn boot(&self) -> Result<BootGeometry, BootGeometryError> {
         let g = jfn_config::window_geometry();
         let at = (g.x >= 0 && g.y >= 0).then_some(jfn_platform_abi::WindowPos { x: g.x, y: g.y });
         let scale = plat().display_scale(at);
@@ -68,8 +68,8 @@ impl WindowGeometryController {
 fn resolve_boot(
     g: JfnWindowGeometry,
     scale: Scale,
-    clamp: impl Fn(WindowGeometry) -> WindowGeometry,
-) -> Result<BootGeometry, Unrepresentable> {
+    clamp: impl Fn(WindowGeometry) -> Result<WindowGeometry, ClampError>,
+) -> Result<BootGeometry, BootGeometryError> {
     let logical = if g.logical_width > 0 && g.logical_height > 0 {
         LogicalSize {
             w: g.logical_width,
@@ -86,13 +86,26 @@ fn resolve_boot(
     let physical = logical.to_physical(scale)?;
     // clamp operates on physical backing pixels; on Wayland it's the identity,
     // so the logical size we seed the toplevel with is unaffected.
-    let clamped = clamp(WindowGeometry::from_raw(physical.w, physical.h, g.x, g.y));
-    Ok(BootGeometry::from_clamped(
-        logical,
-        scale,
-        clamped,
-        g.maximized,
-    ))
+    let saved = WindowGeometry::from_raw(physical.w, physical.h, g.x, g.y);
+    let boot = |geometry| BootGeometry::from_clamped(logical, scale, geometry, g.maximized);
+    match clamp(saved) {
+        Ok(clamped) => Ok(boot(clamped)),
+        Err(error) => Err(BootGeometryError::Clamp {
+            error,
+            unclamped: boot(saved),
+        }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+pub enum BootGeometryError {
+    #[error(transparent)]
+    Size(#[from] Unrepresentable),
+    #[error("not clamped on-screen: {error}")]
+    Clamp {
+        error: ClampError,
+        unclamped: BootGeometry,
+    },
 }
 
 /// The logical and physical sizes the saved geometry was written at.
@@ -312,8 +325,8 @@ mod tests {
         );
     }
 
-    fn identity_clamp(w: WindowGeometry) -> WindowGeometry {
-        w
+    fn identity_clamp(w: WindowGeometry) -> Result<WindowGeometry, ClampError> {
+        Ok(w)
     }
 
     #[test]

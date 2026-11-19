@@ -182,11 +182,14 @@ impl Platform for X11Platform {
     }
 
     /// X11 constrains only the size; position is left to the WM.
-    fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry {
-        match crate::lifecycle::screen_bounds() {
+    fn clamp_window_geometry(
+        &self,
+        g: WindowGeometry,
+    ) -> Result<WindowGeometry, jfn_platform_abi::geometry::ClampError> {
+        Ok(match crate::lifecycle::screen_bounds() {
             Some(bounds) => jfn_platform_abi::geometry::clamp_size_to_bounds(g, bounds),
             None => g,
-        }
+        })
     }
 
     // the geometry and input threads own their own loops

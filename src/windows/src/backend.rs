@@ -381,11 +381,14 @@ impl Platform for WindowsPlatform {
         Ok(crate::window::stored_window_state()?.position)
     }
 
-    fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry {
+    fn clamp_window_geometry(
+        &self,
+        g: WindowGeometry,
+    ) -> Result<WindowGeometry, jfn_platform_abi::geometry::ClampError> {
         let (mut w, mut h) = (g.w, g.h);
         let (mut x, mut y) = g.raw_position();
-        win_clamp_window_geometry(&mut w, &mut h, &mut x, &mut y);
-        WindowGeometry::from_raw(w, h, x, y)
+        win_clamp_window_geometry(&mut w, &mut h, &mut x, &mut y)?;
+        Ok(WindowGeometry::from_raw(w, h, x, y))
     }
 
     fn pump(&self) {

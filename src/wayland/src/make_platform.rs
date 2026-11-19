@@ -222,8 +222,8 @@ impl Platform for WaylandPlatform {
     fn clamp_window_geometry(
         &self,
         g: jfn_platform_abi::WindowGeometry,
-    ) -> jfn_platform_abi::WindowGeometry {
-        g
+    ) -> Result<jfn_platform_abi::WindowGeometry, jfn_platform_abi::geometry::ClampError> {
+        Ok(g)
     }
 
     // the Wayland event loop runs on its own thread; the app main thread has
