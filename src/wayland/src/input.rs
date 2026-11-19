@@ -40,7 +40,7 @@ use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use xkbcommon::xkb;
 
 use jfn_input::buttons::{BTN_BACK, BTN_EXTRA, BTN_FORWARD, BTN_SIDE};
-use jfn_input::{HistoryDirection, PointerMotion, TouchPhase};
+use jfn_input::{HistoryDirection, PointerFocus, TouchPhase};
 use jfn_platform_abi::WindowPoint;
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_ALT_DOWN, EVENTFLAG_CONTROL_DOWN, EVENTFLAG_SHIFT_DOWN,
@@ -78,7 +78,8 @@ impl SeatShared {
     }
 }
 
-pub type MouseMoveFn = fn(p: WindowPoint, mods: u32, motion: PointerMotion);
+pub type MouseMoveFn = fn(focus: &mut PointerFocus, p: WindowPoint, mods: u32);
+pub type MouseLeaveFn = fn(focus: &mut PointerFocus, p: WindowPoint, mods: u32);
 pub type MouseButtonFn = fn(button: u32, pressed: c_int, p: WindowPoint, mods: u32);
 pub type PointerCancelFn = fn();
 pub type ScrollFn = fn(p: WindowPoint, dx: i32, dy: i32, mods: u32);
@@ -91,6 +92,7 @@ pub type TouchFn = fn(id: i32, phase: TouchPhase, p: WindowPoint, mods: u32);
 #[derive(Clone, Copy)]
 pub struct Callbacks {
     pub mouse_move: Option<MouseMoveFn>,
+    pub mouse_leave: Option<MouseLeaveFn>,
     pub mouse_button: Option<MouseButtonFn>,
     pub pointer_cancel: Option<PointerCancelFn>,
     pub scroll: Option<ScrollFn>,
@@ -882,6 +884,7 @@ fn init_impl(rt: &'static WlRuntime, display: *mut c_void, cb: Callbacks) -> Opt
         Arc::new(ContentInput {
             cb,
             root: std::sync::OnceLock::new(),
+            focus: Mutex::new(PointerFocus::new()),
         }),
     );
 
@@ -967,6 +970,7 @@ impl InputThread {
 struct ContentInput {
     cb: Callbacks,
     root: std::sync::OnceLock<wl_surface::WlSurface>,
+    focus: Mutex<PointerFocus>,
 }
 impl ContentInput {
     fn window_point(&self, at: &SurfacePoint) -> Option<WindowPoint> {
@@ -977,16 +981,25 @@ impl InputTarget for ContentInput {
     fn registered(&self, surface: &wl_surface::WlSurface) {
         let _ = self.root.set(surface.clone());
     }
-    fn motion(&self, at: &SurfacePoint, modifiers: u32, leave: bool) {
+    fn motion(&self, at: &SurfacePoint, modifiers: u32) {
         if let (Some(f), Some(p)) = (self.cb.mouse_move, self.window_point(at)) {
-            f(p, modifiers, PointerMotion::from_leave(leave));
+            f(&mut self.focus.lock(), p, modifiers);
+        }
+    }
+    fn leave(&self, at: &SurfacePoint, modifiers: u32) {
+        if let (Some(f), Some(p)) = (self.cb.mouse_leave, self.window_point(at)) {
+            f(&mut self.focus.lock(), p, modifiers);
         }
     }
     fn button(&self, button: u32, pressed: bool, at: &SurfacePoint, modifiers: u32) {
-        if matches!(button, BTN_SIDE | BTN_EXTRA | BTN_BACK | BTN_FORWARD) {
+        let direction = match button {
+            BTN_SIDE | BTN_BACK => Some(HistoryDirection::Back),
+            BTN_EXTRA | BTN_FORWARD => Some(HistoryDirection::Forward),
+            _ => None,
+        };
+        if let Some(direction) = direction {
             if pressed && let Some(f) = self.cb.history_nav {
-                let forward = matches!(button, BTN_EXTRA | BTN_FORWARD);
-                f(HistoryDirection::from_forward(forward));
+                f(direction);
             }
             return;
         }

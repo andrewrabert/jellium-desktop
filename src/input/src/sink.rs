@@ -29,7 +29,8 @@ pub trait WebInput: Send + Sync {
         mouse_up: bool,
         click_count: c_int,
     );
-    fn send_mouse_move(&self, p: WebPoint, modifiers: u32, leave: bool);
+    fn send_mouse_move(&self, p: WebPoint, modifiers: u32);
+    fn send_mouse_leave(&self, p: WebPoint, modifiers: u32);
     fn send_mouse_wheel(&self, p: WebPoint, modifiers: u32, delta_x: c_int, delta_y: c_int);
     fn send_touch_event(
         &self,
@@ -40,7 +41,8 @@ pub trait WebInput: Send + Sync {
     );
     fn capture_lost(&self);
     fn set_focus(&self, focus: bool);
-    fn navigate_history(&self, forward: bool);
+    fn go_back(&self);
+    fn go_forward(&self);
     fn undo(&self);
     fn redo(&self);
     fn cut(&self);
@@ -70,7 +72,8 @@ pub trait ShellInput: Send + Sync {
     /// A middle press the shell overlay owns; pastes the primary selection
     /// into the field under `p`.
     fn primary_paste(&self, p: WindowPoint);
-    fn send_mouse_move(&self, p: WindowPoint, modifiers: u32, leave: bool);
+    fn send_mouse_move(&self, p: WindowPoint, modifiers: u32);
+    fn send_mouse_leave(&self, p: WindowPoint, modifiers: u32);
     fn send_mouse_click(
         &self,
         p: WindowPoint,
@@ -81,6 +84,7 @@ pub trait ShellInput: Send + Sync {
     );
     fn send_mouse_wheel(&self, p: WindowPoint, modifiers: u32, delta_x: c_int, delta_y: c_int);
     fn pointer_cancel(&self);
+    fn cancel_press(&self, button: c_int);
     fn set_focus(&self, focus: bool);
     fn edit(&self, command: EditCommand);
 }
@@ -256,7 +260,9 @@ mod tests {
         ) {
         }
 
-        fn send_mouse_move(&self, _p: WebPoint, _modifiers: u32, _leave: bool) {}
+        fn send_mouse_move(&self, _p: WebPoint, _modifiers: u32) {}
+
+        fn send_mouse_leave(&self, _p: WebPoint, _modifiers: u32) {}
 
         fn send_mouse_wheel(
             &self,
@@ -282,7 +288,9 @@ mod tests {
             TAKEN.lock().push(focus);
         }
 
-        fn navigate_history(&self, _forward: bool) {}
+        fn go_back(&self) {}
+
+        fn go_forward(&self) {}
 
         fn undo(&self) {}
 

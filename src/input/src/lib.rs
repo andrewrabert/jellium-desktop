@@ -96,47 +96,75 @@ fn target_for_key() -> Target {
     sink::shell_state().map_or(Target::None, route_key)
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PointerMotion {
-    Within = 0,
-    Leave = 1,
-}
-
-impl PointerMotion {
-    pub fn from_leave(leave: bool) -> Self {
-        if leave { Self::Leave } else { Self::Within }
-    }
-}
-
-#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryDirection {
-    Back = 0,
-    Forward = 1,
+    Back,
+    Forward,
 }
 
-impl HistoryDirection {
-    pub fn from_forward(forward: bool) -> Self {
-        if forward { Self::Forward } else { Self::Back }
+#[derive(Debug, Default)]
+pub struct PointerFocus {
+    hovered: Option<Target>,
+}
+
+impl PointerFocus {
+    pub const fn new() -> Self {
+        Self { hovered: None }
     }
 }
 
-pub fn outside_window() -> WindowPoint {
-    WindowPoint::from_window(-1.0, -1.0)
-}
-
-pub fn jfn_input_dispatch_mouse_move(p: WindowPoint, mods: u32, motion: PointerMotion) {
-    let leave = motion == PointerMotion::Leave;
-    match target_for_pointer(p) {
-        Ok((Target::Shell, _)) => with_shell(|s| s.send_mouse_move(p, mods, leave)),
-        Ok((Target::Web, Some(routing))) => {
+fn send_mouse_leave(target: Target, routing: Option<Routing>, p: WindowPoint, mods: u32) {
+    match (target, routing) {
+        (Target::Shell, _) => with_shell(|s| s.send_mouse_leave(p, mods)),
+        (Target::Web, Some(routing)) => {
             let w = to_web_point(p, routing.web_top);
-            with_web(|b| b.send_mouse_move(w, mods, leave));
+            with_web(|b| b.send_mouse_leave(w, mods));
         }
-        Ok(_) => {}
-        Err(e) => report_window_state(&e),
+        _ => {}
     }
+}
+
+pub fn jfn_input_dispatch_mouse_move(focus: &mut PointerFocus, p: WindowPoint, mods: u32) {
+    let (target, routing) = match target_for_pointer(p) {
+        Ok(routed) => routed,
+        Err(e) => {
+            report_window_state(&e);
+            return;
+        }
+    };
+    let entered = match target {
+        Target::None => None,
+        target => Some(target),
+    };
+    let left = focus.hovered;
+    if let Some(left) = left
+        && Some(left) != entered
+    {
+        send_mouse_leave(left, routing, p, mods);
+    }
+    match (target, routing) {
+        (Target::Shell, _) => with_shell(|s| s.send_mouse_move(p, mods)),
+        (Target::Web, Some(routing)) => {
+            let w = to_web_point(p, routing.web_top);
+            with_web(|b| b.send_mouse_move(w, mods));
+        }
+        _ => {}
+    }
+    focus.hovered = entered;
+}
+
+pub fn jfn_input_dispatch_mouse_leave(focus: &mut PointerFocus, p: WindowPoint, mods: u32) {
+    let Some(left) = focus.hovered.take() else {
+        return;
+    };
+    let routing = match routing() {
+        Ok(routing) => routing,
+        Err(e) => {
+            report_window_state(&e);
+            None
+        }
+    };
+    send_mouse_leave(left, routing, p, mods);
 }
 
 /// A right press routed to [`Target::Shell`] calls
@@ -251,20 +279,16 @@ pub fn jfn_input_dispatch_touch(id: i32, phase: TouchPhase, p: WindowPoint, mods
         }
         touch::Delivery::ShellButton(phase) => with_shell(|s| match phase {
             TouchPhase::Pressed => {
-                s.send_mouse_move(p, mods, false);
+                s.send_mouse_move(p, mods);
                 s.send_mouse_click(p, mods, MBT_LEFT, false, 1);
             }
-            TouchPhase::Moved => s.send_mouse_move(p, mods, false),
+            TouchPhase::Moved => s.send_mouse_move(p, mods),
             // No cursor stays behind a lifted finger to hover anything.
             TouchPhase::Released => {
                 s.send_mouse_click(p, mods, MBT_LEFT, true, 1);
-                s.send_mouse_move(p, mods, true);
+                s.send_mouse_leave(p, mods);
             }
-            // Released outside the window, so the press activates nothing.
-            TouchPhase::Cancelled => {
-                s.send_mouse_click(outside_window(), mods, MBT_LEFT, true, 1);
-                s.send_mouse_move(p, mods, true);
-            }
+            TouchPhase::Cancelled => s.cancel_press(MBT_LEFT),
         }),
         touch::Delivery::WindowGesture(hit) => with_shell(|s| s.window_gesture(hit)),
         touch::Delivery::Drop => {}
@@ -274,7 +298,10 @@ pub fn jfn_input_dispatch_touch(id: i32, phase: TouchPhase, p: WindowPoint, mods
 /// Routed like a key: dropped while a modal owns input.
 pub fn jfn_input_dispatch_history_nav(direction: HistoryDirection) {
     if target_for_key() == Target::Web {
-        with_web(|b| b.navigate_history(direction == HistoryDirection::Forward));
+        with_web(|b| match direction {
+            HistoryDirection::Back => b.go_back(),
+            HistoryDirection::Forward => b.go_forward(),
+        });
     }
 }
 

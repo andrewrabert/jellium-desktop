@@ -56,7 +56,8 @@ pub(crate) trait InputTarget: Send + Sync {
     fn registered(&self, _surface: &WlSurface) {}
     fn configured(&self, _size: jfn_platform_abi::LogicalSize) {}
     fn dismissed(&self) {}
-    fn motion(&self, _at: &SurfacePoint, _modifiers: u32, _leave: bool) {}
+    fn motion(&self, _at: &SurfacePoint, _modifiers: u32) {}
+    fn leave(&self, _at: &SurfacePoint, _modifiers: u32) {}
     fn button(&self, _button: u32, _pressed: bool, _at: &SurfacePoint, _modifiers: u32) {}
     fn pointer_cancel(&self) {}
     fn scroll(&self, _at: &SurfacePoint, _dx: i32, _dy: i32, _modifiers: u32) {}
@@ -66,17 +67,17 @@ pub(crate) trait InputTarget: Send + Sync {
     fn touch(&self, _id: i32, phase: TouchPhase, at: &SurfacePoint, modifiers: u32) {
         match phase {
             TouchPhase::Pressed => {
-                self.motion(at, modifiers, false);
+                self.motion(at, modifiers);
                 self.button(BTN_LEFT, true, at, modifiers | EVENTFLAG_LEFT_MOUSE_BUTTON);
             }
             TouchPhase::Moved => {
-                self.motion(at, modifiers | EVENTFLAG_LEFT_MOUSE_BUTTON, false);
+                self.motion(at, modifiers | EVENTFLAG_LEFT_MOUSE_BUTTON);
             }
             TouchPhase::Released => {
                 self.button(BTN_LEFT, false, at, modifiers);
-                self.motion(at, modifiers, true);
+                self.leave(at, modifiers);
             }
-            TouchPhase::Cancelled => self.motion(at, modifiers, true),
+            TouchPhase::Cancelled => self.leave(at, modifiers),
         }
     }
 }
@@ -160,7 +161,7 @@ impl SeatInput {
             }
         }
         if let Some(destination) = self.destinations.get(&id) {
-            destination.target.motion(at, modifiers, true);
+            destination.target.leave(at, modifiers);
         }
     }
 
@@ -168,7 +169,7 @@ impl SeatInput {
         let id = at.surface().id();
         let modifiers = modifiers | self.button_modifiers(&id);
         if let Some(destination) = self.destinations.get(&id) {
-            destination.target.motion(at, modifiers, false);
+            destination.target.motion(at, modifiers);
         }
     }
 

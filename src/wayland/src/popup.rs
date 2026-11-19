@@ -109,10 +109,8 @@ impl crate::protocol::InputTarget for MenuInput {
             menu.on_done(self.generation);
         }
     }
-    fn motion(&self, at: &SurfacePoint, _: u32, leave: bool) {
-        if !leave {
-            self.pointer(at, false);
-        }
+    fn motion(&self, at: &SurfacePoint, _: u32) {
+        self.pointer(at, false);
     }
     fn button(&self, _: u32, pressed: bool, at: &SurfacePoint, _: u32) {
         if pressed {
