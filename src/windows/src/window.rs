@@ -88,7 +88,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-pub(crate) fn sample() -> Result<Option<PhysicalSize>, ClientExtentError> {
+pub(crate) fn sample() -> Result<Option<PhysicalSize>, WindowStateError> {
     let Some(hwnd) = crate::platform::win_ensure_hwnd() else {
         return Ok(None);
     };
@@ -107,7 +107,7 @@ pub(crate) fn sample() -> Result<Option<PhysicalSize>, ClientExtentError> {
     let fullscreen = crate::platform::win_is_fullscreen();
     let state = WindowState {
         extent,
-        position: window_position(hwnd),
+        position: Some(window_position(hwnd)?),
         maximized: !fullscreen && unsafe { IsZoomed(hwnd) }.as_bool(),
         fullscreen,
         web_top: 0,
@@ -123,18 +123,19 @@ pub(crate) fn sample() -> Result<Option<PhysicalSize>, ClientExtentError> {
 /// Window position relative to the monitor's working area (excludes the
 /// taskbar), in physical pixels. Matches mpv's `--geometry +X+Y` coordinate
 /// system on Windows (`vo_calc_window_geometry` uses the working area).
-fn window_position(hwnd: HWND) -> Option<WindowPos> {
+fn window_position(hwnd: HWND) -> Result<WindowPos, WindowStateError> {
     let mut wr = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut wr) }.ok()?;
+    unsafe { GetWindowRect(hwnd, &mut wr) }
+        .map_err(|e| WindowStateError::WindowRect(e.code().0))?;
     let mon: HMONITOR = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
-    if !unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
-        return None;
-    }
-    Some(WindowPos {
+    unsafe { GetMonitorInfoW(mon, &mut mi) }
+        .ok()
+        .map_err(|e| WindowStateError::MonitorInfo(e.code().0))?;
+    Ok(WindowPos {
         x: wr.left - mi.rcWork.left,
         y: wr.top - mi.rcWork.top,
     })
@@ -164,7 +165,7 @@ fn log_sample(hwnd: HWND, dpi: u32, extent: WindowExtent) {
     );
 }
 
-pub(crate) fn republish() -> Result<Option<PhysicalSize>, ClientExtentError> {
+pub(crate) fn republish() -> Result<Option<PhysicalSize>, WindowStateError> {
     let Some(client) = sample()? else {
         return Ok(None);
     };
@@ -172,7 +173,7 @@ pub(crate) fn republish() -> Result<Option<PhysicalSize>, ClientExtentError> {
     Ok(Some(client))
 }
 
-pub(crate) fn publish_deferred() -> Result<Option<PhysicalSize>, ClientExtentError> {
+pub(crate) fn publish_deferred() -> Result<Option<PhysicalSize>, WindowStateError> {
     let Some(client) = sample()? else {
         return Ok(None);
     };

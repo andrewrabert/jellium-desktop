@@ -559,8 +559,10 @@ pub trait Platform: Send + Sync {
     /// Who creates the app window, and the live geometry authority for it.
     fn window_owner(&self) -> WindowOwner<'_>;
 
-    /// Clamp saved geometry to stay on-screen.
-    fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry;
+    fn clamp_window_geometry(
+        &self,
+        g: WindowGeometry,
+    ) -> Result<WindowGeometry, geometry::ClampError>;
 
     fn pump(&self);
     /// Block the process main thread until [`wake_main_loop`] is called.

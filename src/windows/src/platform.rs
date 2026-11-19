@@ -28,7 +28,7 @@ use jfn_mpv::api::{
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_platform_abi::WindowStateError;
-use jfn_platform_abi::geometry::{Bounds, WindowGeometry, clamp_to_bounds};
+use jfn_platform_abi::geometry::{Bounds, ClampError, WindowGeometry, clamp_to_bounds};
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 
 use crate::input::{
@@ -356,27 +356,22 @@ pub(crate) fn win_cleanup() -> Result<(), crate::window::NotifierPanicked> {
     notifier
 }
 
-/// Resolve saved geometry against the primary monitor's working area so the
-/// window never opens larger than the screen or off-screen, and center any
-/// unset axis.
 pub(crate) fn win_clamp_window_geometry(
     w: &mut c_int,
     h: &mut c_int,
     x: &mut c_int,
     y: &mut c_int,
-) {
+) -> Result<(), ClampError> {
     let mut work = RECT::default();
-    let ok = unsafe {
+    unsafe {
         SystemParametersInfoW(
             SPI_GETWORKAREA,
             0,
             Some(&mut work as *mut RECT as *mut c_void),
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         )
-    };
-    if ok.is_err() {
-        return;
     }
+    .map_err(|e| ClampError::WorkArea(e.code().0))?;
     let vw = work.right - work.left;
     let vh = work.bottom - work.top;
     let mut g = WindowGeometry::from_raw(*w, *h, *x, *y);
@@ -386,4 +381,5 @@ pub(crate) fn win_clamp_window_geometry(
     let (nx, ny) = g.raw_position();
     *x = nx;
     *y = ny;
+    Ok(())
 }

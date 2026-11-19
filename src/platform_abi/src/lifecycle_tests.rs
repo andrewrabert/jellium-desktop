@@ -110,7 +110,10 @@ impl Platform for Backend {
     fn window_owner(&self) -> WindowOwner<'_> {
         unreachable!("lifecycle test never calls this platform operation")
     }
-    fn clamp_window_geometry(&self, g: WindowGeometry) -> WindowGeometry {
+    fn clamp_window_geometry(
+        &self,
+        g: WindowGeometry,
+    ) -> Result<WindowGeometry, geometry::ClampError> {
         unreachable!("lifecycle test never calls this platform operation")
     }
     fn pump(&self) {
