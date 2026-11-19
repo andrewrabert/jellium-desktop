@@ -80,7 +80,10 @@ pub fn jfn_input_dispatch_key_raw(keysym: u32, native_code: u32, mods: u32, pres
     const XF86_FORWARD: u32 = 0x1008FF27;
     if keysym == XF86_BACK || keysym == XF86_FORWARD {
         if pressed != 0 {
-            jfn_input_dispatch_history_nav(HistoryDirection::from_forward(keysym == XF86_FORWARD));
+            jfn_input_dispatch_history_nav(match keysym {
+                XF86_FORWARD => HistoryDirection::Forward,
+                _ => HistoryDirection::Back,
+            });
         }
         return;
     }

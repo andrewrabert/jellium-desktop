@@ -88,13 +88,14 @@ impl jfn_input::ShellInput for ShellSink {
         crate::shell::post(Work::PrimaryPaste(p));
     }
 
-    fn send_mouse_move(&self, p: WindowPoint, _modifiers: u32, leave: bool) {
-        let event = if leave {
-            mouse::Event::CursorLeft
-        } else {
-            mouse::Event::CursorMoved { position: point(p) }
-        };
-        crate::shell::post(Work::Event(Event::Mouse(event)));
+    fn send_mouse_move(&self, p: WindowPoint, _modifiers: u32) {
+        crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorMoved {
+            position: point(p),
+        })));
+    }
+
+    fn send_mouse_leave(&self, _p: WindowPoint, _modifiers: u32) {
+        crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorLeft)));
     }
 
     fn send_mouse_click(
@@ -108,12 +109,7 @@ impl jfn_input::ShellInput for ShellSink {
         crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorMoved {
             position: point(p),
         })));
-        // CEF mouse buttons: 0 = left, 1 = middle, 2 = right.
-        let button = match button {
-            1 => mouse::Button::Middle,
-            2 => mouse::Button::Right,
-            _ => mouse::Button::Left,
-        };
+        let button = iced_button(button);
         {
             let mut held = HELD.lock();
             held.retain(|b| *b != button);
@@ -150,6 +146,15 @@ impl jfn_input::ShellInput for ShellSink {
         }
     }
 
+    fn cancel_press(&self, button: c_int) {
+        let button = iced_button(button);
+        HELD.lock().retain(|b| *b != button);
+        crate::shell::post(Work::Event(Event::Mouse(mouse::Event::CursorLeft)));
+        crate::shell::post(Work::Event(Event::Mouse(mouse::Event::ButtonReleased(
+            button,
+        ))));
+    }
+
     fn set_focus(&self, focus: bool) {
         let event = if focus {
             iced_core::window::Event::Focused
@@ -164,6 +169,14 @@ impl jfn_input::ShellInput for ShellSink {
             field: crate::shell::actor::Target::Focused,
             command,
         });
+    }
+}
+
+fn iced_button(button: c_int) -> mouse::Button {
+    match button {
+        1 => mouse::Button::Middle,
+        2 => mouse::Button::Right,
+        _ => mouse::Button::Left,
     }
 }
 

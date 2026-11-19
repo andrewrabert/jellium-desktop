@@ -87,12 +87,20 @@ impl Inner {
         );
     }
 
-    pub(crate) fn send_mouse_move(&self, x: c_int, y: c_int, modifiers: u32, leave: bool) {
+    pub(crate) fn send_mouse_move(&self, x: c_int, y: c_int, modifiers: u32) {
         let Some(host) = self.host() else {
             return;
         };
         let me = MouseEvent { x, y, modifiers };
-        host.send_mouse_move_event(Some(&me), if leave { 1 } else { 0 });
+        host.send_mouse_move_event(Some(&me), 0);
+    }
+
+    pub(crate) fn send_mouse_leave(&self, x: c_int, y: c_int, modifiers: u32) {
+        let Some(host) = self.host() else {
+            return;
+        };
+        let me = MouseEvent { x, y, modifiers };
+        host.send_mouse_move_event(Some(&me), 1);
     }
 
     pub(crate) fn send_capture_lost(&self) {

@@ -9,6 +9,7 @@
 #![allow(non_snake_case)]
 
 use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::ffi::c_int;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -31,17 +32,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SUBTRACT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GA_ROOT, GetAncestor,
-    GetClientRect, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HCURSOR, HICON,
-    HMENU, HTCLIENT, IDC_APPSTARTING, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO,
-    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_WAIT, KF_EXTENDED,
-    LoadCursorW, MSG, PostMessageW, PostThreadMessageW, RegisterClassExW, SET_WINDOW_POS_FLAGS,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetWindowPos, TranslateMessage,
-    UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APPCOMMAND, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD, WS_VISIBLE, XBUTTON2,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GA_ROOT,
+    GWLP_USERDATA, GetAncestor, GetClientRect, GetCursorPos, GetForegroundWindow, GetMessageW,
+    GetWindowLongPtrW, GetWindowThreadProcessId, HCURSOR, HICON, HMENU, HTCLIENT, IDC_APPSTARTING,
+    IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_WAIT, KF_EXTENDED, LoadCursorW, MSG, PostMessageW,
+    PostThreadMessageW, RegisterClassExW, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SetCursor, SetWindowLongPtrW, SetWindowPos, TranslateMessage, UnregisterClassW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APPCOMMAND, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_QUIT,
+    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD, WS_VISIBLE,
+    XBUTTON2,
 };
 use windows::core::{PCWSTR, w};
 
@@ -61,9 +64,10 @@ use jfn_platform_abi::{LogicalPoint, PhysicalPoint, WindowExtent, WindowStateErr
 
 use jfn_input::key::{KeyReport, PhysicalKey};
 use jfn_input::{
-    HistoryDirection, PointerMotion, jfn_input_dispatch_history_nav, jfn_input_dispatch_key,
+    HistoryDirection, PointerFocus, jfn_input_dispatch_history_nav, jfn_input_dispatch_key,
     jfn_input_dispatch_keyboard_focus, jfn_input_dispatch_mouse_button,
-    jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll, jfn_input_dispatch_utf16,
+    jfn_input_dispatch_mouse_leave, jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll,
+    jfn_input_dispatch_utf16,
 };
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 
@@ -80,6 +84,22 @@ static STATE: Mutex<State> = Mutex::new(State {
     thread_id: 0,
     cursor_type: CursorShape::Pointer.as_raw(),
 });
+
+struct InputWindowState {
+    pointer: RefCell<PointerFocus>,
+}
+
+unsafe fn input_window_state<'a>(hwnd: HWND) -> Option<&'a InputWindowState> {
+    let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const InputWindowState;
+    unsafe { raw.as_ref() }
+}
+
+fn destroy_input_window(hwnd: HWND, state: *const InputWindowState) {
+    if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == state as isize {
+        let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+    }
+    let _ = unsafe { DestroyWindow(hwnd) };
+}
 
 /// The input child window, or `None` before the input thread creates it and
 /// after it tears it down.
@@ -305,6 +325,32 @@ fn window_point(p: LogicalPoint) -> jfn_platform_abi::WindowPoint {
     jfn_platform_abi::WindowPoint::from_window(f64::from(p.x), f64::from(p.y))
 }
 
+#[derive(Debug, thiserror::Error)]
+enum LeavePointError {
+    #[error("{operation}: {source}")]
+    Win32 {
+        operation: &'static str,
+        source: windows::core::Error,
+    },
+    #[error("leave point scale: {0}")]
+    Scale(#[from] WindowStateError),
+}
+
+impl LeavePointError {
+    fn win32(operation: &'static str) -> impl FnOnce(windows::core::Error) -> Self {
+        move |source| Self::Win32 { operation, source }
+    }
+}
+
+fn leave_point(hwnd: HWND) -> Result<LogicalPoint, LeavePointError> {
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt) }.map_err(LeavePointError::win32("GetCursorPos"))?;
+    unsafe { ScreenToClient(hwnd, &mut pt) }
+        .ok()
+        .map_err(LeavePointError::win32("ScreenToClient"))?;
+    Ok(view_point(pt.x, pt.y)?)
+}
+
 /// One debug line per press.
 fn log_press(msg: u32, physical: PhysicalPoint, logical: LogicalPoint, extent: WindowExtent) {
     let logical_size = extent.logical();
@@ -333,24 +379,56 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             return LRESULT(1);
         }
 
+        WM_NCCREATE => {
+            let create = lp.0 as *const CREATESTRUCTW;
+            if let Some(create) = unsafe { create.as_ref() } {
+                let _ = unsafe {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize)
+                };
+            }
+        }
+
+        WM_NCDESTROY => {
+            let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+        }
+
         WM_MOUSEMOVE => {
+            let Some(state) = (unsafe { input_window_state(hwnd) }) else {
+                return LRESULT(0);
+            };
             match view_point(get_x_lparam(lp), get_y_lparam(lp)) {
-                Ok(p) => jfn_input_dispatch_mouse_move(
-                    window_point(p),
-                    mouse_modifiers(wp),
-                    PointerMotion::Within,
-                ),
+                Ok(p) => match state.pointer.try_borrow_mut() {
+                    Ok(mut focus) => {
+                        jfn_input_dispatch_mouse_move(
+                            &mut focus,
+                            window_point(p),
+                            mouse_modifiers(wp),
+                        );
+                    }
+                    Err(e) => tracing::error!(target: "platform", "mouse move dropped: {e}"),
+                },
                 Err(e) => tracing::error!(target: "platform", "mouse move dropped: {e}"),
             }
             return LRESULT(0);
         }
 
         WM_MOUSELEAVE => {
-            jfn_input_dispatch_mouse_move(
-                jfn_input::outside_window(),
-                mouse_modifiers(wp),
-                PointerMotion::Leave,
-            );
+            let Some(state) = (unsafe { input_window_state(hwnd) }) else {
+                return LRESULT(0);
+            };
+            match leave_point(hwnd) {
+                Ok(p) => match state.pointer.try_borrow_mut() {
+                    Ok(mut focus) => {
+                        jfn_input_dispatch_mouse_leave(
+                            &mut focus,
+                            window_point(p),
+                            mouse_modifiers(wp),
+                        );
+                    }
+                    Err(e) => tracing::error!(target: "platform", "mouse leave dropped: {e}"),
+                },
+                Err(e) => tracing::error!(target: "platform", "mouse leave dropped: {e}"),
+            }
             return LRESULT(0);
         }
 
@@ -387,7 +465,10 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         WM_XBUTTONDOWN | WM_XBUTTONUP => {
             let btn = get_xbutton_wparam(wp);
             if msg == WM_XBUTTONDOWN {
-                jfn_input_dispatch_history_nav(HistoryDirection::from_forward(btn == XBUTTON2));
+                jfn_input_dispatch_history_nav(match btn {
+                    XBUTTON2 => HistoryDirection::Forward,
+                    _ => HistoryDirection::Back,
+                });
             }
             return LRESULT(1);
         }
@@ -444,8 +525,10 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
             if vk == VK_BROWSER_BACK.0 || vk == VK_BROWSER_FORWARD.0 {
                 if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-                    let forward = vk == VK_BROWSER_FORWARD.0;
-                    jfn_input_dispatch_history_nav(HistoryDirection::from_forward(forward));
+                    jfn_input_dispatch_history_nav(match vk {
+                        v if v == VK_BROWSER_FORWARD.0 => HistoryDirection::Forward,
+                        _ => HistoryDirection::Back,
+                    });
                 }
                 return LRESULT(0);
             }
@@ -521,6 +604,11 @@ pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void
     };
     unsafe { RegisterClassExW(&wc) };
 
+    let window_state = Box::new(InputWindowState {
+        pointer: RefCell::new(PointerFocus::new()),
+    });
+    let state_ptr: *const InputWindowState = std::ptr::from_ref(&*window_state);
+
     let mut rc = RECT::default();
     let _ = unsafe { GetClientRect(mpv, &mut rc) };
 
@@ -537,7 +625,7 @@ pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void
             Some(mpv),
             Some(HMENU(std::ptr::null_mut())),
             Some(hinst.into()),
-            None,
+            Some(state_ptr.cast::<std::ffi::c_void>()),
         )
     };
 
@@ -574,10 +662,15 @@ pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void
         if m.hwnd.is_invalid() && m.message == WM_JFN_RECREATE_WINDOW {
             let old = STATE.lock().input_hwnd_raw;
             if old != 0 {
-                let _ = unsafe { DestroyWindow(HWND(old as *mut std::ffi::c_void)) };
+                destroy_input_window(HWND(old as *mut std::ffi::c_void), state_ptr);
                 STATE.lock().input_hwnd_raw = 0;
             }
-            recreate_input_child_window(HWND(m.lParam.0 as *mut std::ffi::c_void), hinst, tid);
+            recreate_input_child_window(
+                HWND(m.lParam.0 as *mut std::ffi::c_void),
+                hinst,
+                tid,
+                state_ptr,
+            );
             continue;
         }
         unsafe {
@@ -589,11 +682,12 @@ pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void
     if STATE.lock().input_hwnd_raw != 0 {
         // The child may have been recreated since startup; destroy the current one.
         let raw = STATE.lock().input_hwnd_raw;
-        let _ = unsafe { DestroyWindow(HWND(raw as *mut std::ffi::c_void)) };
+        destroy_input_window(HWND(raw as *mut std::ffi::c_void), state_ptr);
         STATE.lock().input_hwnd_raw = 0;
     }
     let _ = unsafe { UnregisterClassW(CLASS_NAME, Some(hinst.into())) };
     STATE.lock().thread_id = 0;
+    drop(window_state);
 }
 
 /// Build a fresh input child window parented to `new_mpv_hwnd`, from the
@@ -608,6 +702,7 @@ fn recreate_input_child_window(
     new_mpv_hwnd: HWND,
     hinst: windows::Win32::Foundation::HMODULE,
     own_tid: u32,
+    state: *const InputWindowState,
 ) {
     let mut rc = RECT::default();
     let _ = unsafe { GetClientRect(new_mpv_hwnd, &mut rc) };
@@ -625,7 +720,7 @@ fn recreate_input_child_window(
             Some(new_mpv_hwnd),
             Some(HMENU(std::ptr::null_mut())),
             Some(hinst.into()),
-            None,
+            Some(state.cast::<std::ffi::c_void>()),
         )
     };
     let input_hwnd = match input_hwnd {

@@ -48,10 +48,17 @@ impl WebInput for WebSink {
         });
     }
 
-    fn send_mouse_move(&self, p: WebPoint, modifiers: u32, leave: bool) {
+    fn send_mouse_move(&self, p: WebPoint, modifiers: u32) {
         let (x, y) = p.floor();
         crate::web_overlay::with_current_client(|client| {
-            client.send_mouse_move(x, y, modifiers, leave);
+            client.send_mouse_move(x, y, modifiers);
+        });
+    }
+
+    fn send_mouse_leave(&self, p: WebPoint, modifiers: u32) {
+        let (x, y) = p.floor();
+        crate::web_overlay::with_current_client(|client| {
+            client.send_mouse_leave(x, y, modifiers);
         });
     }
 
@@ -80,14 +87,18 @@ impl WebInput for WebSink {
         });
     }
 
-    fn navigate_history(&self, forward: bool) {
+    fn go_back(&self) {
         crate::web_overlay::with_current_client(|client| {
-            if forward {
-                if client.can_go_forward() {
-                    client.go_forward();
-                }
-            } else if client.can_go_back() {
+            if client.can_go_back() {
                 client.go_back();
+            }
+        });
+    }
+
+    fn go_forward(&self) {
+        crate::web_overlay::with_current_client(|client| {
+            if client.can_go_forward() {
+                client.go_forward();
             }
         });
     }

@@ -16,13 +16,14 @@ use jfn_platform_abi::cursor::CursorShape;
 
 use jfn_input::{
     jfn_input_dispatch_char, jfn_input_dispatch_history_nav, jfn_input_dispatch_keyboard_focus,
-    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_move,
+    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_leave, jfn_input_dispatch_mouse_move,
     jfn_input_dispatch_pointer_cancel, jfn_input_dispatch_scroll, jfn_input_dispatch_touch,
 };
 use jfn_linux_util::input::jfn_input_dispatch_key_raw;
 
 const CALLBACKS: Callbacks = Callbacks {
     mouse_move: Some(jfn_input_dispatch_mouse_move),
+    mouse_leave: Some(jfn_input_dispatch_mouse_leave),
     mouse_button: Some(jfn_input_dispatch_mouse_button),
     pointer_cancel: Some(jfn_input_dispatch_pointer_cancel),
     scroll: Some(jfn_input_dispatch_scroll),

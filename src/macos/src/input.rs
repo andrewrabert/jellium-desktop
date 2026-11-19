@@ -67,8 +67,8 @@ const NS_TRACKING_IN_VISIBLE_RECT: u64 = 0x200;
 
 use jfn_input::key::{KeyReport, PhysicalKey};
 use jfn_input::{
-    HistoryDirection, PointerMotion, jfn_input_dispatch_history_nav, jfn_input_dispatch_key,
-    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_move,
+    HistoryDirection, PointerFocus, jfn_input_dispatch_history_nav, jfn_input_dispatch_key,
+    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_leave, jfn_input_dispatch_mouse_move,
     jfn_input_dispatch_scroll_precise, jfn_input_dispatch_utf16,
 };
 
@@ -279,6 +279,7 @@ fn flush_scroll_accumulator() {
 #[derive(Default)]
 struct ViewIvars {
     tracking_area: Mutex<Option<Retained<AnyObject>>>,
+    pointer_focus: Mutex<PointerFocus>,
 }
 
 define_class!(
@@ -359,9 +360,13 @@ define_class!(
         #[unsafe(method(otherMouseDown:))]
         fn other_mouse_down(&self, event: &AnyObject) {
             let n: isize = unsafe { msg_send![event, buttonNumber] };
-            if n == NS_MOUSE_BUTTON_BACK || n == NS_MOUSE_BUTTON_FORWARD {
-                let forward = n == NS_MOUSE_BUTTON_FORWARD;
-                jfn_input_dispatch_history_nav(HistoryDirection::from_forward(forward));
+            let direction = match n {
+                NS_MOUSE_BUTTON_BACK => Some(HistoryDirection::Back),
+                NS_MOUSE_BUTTON_FORWARD => Some(HistoryDirection::Forward),
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                jfn_input_dispatch_history_nav(direction);
                 return;
             }
             dispatch_mouse_button(self, event, BTN_MIDDLE, true);
@@ -377,24 +382,24 @@ define_class!(
 
         // ---- Mouse move ----
         #[unsafe(method(mouseMoved:))]
-        fn mouse_moved(&self, event: &AnyObject) { dispatch_mouse_move(self, event, false); }
+        fn mouse_moved(&self, event: &AnyObject) { dispatch_mouse_move(self, event); }
         #[unsafe(method(mouseDragged:))]
-        fn mouse_dragged(&self, event: &AnyObject) { dispatch_mouse_move(self, event, false); }
+        fn mouse_dragged(&self, event: &AnyObject) { dispatch_mouse_move(self, event); }
         #[unsafe(method(rightMouseDragged:))]
-        fn right_mouse_dragged(&self, event: &AnyObject) { dispatch_mouse_move(self, event, false); }
+        fn right_mouse_dragged(&self, event: &AnyObject) { dispatch_mouse_move(self, event); }
         #[unsafe(method(otherMouseDragged:))]
-        fn other_mouse_dragged(&self, event: &AnyObject) { dispatch_mouse_move(self, event, false); }
+        fn other_mouse_dragged(&self, event: &AnyObject) { dispatch_mouse_move(self, event); }
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, event: &AnyObject) {
             G_MOUSE_INSIDE.store(true, Ordering::SeqCst);
             apply_cursor_state();
-            dispatch_mouse_move(self, event, false);
+            dispatch_mouse_move(self, event);
         }
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, event: &AnyObject) {
             G_MOUSE_INSIDE.store(false, Ordering::SeqCst);
             apply_cursor_state();
-            dispatch_mouse_move(self, event, true);
+            dispatch_mouse_leave(self, event);
         }
 
         // ---- Scroll ----
@@ -589,15 +594,25 @@ fn dispatch_mouse_button(view: &InputView, event: &AnyObject, button_code: u32, 
     );
 }
 
-fn dispatch_mouse_move(view: &InputView, event: &AnyObject, leave: bool) {
+fn pointer_report(view: &InputView, event: &AnyObject) -> (WindowPoint, u32) {
     let loc = mouse_loc_in_view(view, event);
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let mods = ns_to_cef_modifiers(raw_flags) | G_MOUSE_BUTTON_MODIFIERS.load(Ordering::SeqCst);
-    jfn_input_dispatch_mouse_move(
-        WindowPoint::from_window(loc.x, loc.y),
-        mods,
-        PointerMotion::from_leave(leave),
-    );
+    (WindowPoint::from_window(loc.x, loc.y), mods)
+}
+
+fn dispatch_mouse_move(view: &InputView, event: &AnyObject) {
+    let (p, mods) = pointer_report(view, event);
+    let mut focus = std::mem::take(&mut *view.ivars().pointer_focus.lock());
+    jfn_input_dispatch_mouse_move(&mut focus, p, mods);
+    *view.ivars().pointer_focus.lock() = focus;
+}
+
+fn dispatch_mouse_leave(view: &InputView, event: &AnyObject) {
+    let (p, mods) = pointer_report(view, event);
+    let mut focus = std::mem::take(&mut *view.ivars().pointer_focus.lock());
+    jfn_input_dispatch_mouse_leave(&mut focus, p, mods);
+    *view.ivars().pointer_focus.lock() = focus;
 }
 
 /// AppKit names a function key with a code unit from the private-use block

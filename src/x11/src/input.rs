@@ -19,8 +19,9 @@ use xcb::{Xid, XidNew, x};
 use xkbcommon::xkb::{self, x11 as xkb_x11};
 
 use jfn_input::{
-    HistoryDirection, PointerMotion, jfn_input_dispatch_char, jfn_input_dispatch_history_nav,
-    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll,
+    HistoryDirection, PointerFocus, jfn_input_dispatch_char, jfn_input_dispatch_history_nav,
+    jfn_input_dispatch_mouse_button, jfn_input_dispatch_mouse_leave, jfn_input_dispatch_mouse_move,
+    jfn_input_dispatch_scroll,
 };
 use jfn_linux_util::input::{compose_feed, compose_pending, jfn_input_dispatch_key_raw};
 use jfn_playback::shutdown::jfn_shutdown_register_waker;
@@ -141,7 +142,11 @@ enum QueuedInputEvent {
         x: i32,
         y: i32,
         modifiers: u32,
-        motion: PointerMotion,
+    },
+    MouseLeave {
+        x: i32,
+        y: i32,
+        modifiers: u32,
     },
     Scroll {
         x: i32,
@@ -317,7 +322,10 @@ fn handle_key(st: &mut State, detail: u8, pressed: bool) -> Result<(), InputErro
             queue(
                 &st.dispatch,
                 QueuedInputEvent::HistoryNav {
-                    direction: HistoryDirection::from_forward(sym == XKB_KEY_XF86FORWARD),
+                    direction: match sym {
+                        XKB_KEY_XF86FORWARD => HistoryDirection::Forward,
+                        _ => HistoryDirection::Back,
+                    },
                 },
             )
         } else {
@@ -420,7 +428,10 @@ fn handle_button(
             return queue(
                 &st.dispatch,
                 QueuedInputEvent::HistoryNav {
-                    direction: HistoryDirection::from_forward(button == 9),
+                    direction: match button {
+                        9 => HistoryDirection::Forward,
+                        _ => HistoryDirection::Back,
+                    },
                 },
             );
         }
@@ -490,7 +501,6 @@ fn handle_motion(st: &mut State, ev: &xcb::x::MotionNotifyEvent) -> Result<(), I
             x: st.ptr_x,
             y: st.ptr_y,
             modifiers: cef_modifiers(st),
-            motion: PointerMotion::Within,
         },
     )
 }
@@ -506,19 +516,18 @@ fn handle_enter(st: &mut State, ev: &xcb::x::EnterNotifyEvent) -> Result<(), Inp
             x: st.ptr_x,
             y: st.ptr_y,
             modifiers: cef_modifiers(st),
-            motion: PointerMotion::Within,
         },
     )
 }
 
-fn handle_leave(st: &State, _ev: &xcb::x::LeaveNotifyEvent) -> Result<(), InputError> {
+fn handle_leave(st: &State, ev: &xcb::x::LeaveNotifyEvent) -> Result<(), InputError> {
+    let point = view_point(ev.event_x() as i32, ev.event_y() as i32)?;
     queue(
         &st.dispatch,
-        QueuedInputEvent::MouseMove {
-            x: st.ptr_x,
-            y: st.ptr_y,
+        QueuedInputEvent::MouseLeave {
+            x: point.x,
+            y: point.y,
             modifiers: cef_modifiers(st),
-            motion: PointerMotion::Leave,
         },
     )
 }
@@ -719,7 +728,7 @@ fn cursor_thread_body(screen_num: i32, window: u32, requests: Channel<CursorShap
     }
 }
 
-fn dispatch_input_event(ev: QueuedInputEvent) {
+fn dispatch_input_event(focus: &mut PointerFocus, ev: QueuedInputEvent) {
     match ev {
         QueuedInputEvent::KeyRaw {
             sym,
@@ -746,12 +755,12 @@ fn dispatch_input_event(ev: QueuedInputEvent) {
             y,
             modifiers,
         } => jfn_input_dispatch_mouse_button(code, pressed, window_point(x, y), modifiers),
-        QueuedInputEvent::MouseMove {
-            x,
-            y,
-            modifiers,
-            motion,
-        } => jfn_input_dispatch_mouse_move(window_point(x, y), modifiers, motion),
+        QueuedInputEvent::MouseMove { x, y, modifiers } => {
+            jfn_input_dispatch_mouse_move(focus, window_point(x, y), modifiers)
+        }
+        QueuedInputEvent::MouseLeave { x, y, modifiers } => {
+            jfn_input_dispatch_mouse_leave(focus, window_point(x, y), modifiers)
+        }
         QueuedInputEvent::Scroll {
             x,
             y,
@@ -763,7 +772,7 @@ fn dispatch_input_event(ev: QueuedInputEvent) {
 }
 
 fn input_dispatch_thread_body(events: Channel<QueuedInputEvent>) {
-    let mut event_loop: EventLoop<'_, ()> = match EventLoop::try_new() {
+    let mut event_loop: EventLoop<'_, PointerFocus> = match EventLoop::try_new() {
         Ok(el) => el,
         Err(e) => {
             eprintln!("[x11] failed to create input dispatch event loop: {e}");
@@ -773,8 +782,8 @@ fn input_dispatch_thread_body(events: Channel<QueuedInputEvent>) {
     let signal = event_loop.get_signal();
     let res = event_loop
         .handle()
-        .insert_source(events, move |ev, (), ()| match ev {
-            ChannelEvent::Msg(ev) => dispatch_input_event(ev),
+        .insert_source(events, move |ev, (), focus| match ev {
+            ChannelEvent::Msg(ev) => dispatch_input_event(focus, ev),
             ChannelEvent::Closed => signal.stop(),
         });
     if let Err(e) = res {
@@ -782,7 +791,8 @@ fn input_dispatch_thread_body(events: Channel<QueuedInputEvent>) {
         return;
     }
 
-    if let Err(e) = event_loop.run(None, &mut (), |()| {}) {
+    let mut focus = PointerFocus::new();
+    if let Err(e) = event_loop.run(None, &mut focus, |_| {}) {
         eprintln!("[x11] input dispatch event loop exited: {e}");
     }
 }
