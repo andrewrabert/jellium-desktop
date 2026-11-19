@@ -43,7 +43,7 @@ pub const INGEST_FLAG_SHUTDOWN: u8 = 1;
 struct PlatformCtx<'a>(&'a dyn jfn_platform_abi::Platform);
 
 impl IngestCtx for PlatformCtx<'_> {
-    fn scale(&self) -> Scale {
+    fn scale(&self) -> Result<Scale, WindowStateError> {
         self.0.scale()
     }
 
@@ -152,7 +152,15 @@ pub fn jfn_playback_window_maximized() -> bool {
 /// the host's current logical content size, then wakes the window-changed
 /// subscribers. `false` when neither a logical content size nor a stored
 /// extent is available.
-pub fn jfn_playback_rescale_window_extent() -> Result<bool, ExtentError> {
+#[derive(Debug, thiserror::Error)]
+pub enum RescaleError {
+    #[error("window scale: {0}")]
+    Scale(#[from] WindowStateError),
+    #[error(transparent)]
+    Extent(#[from] ExtentError),
+}
+
+pub fn jfn_playback_rescale_window_extent() -> Result<bool, RescaleError> {
     let Some(lease) = jfn_platform_abi::try_lease() else {
         return Ok(false);
     };
@@ -164,7 +172,7 @@ pub fn jfn_playback_rescale_window_extent() -> Result<bool, ExtentError> {
             None => return Ok(false),
         },
     };
-    let extent = extent_at(plat.scale(), logical)?;
+    let extent = extent_at(plat.scale()?, logical)?;
     state().set_window_extent(extent);
     jfn_platform_abi::notify_window_changed();
     Ok(true)

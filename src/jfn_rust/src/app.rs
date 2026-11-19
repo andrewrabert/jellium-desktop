@@ -447,14 +447,16 @@ fn initialize_playback_coordination() -> PlaybackCoordination {
 enum CleanupError {
     #[error("mpv termination unconfirmed: {0}")]
     Termination(String),
-    #[error("shell shutdown: {0:?}")]
-    Shell(crate::shell::ShutdownOutcome),
+    #[error(transparent)]
+    Shell(#[from] crate::shell::ShellShutdownError),
     #[error(transparent)]
     Cef(#[from] jfn_cef::ShutdownError),
     #[error(transparent)]
     Platform(#[from] jfn_platform_abi::PlatformBusy),
     #[error(transparent)]
     HostRelease(#[from] jfn_platform_abi::HostReleaseError),
+    #[error(transparent)]
+    Detach(#[from] jfn_platform_abi::DetachError),
 }
 #[derive(Debug)]
 struct CleanupErrors(Vec<CleanupError>);
@@ -526,53 +528,85 @@ struct InitializedNative {
     mpv: MpvRuntime,
 }
 trait NativePhase {
-    fn cleanup(self) -> Result<(), CleanupError>;
+    fn cleanup(self) -> Result<(), CleanupErrors>;
+}
+fn detached(error: jfn_platform_abi::DetachError, rest: Result<(), CleanupError>) -> CleanupErrors {
+    let mut failures = vec![CleanupError::from(error)];
+    failures.extend(rest.err());
+    CleanupErrors(failures)
+}
+fn post_window_failure(
+    failure: jfn_platform_abi::PostWindowError<jfn_platform_abi::BlockingError>,
+) -> CleanupError {
+    match failure {
+        jfn_platform_abi::PostWindowError::Termination { error, post_window } => {
+            let detail = error.to_string();
+            error.abandon();
+            post_window.abandon();
+            CleanupError::Termination(detail)
+        }
+        jfn_platform_abi::PostWindowError::HostRelease(error) => error.into(),
+    }
 }
 impl NativePhase for PreparedNative {
-    fn cleanup(self) -> Result<(), CleanupError> {
+    fn cleanup(self) -> Result<(), CleanupErrors> {
+        let failed = |failure| match failure {
+            jfn_platform_abi::PostWindowError::<std::convert::Infallible>::Termination {
+                error,
+                ..
+            } => match error {},
+            jfn_platform_abi::PostWindowError::HostRelease(error) => CleanupError::from(error),
+        };
         match self
             .prepared
             .cleanup(|| Ok::<(), std::convert::Infallible>(()))
         {
             Ok(()) => Ok(()),
-            Err(jfn_platform_abi::PostWindowError::Termination { error, .. }) => match error {},
-            Err(jfn_platform_abi::PostWindowError::HostRelease(error)) => Err(error.into()),
+            Err(jfn_platform_abi::PreparedCleanupError::PostWindow(failure)) => {
+                Err(CleanupErrors(vec![failed(failure)]))
+            }
+            Err(jfn_platform_abi::PreparedCleanupError::Detach { error, rest }) => {
+                Err(detached(error, rest.map_err(failed)))
+            }
         }
     }
 }
 impl NativePhase for MpvNative {
-    fn cleanup(self) -> Result<(), CleanupError> {
+    fn cleanup(self) -> Result<(), CleanupErrors> {
         match self.prepared.cleanup(|| self.mpv.terminate()) {
             Ok(()) => Ok(()),
-            Err(jfn_platform_abi::PostWindowError::Termination { error, post_window }) => {
-                let detail = error.to_string();
-                error.abandon();
-                post_window.abandon();
-                Err(CleanupError::Termination(detail))
+            Err(jfn_platform_abi::PreparedCleanupError::PostWindow(failure)) => {
+                Err(CleanupErrors(vec![post_window_failure(failure)]))
             }
-            Err(jfn_platform_abi::PostWindowError::HostRelease(error)) => Err(error.into()),
+            Err(jfn_platform_abi::PreparedCleanupError::Detach { error, rest }) => {
+                Err(detached(error, rest.map_err(post_window_failure)))
+            }
         }
     }
 }
 impl NativePhase for InitializedNative {
-    fn cleanup(self) -> Result<(), CleanupError> {
+    fn cleanup(self) -> Result<(), CleanupErrors> {
         self.platform
             .platform()
             .set_idle_inhibit(IdleInhibitLevel::None);
-        match self.platform.cleanup(|| self.mpv.terminate()) {
-            Ok(()) => Ok(()),
+        let failure = match self.platform.cleanup(|| self.mpv.terminate()) {
+            Ok(()) => return Ok(()),
             Err(jfn_platform_abi::PlatformCleanupError::Busy { runtime, terminate }) => {
                 let _ = Box::leak(Box::new((runtime, terminate)));
-                Err(jfn_platform_abi::PlatformBusy.into())
+                jfn_platform_abi::PlatformBusy.into()
             }
             Err(jfn_platform_abi::PlatformCleanupError::Termination { error, post_window }) => {
-                let detail = error.to_string();
-                error.abandon();
-                post_window.abandon();
-                Err(CleanupError::Termination(detail))
+                post_window_failure(jfn_platform_abi::PostWindowError::Termination {
+                    error,
+                    post_window,
+                })
             }
-            Err(jfn_platform_abi::PlatformCleanupError::HostRelease(error)) => Err(error.into()),
-        }
+            Err(jfn_platform_abi::PlatformCleanupError::HostRelease(error)) => error.into(),
+            Err(jfn_platform_abi::PlatformCleanupError::Detach { error, rest }) => {
+                return Err(detached(error, rest.map_err(post_window_failure)));
+            }
+        };
+        Err(CleanupErrors(vec![failure]))
     }
 }
 struct NativeOwner<P: NativePhase>(Option<P>);
@@ -596,7 +630,7 @@ impl<P: NativePhase> NativeOwner<P> {
             .expect("native phase already consumed by teardown")
     }
 
-    fn cleanup(&mut self) -> Result<(), CleanupError> {
+    fn cleanup(&mut self) -> Result<(), CleanupErrors> {
         self.0.take().map_or(Ok(()), NativePhase::cleanup)
     }
 }
@@ -664,11 +698,10 @@ impl Services {
         let playback = self.playback.take().map(PlaybackCoordination::stop);
         jfn_config::settings_shutdown_save_worker();
         let mut failures = Vec::new();
-        if let Some(shell) = self.shell.take() {
-            let result = shell.shutdown();
-            if result != crate::shell::ShutdownOutcome::Terminated {
-                failures.push(CleanupError::Shell(result));
-            }
+        if let Some(shell) = self.shell.take()
+            && let Err(error) = shell.shutdown()
+        {
+            failures.push(error.into());
         }
         WEB_OVERLAY.lock().take();
         if let Some(mut cef) = self.cef.take()
@@ -697,8 +730,8 @@ impl Drop for Services {
 impl<P: NativePhase> StartupResources<P> {
     fn cleanup(&mut self) -> Result<(), CleanupErrors> {
         let mut failures = self.services.cleanup().err().map_or_else(Vec::new, |e| e.0);
-        if let Err(error) = self.native.cleanup() {
-            failures.push(error);
+        if let Err(errors) = self.native.cleanup() {
+            failures.extend(errors.0);
         }
         if failures.is_empty() {
             Ok(())
@@ -796,9 +829,10 @@ fn boot_mpv_reconcile(hz: f64) -> Result<(), MpvReconcileError> {
     let window = crate::window_geometry::controller()
         .source()
         .window_state()?;
+    let scale = plat().scale()?;
     tracing::info!(target: "Main",
-        "[FLOW] scale={} fullscreen={} display-hz={hz}",
-        plat().scale(), window.fullscreen
+        "[FLOW] scale={scale} fullscreen={} display-hz={hz}",
+        window.fullscreen
     );
 
     // Saved intent, not an observation: the OS may still be applying the
@@ -808,10 +842,9 @@ fn boot_mpv_reconcile(hz: f64) -> Result<(), MpvReconcileError> {
     let Some((logical, physical)) = crate::window_geometry::saved_sizes(&saved) else {
         return Ok(());
     };
-    let reconciled =
-        plat()
-            .window_owner()
-            .reconcile_mpv_size(plat().scale(), logical, physical, locked)?;
+    let reconciled = plat()
+        .window_owner()
+        .reconcile_mpv_size(scale, logical, physical, locked)?;
     if let Some(resized) = reconciled {
         let clamped = plat().clamp_window_geometry(&WindowGeometry {
             w: resized.w,
@@ -821,8 +854,8 @@ fn boot_mpv_reconcile(hz: f64) -> Result<(), MpvReconcileError> {
         let (new_pw, new_ph) = (clamped.w, clamped.h);
         let geom_str = format!("{new_pw}x{new_ph}");
         tracing::info!(target: "Main",
-            "[FLOW] scale {}, saved {}x{} logical at {}x{} physical, resize to {}",
-            plat().scale(), logical.w, logical.h,
+            "[FLOW] scale {scale}, saved {}x{} logical at {}x{} physical, resize to {}",
+            logical.w, logical.h,
             physical.w, physical.h, geom_str);
         let g_c = cs(&geom_str);
         unsafe { jfn_mpv::api::jfn_mpv_set_geometry(g_c.as_ptr()) };
@@ -1402,7 +1435,7 @@ mod lifecycle_tests {
     fn native_owner_cleanup_runs_exactly_once_after_explicit_teardown() {
         struct Fake(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl NativePhase for Fake {
-            fn cleanup(self) -> Result<(), CleanupError> {
+            fn cleanup(self) -> Result<(), CleanupErrors> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
@@ -1417,7 +1450,7 @@ mod lifecycle_tests {
     fn native_owner_rolls_back_during_unwind() {
         struct Fake(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl NativePhase for Fake {
-            fn cleanup(self) -> Result<(), CleanupError> {
+            fn cleanup(self) -> Result<(), CleanupErrors> {
                 self.0.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }

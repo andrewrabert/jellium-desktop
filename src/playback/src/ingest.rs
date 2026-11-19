@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use crossbeam_utils::atomic::AtomicCell;
 use jfn_mpv::{Event, ObserveId, PropertyValue};
-use jfn_platform_abi::{ExtentError, LogicalSize, PhysicalSize, Scale, WindowExtent};
+use jfn_platform_abi::{
+    ExtentError, LogicalSize, PhysicalSize, Scale, WindowExtent, WindowStateError,
+};
 
 use crate::coordinator::Input;
 use crate::types::{EndReason, PlaybackBufferedRange};
@@ -44,13 +46,15 @@ pub enum IngestError {
     OsdDimsRange(#[from] std::num::TryFromIntError),
     #[error(transparent)]
     OsdDimsExtent(#[from] ExtentError),
+    #[error("window scale: {0}")]
+    Scale(#[from] WindowStateError),
 }
 
 /// Caller-provided platform hooks. Implementations stay outside this crate so
 /// jfn-playback doesn't grow a platform dep.
 pub trait IngestCtx {
     /// The display scale the platform reports.
-    fn scale(&self) -> Scale;
+    fn scale(&self) -> Result<Scale, WindowStateError>;
 
     /// The app window's logical size where the OS, not mpv's
     /// `osd-dimensions`, is the authority for it.
@@ -272,7 +276,7 @@ fn digest_osd_dims<C: IngestCtx>(
     }
     let (w, h) = (i32::try_from(w)?, i32::try_from(h)?);
     let physical = PhysicalSize { w, h };
-    let scale = ctx.scale();
+    let scale = ctx.scale()?;
     let extent = match ctx.os_logical_size().filter(|l| l.w > 0 && l.h > 0) {
         Some(logical) => extent_at(scale, logical),
         None => extent_of(scale, physical),
@@ -353,8 +357,8 @@ mod tests {
         mac: Option<LogicalSize>,
     }
     impl IngestCtx for TestCtx {
-        fn scale(&self) -> Scale {
-            self.scale
+        fn scale(&self) -> Result<Scale, WindowStateError> {
+            Ok(self.scale)
         }
         fn os_logical_size(&self) -> Option<LogicalSize> {
             self.mac

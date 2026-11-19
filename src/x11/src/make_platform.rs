@@ -46,8 +46,12 @@ impl Platform for X11Platform {
         crate::lifecycle::init()
     }
 
-    fn cleanup(&self, _access: &jfn_platform_abi::LifecycleAccess) {
+    fn cleanup(
+        &self,
+        _access: &jfn_platform_abi::LifecycleAccess,
+    ) -> Result<(), jfn_platform_abi::DetachError> {
         crate::lifecycle::cleanup();
+        Ok(())
     }
 
     // Runs after mpv_terminate_destroy: mpv's embedded window is gone, so the
@@ -96,9 +100,9 @@ impl Platform for X11Platform {
         surface::set_visibility(SurfaceId::from_handle(s), visibility)
     }
 
-    fn apply_stack(&self, ordered: &[SurfaceHandle]) {
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) -> Result<(), jfn_platform_abi::StackError> {
         let ids: Vec<SurfaceId> = ordered.iter().map(|&h| SurfaceId::from_handle(h)).collect();
-        surface::apply_stack(&ids);
+        surface::apply_stack(&ids)
     }
 
     fn menu_delivery(
@@ -161,8 +165,8 @@ impl Platform for X11Platform {
         crate::geometry::set_parent_fullscreen(!parent.fullscreen);
     }
 
-    fn scale(&self) -> jfn_platform_abi::Scale {
-        crate::scale::window_scale()
+    fn scale(&self) -> Result<jfn_platform_abi::Scale, jfn_platform_abi::WindowStateError> {
+        Ok(crate::scale::window_scale())
     }
 
     fn display_scale(&self, at: Option<WindowPos>) -> jfn_platform_abi::Scale {

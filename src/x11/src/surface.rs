@@ -170,8 +170,12 @@ pub fn set_visibility(id: SurfaceId, visibility: Visibility) -> VisibilityCommit
 }
 
 /// Stack `ordered[0..]` above the app top-level, bottom to top.
-pub fn apply_stack(ordered: &[SurfaceId]) {
-    let _ = enqueue(GeometryCommand::SetOrder {
+pub fn apply_stack(ordered: &[SurfaceId]) -> Result<(), jfn_platform_abi::StackError> {
+    enqueue(GeometryCommand::SetOrder {
         ids: ordered.to_vec(),
-    });
+    })
+    .map(|_ticket| ())
+    .ok_or_else(|| {
+        jfn_platform_abi::StackError::new("X11 restack", "the geometry thread is not running")
+    })
 }

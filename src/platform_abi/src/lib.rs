@@ -470,7 +470,7 @@ pub trait Platform: Send + Sync {
     fn early_init(&self);
     /// `mpv` is the opaque libmpv `mpv_handle` — a raw C handle, stays raw.
     fn init(&self, access: &LifecycleAccess, mpv: *mut c_void) -> Result<(), PlatformInitError>;
-    fn cleanup(&self, access: &LifecycleAccess);
+    fn cleanup(&self, access: &LifecycleAccess) -> Result<(), DetachError>;
     fn post_window_cleanup(&self, access: &LifecycleAccess) -> Result<(), HostReleaseError>;
 
     // Per-surface
@@ -507,7 +507,7 @@ pub trait Platform: Send + Sync {
 
     /// Applies the whole order, bottom first, in one transaction, and pins the
     /// video plane below every named surface.
-    fn apply_stack(&self, ordered: &[SurfaceHandle]);
+    fn apply_stack(&self, ordered: &[SurfaceHandle]) -> Result<(), StackError>;
 
     /// How this backend delivers `kind`; `Host` names the backend's own menu
     /// host.
@@ -549,7 +549,7 @@ pub trait Platform: Send + Sync {
     fn resize_gate(&self) -> Option<&dyn ResizeGate>;
 
     /// The display scale this backend reports for the app window.
-    fn scale(&self) -> Scale;
+    fn scale(&self) -> Result<Scale, WindowStateError>;
 
     /// The display scale this backend reports for the display holding `at`,
     /// or for its own default display when `at` is `None`.
@@ -955,17 +955,21 @@ impl PreparedPlatform {
             _thread: std::marker::PhantomData,
         })
     }
-    pub fn cleanup<F, E>(self, terminate_window: F) -> Result<(), PostWindowError<E>>
+    pub fn cleanup<F, E>(self, terminate_window: F) -> Result<(), PreparedCleanupError<E>>
     where
         F: FnOnce() -> Result<(), E>,
     {
         let access = LifecycleAccess { _private: () };
-        self.platform.cleanup(&access);
-        PostWindowCleanup {
+        let detached = self.platform.cleanup(&access);
+        let rest = PostWindowCleanup {
             platform: self.platform,
             _thread: std::marker::PhantomData,
         }
-        .retry(terminate_window)
+        .retry(terminate_window);
+        match detached {
+            Ok(()) => rest.map_err(PreparedCleanupError::PostWindow),
+            Err(error) => Err(PreparedCleanupError::Detach { error, rest }),
+        }
     }
 }
 impl PlatformRuntime {
@@ -1029,19 +1033,21 @@ impl PlatformRuntime {
             }
         }
         let access = LifecycleAccess { _private: () };
-        self.platform().cleanup(&access);
+        let detached = self.platform().cleanup(&access);
         let remaining = PostWindowCleanup {
             platform: self.lease.platform,
             _thread: std::marker::PhantomData,
         };
-        remaining
-            .retry(terminate_window)
-            .map_err(|failure| match failure {
+        let rest = remaining.retry(terminate_window);
+        match detached {
+            Ok(()) => rest.map_err(|failure| match failure {
                 PostWindowError::Termination { error, post_window } => {
                     PlatformCleanupError::Termination { error, post_window }
                 }
                 PostWindowError::HostRelease(error) => PlatformCleanupError::HostRelease(error),
-            })
+            }),
+            Err(error) => Err(PlatformCleanupError::Detach { error, rest }),
+        }
     }
 }
 
@@ -1058,6 +1064,18 @@ pub enum PlatformCleanupError<F, E> {
     },
     /// The window is gone and every cleanup phase ran; nothing is retained.
     HostRelease(HostReleaseError),
+    Detach {
+        error: DetachError,
+        rest: Result<(), PostWindowError<E>>,
+    },
+}
+
+pub enum PreparedCleanupError<E> {
+    PostWindow(PostWindowError<E>),
+    Detach {
+        error: DetachError,
+        rest: Result<(), PostWindowError<E>>,
+    },
 }
 
 pub enum PostWindowError<E> {
@@ -1069,6 +1087,64 @@ pub enum PostWindowError<E> {
     /// The window is gone and post-window cleanup ran, but the backend could
     /// not release something. Nothing is retained.
     HostRelease(HostReleaseError),
+}
+
+#[derive(Debug)]
+pub struct DetachError {
+    operation: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl DetachError {
+    pub fn new(
+        operation: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self {
+            operation,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DetachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.operation, self.source)
+    }
+}
+impl std::error::Error for DetachError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+#[derive(Debug)]
+pub struct StackError {
+    operation: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl StackError {
+    pub fn new(
+        operation: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self {
+            operation,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for StackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.operation, self.source)
+    }
+}
+impl std::error::Error for StackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
 }
 
 /// A backend resource that outlives the window could not be released.

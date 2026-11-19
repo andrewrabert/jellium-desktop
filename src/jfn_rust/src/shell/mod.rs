@@ -109,6 +109,16 @@ pub enum StartError {
     StartupAlreadyClaimed,
     #[error("shell thread could not start: {0}")]
     Thread(#[from] std::io::Error),
+    #[error("shell overlay stacking: {0}")]
+    Stack(#[from] jfn_platform_abi::StackError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShellShutdownError {
+    #[error("shell termination unconfirmed: {0:?}")]
+    Unterminated(ShutdownOutcome),
+    #[error("shell overlay unstacking: {0}")]
+    Unstacked(#[from] jfn_platform_abi::StackError),
 }
 /// The actor's sender, created before any thread exists, so work posted before
 /// the render thread starts is delivered when it does.
@@ -165,7 +175,7 @@ pub fn shell_start(
         subscriptions: None,
         _thread: std::marker::PhantomData,
     };
-    jfn_platform_abi::stack::occupy(Plane::ShellOverlay, surface);
+    jfn_platform_abi::stack::occupy(Plane::ShellOverlay, surface)?;
     *SURFACE.lock() = Some(surface);
 
     // Declares that we present to it ourselves: from here the backend attaches
@@ -203,13 +213,13 @@ pub fn shell_start(
 }
 
 impl Shell {
-    pub fn shutdown(mut self) -> ShutdownOutcome {
+    pub fn shutdown(mut self) -> Result<(), ShellShutdownError> {
         self.stop()
     }
 
-    fn stop(&mut self) -> ShutdownOutcome {
+    fn stop(&mut self) -> Result<(), ShellShutdownError> {
         let Some(platform) = self.platform.take() else {
-            return ShutdownOutcome::Terminated;
+            return Ok(());
         };
         CLOSED.store(true, std::sync::atomic::Ordering::Release);
         self.subscriptions.take();
@@ -229,22 +239,19 @@ impl Shell {
         } else {
             ShutdownOutcome::Terminated
         };
-        {
-            if result.terminated() {
-                jfn_platform_abi::stack::vacate(Plane::ShellOverlay);
-                platform.platform().free_surface(self.surface);
-            } else {
-                let _ = Box::leak(Box::new(platform));
-            }
+        if !result.terminated() {
+            let _ = Box::leak(Box::new(platform));
+            return Err(ShellShutdownError::Unterminated(result));
         }
-        result
+        let unstacked = jfn_platform_abi::stack::vacate(Plane::ShellOverlay);
+        platform.platform().free_surface(self.surface);
+        Ok(unstacked?)
     }
 }
 impl Drop for Shell {
     fn drop(&mut self) {
-        let result = self.stop();
-        if !result.terminated() {
-            tracing::error!(?result, "shell termination unconfirmed; retaining platform");
+        if let Err(error) = self.stop() {
+            tracing::error!("shell drop: {error}");
         }
     }
 }
