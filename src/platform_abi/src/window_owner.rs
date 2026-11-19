@@ -86,7 +86,7 @@ impl<'src> WindowOwner<'src> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{COVERED_SCALES, WindowGeometry};
+    use crate::geometry::{COVERED_SCALES, WindowGeometry, WindowPos};
     use crate::window_source::{WindowState, WindowStateError};
     use parking_lot::Mutex;
 
@@ -126,8 +126,7 @@ mod tests {
 
     fn boot(
         scale: Scale,
-        x: i32,
-        y: i32,
+        position: Option<WindowPos>,
         maximized: bool,
     ) -> Result<BootGeometry, Unrepresentable> {
         let logical = LogicalSize { w: 1280, h: 720 };
@@ -135,7 +134,11 @@ mod tests {
         Ok(BootGeometry::from_clamped(
             logical,
             scale,
-            WindowGeometry::from_raw(physical.w, physical.h, x, y),
+            WindowGeometry {
+                w: physical.w,
+                h: physical.h,
+                position,
+            },
             maximized,
         ))
     }
@@ -149,7 +152,7 @@ mod tests {
         for scale in COVERED_SCALES {
             handed.push(
                 owner
-                    .apply_boot_geometry(&boot(scale, 100, 50, false)?)
+                    .apply_boot_geometry(&boot(scale, Some(WindowPos { x: 100, y: 50 }), false)?)
                     .map(|w| w.geometry),
             );
         }
@@ -174,27 +177,27 @@ mod tests {
     #[test]
     fn an_mpv_owner_seeds_nothing_and_answers_the_exact_geometry_string() {
         let owner = WindowOwner::Mpv(&MpvWindow);
-        let describe = |x, y, maximized| {
-            boot(Scale::ONE, x, y, maximized).map(|g| {
+        let describe = |position, maximized| {
+            boot(Scale::ONE, position, maximized).map(|g| {
                 owner
                     .apply_boot_geometry(&g)
                     .map(|w| (w.geometry, w.force_position, w.maximized))
             })
         };
         assert_eq!(
-            describe(-1, -1, false),
+            describe(None, false),
             Ok(Some(("1280x720".to_owned(), false, false)))
         );
         assert_eq!(
-            describe(100, 50, false),
+            describe(Some(WindowPos { x: 100, y: 50 }), false),
             Ok(Some(("1280x720+100+50".to_owned(), true, false)))
         );
         assert_eq!(
-            describe(-1, -1, true),
+            describe(None, true),
             Ok(Some(("1280x720".to_owned(), false, true)))
         );
         assert_eq!(
-            describe(100, 50, true),
+            describe(Some(WindowPos { x: 100, y: 50 }), true),
             Ok(Some(("1280x720+100+50".to_owned(), true, true)))
         );
     }

@@ -796,26 +796,25 @@ fn boot_mpv_reconcile(hz: f64) -> Result<(), MpvReconcileError> {
     // maximize, and a set_geometry landing mid-flight leaves mpv's stored
     // window size disagreeing with the visible window.
     let locked = saved.maximized || window.fullscreen || window.maximized;
-    let reconciled = match crate::window_geometry::saved_sizes(&saved) {
-        Some((logical, physical)) => {
-            plat()
-                .window_owner()
-                .reconcile_mpv_size(plat().scale(), logical, physical, locked)
-        }
-        None => Ok(None),
-    }?;
-    if let Some(physical) = reconciled {
+    let Some((logical, physical)) = crate::window_geometry::saved_sizes(&saved) else {
+        return Ok(());
+    };
+    let reconciled =
+        plat()
+            .window_owner()
+            .reconcile_mpv_size(plat().scale(), logical, physical, locked)?;
+    if let Some(resized) = reconciled {
         let clamped = plat().clamp_window_geometry(WindowGeometry {
-            w: physical.w,
-            h: physical.h,
+            w: resized.w,
+            h: resized.h,
             position: None,
         })?;
         let (new_pw, new_ph) = (clamped.w, clamped.h);
         let geom_str = format!("{new_pw}x{new_ph}");
         tracing::info!(target: "Main",
             "[FLOW] scale {}, saved {}x{} logical at {}x{} physical, resize to {}",
-            plat().scale(), saved.logical_width, saved.logical_height,
-            saved.width, saved.height, geom_str);
+            plat().scale(), logical.w, logical.h,
+            physical.w, physical.h, geom_str);
         let g_c = cs(&geom_str);
         unsafe { jfn_mpv::api::jfn_mpv_set_geometry(g_c.as_ptr()) };
     }

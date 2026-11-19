@@ -385,10 +385,7 @@ impl Platform for WindowsPlatform {
         &self,
         g: WindowGeometry,
     ) -> Result<WindowGeometry, jfn_platform_abi::geometry::ClampError> {
-        let (mut w, mut h) = (g.w, g.h);
-        let (mut x, mut y) = g.raw_position();
-        win_clamp_window_geometry(&mut w, &mut h, &mut x, &mut y)?;
-        Ok(WindowGeometry::from_raw(w, h, x, y))
+        win_clamp_window_geometry(g)
     }
 
     fn pump(&self) {
