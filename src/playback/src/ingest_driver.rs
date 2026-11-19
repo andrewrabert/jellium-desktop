@@ -98,13 +98,12 @@ pub fn jfn_playback_ingest_mpv_event_owned(
     Ok(dispatch(outs))
 }
 
-pub fn jfn_playback_reconcile_window_mode() {
+pub fn jfn_playback_reconcile_window_mode() -> Result<(), WindowModeError> {
     match reconcile_window_mode() {
-        Ok(())
-        | Err(WindowModeError::WindowState(
+        Err(WindowModeError::WindowState(
             WindowStateError::NoWindow | WindowStateError::WebOffsetUnstated,
-        )) => {}
-        Err(e) => tracing::error!(target: "mpv", "window mode reconcile: {e}"),
+        )) => Ok(()),
+        reconciled => reconciled,
     }
 }
 

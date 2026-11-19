@@ -170,7 +170,13 @@ impl Inner {
             let authority = Arc::clone(&inner.session);
             authority.dispatch(|| {
                 let mut task = DispatchPopupTask::new(inner, idx, selected, selectable.clone());
-                let _ = post_task(ThreadId::UI, Some(&mut task));
+                if post_task(ThreadId::UI, Some(&mut task)) != 1 {
+                    jfn_logging::log(
+                        jfn_logging::Category::Cef,
+                        jfn_logging::Level::Error,
+                        &format!("dropdown selection {idx}: the UI thread rejected the task"),
+                    );
+                }
             });
         });
         match (self.dropdown(), at) {

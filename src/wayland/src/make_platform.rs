@@ -317,7 +317,9 @@ impl Platform for WaylandPlatform {
     }
 
     fn set_titlebar_present(&self, present: bool) {
-        self.rt().window().set_titlebar_present(self.rt(), present);
+        if let Err(e) = self.rt().window().set_titlebar_present(self.rt(), present) {
+            tracing::error!(target: "Main", "titlebar presence: {e}; surfaces left unplaced");
+        }
     }
 
     fn shared_texture_supported(&self) -> bool {

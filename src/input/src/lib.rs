@@ -36,7 +36,9 @@ fn report_window_state(e: &WindowStateError) {
     match e {
         WindowStateError::NoWindow
         | WindowStateError::WebOffsetUnstated
-        | WindowStateError::NoPlatform => {}
+        | WindowStateError::NoPlatform => {
+            tracing::trace!(target: "Main", "input: window state: {e}");
+        }
         e => tracing::error!(target: "Main", "input: window state: {e}"),
     }
 }

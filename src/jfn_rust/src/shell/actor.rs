@@ -982,11 +982,14 @@ fn resolve_deferred(
     if let Some(anchor) = menu_anchor {
         let raised = Fields::collect(ui, painter.renderer());
         if let Some(field) = raised.at(point(anchor)) {
-            crate::shell::menu::open_edit(
-                field,
-                anchor,
-                model.basis,
-                crate::shell::lang::strings(),
+            report_menu(
+                "edit menu",
+                crate::shell::menu::open_edit(
+                    field,
+                    anchor,
+                    model.basis,
+                    crate::shell::lang::strings(),
+                ),
             );
         }
     }
@@ -1292,6 +1295,13 @@ fn caret_anchor(field: &crate::shell::fields::Snapshot) -> WindowPoint {
 /// The field takes focus on Windows and macOS whether or not the press landed
 /// inside its selection, so the keys typed after the menu closes reach it and
 /// macOS's own Edit menu resolves [`Target::Focused`] to it.
+fn report_menu(menu: &str, opened: Result<(), jfn_platform_abi::MenuOpenError>) {
+    match opened {
+        Ok(()) | Err(jfn_platform_abi::MenuOpenError::NothingSelectable) => {}
+        Err(e) => tracing::error!("{menu}: {e}"),
+    }
+}
+
 fn raise_menu(
     fields: &Fields,
     p: WindowPoint,
@@ -1302,7 +1312,7 @@ fn raise_menu(
 ) -> Option<WindowPoint> {
     let at = point(p);
     let Some(field) = fields.at(at) else {
-        (actions.open_menu)(p, basis, restricted);
+        report_menu("app menu", (actions.open_menu)(p, basis, restricted));
         return None;
     };
     let lease = jfn_platform_abi::try_lease()?;

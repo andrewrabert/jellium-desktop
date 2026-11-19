@@ -45,20 +45,17 @@ impl WindowGeometryController {
 
     /// Read live state and write it back to config. Called at teardown before
     /// any thread-join that could hang.
-    pub fn persist(&self) {
+    pub fn persist(&self) -> Result<(), WindowStateError> {
         let was_max_before_fs =
             jfn_playback::browser_sink::jfn_playback_was_maximized_before_fullscreen();
-        match geometry_to_persist(
+        if let Some(g) = geometry_to_persist(
             self.source(),
             jfn_config::window_geometry(),
             was_max_before_fs,
-        ) {
-            Ok(Some(g)) => jfn_config::set_window_geometry(g),
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!(target: "Main", "window geometry not persisted: {e}; the saved geometry stands");
-            }
+        )? {
+            jfn_config::set_window_geometry(g);
         }
+        Ok(())
     }
 }
 

@@ -133,16 +133,20 @@ impl SoftwareMenu {
             if surface.window_basis() != live.menu.basis {
                 return close_current(s, MenuClose::Finished);
             }
-            let asked = view(&live.laid).map(|v| v.logical());
-            if let Err(e) = &asked {
-                tracing::error!(target: "menu", "menu extent as asked: {e}");
-            }
-            if asked != Ok(configured) {
+            let asked = match view(&live.laid) {
+                Ok(v) => v.logical(),
+                Err(e) => {
+                    tracing::error!(target: "menu", "menu extent as asked: {e}; closing");
+                    return close_current(s, MenuClose::Finished);
+                }
+            };
+            if asked != configured {
                 let scale = live.laid.metrics.scale;
                 match scale.to_physical(configured.h) {
                     Ok(h) => live.laid.view_ph = live.laid.view_ph.min(h),
                     Err(e) => {
-                        tracing::error!(target: "menu", "configured menu height: {e}");
+                        tracing::error!(target: "menu", "configured menu height: {e}; closing");
+                        return close_current(s, MenuClose::Finished);
                     }
                 }
                 let active = live.menu.fsm.active;
@@ -191,8 +195,8 @@ impl SoftwareMenu {
                     let (x, y) = match buffer_point(&live.laid, at) {
                         Ok(point) => point,
                         Err(e) => {
-                            tracing::error!(target: "menu", "menu pointer position: {e}");
-                            return None;
+                            tracing::error!(target: "menu", "menu pointer position: {e}; closing");
+                            return close_current(s, MenuClose::Finished);
                         }
                     };
                     step(

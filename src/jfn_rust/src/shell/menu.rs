@@ -95,12 +95,12 @@ pub fn open_edit(
     anchor: WindowPoint,
     basis: jfn_platform_abi::WindowBasis,
     strings: &Strings,
-) {
+) -> Result<(), MenuOpenError> {
     let Some(lease) = jfn_platform_abi::try_lease() else {
-        return;
+        return Ok(());
     };
     let MenuDelivery::Host(host) = lease.platform().menu_delivery(MenuKind::ContextMenu) else {
-        return;
+        return Ok(());
     };
     let items = Item::ALL
         .into_iter()
@@ -112,7 +112,7 @@ pub fn open_edit(
         })
         .collect();
     let id = field.id.clone();
-    let opened = host.open(MenuRequest {
+    host.open(MenuRequest {
         items,
         anchor,
         basis,
@@ -127,11 +127,8 @@ pub fn open_edit(
                 command: item.command(),
             });
         }),
-    });
-    match opened {
-        Ok(_) | Err(MenuOpenError::NothingSelectable) => {}
-        Err(e) => tracing::error!("edit menu: {e}"),
-    }
+    })
+    .map(drop)
 }
 
 #[cfg(test)]
