@@ -52,13 +52,19 @@ pub fn jfn_playback_init() {
         register_builtin_sinks(&c);
         c.start();
         c.window_subscription = Some(jfn_platform_abi::subscribe_window_changed(
-            crate::ingest_driver::jfn_playback_reconcile_window_mode,
+            reconcile_window_mode,
         ));
         *guard = Some(c);
     }
     // The immediate reconcile is load-bearing: mode posts made before the
     // coordinator existed were dropped by `post`, and no wakeup replays them.
-    crate::ingest_driver::jfn_playback_reconcile_window_mode();
+    reconcile_window_mode();
+}
+
+fn reconcile_window_mode() {
+    if let Err(e) = crate::ingest_driver::jfn_playback_reconcile_window_mode() {
+        tracing::error!(target: "mpv", "window mode reconcile: {e}");
+    }
 }
 
 fn register_builtin_sinks(c: &PlaybackCoordinator) {

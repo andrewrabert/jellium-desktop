@@ -60,6 +60,19 @@ pub(crate) enum BuildError {
     BelowOnePixel { w: i32, h: i32 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+pub(crate) enum PublishError {
+    #[error("window extent {w}x{h}: {source}")]
+    Extent {
+        w: c_int,
+        h: c_int,
+        #[source]
+        source: BuildError,
+    },
+    #[error("window state placement: {0}")]
+    Placement(#[from] Unrepresentable),
+}
+
 impl WindowExtent {
     fn build(
         logical: WindowSize,
@@ -254,13 +267,18 @@ impl WindowState {
         st.scale = Some(crate::scale::unstated(&mut st.unstated));
     }
 
-    pub(crate) fn publish(&self, rt: &'static WlRuntime, logical: WindowSize, mode: WindowMode) {
+    pub(crate) fn publish(
+        &self,
+        rt: &'static WlRuntime,
+        logical: WindowSize,
+        mode: WindowMode,
+    ) -> Result<(), PublishError> {
         let decorations = rt.root().effective_decorations();
         let fullscreen = mode == WindowMode::Fullscreen;
         let built = {
             let mut st = self.inner.write();
             let Some(scale) = st.scale else {
-                return;
+                return Ok(());
             };
             match WindowExtent::build(logical, scale, mode, st.generation + 1) {
                 Ok(extent) => {
@@ -284,28 +302,25 @@ impl WindowState {
                 Err(e) => Err(e),
             }
         };
-        let (extent, web_top, changed) = match built {
-            Ok(built) => built,
-            Err(e) => {
-                tracing::error!(
-                    target: "Main",
-                    "window extent {}x{}: {e}; the published extent stands",
-                    logical.w(),
-                    logical.h()
-                );
-                return;
-            }
-        };
+        let (extent, web_top, changed) = built.map_err(|source| PublishError::Extent {
+            w: logical.w(),
+            h: logical.h(),
+            source,
+        })?;
         tracing::debug!(
             target: "Main",
             "window extent gen={} logical={}x{} physical={}x{} scale={} web_top={web_top:?}",
             extent.generation, extent.logical.w, extent.logical.h,
             extent.physical.w, extent.physical.h, extent.scale
         );
-        Self::published(rt, fullscreen, changed);
+        Ok(Self::published(rt, fullscreen, changed)?)
     }
 
-    pub(crate) fn set_titlebar_present(&self, rt: &'static WlRuntime, present: bool) {
+    pub(crate) fn set_titlebar_present(
+        &self,
+        rt: &'static WlRuntime,
+        present: bool,
+    ) -> Result<(), Unrepresentable> {
         let decorations = rt.root().effective_decorations();
         let (fullscreen, changed) = {
             let mut st = self.inner.write();
@@ -315,29 +330,34 @@ impl WindowState {
                 Titlebar::Absent
             };
             if st.titlebar == titlebar {
-                return;
+                return Ok(());
             }
             st.titlebar = titlebar;
             let Some(extent) = st.extent else {
-                return;
+                return Ok(());
             };
             let fullscreen = extent.mode == WindowMode::Fullscreen;
             let web_top = Some(jfn_platform_abi::web_top(decorations, fullscreen, present));
             (fullscreen, st.set_web_top(web_top))
         };
-        Self::published(rt, fullscreen, changed);
+        Self::published(rt, fullscreen, changed)
     }
 
-    fn published(rt: &'static WlRuntime, fullscreen: bool, changed: bool) {
-        if rt.try_core().is_some()
-            && let Err(e) = wl_ops::on_configure(rt, fullscreen)
-        {
-            tracing::error!(target: "Main", "window state published: {e}; left unplaced");
-        }
+    fn published(
+        rt: &'static WlRuntime,
+        fullscreen: bool,
+        changed: bool,
+    ) -> Result<(), Unrepresentable> {
+        let placed = if rt.try_core().is_some() {
+            wl_ops::on_configure(rt, fullscreen)
+        } else {
+            Ok(())
+        };
         jfn_platform_abi::notify_window_changed();
         if changed && let Some(menu) = rt.menu() {
             menu.window_changed();
         }
+        placed
     }
 
     /// The compositor's `wp_fractional_scale_v1.preferred_scale`: the

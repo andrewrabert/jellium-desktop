@@ -784,7 +784,9 @@ impl RunningRuntime {
             jfn_playback::jfn_shutdown_initiate();
         }
         plat().run_main_loop();
-        crate::window_geometry::controller().persist();
+        if let Err(e) = crate::window_geometry::controller().persist() {
+            tracing::error!(target: "Main", "window geometry not persisted: {e}; the saved geometry stands");
+        }
         jfn_config::settings_save();
         let manager = self
             .manager_thread

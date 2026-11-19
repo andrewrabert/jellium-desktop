@@ -41,7 +41,11 @@ use jfn_platform_abi::{
 /// Application policy injected by the process composition root.
 #[derive(Clone, Copy)]
 pub struct ApplicationActions {
-    pub open_menu: fn(jfn_platform_abi::WindowPoint, jfn_platform_abi::WindowBasis, bool),
+    pub open_menu: fn(
+        jfn_platform_abi::WindowPoint,
+        jfn_platform_abi::WindowBasis,
+        bool,
+    ) -> Result<(), jfn_platform_abi::MenuOpenError>,
 }
 
 /// Owns its surface and actor. Drop requests a bounded stop. Unconfirmed

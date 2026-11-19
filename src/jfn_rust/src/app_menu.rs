@@ -40,14 +40,18 @@ fn dispatch(id: i32) -> bool {
     true
 }
 
-fn open_host(anchor: WindowPoint, basis: jfn_platform_abi::WindowBasis, restricted: bool) {
+fn open_host(
+    anchor: WindowPoint,
+    basis: jfn_platform_abi::WindowBasis,
+    restricted: bool,
+) -> Result<(), MenuOpenError> {
     let Some(platform) = jfn_platform_abi::try_lease() else {
-        return;
+        return Ok(());
     };
     let MenuDelivery::Host(host) = platform.menu_delivery(MenuKind::ContextMenu) else {
-        return;
+        return Ok(());
     };
-    let opened = host.open(MenuRequest {
+    host.open(MenuRequest {
         items: items(restricted),
         anchor,
         basis,
@@ -56,11 +60,8 @@ fn open_host(anchor: WindowPoint, basis: jfn_platform_abi::WindowBasis, restrict
         on_selected: MenuSelection::new(|id| {
             dispatch(id);
         }),
-    });
-    match opened {
-        Ok(_) | Err(MenuOpenError::NothingSelectable) => {}
-        Err(e) => tracing::error!("app menu: {e}"),
-    }
+    })
+    .map(drop)
 }
 
 pub(crate) fn shell_actions() -> crate::shell::ApplicationActions {

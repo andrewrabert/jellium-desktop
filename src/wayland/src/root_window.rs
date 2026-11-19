@@ -446,7 +446,9 @@ impl RootState {
         // Pass logical (not physical) size: mpv and the overlay apply scale
         // themselves, so a physical size here would double-scale.
         self.rt.proxy().set_window_size(size);
-        self.rt.window().publish(self.rt, size, self.mode);
+        if let Err(e) = self.rt.window().publish(self.rt, size, self.mode) {
+            tracing::error!(target: "Main", "{e}");
+        }
 
         self.rt
             .root()
