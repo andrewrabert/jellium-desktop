@@ -126,12 +126,16 @@ pub enum MenuOpenError {
     NoWindow,
     #[error("the window state the menu was requested under has been replaced")]
     StaleBasis,
+    #[error("the menu request could not be delivered to the thread that shows it")]
+    Undeliverable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MenuShutdownError {
     #[error("menu thread panicked")]
     ThreadPanicked,
+    #[error("the end request could not be delivered to the menu thread")]
+    Undeliverable,
 }
 
 pub trait MenuHost: Send + Sync {

@@ -96,6 +96,7 @@ pub(crate) fn jfn_cef_initialize(
     platform: &dyn jfn_platform_abi::Platform,
     options: &crate::InitOptions,
 ) -> Result<(), crate::InitError> {
+    let paths = platform.cef_paths()?;
     let mut pending_switches = platform_switches(platform.display());
     if options.disable_gpu_compositing {
         pending_switches.push(state::PendingSwitch::flag("disable-gpu-compositing"));
@@ -128,7 +129,7 @@ pub(crate) fn jfn_cef_initialize(
         settings.multi_threaded_message_loop = 1;
     }
 
-    fill_paths(&mut settings, platform);
+    fill_paths(&mut settings, paths);
 
     // An external pump must install its run-loop hooks before
     // CefInitialize so the first OnScheduleMessagePumpWork (fired
@@ -231,8 +232,7 @@ pub(crate) fn jfn_cef_shutdown(runtime: &crate::InitializedCef) {
 
 // ---- helpers ---------------------------------------------------------------
 
-fn fill_paths(settings: &mut Settings, platform: &dyn jfn_platform_abi::Platform) {
-    let paths = platform.cef_paths();
+fn fill_paths(settings: &mut Settings, paths: jfn_platform_abi::CefPaths) {
     let set = |dst: &mut CefString, v: Option<std::path::PathBuf>| {
         if let Some(v) = v {
             *dst = CefString::from(v.to_string_lossy().as_ref());

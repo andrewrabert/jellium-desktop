@@ -125,7 +125,7 @@ impl Platform for X11Platform {
         &crate::mpv_host::X11MpvHost
     }
 
-    fn cef_paths(&self) -> jfn_platform_abi::CefPaths {
+    fn cef_paths(&self) -> std::io::Result<jfn_platform_abi::CefPaths> {
         jfn_linux_util::cef_paths()
     }
 

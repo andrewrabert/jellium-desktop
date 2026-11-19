@@ -80,7 +80,18 @@ impl MenuHost for WinMenuHost {
         if let Some(prev) = displaced {
             prev.on_selected.resolve(MENU_DISMISSED);
         }
-        let _ = unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_TRACK, WPARAM(0), LPARAM(0)) };
+        if unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_TRACK, WPARAM(0), LPARAM(0)) }.is_err() {
+            let mut current = CURRENT.lock();
+            if *current == Some(handle) {
+                *current = None;
+            }
+            drop(current);
+            let parked = PENDING.lock().take();
+            if let Some(parked) = parked {
+                parked.on_selected.resolve(MENU_DISMISSED);
+            }
+            return Err(MenuOpenError::Undeliverable);
+        }
         Ok(handle)
     }
 
@@ -93,7 +104,9 @@ impl MenuHost for WinMenuHost {
         if let Some(pending) = pending {
             pending.on_selected.resolve(MENU_DISMISSED);
         }
-        post_end();
+        if post_end().is_err() {
+            tracing::error!(target: "platform", "menu hide: end request undeliverable");
+        }
     }
 
     fn shutdown(&self) -> Result<(), MenuShutdownError> {
@@ -101,15 +114,16 @@ impl MenuHost for WinMenuHost {
         if let Some(pending) = pending {
             pending.on_selected.resolve(MENU_DISMISSED);
         }
-        post_end();
-        Ok(())
+        post_end()
     }
 }
 
-fn post_end() {
-    if let Some(hwnd) = input_hwnd() {
-        let _ = unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_END, WPARAM(0), LPARAM(0)) };
-    }
+fn post_end() -> Result<(), MenuShutdownError> {
+    let Some(hwnd) = input_hwnd() else {
+        return Ok(());
+    };
+    unsafe { PostMessageW(Some(hwnd), WM_JFN_MENU_END, WPARAM(0), LPARAM(0)) }
+        .map_err(|_| MenuShutdownError::Undeliverable)
 }
 
 fn wide(s: &str) -> Vec<u16> {

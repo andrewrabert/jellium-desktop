@@ -621,19 +621,20 @@ impl Platform for MacosPlatform {
         &NowPlayingSink
     }
 
-    fn cef_paths(&self) -> jfn_platform_abi::CefPaths {
-        let exe = std::env::current_exe()
-            .and_then(std::fs::canonicalize)
-            .unwrap_or_default();
-        let app_contents = exe.parent().and_then(|p| p.parent()).unwrap_or(&exe);
+    fn cef_paths(&self) -> std::io::Result<jfn_platform_abi::CefPaths> {
+        let exe = std::env::current_exe().and_then(std::fs::canonicalize)?;
+        let app_contents = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| std::io::Error::other("the executable is not inside an app bundle"))?;
         let framework = app_contents
             .join("Frameworks")
             .join("Chromium Embedded Framework.framework");
-        jfn_platform_abi::CefPaths {
+        Ok(jfn_platform_abi::CefPaths {
             framework_dir_path: Some(framework),
             browser_subprocess_path: Some(exe),
             ..Default::default()
-        }
+        })
     }
 
     fn set_fullscreen(&self, v: bool) {

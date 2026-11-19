@@ -206,6 +206,8 @@ pub enum InitError {
     Native,
     #[error("CEF readiness task was rejected")]
     Readiness,
+    #[error("CEF paths: {0}")]
+    Paths(#[from] std::io::Error),
 }
 
 /// One state machine governs native producer admission, overlay registration,
