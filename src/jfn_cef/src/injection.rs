@@ -133,6 +133,7 @@ pub(crate) enum InjectedScript {
     MpvVideoPlayer,
     MpvAudioPlayer,
     InputPlugin,
+    UserSwitch,
     SelectMenu,
 }
 
@@ -144,6 +145,7 @@ impl InjectedScript {
             "mpv-video-player.js" => Self::MpvVideoPlayer,
             "mpv-audio-player.js" => Self::MpvAudioPlayer,
             "input-plugin.js" => Self::InputPlugin,
+            "user-switch.js" => Self::UserSwitch,
             "select-menu.js" => Self::SelectMenu,
             _ => return None,
         })
@@ -156,6 +158,7 @@ impl InjectedScript {
             Self::MpvVideoPlayer => "mpv-video-player.js",
             Self::MpvAudioPlayer => "mpv-audio-player.js",
             Self::InputPlugin => "input-plugin.js",
+            Self::UserSwitch => "user-switch.js",
             Self::SelectMenu => "select-menu.js",
         }
     }
@@ -207,6 +210,7 @@ const WEB_SCRIPTS: &[InjectedScript] = &[
     InjectedScript::MpvVideoPlayer,
     InjectedScript::MpvAudioPlayer,
     InjectedScript::InputPlugin,
+    InjectedScript::UserSwitch,
 ];
 const FUNCTIONS_KEY: &str = "functions";
 const SCRIPTS_KEY: &str = "scripts";
