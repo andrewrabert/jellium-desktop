@@ -1,39 +1,65 @@
 //! Mesa driver environment workarounds, applied per CEF runtime version.
 
 /// The CEF major whose Linux shared-texture OSR capturer requests
-/// `SCANOUT` buffers with the compositor's full modifier list, letting
-/// radeonsi pick an AMD DCC modifier that then never paints. See
+/// `SCANOUT` buffers with the compositor's full modifier list, letting the
+/// driver pick a compressed modifier that then never paints: the first frame
+/// capture fails and the web overlay stays on its first frame. See
 /// <https://github.com/andrewrabert/jellium-desktop/commit/ec4cba2004989cd9e06a96dc6c21ba121bf396f6>.
-const DCC_BROKEN_CEF_MAJOR: u32 = 156;
+const COMPRESSION_BROKEN_CEF_MAJOR: u32 = 156;
 
-const AMD_DEBUG: &str = "AMD_DEBUG";
-const NODCC: &str = "nodcc";
+/// A Mesa debug variable and the flag in it that keeps the driver off its
+/// compressed modifiers. Both variables are comma-separated flag lists
+/// (<https://docs.mesa3d.org/envvars.html>), and a driver ignores the other
+/// vendor's variable, so every entry is exported on every machine.
+struct Workaround {
+    var: &'static str,
+    flag: &'static str,
+}
 
-/// Value `AMD_DEBUG` must carry for `cef_major`, given its current value.
-/// `None` means leave the variable untouched. `AMD_DEBUG` is a
-/// comma-separated flag list (<https://docs.mesa3d.org/envvars.html>), so
-/// an existing value is kept verbatim and `nodcc` appended to it.
-fn amd_debug_for(cef_major: u32, current: Option<&str>) -> Option<String> {
-    if cef_major != DCC_BROKEN_CEF_MAJOR {
+const WORKAROUNDS: [Workaround; 2] = [
+    // radeonsi: Delta Color Compression.
+    Workaround {
+        var: "AMD_DEBUG",
+        flag: "nodcc",
+    },
+    // iris and anv: Color Control Surface compression.
+    Workaround {
+        var: "INTEL_DEBUG",
+        flag: "noccs",
+    },
+];
+
+/// Value a debug variable must carry for `cef_major`, given its current
+/// value. `None` means leave the variable untouched. An existing value is
+/// kept verbatim and `flag` appended to it.
+fn debug_value_for(cef_major: u32, current: Option<&str>, flag: &str) -> Option<String> {
+    if cef_major != COMPRESSION_BROKEN_CEF_MAJOR {
         return None;
     }
     match current.filter(|s| !s.is_empty()) {
-        None => Some(NODCC.to_owned()),
-        Some(cur) if cur.split(',').any(|flag| flag == NODCC) => None,
-        Some(cur) => Some(format!("{cur},{NODCC}")),
+        None => Some(flag.to_owned()),
+        Some(cur) if cur.split(',').any(|f| f == flag) => None,
+        Some(cur) => Some(format!("{cur},{flag}")),
     }
 }
 
-/// Export `AMD_DEBUG=nodcc` to this process and everything it spawns (CEF's
-/// GPU process, mpv) when the loaded libcef is the affected major. Any
-/// other major leaves the environment alone. Must run on the main thread
-/// before CEF initialization and mpv boot, so both inherit it.
-pub fn apply_amd_dcc_workaround(cef_major: u32) -> Option<String> {
-    let current = std::env::var(AMD_DEBUG).ok();
-    let value = amd_debug_for(cef_major, current.as_deref())?;
-    // SAFETY: startup path on the main thread; nothing reads AMD_DEBUG yet.
-    unsafe { std::env::set_var(AMD_DEBUG, &value) };
-    Some(value)
+/// Export `AMD_DEBUG=nodcc` and `INTEL_DEBUG=noccs` to this process and
+/// everything it spawns (CEF's GPU process, mpv) when the loaded libcef is
+/// the affected major. Any other major leaves the environment alone. Must
+/// run on the main thread before CEF initialization and mpv boot, so both
+/// inherit it. Returns each variable it set, with its new value.
+pub fn apply_compression_workarounds(cef_major: u32) -> Vec<(&'static str, String)> {
+    let mut applied = Vec::new();
+    for Workaround { var, flag } in WORKAROUNDS {
+        let current = std::env::var(var).ok();
+        if let Some(value) = debug_value_for(cef_major, current.as_deref(), flag) {
+            // SAFETY: startup path on the main thread; nothing reads the
+            // Mesa debug variables yet.
+            unsafe { std::env::set_var(var, &value) };
+            applied.push((var, value));
+        }
+    }
+    applied
 }
 
 #[cfg(test)]
@@ -42,24 +68,43 @@ mod tests {
 
     #[test]
     fn only_the_broken_major_is_patched() {
-        assert_eq!(amd_debug_for(154, None), None);
-        assert_eq!(amd_debug_for(157, None), None);
-        assert_eq!(amd_debug_for(156, None), Some("nodcc".to_owned()));
+        for flag in ["nodcc", "noccs"] {
+            assert_eq!(debug_value_for(154, None, flag), None);
+            assert_eq!(debug_value_for(157, None, flag), None);
+            assert_eq!(debug_value_for(156, None, flag), Some(flag.to_owned()));
+        }
     }
 
     #[test]
     fn existing_flags_are_kept() {
-        assert_eq!(amd_debug_for(156, Some("")), Some("nodcc".to_owned()));
         assert_eq!(
-            amd_debug_for(156, Some("nodma")),
+            debug_value_for(156, Some(""), "nodcc"),
+            Some("nodcc".to_owned())
+        );
+        assert_eq!(
+            debug_value_for(156, Some("nodma"), "nodcc"),
             Some("nodma,nodcc".to_owned())
         );
         assert_eq!(
-            amd_debug_for(156, Some("nodma,nogfx")),
+            debug_value_for(156, Some("nodma,nogfx"), "nodcc"),
             Some("nodma,nogfx,nodcc".to_owned())
         );
-        assert_eq!(amd_debug_for(156, Some("nodcc")), None);
-        assert_eq!(amd_debug_for(156, Some("nodma,nodcc")), None);
-        assert_eq!(amd_debug_for(154, Some("nodma")), None);
+        assert_eq!(debug_value_for(156, Some("nodcc"), "nodcc"), None);
+        assert_eq!(debug_value_for(156, Some("nodma,nodcc"), "nodcc"), None);
+        assert_eq!(debug_value_for(154, Some("nodma"), "nodcc"), None);
+        assert_eq!(
+            debug_value_for(156, Some("perf"), "noccs"),
+            Some("perf,noccs".to_owned())
+        );
+        assert_eq!(debug_value_for(156, Some("noccs,perf"), "noccs"), None);
+    }
+
+    #[test]
+    fn a_flag_is_matched_whole() {
+        // `noccsx` is not `noccs`; only an exact list entry counts.
+        assert_eq!(
+            debug_value_for(156, Some("noccsx"), "noccs"),
+            Some("noccsx,noccs".to_owned())
+        );
     }
 }
