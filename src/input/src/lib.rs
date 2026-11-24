@@ -22,7 +22,7 @@ pub use sink::{
     EditCommand, FieldEdit, ShellInput, WebInput, field_edit, install_shell, install_web,
     publish_field_edit, publish_shell_state, shell_state, web_became_live,
 };
-pub use touch::TouchPhase;
+pub use touch::{Contact, PointerKind, TouchPhase, TouchPoint, WebTouch};
 
 use route::{from_web_point, is_text, route_key, route_pointer, to_web_point};
 use sink::{with_shell, with_web};
@@ -260,7 +260,8 @@ fn dispatch_scroll(p: WindowPoint, dx: i32, dy: i32, mods: u32) {
 
 static TOUCHES: parking_lot::Mutex<touch::Touches> = parking_lot::Mutex::new(touch::Touches::new());
 
-pub fn jfn_input_dispatch_touch(id: i32, phase: TouchPhase, p: WindowPoint, mods: u32) {
+pub fn jfn_input_dispatch_touch(point: TouchPoint, phase: TouchPhase, mods: u32) {
+    let p = point.position;
     let routing = match routing() {
         Ok(routing) => routing,
         Err(e) => {
@@ -268,16 +269,27 @@ pub fn jfn_input_dispatch_touch(id: i32, phase: TouchPhase, p: WindowPoint, mods
             None
         }
     };
-    let delivery = TOUCHES
-        .lock()
-        .route(id, phase, routing.map(|routing| route::hit(routing, p)));
+    let delivery = TOUCHES.lock().route(
+        point.contact,
+        phase,
+        routing.map(|routing| route::hit(routing, p)),
+    );
     match delivery {
-        touch::Delivery::Web(phase) => {
+        touch::Delivery::Web(phase, id) => {
             let Some(routing) = routing else {
                 return;
             };
             let w = to_web_point(p, routing.web_top);
-            with_web(|b| b.send_touch_event(id, w, mods, phase));
+            let touch = WebTouch {
+                id,
+                x: w.x() as f32,
+                y: w.y() as f32,
+                pressure: point.pressure,
+                kind: point.kind,
+                phase,
+                modifiers: mods,
+            };
+            with_web(|b| b.send_touch_event(touch));
         }
         touch::Delivery::ShellButton(phase) => with_shell(|s| match phase {
             TouchPhase::Pressed => {
