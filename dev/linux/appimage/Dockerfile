@@ -7,6 +7,10 @@ FROM fedora:44
 # can decode the media and the device profile advertises it to the server.
 # ffmpeg-devel below pulls it in; --allowerasing handles the swap for the
 # libplacebo/libass deps.
+# libva-devel is required for mpv's VA-API hwdec (the mpv build below sets
+# -Dvaapi=enabled); without it hwdec=vaapi can't create a device and video
+# falls back to software decoding. libdisplay-info-devel enables mpv's drm
+# feature, which vaapi-drm (render-node VA display) depends on.
 RUN dnf -y upgrade && \
     dnf -y install \
         "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
@@ -27,6 +31,7 @@ RUN dnf -y upgrade && \
         vulkan-headers vulkan-loader-devel wayland-protocols-devel python3-docutils \
         libglvnd-devel mesa-libGL-devel mesa-libEGL-devel mesa-libgbm-devel \
         systemd-devel libdrm-devel libX11-devel xcb-util-cursor-devel \
+        libva-devel libdisplay-info-devel \
         pipewire-devel luajit-devel rubberband-devel uchardet-devel \
         xcb-util-devel \
         plasma-wayland-protocols-devel \
@@ -55,7 +60,7 @@ RUN git clone --depth 1 --branch "${MPV_VERSION}" \
         https://github.com/mpv-player/mpv.git /tmp/mpv && \
     meson setup /tmp/mpv/build /tmp/mpv \
         --prefix=/usr/local --libdir=lib64 --default-library=shared \
-        -Dlibmpv=true -Dcplayer=false -Dlua=luajit && \
+        -Dlibmpv=true -Dcplayer=false -Dlua=luajit -Dvaapi=enabled && \
     meson install -C /tmp/mpv/build --strip && \
     rm -rf /tmp/mpv && \
     echo /usr/local/lib64 > /etc/ld.so.conf.d/usr-local-lib64.conf && \

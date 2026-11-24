@@ -9,6 +9,33 @@ export PIPEWIRE_MODULE_DIR="${HERE}/usr/lib/pipewire-0.3"
 # Fedora's ffmpeg-free uses GnuTLS, which requires a crypto-policies priority file.
 export GNUTLS_SYSTEM_PRIORITY_FILE="${HERE}/usr/share/crypto-policies/DEFAULT/gnutls.txt"
 
+# VA-API: a VA driver built for VA-API 1.N exports only __vaDriverInit_1_N and
+# libva tries only its own version and older, so libva must not be older than
+# the host's drivers. When the host libva is at least as new as the bundled one,
+# preload it (ld.so skips a preload it can't load instead of failing). Otherwise
+# keep the bundled libva, which only searches Fedora's /usr/lib64/dri*, and
+# point it at the host's driver directories. Runs before LD_LIBRARY_PATH is set
+# because readlink/uname are host binaries.
+va_version() { v="$(readlink -f "$1")"; v="${v##*/libva.so.2.}"; echo "${v%%.*}"; }
+host_va_dir=""
+for d in /usr/lib64 "/usr/lib/$(uname -m)-linux-gnu" /usr/lib; do
+    [ -e "$d/libva.so.2" ] && { host_va_dir="$d"; break; }
+done
+if [ -n "$host_va_dir" ] && \
+   [ "$(va_version "$host_va_dir/libva.so.2")" -ge "$(va_version "${HERE}/usr/lib/libva.so.2")" ] 2>/dev/null; then
+    for lib in libva.so.2 libva-drm.so.2 libva-wayland.so.2 libva-x11.so.2; do
+        [ -e "$host_va_dir/$lib" ] && LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$host_va_dir/$lib"
+    done
+    export LD_PRELOAD
+elif [ -z "${LIBVA_DRIVERS_PATH:-}" ]; then
+    va_drivers=""
+    for d in /usr/lib64/dri-nonfree /usr/lib64/dri-freeworld /usr/lib64/dri \
+             "/usr/lib/$(uname -m)-linux-gnu/dri" /usr/lib/dri /run/opengl-driver/lib/dri; do
+        [ -d "$d" ] && va_drivers="${va_drivers:+$va_drivers:}$d"
+    done
+    [ -n "$va_drivers" ] && export LIBVA_DRIVERS_PATH="$va_drivers"
+fi
+
 # LD_LIBRARY_PATH for library resolution (bundled first; glibc and GPU/driver
 # libs are not bundled and resolve from the host).
 export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
