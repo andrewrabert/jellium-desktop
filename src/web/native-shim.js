@@ -377,6 +377,10 @@
         window[plugin] = () => window['_' + plugin];
     }
 
+    // The server settings.json named when this page loaded; onLocalUserSignedIn
+    // moves it to each newly signed-in server.
+    let savedServerUrl = jmpInfo.settings.main.userWebClient || '';
+
     window.NativeShell = {
         openUrl(url, target) {
             window.api.system.openExternalUrl(url);
@@ -386,6 +390,30 @@
         },
         openClientSettings() {
             window.jmpNative.openClientSettings();
+        },
+        // jellyfin-web calls this after every sign-in, once window.ApiClient is
+        // the signed-in server's client. Saving that server's address makes a
+        // server chosen in Select Server open on the next launch; without it the
+        // address from the first connect is loaded forever. A failure here must
+        // never break the sign-in itself.
+        onLocalUserSignedIn(user) {
+            try {
+                const apiClient = window.ApiClient;
+                if (!user || !apiClient || apiClient.serverId() !== user.ServerId) {
+                    return Promise.resolve();
+                }
+                const address = String(apiClient.serverAddress() || '');
+                const trimmed = (url) => url.replace(/\/+$/, '');
+                if (address && trimmed(address) !== trimmed(savedServerUrl)
+                        && window.jmpNative && window.jmpNative.saveServerUrl) {
+                    window.jmpNative.saveServerUrl(address);
+                    savedServerUrl = address;
+                    console.info('[Media] Saved signed-in server for the next launch: ' + address);
+                }
+            } catch (e) {
+                console.error('[Media] Could not save the signed-in server:', e);
+            }
+            return Promise.resolve();
         },
         getPlugins() {
             return plugins;

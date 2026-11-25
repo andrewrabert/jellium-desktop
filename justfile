@@ -39,6 +39,11 @@ clean:
 test: build
     cargo test --manifest-path src/Cargo.toml --workspace
 
+# Test the injected web shim without building the native client (requires Node.js)
+[group('test')]
+test-web:
+    node --test tests/*.test.mjs
+
 # Run tests (loads MSVC + bindgen libclang env via dev/windows/env.ps1)
 [group('test')]
 [windows]
